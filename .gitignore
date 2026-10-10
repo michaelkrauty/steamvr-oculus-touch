@@ -1,0 +1,11 @@
+/build/
+/target/
+*.rec
+*.bak-*
+/.cache/
+/.claude/
+/.superpowers/
+
+__pycache__/
+*.py[cod]
+/third_party/.wraplock

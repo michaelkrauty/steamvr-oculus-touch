@@ -1,0 +1,23 @@
+[package]
+name = "cv1touch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/michaelkrauty/cv1touch"
+readme = "README.md"
+description = "Rift CV1 Touch controller tracking daemon and tools"
+
+[dependencies]
+libc = "0.2"
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+bindgen = "0.72"
+
+# The calibration tests run bundle adjustment on synthetic rooms; unoptimised nalgebra is ~50x slower.
+[profile.test]
+opt-level = 2

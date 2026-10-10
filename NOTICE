@@ -1,0 +1,9 @@
+cv1touch
+Copyright 2026 Michael Krauty
+
+Original cv1touch code is licensed under the Apache License, Version 2.0.
+Vendored third-party source retains its own terms and copyright notices.
+See THIRD_PARTY_NOTICES.md and the source headers for attribution and licenses.
+
+This project includes modified OpenHMD acquisition code and OpenVR SDK headers.
+It is not affiliated with or endorsed by Meta, Oculus, or Valve.

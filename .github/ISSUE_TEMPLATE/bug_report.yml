@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible cv1touch problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+      description: Include the reproduction steps. Search existing issues first.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and environment
+      description: Commit/version, distribution, SteamVR version, headset model, sensor count and USB layout. Omit serials and personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Diagnostics
+      description: Relevant doctor/status/log output, with personal identifiers removed. Do not attach raw room images or private recordings.

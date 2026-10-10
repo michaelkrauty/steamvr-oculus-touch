@@ -1,0 +1,2551 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Michael Krauty
+
+//! cv1touchd: owns the Rift CV1 headset radio and sensors through the vendored OpenHMD engine and
+//! publishes both Touch controllers' state to shared memory.
+
+use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::mem;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use cv1touch::control::{self, Command};
+use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
+use cv1touch::hand::{Hand, HandConfig};
+use cv1touch::recorder::{self, Recorder};
+use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
+use cv1touch::track::pipeline::{self, Pipeline, Stamped};
+use cv1touch::track::predict::{ShapeParams, VelocityShaper};
+use cv1touch::track::tracker::Stats;
+use cv1touch::{align, calib, ffi, modes, track};
+
+/// Decided by the Task 4 live check, see docs/notes/hmd-leds.md.
+const DEFAULT_HMD_LEDS_OFF: bool = true;
+const IO_FAILURES_BEFORE_REOPEN: u32 = 50;
+const SENSOR_PUBLISH_NS: u64 = 250_000_000;
+const RECORDER_RING_BYTES: usize = 64 << 20;
+/// Pixels at or below this are the sensors' dark noise (WMTD000000001 speckles up to ~10) and are
+/// not recorded; blobs start at the engine's threshold of 36, so their halos are kept.
+const RAW_FRAME_FLOOR: u8 = 7;
+const MAX_CLIENTS: usize = 16;
+
+/// Which pose cv1touchd publishes: its own tracker (OpenHMD only acquires) or OpenHMD's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrackerKind {
+    Rust,
+    OpenHmd,
+}
+
+/// Inputs for the tracking pipeline, copied out of the engine callbacks in arrival order.
+enum TrackIn {
+    HmdClock(u64, u32),
+    Frame(Box<engine::FrameInfo>, Vec<Blob>),
+}
+
+#[derive(Clone, Copy)]
+struct Haptic {
+    duration_s: f32,
+    frequency_hz: f32,
+    amplitude: f32,
+}
+
+type StationPoses = Vec<(String, nalgebra::Isometry3<f64>)>;
+type TimedStationPoses = (u64, StationPoses);
+
+struct Daemon {
+    shm: ShmWriter,
+    rec: Recorder,
+    quit: AtomicBool,
+    haptics: Mutex<[Option<Haptic>; 2]>,
+    /// Sensor intrinsics and LED models still to be written into the active recording.
+    session: Mutex<recorder::SessionInfo>,
+    opts: Mutex<EngineOptions>,
+    mode: Mutex<String>,
+    reopen: AtomicBool,
+    tracker: TrackerKind,
+    track_in: Mutex<Vec<TrackIn>>,
+    track_stats: Mutex<[(Stats, bool); 2]>,
+    /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
+    landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
+    /// How the Lighthouse universe moved since the registration (see `universe_watch`), with
+    /// the registration it was measured against (its `created_unix_s`).
+    universe_shift: Mutex<Option<(u64, nalgebra::Isometry3<f64>)>>,
+    /// Asks `universe_watch` to measure now rather than at its next check.
+    universe_recheck: AtomicBool,
+    /// The base stations' raw poses as the SteamVR driver last reported them (`stations`), with
+    /// when they arrived (shm clock).
+    driver_stations: Mutex<Option<TimedStationPoses>>,
+    /// `universe-watch off` stops the watch (the registration stays as last followed).
+    universe_watch_on: AtomicBool,
+    /// `shaping off` publishes the tracked velocities as they are (see `track::predict`).
+    shaping_on: AtomicBool,
+    /// The current recording keeps the sensors' pixels (RAW_FRAME records).
+    record_frames: AtomicBool,
+    /// Extra stamp shift of published poses, ns (`latency` command; 0 by default).
+    extra_latency_ns: std::sync::atomic::AtomicI64,
+    /// Per hand: the newest battery percentage from the radio, -1 before the first.
+    battery: [std::sync::atomic::AtomicI32; 2],
+    /// Wakes the radio thread (an eventfd): new camera frames or bodies, or time to stop. It lives as
+    /// long as the daemon, so a sensor thread never writes to a closed (or reused) descriptor.
+    radio_wake: std::os::fd::OwnedFd,
+    /// The radio thread runs: it records the radio's reports (stamped as they land), not the engine.
+    radio_on: AtomicBool,
+    /// Input injection for automated tests.
+    inject: Injection,
+}
+
+impl Daemon {
+    fn wake_radio(&self) {
+        let one = 1u64;
+        // SAFETY: an eventfd takes one u64; a full counter (never, in practice) just drops the wake.
+        unsafe {
+            libc::write(
+                self.radio_wake.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            )
+        };
+    }
+}
+
+/// A sensor whose landmarks moved this far (px) two windows running is reported as knocked; one
+/// landmark alone (a single blob mode) wanders a few tenths and needs more.
+const LANDMARK_ALERT_PX: f64 = 0.4;
+const LANDMARK_ALERT_SINGLE_PX: f64 = 1.0;
+const LANDMARK_WINDOW_NS: u64 = 60_000_000_000;
+
+const BIAS_SAVE_NS: u64 = 30_000_000_000;
+
+/// Each controller's IMU biases across restarts (see `track::biases`): seeded into a new tracker,
+/// taken every 30 s while it tracks and written then and when the engine closes.
+struct BiasMemory {
+    file: track::biases::BiasFile,
+    keys: [Option<String>; 2],
+    next_save: u64,
+    dirty: bool,
+}
+
+impl BiasMemory {
+    fn load() -> BiasMemory {
+        BiasMemory {
+            file: track::biases::load(&track::biases::default_path()),
+            keys: [None, None],
+            next_save: 0,
+            dirty: false,
+        }
+    }
+
+    fn seed(&mut self, p: &mut Pipeline, hand: usize, leds: &[calib::capture::Led]) {
+        let key = track::biases::key(hand, leds);
+        if let Some(e) = self.file.controllers.get(&key) {
+            p.seed_biases(hand, e.gyro(), e.accel());
+            let a = e.accel();
+            log(format!(
+                "{}: IMU biases from the last run (accelerometer {:+.3} {:+.3} {:+.3} m/s^2)",
+                ["left", "right"][hand],
+                a.x,
+                a.y,
+                a.z
+            ));
+        }
+        self.keys[hand] = Some(key);
+    }
+
+    /// Every 30 s, the tracking controllers' biases: the file's new contents when they changed, for
+    /// `save_biases` (on the engine thread: no file I/O on the radio thread).
+    fn update(&mut self, p: &Pipeline, now: u64) -> Option<track::biases::BiasFile> {
+        if now < self.next_save {
+            return None;
+        }
+        self.next_save = now + BIAS_SAVE_NS;
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let (Some(key), Some(s)) = (self.keys[h].as_ref(), p.latest(h)) else {
+                continue;
+            };
+            if s.output.tracking {
+                let (g, a) = (s.output.gyro_bias, s.output.accel_bias);
+                let unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                self.file.controllers.insert(
+                    key.clone(),
+                    track::biases::Entry {
+                        gyro: [g.x, g.y, g.z],
+                        accel: [a.x, a.y, a.z],
+                        updated_unix_s: unix,
+                    },
+                );
+                self.dirty = true;
+            }
+        }
+        self.take_changed()
+    }
+
+    /// The file's contents if they changed since last taken.
+    fn take_changed(&mut self) -> Option<track::biases::BiasFile> {
+        mem::take(&mut self.dirty).then(|| self.file.clone())
+    }
+}
+
+fn save_biases(f: &track::biases::BiasFile) {
+    if let Err(e) = track::biases::save(&track::biases::default_path(), f) {
+        log(format!("IMU biases not saved: {e}"));
+    }
+}
+
+/// Watches the landmarks (static infrared sources such as the base stations) for a moved sensor.
+struct LandmarkWatch {
+    monitor: track::landmarks::Monitor,
+    sensors: std::collections::BTreeSet<String>,
+    /// Per sensor: the last alert (shift magnitude), to report changes only.
+    alerted: std::collections::BTreeMap<String, f64>,
+    /// Consecutive windows without any landmark measured, per sensor.
+    missing: std::collections::BTreeMap<String, u32>,
+    /// Consecutive windows over the alert threshold, per sensor.
+    over: std::collections::BTreeMap<String, u32>,
+}
+
+impl LandmarkWatch {
+    fn load() -> Option<LandmarkWatch> {
+        let path = track::landmarks::default_path();
+        match track::landmarks::load(&path) {
+            Ok(f) if !f.landmarks.is_empty() => {
+                let sensors = f.landmarks.iter().map(|l| l.serial.clone()).collect();
+                log(format!(
+                    "watching {} landmarks from {} for moved sensors",
+                    f.landmarks.len(),
+                    path.display()
+                ));
+                Some(LandmarkWatch {
+                    monitor: track::landmarks::Monitor::new(f.landmarks, LANDMARK_WINDOW_NS),
+                    sensors,
+                    alerted: Default::default(),
+                    missing: Default::default(),
+                    over: Default::default(),
+                })
+            }
+            Ok(_) => None,
+            Err(e) => {
+                if path.exists() {
+                    log(e);
+                }
+                None
+            }
+        }
+    }
+
+    fn frame(&mut self, d: &Daemon, info: &engine::FrameInfo, blobs: &[Blob]) {
+        let serial = engine::cstr_field(&info.serial);
+        let unlabelled: Vec<nalgebra::Vector2<f64>> = blobs
+            .iter()
+            .filter(|b| b.led_id < 0)
+            .map(|b| nalgebra::Vector2::new(b.x as f64, b.y as f64))
+            .collect();
+        let Some(shifts) = self
+            .monitor
+            .frame(&serial, info.frame_start_host_ns, &unlabelled, 20)
+        else {
+            return;
+        };
+        let mut out = d.landmark_shifts.lock().unwrap();
+        for sensor in &self.sensors {
+            match shifts.iter().find(|s| &s.serial == sensor) {
+                Some(s) => {
+                    self.missing.remove(sensor);
+                    let m = s.shift.norm();
+                    out.insert(sensor.clone(), (s.shift.x, s.shift.y, s.landmarks));
+                    let last = self.alerted.get(sensor).copied().unwrap_or(0.0);
+                    let threshold = if s.landmarks >= 2 {
+                        LANDMARK_ALERT_PX
+                    } else {
+                        LANDMARK_ALERT_SINGLE_PX
+                    };
+                    let over = self.over.entry(sensor.clone()).or_default();
+                    *over = if m >= threshold { *over + 1 } else { 0 };
+                    if *over >= 2 && (m - last).abs() >= 0.2 {
+                        log(format!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y));
+                        self.alerted.insert(sensor.clone(), m);
+                    } else if *over == 0 && last >= LANDMARK_ALERT_PX {
+                        log(format!("sensor {sensor}: landmarks back in place"));
+                        self.alerted.insert(sensor.clone(), m);
+                    }
+                }
+                None => {
+                    let n = self.missing.entry(sensor.clone()).or_default();
+                    *n += 1;
+                    if *n == 3 {
+                        log(format!("sensor {sensor}: none of its landmarks seen for 3 minutes (moved more than a pixel, or the base stations are off)"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl EngineSink for Daemon {
+    fn frame(&self, info: &engine::FrameInfo, blobs: &[Blob]) {
+        if self.rec.active() {
+            self.rec.write(
+                recorder::FRAME_OBS,
+                info.frame_start_host_ns,
+                &[recorder::as_bytes(info), recorder::slice_bytes(blobs)],
+            );
+        }
+        if self.tracker == TrackerKind::Rust {
+            self.track_in
+                .lock()
+                .unwrap()
+                .push(TrackIn::Frame(Box::new(*info), blobs.to_vec()));
+            self.wake_radio();
+        }
+    }
+
+    fn image(
+        &self,
+        info: &engine::FrameInfo,
+        width: usize,
+        height: usize,
+        stride: usize,
+        pixels: &[u8],
+    ) {
+        if self.record_frames.load(Ordering::Acquire) && self.rec.active() {
+            let payload =
+                recorder::encode_frame(info, width, height, stride, pixels, RAW_FRAME_FLOOR);
+            self.rec
+                .write(recorder::RAW_FRAME, info.frame_start_host_ns, &[&payload]);
+        }
+    }
+
+    fn report(&self, source: i32, ts: u64, data: &[u8]) {
+        // the radio thread records its own copy of the radio's reports, stamped as they land
+        if self.rec.active() && !(source == 1 && self.radio_on.load(Ordering::Acquire)) {
+            self.rec.write(
+                recorder::RAW_REPORT,
+                ts,
+                &[&(source as u32).to_le_bytes(), data],
+            );
+        }
+        if source == 1 {
+            for (hand, pct) in cv1touch::hand::battery_from_radio(data) {
+                // logged when it changes: it read 100 for hours on fresh cells, and the first
+                // drop will show what the channel really is
+                let was = self.battery[hand].swap(pct, Ordering::Relaxed);
+                if was != pct {
+                    log(format!(
+                        "{} Touch battery {pct}%{}",
+                        ["left", "right"][hand],
+                        if was >= 0 {
+                            format!(" (was {was}%)")
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
+        }
+        if self.tracker == TrackerKind::Rust && source == 0 {
+            if let Some(us) = pipeline::hmd_report_timestamp(data) {
+                self.track_in
+                    .lock()
+                    .unwrap()
+                    .push(TrackIn::HmdClock(ts, us));
+            }
+        }
+    }
+}
+
+fn log(msg: impl AsRef<str>) {
+    eprintln!("cv1touchd: {}", msg.as_ref());
+}
+
+fn publish_disconnected(d: &Daemon) {
+    let now = shm::now_ns();
+    for h in [HAND_LEFT, HAND_RIGHT] {
+        d.shm.publish_hand(
+            h,
+            &ControllerState {
+                publish_host_ns: now,
+                battery_percent: -1,
+                ..Default::default()
+            },
+        );
+    }
+    d.shm.publish_sensors(&[]);
+    d.shm.signal();
+    d.shm.heartbeat(now);
+}
+
+fn sensor_status(s: &engine::Sensor) -> SensorStatus {
+    let mut out = SensorStatus::default();
+    shm::set_serial(&mut out, &engine::sensor_serial(s));
+    out.placed = s.have_camera_pose as u32;
+    out.frames = s.frames;
+    out.pose_fixes[HAND_LEFT] = s.pose_fixes[2]; // OpenHMD device id 2 = left
+    out.pose_fixes[HAND_RIGHT] = s.pose_fixes[1]; // OpenHMD device id 1 = right
+    out.camera_orient = s.camera_orient;
+    out.camera_pos = s.camera_pos;
+    out
+}
+
+/// Writes whatever session info (sensor intrinsics, each controller's LED model) has become
+/// available and is not in the recording yet.
+fn write_session_info(d: &Daemon, e: &Engine) {
+    let mut session = d.session.lock().unwrap();
+    if session.complete(2) {
+        return;
+    }
+    let sensors = e.sensors();
+    let models: Vec<(i32, Vec<engine::LedEntry>)> = [HAND_LEFT, HAND_RIGHT]
+        .iter()
+        .filter_map(|&h| Some((e.controller(h)?.device_id, e.led_model(h))))
+        .collect();
+    let known: Vec<(i32, bool)> = models
+        .iter()
+        .map(|(dev, m)| (*dev, !m.is_empty()))
+        .collect();
+    let (write_sensors, devices) = session.plan(!sensors.is_empty(), &known);
+    let now = shm::now_ns();
+    if write_sensors {
+        for s in &sensors {
+            d.rec
+                .write(recorder::SENSOR_INFO, now, &[recorder::as_bytes(s)]);
+        }
+    }
+    for (device, model) in models.iter().filter(|(dev, _)| devices.contains(dev)) {
+        d.rec.write(
+            recorder::LED_MODEL,
+            now,
+            &[
+                &recorder::led_model_prefix(*device, model.len()),
+                recorder::slice_bytes(model),
+            ],
+        );
+    }
+}
+
+/// The tracking pipeline for an engine just opened: calibrated sensors only (None without any, so
+/// OpenHMD's poses are published).
+fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline> {
+    if d.tracker != TrackerKind::Rust || opts.fixed_poses.is_empty() {
+        return None;
+    }
+    let mut p = Pipeline::new(pipeline::Options::default());
+    for s in e.sensors() {
+        let serial = engine::sensor_serial(&s);
+        if let Some(pose) = opts.fixed_poses.iter().find(|f| f.serial == serial) {
+            p.sensor(
+                &serial,
+                calib::camera::CameraModel::from_sensor(&s),
+                calib::iso_from_xyzw(pose.orient, pose.pos),
+            );
+        }
+    }
+    d.track_in.lock().unwrap().clear();
+    Some(p)
+}
+
+/// Puts the tracker's pose into the published state, stamped `extra_ns` earlier than the
+/// pipeline's estimate of when the controller was there (the `latency` adjustment).
+/// `shaper` turns the velocities into the ones SteamVR's constant-velocity prediction should use
+/// (see `track::predict`); the pose is published as tracked.
+fn apply_tracked(
+    state: &mut ControllerState,
+    s: &Stamped,
+    extra_ns: i64,
+    shaper: &mut VelocityShaper,
+    shaping: bool,
+) {
+    let q = s.output.world_from_model.rotation;
+    let t = s.output.world_from_model.translation.vector;
+    state.orient = [q.i as f32, q.j as f32, q.k as f32, q.w as f32];
+    state.pos = [t.x as f32, t.y as f32, t.z as f32];
+    let (w, v) = shaper.shape_body(
+        s.host_ns,
+        &q,
+        s.gyro - s.gyro_bias,
+        s.output.tracking.then_some(s.output.vel),
+    );
+    let (w, v) = if shaping {
+        (w, v)
+    } else {
+        (s.output.ang_vel_world, Some(s.output.vel))
+    };
+    let v = v.unwrap_or(s.output.vel);
+    state.lin_vel = [v.x as f32, v.y as f32, v.z as f32];
+    // the driver takes orient * (ang_vel - gyro_bias) as the world rate: the shaped one, in the body
+    let body = q.inverse() * w + s.gyro_bias;
+    state.ang_vel = [body.x as f32, body.y as f32, body.z as f32];
+    state.gyro_bias = [
+        s.gyro_bias.x as f32,
+        s.gyro_bias.y as f32,
+        s.gyro_bias.z as f32,
+    ];
+    let shift = |t: u64| (t as i64).saturating_sub(extra_ns).max(0) as u64;
+    state.sample_host_ns = shift(s.host_ns);
+    state.last_position_fix_host_ns = if s.last_fix_host_ns == 0 {
+        0
+    } else {
+        shift(s.last_fix_host_ns)
+    };
+    if s.output.tracking {
+        state.flags |= ffi::CV1T_FLAG_POSITION;
+    } else {
+        state.flags &= !ffi::CV1T_FLAG_POSITION;
+    }
+}
+
+const UNIVERSE_CHECK_MS: u64 = 60_000;
+/// How often the watch looks at the stations the driver reports (cheap: no SteamVR connection).
+const UNIVERSE_DRIVER_CHECK_MS: u64 = 5_000;
+/// The driver's report counts as current this long; past it, the watch connects to SteamVR itself
+/// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS`.
+const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
+
+/// Keeps the registration on the Lighthouse universe it was fitted in. A SteamVR restart can
+/// re-bootstrap the universe from another base station and move it by centimetres (24 mm and 0.7
+/// deg on 2026-10-08); the stations themselves do not move, so their raw poses, against those the
+/// registration recorded, measure the move. Checked once a minute with a short-lived background
+/// OpenVR connection (one that never keeps SteamVR from quitting).
+fn universe_watch(d: Arc<Daemon>) {
+    let mut first = true;
+    let mut warned_disagree = false;
+    let mut last_connect: Option<std::time::Instant> = None;
+    while !d.quit.load(Ordering::Acquire) {
+        sleep_until(
+            &d,
+            if first {
+                5_000
+            } else {
+                UNIVERSE_DRIVER_CHECK_MS
+            },
+            || d.universe_recheck.swap(false, Ordering::AcqRel),
+        );
+        first = false;
+        if !d.universe_watch_on.load(Ordering::Acquire) {
+            continue;
+        }
+        let Ok(reg) = align::load_registration(&align::registration_path()) else {
+            continue;
+        };
+        if reg.stations.len() < 2 {
+            continue;
+        }
+        // the stations as the driver sees them inside SteamVR; else (an older driver) a short
+        // SteamVR connection of our own, once a minute: each one costs vrserver an app connect
+        let reported = d
+            .driver_stations
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(at, _)| shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS);
+        let now = match reported {
+            Some((_, v)) => v,
+            None => {
+                if last_connect
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(UNIVERSE_CHECK_MS))
+                {
+                    continue;
+                }
+                last_connect = Some(std::time::Instant::now());
+                let Ok(client) = cv1touch::vr::Client::connect() else {
+                    continue;
+                };
+                let v = client.stations();
+                drop(client);
+                v
+            }
+        };
+        if now.len() < 2 {
+            continue;
+        }
+        let Some(shift) = reg.follow(&now) else {
+            if !warned_disagree {
+                warned_disagree = true;
+                log("universe watch: the base stations disagree on how the universe moved (one bumped?); registration left as it is");
+            }
+            continue;
+        };
+        warned_disagree = false;
+        let s = shift.now_from_then;
+        let s = if s.translation.vector.norm() < 5e-4 && s.rotation.angle() < 0.01f64.to_radians() {
+            nalgebra::Isometry3::identity()
+        } else {
+            s
+        };
+        let prev = d
+            .universe_shift
+            .lock()
+            .unwrap()
+            .filter(|p| p.0 == reg.created_unix_s)
+            .map(|p| p.1);
+        let moved = prev.is_none_or(|p| {
+            (p.inverse() * s).translation.vector.norm() > 3e-4
+                || (p.inverse() * s).rotation.angle() > 0.01f64.to_radians()
+        });
+        if moved {
+            *d.universe_shift.lock().unwrap() = Some((reg.created_unix_s, s));
+            let (alignment, _) = align::load_with(Some(&s));
+            d.shm.publish_alignment(&alignment);
+            if s != nalgebra::Isometry3::identity()
+                || prev.is_some_and(|p| p != nalgebra::Isometry3::identity())
+            {
+                log(format!(
+                    "universe watch: the Lighthouse universe moved {:.1} mm, {:.2} deg in the play area since the registration ({} stations, disagreeing there by {:.1} mm rms); registration follows",
+                    (s * reg.play_area_point() - reg.play_area_point()).norm() * 1e3,
+                    s.rotation.angle().to_degrees(),
+                    shift.stations,
+                    shift.residual_m * 1e3
+                ));
+            }
+        }
+    }
+}
+
+fn sleep_interruptible(d: &Daemon, ms: u64) {
+    sleep_until(d, ms, || false);
+}
+
+/// Sleeps `ms`, or until quitting or `wake` says so.
+fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
+    for _ in 0..ms / 50 {
+        if d.quit.load(Ordering::Acquire) || wake() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The only thread that touches OpenHMD.
+fn engine_main(d: Arc<Daemon>) {
+    let mut last_err = String::new();
+    while !d.quit.load(Ordering::Acquire) {
+        let opts = d.opts.lock().unwrap().clone();
+        let mut e = match Engine::open(&opts, d.clone()) {
+            Ok(e) => e,
+            Err(err) => {
+                if err != last_err {
+                    log(format!("waiting for headset: {err}"));
+                    last_err = err;
+                }
+                publish_disconnected(&d);
+                sleep_interruptible(&d, 1000);
+                continue;
+            }
+        };
+        last_err.clear();
+        d.session.lock().unwrap().reset(); // sensors may differ after a reopen
+        log(format!(
+            "engine running with {} sensor(s)",
+            e.sensors().len()
+        ));
+        make_usb_thread_realtime();
+        let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
+        for serial in modes::unposed_sensors(&opts, &open) {
+            log(format!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)"));
+        }
+        let link = RadioLink::default();
+        // the radio thread holds a decoder pointing into the engine: the scope joins it first
+        thread::scope(|scope| {
+            let radio = new_pipeline(&d, &opts, &e).and_then(|pipe| {
+                let Some(path) = engine::radio_hidraw(std::path::Path::new("/sys/class/hidraw")) else {
+                    log("no hidraw node for the headset's radio: publishing OpenHMD poses");
+                    return None;
+                };
+                let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        log(format!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display()));
+                        return None;
+                    }
+                };
+                // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
+                let dec = unsafe { e.radio_decoder() }?;
+                log(format!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display()));
+                let watch = LandmarkWatch::load();
+                let (d, link) = (&*d, &link);
+                Some(thread::Builder::new().name("cv1t-radio".into()).spawn_scoped(scope, move || radio_main(d, link, dec, file, pipe, watch)).expect("radio thread"))
+            });
+            {
+                let _stop = StopRadio { d: &d, link: &link };
+                engine_loop(&d, &mut e, &link, radio.is_some());
+            }
+            if let Some(Err(_)) = radio.map(|r| r.join()) {
+                log("radio thread panicked");
+            }
+        });
+        if let Some(f) = link.biases.lock().unwrap().take() {
+            save_biases(&f);
+        }
+        drop(e);
+        publish_disconnected(&d);
+    }
+}
+
+/// How long `test-inject on` arms input injection: it disarms itself, so a forgotten test leaves
+/// nothing switched on.
+const INJECT_ARMED_NS: u64 = 600_000_000_000;
+
+/// Input injection for automated tests (`test-inject`, `inject`): off by default, armed for
+/// `INJECT_ARMED_NS` at a time. Whichever thread publishes a hand ORs what is pressed into its
+/// state (`publish_hand_state`), so each shm slot keeps its one writer; nothing outlives the
+/// arming or the daemon.
+#[derive(Default)]
+struct Injection {
+    /// When the arming runs out (shm clock; 0: disarmed); checked without the lock on every publish.
+    armed_until: std::sync::atomic::AtomicU64,
+    /// Per hand: what is pressed, and until when.
+    pressed: Mutex<[(control::Injected, u64); 2]>,
+}
+
+impl Injection {
+    fn arm(&self, now: u64) {
+        *self.pressed.lock().unwrap() = Default::default();
+        self.armed_until
+            .store(now + INJECT_ARMED_NS, Ordering::Release);
+    }
+
+    fn disarm(&self) {
+        self.armed_until.store(0, Ordering::Release);
+        *self.pressed.lock().unwrap() = Default::default();
+    }
+
+    /// How long it stays armed, ns; None when disarmed.
+    fn armed_for(&self, now: u64) -> Option<u64> {
+        let until = self.armed_until.load(Ordering::Acquire);
+        (now < until).then(|| until - now)
+    }
+
+    fn press(
+        &self,
+        hand: usize,
+        inputs: control::Injected,
+        ms: u32,
+        now: u64,
+    ) -> Result<(), String> {
+        if self.armed_for(now).is_none() {
+            return Err("test-inject is off (cv1touch test-inject on)".into());
+        }
+        self.pressed.lock().unwrap()[hand] = (inputs, now + ms as u64 * 1_000_000);
+        Ok(())
+    }
+
+    fn apply(&self, hand: usize, now: u64, st: &mut ControllerState) {
+        if now >= self.armed_until.load(Ordering::Acquire) {
+            return;
+        }
+        let (inputs, until) = self.pressed.lock().unwrap()[hand];
+        if now >= until {
+            return;
+        }
+        st.buttons |= inputs.buttons;
+        st.touches |= inputs.touches;
+        if inputs.trigger {
+            st.trigger = 1.0;
+        }
+        if inputs.grip {
+            st.grip = 1.0;
+        }
+    }
+}
+
+/// Stops the radio thread when the engine loop ends, a panic included (the scope would wait on
+/// the thread forever otherwise).
+struct StopRadio<'a> {
+    d: &'a Daemon,
+    link: &'a RadioLink,
+}
+
+impl Drop for StopRadio<'_> {
+    fn drop(&mut self) {
+        self.link.stop.store(true, Ordering::Release);
+        self.d.wake_radio();
+    }
+}
+
+/// What the engine thread and the radio thread share for one open engine.
+#[derive(Default)]
+struct RadioLink {
+    stop: AtomicBool,
+    /// The engine's newest view of each controller (calibration, connection, OpenHMD's pose):
+    /// the radio thread's samples go out over it.
+    engine_view: Mutex<[Option<engine::Controller>; 2]>,
+    /// Which thread publishes each hand.
+    hands: HandOwnership,
+    /// Bodies the engine found for the radio thread to add.
+    bodies: Mutex<Vec<NewBody>>,
+    /// The bias file's new contents from the radio thread, for the engine thread to write.
+    biases: Mutex<Option<track::biases::BiasFile>>,
+}
+
+struct NewBody {
+    hand: usize,
+    device_id: i32,
+    leds: Vec<calib::capture::Led>,
+    imu: nalgebra::Vector3<f64>,
+}
+
+/// Which thread writes a hand's shm slot, which takes one writer at a time: the engine (OpenHMD's
+/// pose) until the radio thread has the hand's tracker body and the engine, between two of its own
+/// publishes, lets go; the radio thread from then on; the engine again once the radio thread has
+/// exited, after its last publish.
+#[derive(Default)]
+struct HandOwnership {
+    wanted: [AtomicBool; 2],
+    radio: [AtomicBool; 2],
+    radio_gone: AtomicBool,
+}
+
+impl HandOwnership {
+    /// Radio thread: it has the hand's body and asks for the hand.
+    fn request(&self, hand: usize) {
+        self.wanted[hand].store(true, Ordering::Release);
+    }
+
+    /// Radio thread: whether it may publish the hand.
+    fn radio_publishes(&self, hand: usize) -> bool {
+        self.radio[hand].load(Ordering::Acquire)
+    }
+
+    /// Radio thread, after its last publish: every hand goes back to the engine.
+    fn radio_exit(&self) {
+        self.radio_gone.store(true, Ordering::Release);
+    }
+
+    /// Engine thread, before each publish of the hand: whether it still publishes it, letting go
+    /// first if the radio thread asked.
+    fn engine_publishes(&self, hand: usize) -> bool {
+        if self.radio_gone.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.radio[hand].load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.wanted[hand].load(Ordering::Acquire) {
+            self.radio[hand].store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+
+/// The engine thread's loop for one open engine: OpenHMD's update (its own filter, the acquisition
+/// the tracker relies on, the headset, haptics), each controller's engine view for the radio
+/// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
+/// from OpenHMD. Returns when the engine is to close.
+fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
+    let mut hands = [
+        Hand::new(HAND_LEFT, HandConfig::default()),
+        Hand::new(HAND_RIGHT, HandConfig::default()),
+    ];
+    let mut shapers = [
+        VelocityShaper::new(ShapeParams::default()),
+        VelocityShaper::new(ShapeParams::default()),
+    ];
+    let (mut was_tracking, mut wrong_locks) = ([false; 2], [0u64; 2]);
+    let mut holds = HoldStats::default();
+    let mut bodies = BodyFinder::default();
+    let (mut failures, mut next_sensors) = (0u32, 0u64);
+    while !d.quit.load(Ordering::Acquire) {
+        if d.reopen.swap(false, Ordering::AcqRel) {
+            log(format!(
+                "reopening the engine for {} mode",
+                d.mode.lock().unwrap()
+            ));
+            return;
+        }
+        let pending = mem::take(&mut *d.haptics.lock().unwrap());
+        for (h, cmd) in pending.iter().enumerate() {
+            if let Some(c) = cmd {
+                e.haptic(h, c.duration_s, c.frequency_hz, c.amplitude);
+            }
+        }
+        if e.update().is_err() {
+            failures += 1;
+            if failures >= IO_FAILURES_BEFORE_REOPEN {
+                log("headset I/O failing; reopening");
+                return;
+            }
+        } else {
+            failures = 0;
+        }
+        let now = shm::now_ns();
+        let mut arrived = [None; 2];
+        let mut published = false;
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let read_from = shm::now_ns();
+            let Some(c) = e.controller(h) else { continue };
+            link.engine_view.lock().unwrap()[h] = Some(c);
+            if !link.hands.engine_publishes(h) {
+                continue;
+            }
+            if c.device_time_ns != holds.last_sample[h] {
+                holds.last_sample[h] = c.device_time_ns;
+                arrived[h] = Some(HoldParts {
+                    held_ns: c.received_host_ns,
+                    filter_ns: c.filter_ns,
+                    update_ns: now.saturating_sub(c.received_host_ns),
+                    read_ns: shm::now_ns().saturating_sub(read_from),
+                });
+            }
+            publish_hand_state(
+                d,
+                h,
+                &c,
+                now,
+                &mut hands[h],
+                None,
+                &mut shapers[h],
+                &mut was_tracking[h],
+                &mut wrong_locks[h],
+            );
+            published = true;
+        }
+        if published {
+            d.shm.signal();
+        }
+        d.shm.heartbeat(now);
+        holds.note(arrived, shm::now_ns());
+        if let Some(f) = link.biases.lock().unwrap().take() {
+            save_biases(&f);
+        }
+        if radio {
+            if bodies.find(e, link) {
+                d.wake_radio();
+            }
+        } else {
+            // no tracker reads the frames: keep the queue from growing
+            d.track_in.lock().unwrap().clear();
+        }
+        if now >= next_sensors {
+            let sensors: Vec<SensorStatus> = e.sensors().iter().map(sensor_status).collect();
+            d.shm.publish_sensors(&sensors);
+            next_sensors = now + SENSOR_PUBLISH_NS;
+            if d.rec.active() {
+                write_session_info(d, e);
+            }
+        }
+    }
+}
+
+/// Finds each controller's tracker body (its LED model and factory IMU position) once the engine
+/// has the model, for the radio thread to add.
+#[derive(Default)]
+struct BodyFinder {
+    sent: [bool; 2],
+    warned: [bool; 2],
+    next_try: [u64; 2],
+}
+
+impl BodyFinder {
+    /// True when it handed the radio thread a body.
+    fn find(&mut self, e: &Engine, link: &RadioLink) -> bool {
+        let now = shm::now_ns();
+        let mut found = false;
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            // a controller with no cached configuration is looked up again every few seconds, not
+            // on every pass of the engine loop
+            if self.sent[h] || now < self.next_try[h] {
+                continue;
+            }
+            let Some(c) = e.controller(h) else { continue };
+            let model = e.led_model(h);
+            if model.is_empty() {
+                continue;
+            }
+            let leds: Vec<calib::capture::Led> = model
+                .iter()
+                .map(|l| calib::capture::Led {
+                    pos: calib::vec3(l.pos),
+                    dir: calib::vec3(l.dir),
+                })
+                .collect();
+            match track::factory::imu_position(&track::factory::openhmd_config_dir(), &leds) {
+                Some(imu) => {
+                    link.bodies.lock().unwrap().push(NewBody {
+                        hand: h,
+                        device_id: c.device_id,
+                        leds,
+                        imu,
+                    });
+                    self.sent[h] = true;
+                    found = true;
+                }
+                None => {
+                    self.next_try[h] = now + 5_000_000_000;
+                    if !self.warned[h] {
+                        self.warned[h] = true;
+                        log(format!("{}: no factory IMU position cached for its LED model; publishing OpenHMD poses for it", ["left", "right"][h]));
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+/// How long the radio thread sleeps with nothing to do, ms: it keeps the hands' published state
+/// current (a controller set down stops sending) about this often.
+const RADIO_IDLE_WAKE_MS: i32 = 20;
+const RADIO_REFRESH_NS: u64 = 20_000_000;
+
+/// The radio thread: reads the radio through its own hidraw handle and publishes each controller
+/// sample as it lands (the tracker's pose at it), and between reports feeds the tracker the camera
+/// frames one at a time, so a report waits for at most one frame. Runs SCHED_RR (`make_realtime`)
+/// with inherited affinity or the explicit `CV1TOUCH_CPUS` selection.
+fn radio_main(
+    d: &Daemon,
+    link: &RadioLink,
+    mut dec: engine::RadioDecoder,
+    radio: fs::File,
+    mut pipe: Pipeline,
+    mut watch: Option<LandmarkWatch>,
+) {
+    if let Err(err) = set_radio_affinity() {
+        log(format!("radio thread keeps the process's CPUs ({err})"));
+    }
+    match make_realtime(RADIO_RT_PRIORITY) {
+        Ok(()) => log(format!(
+            "radio thread real-time (SCHED_RR {RADIO_RT_PRIORITY})"
+        )),
+        Err(err) => log(format!("radio thread stays normal priority ({err})")),
+    }
+    d.radio_on.store(true, Ordering::Release);
+    let _exit = RadioExit { d, link };
+    let mut biases = BiasMemory::load();
+    let mut hands = [
+        Hand::new(HAND_LEFT, HandConfig::default()),
+        Hand::new(HAND_RIGHT, HandConfig::default()),
+    ];
+    let mut shapers = [
+        VelocityShaper::new(ShapeParams::default()),
+        VelocityShaper::new(ShapeParams::default()),
+    ];
+    let (mut was_tracking, mut wrong_locks) = ([false; 2], [0u64; 2]);
+    let mut holds = HoldStats::default();
+    let mut newest: [Option<engine::Controller>; 2] = [None; 2];
+    let mut last_publish = [0u64; 2];
+    let mut queue: std::collections::VecDeque<TrackIn> = Default::default();
+    let mut next_stats = 0u64;
+    let mut buf = [0u8; 64];
+    let (radio_fd, wake_fd) = (radio.as_raw_fd(), d.radio_wake.as_raw_fd());
+    let mut radio_failed = false;
+    let mut rest = Rest::new();
+    while !link.stop.load(Ordering::Acquire) && !radio_failed {
+        let mut fds = [
+            libc::pollfd {
+                fd: radio_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: valid pollfd array.
+        unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                2,
+                if queue.is_empty() {
+                    RADIO_IDLE_WAKE_MS
+                } else {
+                    0
+                },
+            )
+        };
+        // every report that is in
+        let mut arrived = [None; 2];
+        let mut published = false;
+        while !radio_failed {
+            // SAFETY: valid fd and buffer.
+            let n =
+                unsafe { libc::read(radio_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                let err = std::io::Error::last_os_error();
+                if n < 0
+                    && err.kind() == ErrorKind::WouldBlock
+                    && fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
+                {
+                    break;
+                }
+                // the headset gone (polling a dead node returns at once, which would spin this
+                // thread): the engine reopens, with a new radio thread
+                log(format!(
+                    "radio read failed ({}); reopening the engine",
+                    if n < 0 {
+                        err.to_string()
+                    } else {
+                        "end of file".into()
+                    }
+                ));
+                radio_failed = true;
+                break;
+            }
+            let at = shm::now_ns();
+            let report = &buf[..n as usize];
+            if d.rec.active() {
+                d.rec
+                    .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
+            }
+            let (samples, k) = dec.decode(report, at);
+            for s in &samples[..k] {
+                let Some(h) = pipeline::device_hand(s.device_id) else {
+                    continue;
+                };
+                if !link.hands.radio_publishes(h) || !pipe.has_body(h) {
+                    continue;
+                }
+                let Some(view) = link.engine_view.lock().unwrap()[h] else {
+                    continue;
+                };
+                let c = radio_sample(&view, s);
+                let now = shm::now_ns();
+                publish_hand_state(
+                    d,
+                    h,
+                    &c,
+                    now,
+                    &mut hands[h],
+                    Some(&mut pipe),
+                    &mut shapers[h],
+                    &mut was_tracking[h],
+                    &mut wrong_locks[h],
+                );
+                newest[h] = Some(*s);
+                last_publish[h] = now;
+                arrived[h] = Some(HoldParts {
+                    held_ns: at,
+                    ..Default::default()
+                });
+                published = true;
+            }
+        }
+        if published {
+            d.shm.signal();
+            holds.note(arrived, shm::now_ns());
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            let mut v = 0u64;
+            // SAFETY: an eventfd reads as one u64.
+            unsafe { libc::read(wake_fd, &mut v as *mut u64 as *mut libc::c_void, 8) };
+        }
+        for b in link.bodies.lock().unwrap().drain(..) {
+            pipe.body(b.device_id, b.leds.clone(), b.imu);
+            log(format!(
+                "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
+                ["left", "right"][b.hand],
+                b.leds.len(),
+                b.imu.x * 1e3,
+                b.imu.y * 1e3,
+                b.imu.z * 1e3
+            ));
+            biases.seed(&mut pipe, b.hand, &b.leds);
+            link.hands.request(b.hand);
+        }
+        // the camera frames, one per pass (with the headset clock samples queued before it)
+        queue.extend(mem::take(&mut *d.track_in.lock().unwrap()));
+        let dropped = trim_frame_backlog(&mut queue);
+        if dropped > 0 {
+            log(format!(
+                "radio thread dropped {dropped} camera frame(s) it could not keep up with"
+            ));
+        }
+        while let Some(item) = queue.pop_front() {
+            match item {
+                TrackIn::HmdClock(host, us) => pipe.hmd_clock_sample(host, us),
+                TrackIn::Frame(info, blobs) => {
+                    if let Some(w) = watch.as_mut() {
+                        w.frame(d, &info, &blobs);
+                    }
+                    pipe.frame(&info, &blobs);
+                    break;
+                }
+            }
+        }
+        // a hand whose controller went quiet still gets its state refreshed (it times out)
+        let now = shm::now_ns();
+        let mut refreshed = false;
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let (Some(s), Some(view)) = (newest[h], link.engine_view.lock().unwrap()[h]) else {
+                continue;
+            };
+            if link.hands.radio_publishes(h)
+                && now.saturating_sub(last_publish[h]) >= RADIO_REFRESH_NS
+            {
+                publish_hand_state(
+                    d,
+                    h,
+                    &radio_sample(&view, &s),
+                    now,
+                    &mut hands[h],
+                    Some(&mut pipe),
+                    &mut shapers[h],
+                    &mut was_tracking[h],
+                    &mut wrong_locks[h],
+                );
+                last_publish[h] = now;
+                refreshed = true;
+            }
+        }
+        if refreshed {
+            d.shm.signal();
+        }
+        if let Some(f) = biases.update(&pipe, now) {
+            *link.biases.lock().unwrap() = Some(f);
+        }
+        rest.if_due(now);
+        if now >= next_stats {
+            *d.track_stats.lock().unwrap() = [HAND_LEFT, HAND_RIGHT].map(|h| {
+                (
+                    pipe.stats(h),
+                    pipe.latest(h).is_some_and(|s| s.output.tracking),
+                )
+            });
+            next_stats = now + SENSOR_PUBLISH_NS;
+        }
+    }
+    if let Some(f) = biases.take_changed() {
+        *link.biases.lock().unwrap() = Some(f);
+    }
+}
+
+/// The radio thread's way out, normal or not: the engine gets the hands back and records the
+/// radio again; if the engine did not ask it to stop (a dead radio, a panic), the engine reopens,
+/// with a new radio thread.
+struct RadioExit<'a> {
+    d: &'a Daemon,
+    link: &'a RadioLink,
+}
+
+impl Drop for RadioExit<'_> {
+    fn drop(&mut self) {
+        self.link.hands.radio_exit();
+        self.d.radio_on.store(false, Ordering::Release);
+        if !self.link.stop.load(Ordering::Acquire) {
+            self.d.reopen.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Frames the radio thread lets queue before it drops the oldest: about 150 ms of four sensors,
+/// a backlog it would not work off without running too long unblocked (see `Rest`).
+const RADIO_MAX_QUEUED_FRAMES: usize = 32;
+
+/// Drops the oldest camera frames past `RADIO_MAX_QUEUED_FRAMES` (the headset clock samples stay:
+/// they are cheap and keep the clock map current). Returns how many went.
+fn trim_frame_backlog(queue: &mut std::collections::VecDeque<TrackIn>) -> usize {
+    let frames = queue
+        .iter()
+        .filter(|i| matches!(i, TrackIn::Frame(..)))
+        .count();
+    let mut excess = frames.saturating_sub(RADIO_MAX_QUEUED_FRAMES);
+    let dropped = excess;
+    queue.retain(|i| {
+        if excess > 0 && matches!(i, TrackIn::Frame(..)) {
+            excess -= 1;
+            return false;
+        }
+        true
+    });
+    dropped
+}
+
+/// How long the radio thread may run without sleeping before it sleeps a moment of its own:
+/// RLIMIT_RTTIME (200 ms) kills the daemon if a real-time thread runs that long unblocked, and a
+/// poll that finds a report or a frame waiting returns without sleeping.
+const RADIO_MAX_RUN_NS: u64 = 50_000_000;
+const RADIO_REST: Duration = Duration::from_micros(200);
+
+/// Tells the radio thread when it last slept (its voluntary context switches) and makes it rest
+/// if that was `RADIO_MAX_RUN_NS` ago.
+struct Rest {
+    switches: i64,
+    since: u64,
+}
+
+impl Rest {
+    fn new() -> Rest {
+        Rest {
+            switches: voluntary_switches(),
+            since: shm::now_ns(),
+        }
+    }
+
+    fn if_due(&mut self, now: u64) {
+        let s = voluntary_switches();
+        if s != self.switches {
+            (self.switches, self.since) = (s, now);
+        } else if now.saturating_sub(self.since) >= RADIO_MAX_RUN_NS {
+            thread::sleep(RADIO_REST);
+            (self.switches, self.since) = (voluntary_switches(), shm::now_ns());
+        }
+    }
+}
+
+/// The calling thread's voluntary context switches (it blocked or slept).
+fn voluntary_switches() -> i64 {
+    // SAFETY: a zeroed rusage filled for the calling thread.
+    let mut u: libc::rusage = unsafe { mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut u) };
+    u.ru_nvcsw
+}
+
+/// The radio thread's sample `s` over the engine's view of its controller. The engine's fix
+/// times run on the engine's device clock, not the decoder's, so they are dropped: the tracker
+/// says whether the hand has a position.
+fn radio_sample(view: &engine::Controller, s: &engine::Controller) -> engine::Controller {
+    engine::Controller {
+        last_pose_fix_device_ns: 0,
+        last_orient_fix_device_ns: 0,
+        ..engine::with_radio_sample(view, s)
+    }
+}
+
+/// Publishes one hand's state from `c`: the engine's controller, or the radio thread's sample over
+/// the engine's view of it (`radio_sample`), with the tracker's pose when it has the hand's body.
+#[allow(clippy::too_many_arguments)]
+fn publish_hand_state(
+    d: &Daemon,
+    h: usize,
+    c: &engine::Controller,
+    now: u64,
+    hand: &mut Hand,
+    pipe: Option<&mut Pipeline>,
+    shaper: &mut VelocityShaper,
+    was_tracking: &mut bool,
+    wrong_locks: &mut u64,
+) {
+    let mut state = hand.update(c, now);
+    if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
+        state.battery_percent = d.battery[h].load(Ordering::Relaxed);
+    }
+    if let Some(p) = pipe.filter(|p| p.has_body(h)) {
+        let v = |a: [f32; 3]| nalgebra::Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+        p.imu(
+            h,
+            c.device_time_ns,
+            c.received_host_ns,
+            v(c.imu_gyro),
+            v(c.imu_accel),
+        );
+        let wl = p.stats(h).wrong_locks;
+        if wl != *wrong_locks {
+            *wrong_locks = wl;
+            log(format!(
+                "{}: dropped a wrong lock (accelerometer bias ran off)",
+                ["left", "right"][h]
+            ));
+        }
+        if let Some(s) = p.latest(h) {
+            if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
+                apply_tracked(
+                    &mut state,
+                    &s,
+                    d.extra_latency_ns.load(Ordering::Relaxed),
+                    shaper,
+                    d.shaping_on.load(Ordering::Relaxed),
+                );
+            } else {
+                state.flags &= !ffi::CV1T_FLAG_POSITION;
+            }
+            if s.output.tracking != *was_tracking {
+                *was_tracking = s.output.tracking;
+                log(format!(
+                    "{}: {}",
+                    ["left", "right"][h],
+                    if s.output.tracking {
+                        "tracking"
+                    } else {
+                        "position lost"
+                    }
+                ));
+            }
+        }
+    }
+    d.inject.apply(h, now, &mut state);
+    d.shm.publish_hand(h, &state);
+    if d.rec.active() {
+        d.rec.write(
+            recorder::CONTROLLER_STATE,
+            now,
+            &[
+                &(h as u32).to_le_bytes(),
+                &[0u8; 4],
+                recorder::as_bytes(&state),
+            ],
+        );
+    }
+}
+
+/// How long the daemon holds each IMU sample: its radio report's arrival to the shm signal that
+/// wakes the driver, and the parts of that. Logged once a minute while samples flow.
+#[derive(Default)]
+struct HoldStats {
+    last_sample: [u64; 2],
+    samples: [Vec<HoldParts>; 2],
+    since: u64,
+}
+
+/// One IMU sample's hold, ns.
+#[derive(Clone, Copy, Debug, Default)]
+struct HoldParts {
+    /// radio arrival to the driver's wake-up
+    held_ns: u64,
+    /// in OpenHMD's own IMU filter, its lock wait included
+    filter_ns: u64,
+    /// arrival to the end of the engine update, the filter included
+    update_ns: u64,
+    /// reading the controller back from the engine (takes the device lock)
+    read_ns: u64,
+}
+
+impl HoldStats {
+    /// `arrived`: per hand, a new sample's parts with `held_ns` still the radio arrival time.
+    fn note(&mut self, arrived: [Option<HoldParts>; 2], now: u64) {
+        for (h, a) in arrived.iter().enumerate() {
+            if let Some(a) = a {
+                self.samples[h].push(HoldParts {
+                    held_ns: now.saturating_sub(a.held_ns),
+                    ..*a
+                });
+            }
+        }
+        if self.since == 0 {
+            self.since = now;
+        }
+        if now.saturating_sub(self.since) < 60_000_000_000 {
+            return;
+        }
+        self.since = now;
+        for h in 0..2 {
+            let v = &mut self.samples[h];
+            if v.len() >= 100 {
+                log(hold_summary(["left", "right"][h], v));
+            }
+            v.clear();
+        }
+    }
+}
+
+fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
+    let ms = |ns: u64| ns as f64 * 1e-6;
+    let col = |f: &dyn Fn(&HoldParts) -> u64| {
+        let mut c: Vec<u64> = v.iter().map(f).collect();
+        c.sort_unstable();
+        let at = |q: f64| ms(c[((c.len() - 1) as f64 * q) as usize]);
+        (at(0.5), at(0.99), at(1.0))
+    };
+    let held = col(&|p| p.held_ns);
+    let filter = col(&|p| p.filter_ns);
+    let rest = col(&|p| p.update_ns.saturating_sub(p.filter_ns));
+    let read = col(&|p| p.read_ns);
+    let ours = col(&|p| p.held_ns.saturating_sub(p.update_ns + p.read_ns));
+    format!(
+        "{hand}: IMU sample held {:.2} ms median, {:.2} p99, {:.2} max (radio arrival to driver wake-up, {} samples); \
+         p99/max in OpenHMD's IMU filter {:.2}/{:.2}, rest of its update {:.2}/{:.2}, reading it back {:.2}/{:.2}, ours {:.2}/{:.2}",
+        held.0, held.1, held.2, v.len(), filter.1, filter.2, rest.1, rest.2, read.1, read.2, ours.1, ours.2
+    )
+}
+
+fn status_json(d: &Daemon) -> String {
+    let hands = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap_or_default());
+    let sensors = d.shm.sensors().unwrap_or_default();
+    let st = d.rec.stats();
+    let al = d.shm.alignment().unwrap_or_default();
+    let hands_json: Vec<String> = hands
+        .iter()
+        .zip(["left", "right"])
+        .zip(d.track_stats.lock().unwrap().iter())
+        .map(|((s, name), (t, tracking))| {
+            format!(
+                "{{\"hand\":\"{name}\",\"flags\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
+                s.flags, t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
+            )
+        })
+        .collect();
+    let sensors_json: Vec<String> = sensors
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"serial\":\"{}\",\"placed\":{},\"frames\":{},\"fixes\":[{},{}],\"landmark_shift\":{}}}",
+                shm::serial_str(s),
+                s.placed,
+                s.frames,
+                s.pose_fixes[HAND_LEFT],
+                s.pose_fixes[HAND_RIGHT],
+                d.landmark_shifts.lock().unwrap().get(&shm::serial_str(s)).map_or("null".to_string(), |(x, y, n)| format!("{{\"dx\":{x:.3},\"dy\":{y:.3},\"landmarks\":{n}}}"))
+            )
+        })
+        .collect();
+    format!(
+        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":[{}]}}",
+        d.shm.generation(),
+        d.tracker,
+        d.mode.lock().unwrap(),
+        al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
+        al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
+        al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
+        al.universe_id,
+        d.rec.active(),
+        st.records,
+        st.dropped,
+        st.write_errors,
+        hands_json.join(","),
+        sensors_json.join(",")
+    )
+}
+
+fn handle(d: &Daemon, line: &str) -> String {
+    match control::parse(line) {
+        Err(e) => format!("err {e}"),
+        Ok(Command::Haptic {
+            hand,
+            duration_s,
+            frequency_hz,
+            amplitude,
+        }) => {
+            d.haptics.lock().unwrap()[hand] = Some(Haptic {
+                duration_s,
+                frequency_hz,
+                amplitude,
+            });
+            "ok".into()
+        }
+        Ok(Command::RecordStart(path, frames)) => match d.rec.start(&path, shm::now_ns()) {
+            Ok(()) => {
+                d.record_frames.store(frames, Ordering::Release);
+                d.session.lock().unwrap().reset();
+                "ok".into()
+            }
+            Err(e) => format!("err {e}"),
+        },
+        Ok(Command::RecordStop) => {
+            if !d.rec.has_session() {
+                return "err not recording".into();
+            }
+            d.record_frames.store(false, Ordering::Release);
+            let s = d.rec.stop();
+            format!(
+                "ok records={} dropped={} write_errors={} bytes={}",
+                s.records, s.dropped, s.write_errors, s.bytes
+            )
+        }
+        Ok(Command::Status) => status_json(d),
+        Ok(Command::CalibrationCapture) => {
+            switch_mode(d, modes::capture(&current_opts(d)), "capture")
+        }
+        Ok(Command::CalibrationProvisional) => {
+            switch_mode(d, modes::provisional(&current_opts(d)), "provisional")
+        }
+        Ok(Command::CalibrationLoad(path)) => match modes::calibrated(&current_opts(d), &path) {
+            Ok((opts, n)) => {
+                switch_mode(d, opts, "calibrated");
+                format!("ok calibrated: {n} sensor poses from {}", path.display())
+            }
+            Err(e) => format!("err {e}"),
+        },
+        Ok(Command::Stations(v)) => {
+            let poses: Vec<(String, nalgebra::Isometry3<f64>)> = v
+                .iter()
+                .map(|(serial, p)| {
+                    (
+                        serial.clone(),
+                        nalgebra::Isometry3::from_parts(
+                            nalgebra::Translation3::new(p[0], p[1], p[2]),
+                            nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                                p[6], p[3], p[4], p[5],
+                            )),
+                        ),
+                    )
+                })
+                .collect();
+            *d.driver_stations.lock().unwrap() = Some((shm::now_ns(), poses));
+            "ok".into()
+        }
+        Ok(Command::TestInject(on)) => {
+            let now = shm::now_ns();
+            match on {
+                Some(true) => {
+                    d.inject.arm(now);
+                    log(format!(
+                        "test input injection armed for {} s",
+                        INJECT_ARMED_NS / 1_000_000_000
+                    ));
+                }
+                Some(false) => d.inject.disarm(),
+                None => {}
+            }
+            match d.inject.armed_for(now) {
+                Some(left) => format!("ok test-inject on ({} s left)", left / 1_000_000_000),
+                None => "ok test-inject off".into(),
+            }
+        }
+        Ok(Command::Inject { hand, inputs, ms }) => {
+            match d.inject.press(hand, inputs, ms, shm::now_ns()) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("err {e}"),
+            }
+        }
+        Ok(Command::Shaping(on)) => {
+            if let Some(on) = on {
+                d.shaping_on.store(on, Ordering::Release);
+            }
+            format!(
+                "ok velocity shaping for SteamVR's prediction {}",
+                if d.shaping_on.load(Ordering::Acquire) {
+                    "on"
+                } else {
+                    "off"
+                }
+            )
+        }
+        Ok(Command::UniverseWatch(on)) => {
+            if let Some(on) = on {
+                d.universe_watch_on.store(on, Ordering::Release);
+            }
+            let src = match d.driver_stations.lock().unwrap().as_ref() {
+                Some((at, v)) if shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS => {
+                    format!(
+                        "{} stations reported by the driver {:.1} s ago",
+                        v.len(),
+                        shm::now_ns().saturating_sub(*at) as f64 * 1e-9
+                    )
+                }
+                _ => "no recent driver report: connecting to SteamVR once a minute".into(),
+            };
+            format!(
+                "ok universe watch {} ({src})",
+                if d.universe_watch_on.load(Ordering::Acquire) {
+                    "on"
+                } else {
+                    "off"
+                }
+            )
+        }
+        Ok(Command::Latency(v)) => {
+            if let Some(ms) = v {
+                d.extra_latency_ns
+                    .store((ms * 1e6) as i64, Ordering::Release);
+            }
+            format!(
+                "ok latency: published poses stamped {:.1} ms earlier than their IMU samples' arrival time ({:.1} ms measured + {:+.1} ms adjustment)",
+                (pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 + d.extra_latency_ns.load(Ordering::Acquire) as f64) * 1e-6,
+                pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 * 1e-6,
+                d.extra_latency_ns.load(Ordering::Acquire) as f64 * 1e-6
+            )
+        }
+        Ok(Command::AlignmentReload) => {
+            // a shift measured against another registration does not apply to this one: until
+            // the watch measures afresh (now), none
+            let created = align::load_registration(&align::registration_path())
+                .map(|r| r.created_unix_s)
+                .ok();
+            let shift = d
+                .universe_shift
+                .lock()
+                .unwrap()
+                .filter(|p| Some(p.0) == created)
+                .map(|p| p.1);
+            d.universe_recheck.store(true, Ordering::Release);
+            let (alignment, notes) = align::load_with(shift.as_ref());
+            d.shm.publish_alignment(&alignment);
+            format!("ok {}", notes.join("; "))
+        }
+    }
+}
+
+fn current_opts(d: &Daemon) -> EngineOptions {
+    d.opts.lock().unwrap().clone()
+}
+
+/// Installs new engine options; the engine thread reopens the engine with them.
+fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
+    *d.opts.lock().unwrap() = opts;
+    *d.mode.lock().unwrap() = mode.to_string();
+    d.reopen.store(true, Ordering::Release);
+    format!("ok {mode}")
+}
+
+/// OpenHMD logs through C's stdout, which is block-buffered when it is not a terminal: under
+/// systemd its lines reached the journal in 4 KB batches, stamped with the flush time rather than
+/// when they happened. Line-buffered, each lands as it is written. Must run before anything prints.
+fn line_buffer_stdout() {
+    extern "C" {
+        static mut stdout: *mut libc::FILE;
+    }
+    unsafe { libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IOLBF, 0) };
+}
+
+/// Keeps the daemon's pages in RAM once touched: under reclaim pressure a swapped-out page costs a
+/// disk read on whichever thread touches it next, the engine thread included. Only touched pages,
+/// not the whole address space (the mapped libraries reserve far more than they use).
+fn lock_memory() -> std::io::Result<()> {
+    // SAFETY: no pointers; only marks this process's mappings.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The radio thread's SCHED_RR priority: above every normal thread, below PipeWire's (20) and
+/// the compositor's (90 and up).
+const RADIO_RT_PRIORITY: u32 = 10;
+/// rtkit's ceiling on RLIMIT_RTTIME (us): it grants real time only to a process that bounds how
+/// long a real-time thread runs without blocking. Past it the kernel kills the daemon (systemd
+/// restarts it); the radio thread blocks on the radio every couple of milliseconds and runs a few
+/// percent of a core.
+const RTTIME_LIMIT_US: u64 = 200_000;
+
+/// Runs the calling thread SCHED_RR through rtkit (no privileges needed), so a radio report wakes
+/// it at once instead of queueing behind whatever normal thread shares its core. rtkit sets
+/// reset-on-fork: threads it starts afterwards stay normal.
+fn make_realtime(priority: u32) -> Result<(), String> {
+    // SAFETY: no arguments.
+    make_thread_realtime(unsafe { libc::gettid() }, priority)
+}
+
+/// `make_realtime` for any thread of the daemon's.
+fn make_thread_realtime(tid: libc::pid_t, priority: u32) -> Result<(), String> {
+    // SAFETY: plain rlimit structs passed by pointer.
+    unsafe {
+        let mut lim: libc::rlimit = mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_RTTIME, &mut lim);
+        if lim.rlim_max > RTTIME_LIMIT_US {
+            let bounded = libc::rlimit {
+                rlim_cur: RTTIME_LIMIT_US,
+                rlim_max: RTTIME_LIMIT_US,
+            };
+            if libc::setrlimit(libc::RLIMIT_RTTIME, &bounded) != 0 {
+                return Err(format!(
+                    "bounding RLIMIT_RTTIME: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    let out = std::process::Command::new("busctl")
+        .args([
+            "call",
+            "org.freedesktop.RealtimeKit1",
+            "/org/freedesktop/RealtimeKit1",
+            "org.freedesktop.RealtimeKit1",
+            "MakeThreadRealtimeWithPID",
+            "ttu",
+        ])
+        .args([
+            std::process::id().to_string(),
+            tid.to_string(),
+            priority.to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("busctl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rtkit: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Keep the inherited affinity unless the user explicitly chooses CPUs.
+/// CV1TOUCH_CPUS accepts comma-separated CPU IDs and inclusive ranges, e.g. "2,4-6".
+fn affinity_cpus(spec: &str, allowed: &libc::cpu_set_t) -> Result<libc::cpu_set_t, String> {
+    // SAFETY: cpu_set_t's all-zero representation is the empty set.
+    let mut selected: libc::cpu_set_t = unsafe { mem::zeroed() };
+    for part in spec.split(',') {
+        let part = part.trim();
+        let (first, last) = part.split_once('-').unwrap_or((part, part));
+        let first = first
+            .parse::<usize>()
+            .map_err(|_| "CV1TOUCH_CPUS: expected CPU IDs or ranges".to_string())?;
+        let last = last
+            .parse::<usize>()
+            .map_err(|_| "CV1TOUCH_CPUS: expected CPU IDs or ranges".to_string())?;
+        if first > last || last >= libc::CPU_SETSIZE as usize {
+            return Err("CV1TOUCH_CPUS: invalid CPU range".into());
+        }
+        for cpu in first..=last {
+            // SAFETY: checked CPU_SETSIZE above; both sets are initialized.
+            unsafe {
+                if !libc::CPU_ISSET(cpu, allowed) {
+                    return Err(format!(
+                        "CV1TOUCH_CPUS: CPU {cpu} is outside the thread's allowed affinity"
+                    ));
+                }
+                libc::CPU_SET(cpu, &mut selected);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn affinity_setting() -> Result<Option<String>, String> {
+    match std::env::var("CV1TOUCH_CPUS") {
+        Ok(spec) => Ok(Some(spec)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("CV1TOUCH_CPUS: {e}")),
+    }
+}
+
+fn thread_affinity(tid: libc::pid_t) -> Result<libc::cpu_set_t, String> {
+    // SAFETY: valid output pointer; only queries the requested thread.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = mem::zeroed();
+        if libc::sched_getaffinity(tid, mem::size_of_val(&allowed), &mut allowed) != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(allowed)
+    }
+}
+
+fn set_radio_affinity() -> Result<(), String> {
+    set_rt_affinity(0)
+}
+
+fn set_rt_affinity(tid: libc::pid_t) -> Result<(), String> {
+    set_rt_affinity_with(tid, affinity_setting()?.as_deref())
+}
+
+fn set_rt_affinity_with(tid: libc::pid_t, spec: Option<&str>) -> Result<(), String> {
+    let Some(spec) = spec else { return Ok(()) };
+    let selected = affinity_cpus(spec, &thread_affinity(tid)?)?;
+    // SAFETY: initialized nonempty set containing only CPUs allowed for this thread.
+    if unsafe { libc::sched_setaffinity(tid, mem::size_of_val(&selected), &selected) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// The thread of ours with this name (its comm), if one is running.
+fn thread_named(name: &str) -> Option<libc::pid_t> {
+    fs::read_dir("/proc/self/task")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let comm = fs::read_to_string(e.path().join("comm")).ok()?;
+            (comm.trim_end() == name)
+                .then(|| e.file_name().to_str()?.parse().ok())
+                .flatten()
+        })
+}
+
+/// OpenHMD's USB event thread's SCHED_RR priority: below the radio thread's.
+const USB_RT_PRIORITY: u32 = 9;
+
+/// Makes OpenHMD's USB event thread (cv1t-usb) real-time, on our real-time CPUs. It reaps and
+/// resubmits every sensor's video transfers: preempted for more than their queue lasts, it lost
+/// video on all of them at once.
+fn make_usb_thread_realtime() {
+    // the thread names itself once it runs, which may be just after the engine opens
+    let found = (0..10).find_map(|i| {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread_named("cv1t-usb")
+    });
+    let Some(tid) = found else {
+        log("no cv1t-usb thread: OpenHMD's USB event thread stays as it is");
+        return;
+    };
+    if let Err(err) = set_rt_affinity(tid) {
+        log(format!("cv1t-usb keeps the process's CPUs ({err})"));
+    }
+    match make_thread_realtime(tid, USB_RT_PRIORITY) {
+        Ok(()) => log(format!("cv1t-usb real-time (SCHED_RR {USB_RT_PRIORITY})")),
+        Err(err) => log(format!("cv1t-usb stays normal priority ({err})")),
+    }
+}
+
+fn eventfd() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain syscall; the descriptor is owned from here on.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor nobody else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Blocks SIGINT/SIGTERM (inherited by threads spawned afterwards) and returns a signalfd for them.
+fn block_signals() -> i32 {
+    // SAFETY: plain signal-mask setup.
+    unsafe {
+        let mut mask: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
+    }
+}
+
+struct Client {
+    stream: UnixStream,
+    buf: Vec<u8>,
+}
+
+fn control_loop(d: &Daemon, listener: &UnixListener, sfd: i32) {
+    let mut clients: Vec<Client> = Vec::new();
+    loop {
+        // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
+        // engine thread for seconds, which must not read as a dead daemon; stale poses are the
+        // driver's own concern (sample age)
+        d.shm.heartbeat(shm::now_ns());
+        let mut fds = vec![
+            libc::pollfd {
+                fd: sfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        fds.extend(clients.iter().map(|c| libc::pollfd {
+            fd: c.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        // SAFETY: valid pollfd array.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) } < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            log("poll failed");
+            return;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            // SAFETY: reading one siginfo from our signalfd.
+            let mut info: libc::signalfd_siginfo = unsafe { mem::zeroed() };
+            unsafe {
+                libc::read(
+                    sfd,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    mem::size_of::<libc::signalfd_siginfo>(),
+                )
+            };
+            log(format!("signal {}: shutting down", info.ssi_signo));
+            return;
+        }
+        let mut keep = vec![true; clients.len()];
+        for (i, c) in clients.iter_mut().enumerate() {
+            if fds[2 + i].revents == 0 {
+                continue;
+            }
+            let mut chunk = [0u8; 1024];
+            match c.stream.read(&mut chunk) {
+                Ok(0) => keep[i] = false,
+                Ok(n) => c.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => keep[i] = false,
+            }
+            while let Some(pos) = c.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = c.buf.drain(..=pos).collect();
+                let reply = handle(d, String::from_utf8_lossy(&line).trim());
+                if c.stream.write_all(format!("{reply}\n").as_bytes()).is_err() {
+                    keep[i] = false;
+                    break;
+                }
+            }
+            if c.buf.len() > 4096 {
+                keep[i] = false; // no newline in 4 KiB: not a protocol client
+            }
+        }
+        let mut it = keep.iter();
+        clients.retain(|_| *it.next().unwrap());
+        if fds[1].revents & libc::POLLIN != 0 {
+            while let Ok((stream, _)) = listener.accept() {
+                if clients.len() < MAX_CLIENTS {
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    clients.push(Client {
+                        stream,
+                        buf: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
+
+fn usage() -> ! {
+    eprintln!("{USAGE}");
+    process::exit(2);
+}
+
+fn random_u64() -> u64 {
+    let mut v = 0u64;
+    // SAFETY: valid buffer of 8 bytes.
+    let n = unsafe { libc::getrandom(&mut v as *mut u64 as *mut libc::c_void, 8, 0) };
+    if n == 8 && v != 0 {
+        v
+    } else {
+        shm::now_ns()
+    }
+}
+
+fn main() {
+    // These queries need neither a device, signal-mask changes, nor locked memory.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.len() == 1 {
+        match arguments[0].as_str() {
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return;
+            }
+            "--version" | "-V" => {
+                println!("cv1touchd {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            _ => {}
+        }
+    }
+    let affinity = affinity_setting().and_then(|spec| {
+        if let Some(spec) = spec {
+            affinity_cpus(&spec, &thread_affinity(0)?)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = affinity {
+        eprintln!("cv1touchd: {e}");
+        process::exit(2);
+    }
+    // First, before any thread exists (the recorder and engine threads inherit this mask):
+    // SIGINT/SIGTERM must reach only the signalfd, never a thread whose default action kills us.
+    let sfd = block_signals();
+    line_buffer_stdout();
+    match lock_memory() {
+        Ok(()) => log("memory locked: pages stay in RAM once touched"),
+        Err(e) => log(format!(
+            "memory not locked ({e}): pages can be swapped out under pressure"
+        )),
+    }
+    let mut opts = EngineOptions {
+        radio_wait_ms: 2,
+        hmd_leds_off: DEFAULT_HMD_LEDS_OFF,
+        ..Default::default()
+    };
+    let mut record: Option<PathBuf> = None;
+    let mut calibration: Option<PathBuf> = None;
+    let mut provisional = false;
+    let mut shm_name = shm::DEFAULT_NAME.to_string();
+    let mut runtime_dir = control::runtime_dir();
+    let mut tracker = TrackerKind::Rust;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--radio-wait-ms" => {
+                opts.radio_wait_ms = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
+            "--hmd-leds" => {
+                opts.hmd_leds_off = match args.next().as_deref() {
+                    Some("on") => false,
+                    Some("off") => true,
+                    _ => usage(),
+                }
+            }
+            "--ignore-sensor" => opts
+                .ignore_sensors
+                .push(args.next().unwrap_or_else(|| usage())),
+            "--record" => record = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--calibration" => {
+                calibration = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())))
+            }
+            "--provisional" => provisional = true,
+            "--tracker" => {
+                tracker = match args.next().as_deref() {
+                    Some("cv1touch") => TrackerKind::Rust,
+                    Some("openhmd") => TrackerKind::OpenHmd,
+                    _ => usage(),
+                }
+            }
+            "--shm-name" => shm_name = args.next().unwrap_or_else(|| usage()),
+            "--runtime-dir" => runtime_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            _ => usage(),
+        }
+    }
+
+    let (opts, mode) = if provisional {
+        (modes::provisional(&opts), "provisional".to_string())
+    } else {
+        let path = calibration
+            .clone()
+            .unwrap_or_else(calib::file::default_path);
+        if calibration.is_some() || path.exists() {
+            match modes::calibrated(&opts, &path) {
+                Ok((o, n)) => {
+                    log(format!(
+                        "calibrated: {n} sensor poses from {}",
+                        path.display()
+                    ));
+                    (o, "calibrated".to_string())
+                }
+                Err(e) => {
+                    log(format!(
+                        "{e} (fix or remove it, or start with --provisional)"
+                    ));
+                    process::exit(1);
+                }
+            }
+        } else {
+            log(format!(
+                "no calibration at {}: provisional placement (run `cv1touch calibrate`)",
+                path.display()
+            ));
+            (modes::provisional(&opts), "provisional".to_string())
+        }
+    };
+
+    if let Err(e) = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&runtime_dir)
+    {
+        log(format!("{}: {e}", runtime_dir.display()));
+        process::exit(1);
+    }
+    // Lock before touching shared memory or the socket: a second instance must not clobber the first.
+    let lock_path = runtime_dir.join("daemon.lock");
+    let _lock = control::lock_single_instance(&lock_path).unwrap_or_else(|e| {
+        log(format!(
+            "another cv1touchd holds {} ({e})",
+            lock_path.display()
+        ));
+        process::exit(1);
+    });
+    let shm = ShmWriter::create(&shm_name, random_u64()).unwrap_or_else(|e| {
+        log(format!("shared memory {shm_name}: {e}"));
+        process::exit(1);
+    });
+    let (alignment, notes) = align::load_default();
+    for n in notes {
+        log(n);
+    }
+    shm.publish_alignment(&alignment);
+    let rec = Recorder::new(RECORDER_RING_BYTES);
+    if let Some(path) = &record {
+        if let Err(e) = rec.start(path, shm::now_ns()) {
+            log(e);
+            process::exit(1);
+        }
+    }
+    let sock_path = runtime_dir.join("control.sock");
+    let _ = fs::remove_file(&sock_path); // stale socket: the lock guarantees no live owner
+    let listener = UnixListener::bind(&sock_path).unwrap_or_else(|e| {
+        log(format!("control socket {}: {e}", sock_path.display()));
+        process::exit(1);
+    });
+    let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+
+    let d = Arc::new(Daemon {
+        shm,
+        rec,
+        quit: AtomicBool::new(false),
+        haptics: Mutex::new([None; 2]),
+        session: Mutex::new(recorder::SessionInfo::default()),
+        opts: Mutex::new(opts),
+        mode: Mutex::new(mode),
+        reopen: AtomicBool::new(false),
+        tracker,
+        track_in: Mutex::new(Vec::new()),
+        track_stats: Mutex::new([(Stats::default(), false); 2]),
+        landmark_shifts: Mutex::new(Default::default()),
+        universe_shift: Mutex::new(None),
+        universe_recheck: AtomicBool::new(false),
+        driver_stations: Mutex::new(None),
+        universe_watch_on: AtomicBool::new(true),
+        shaping_on: AtomicBool::new(true),
+        record_frames: AtomicBool::new(false),
+        extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
+        battery: [
+            std::sync::atomic::AtomicI32::new(-1),
+            std::sync::atomic::AtomicI32::new(-1),
+        ],
+        radio_wake: eventfd().expect("eventfd"),
+        radio_on: AtomicBool::new(false),
+        inject: Injection::default(),
+    });
+    let engine_thread = {
+        let d = Arc::clone(&d);
+        thread::Builder::new()
+            .name("cv1t-engine".into())
+            .spawn(move || engine_main(d))
+            .expect("engine thread")
+    };
+    let universe_thread = {
+        let d = Arc::clone(&d);
+        thread::Builder::new()
+            .name("cv1t-universe".into())
+            .spawn(move || universe_watch(d))
+            .expect("universe thread")
+    };
+    log(format!(
+        "running: shm {shm_name}, control {}, {} mode, hmd leds {}, ignoring sensors {:?}",
+        sock_path.display(),
+        d.mode.lock().unwrap(),
+        if d.opts.lock().unwrap().hmd_leds_off {
+            "off"
+        } else {
+            "on"
+        },
+        d.opts.lock().unwrap().ignore_sensors
+    ));
+
+    control_loop(&d, &listener, sfd);
+
+    d.quit.store(true, Ordering::Release);
+    let _ = engine_thread.join();
+    let _ = universe_thread.join();
+    d.rec.stop();
+    drop(listener);
+    let _ = fs::remove_file(&sock_path);
+    // SAFETY: closing our signalfd.
+    unsafe { libc::close(sfd) };
+    log("stopped");
+    // `d` drops here: ShmWriter zeroes the magic and unlinks the segment.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_armed_inject_presses_for_its_duration_only() {
+        let inj = Injection::default();
+        let x = control::Injected {
+            buttons: cv1touch::hand::BTN_X,
+            touches: cv1touch::hand::TOUCH_X,
+            trigger: true,
+            grip: false,
+        };
+        let pressed = |at: u64| {
+            let mut st = ControllerState {
+                buttons: cv1touch::hand::BTN_Y,
+                trigger: 0.25,
+                grip: 0.5,
+                ..Default::default()
+            };
+            inj.apply(HAND_LEFT, at, &mut st);
+            st
+        };
+        assert!(
+            inj.press(HAND_LEFT, x, 200, 1_000).is_err(),
+            "not while disarmed"
+        );
+        inj.arm(1_000);
+        inj.press(HAND_LEFT, x, 200, 1_000).unwrap();
+        let st = pressed(100_000_000);
+        assert_eq!(
+            (st.buttons, st.touches, st.trigger, st.grip),
+            (
+                cv1touch::hand::BTN_X | cv1touch::hand::BTN_Y,
+                cv1touch::hand::TOUCH_X,
+                1.0,
+                0.5
+            ),
+            "ORed in, the rest kept"
+        );
+        assert_eq!(
+            pressed(201_000_001).buttons,
+            cv1touch::hand::BTN_Y,
+            "released after 200 ms"
+        );
+        let mut right = ControllerState::default();
+        inj.apply(HAND_RIGHT, 100_000_000, &mut right);
+        assert_eq!(right.buttons, 0, "the other hand untouched");
+        // a new inject for the hand replaces the old; disarming (or the arming running out) releases
+        inj.press(
+            HAND_LEFT,
+            control::Injected {
+                grip: true,
+                ..Default::default()
+            },
+            2000,
+            300_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            (pressed(400_000_000).buttons, pressed(400_000_000).grip),
+            (cv1touch::hand::BTN_Y, 1.0)
+        );
+        inj.disarm();
+        assert_eq!(pressed(400_000_000).grip, 0.5);
+        inj.arm(0);
+        inj.press(HAND_LEFT, x, 2000, INJECT_ARMED_NS - 1_000_000)
+            .unwrap();
+        assert_eq!(
+            pressed(INJECT_ARMED_NS + 1).buttons,
+            cv1touch::hand::BTN_Y,
+            "armed for INJECT_ARMED_NS only"
+        );
+    }
+
+    #[test]
+    fn one_thread_at_a_time_publishes_a_hand() {
+        let o = HandOwnership::default();
+        // the engine publishes until the radio thread asks for the hand
+        assert!(o.engine_publishes(HAND_LEFT) && !o.radio_publishes(HAND_LEFT));
+        o.request(HAND_LEFT);
+        assert!(
+            !o.radio_publishes(HAND_LEFT),
+            "not before the engine lets go"
+        );
+        // the engine lets go between two of its publishes, and only then may the radio thread write
+        assert!(!o.engine_publishes(HAND_LEFT));
+        assert!(o.radio_publishes(HAND_LEFT) && !o.engine_publishes(HAND_LEFT));
+        assert!(
+            o.engine_publishes(HAND_RIGHT),
+            "the other hand stays the engine's"
+        );
+        // once the radio thread is gone (after its last publish) the engine has every hand again
+        o.radio_exit();
+        assert!(o.engine_publishes(HAND_LEFT) && o.engine_publishes(HAND_RIGHT));
+    }
+
+    #[test]
+    fn a_backlog_of_frames_drops_the_oldest_and_keeps_the_clock_samples() {
+        let frame = |t: u64| {
+            TrackIn::Frame(
+                Box::new(engine::FrameInfo {
+                    frame_start_host_ns: t,
+                    ..Default::default()
+                }),
+                Vec::new(),
+            )
+        };
+        let mut q: std::collections::VecDeque<TrackIn> = Default::default();
+        for t in 0..(RADIO_MAX_QUEUED_FRAMES as u64 + 3) {
+            q.push_back(TrackIn::HmdClock(t, t as u32));
+            q.push_back(frame(t));
+        }
+        assert_eq!(trim_frame_backlog(&mut q), 3);
+        let frames: Vec<u64> = q
+            .iter()
+            .filter_map(|i| {
+                if let TrackIn::Frame(f, _) = i {
+                    Some(f.frame_start_host_ns)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(frames.len(), RADIO_MAX_QUEUED_FRAMES);
+        assert_eq!(frames[0], 3, "the oldest go");
+        assert_eq!(
+            q.iter()
+                .filter(|i| matches!(i, TrackIn::HmdClock(..)))
+                .count(),
+            RADIO_MAX_QUEUED_FRAMES + 3
+        );
+        assert_eq!(trim_frame_backlog(&mut q), 0);
+    }
+
+    #[test]
+    fn finds_a_thread_of_ours_by_its_name() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let t = thread::Builder::new()
+            .name("cv1t-findme".into())
+            .spawn(move || {
+                // SAFETY: no arguments.
+                tx.send(unsafe { libc::gettid() }).unwrap();
+                stop_rx.recv().ok();
+            })
+            .unwrap();
+        let tid = rx.recv().unwrap();
+        assert_eq!(thread_named("cv1t-findme"), Some(tid));
+        assert_eq!(thread_named("cv1t-nobody"), None);
+        stop_tx.send(()).unwrap();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn default_affinity_preserves_a_restricted_thread() {
+        thread::spawn(|| {
+            let before = thread_affinity(0).unwrap();
+            let cpu = (0..libc::CPU_SETSIZE as usize)
+                .find(|&c| unsafe { libc::CPU_ISSET(c, &before) })
+                .unwrap();
+            set_rt_affinity_with(0, Some(&cpu.to_string())).unwrap();
+            set_rt_affinity_with(0, None).unwrap();
+            let after = thread_affinity(0).unwrap();
+            let got: Vec<_> = (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| unsafe { libc::CPU_ISSET(c, &after) })
+                .collect();
+            assert_eq!(
+                got,
+                vec![cpu],
+                "default affinity must not widen or replace the inherited mask"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_affinity_validates_ranges_and_the_allowed_mask() {
+        let mut allowed: libc::cpu_set_t = unsafe { mem::zeroed() };
+        for cpu in [0, 2, 3, 7] {
+            unsafe { libc::CPU_SET(cpu, &mut allowed) };
+        }
+        let selected = affinity_cpus("0,2-3,7", &allowed).unwrap();
+        let got: Vec<_> = (0..8)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &selected) })
+            .collect();
+        assert_eq!(got, vec![0, 2, 3, 7]);
+        for spec in [
+            "",
+            "1",
+            "0-3",
+            "7-2",
+            "a",
+            "0,,2",
+            "2-",
+            "1024",
+            "0-999999999",
+        ] {
+            assert!(affinity_cpus(spec, &allowed).is_err(), "accepted {spec:?}");
+        }
+    }
+
+    #[test]
+    fn a_radio_sample_goes_out_over_the_engines_view_without_its_clock() {
+        let view = engine::Controller {
+            calibrated: true,
+            device_time_ns: 9_000_000,
+            received_host_ns: 1,
+            last_pose_fix_device_ns: 8_990_000,
+            last_orient_fix_device_ns: 8_995_000,
+            view_pos: [0.1, 1.2, -0.3],
+            device_id: 2,
+            ..Default::default()
+        };
+        let s = engine::Controller {
+            calibrated: true,
+            device_time_ns: 42_000,
+            received_host_ns: 77,
+            imu_gyro: [1.0, 0.0, 0.0],
+            imu_accel: [0.0, 9.8, 0.0],
+            buttons: 1,
+            trigger: 0.5,
+            device_id: 2,
+            ..Default::default()
+        };
+        let c = radio_sample(&view, &s);
+        assert_eq!(
+            (
+                c.device_time_ns,
+                c.received_host_ns,
+                c.imu_gyro,
+                c.imu_accel,
+                c.buttons,
+                c.trigger
+            ),
+            (42_000, 77, [1.0, 0.0, 0.0], [0.0, 9.8, 0.0], 1, 0.5)
+        );
+        assert!(
+            c.calibrated && c.view_pos == [0.1, 1.2, -0.3] && c.device_id == 2,
+            "the engine's view carries over"
+        );
+        assert_eq!(
+            (c.last_pose_fix_device_ns, c.last_orient_fix_device_ns),
+            (0, 0),
+            "the engine's fix times are on another clock"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs rtkit headroom: rtkit grants a user at most 25 threads, and a running SteamVR holds 14"]
+    fn realtime_request_makes_only_the_calling_thread_round_robin() {
+        thread::spawn(|| {
+            make_realtime(RADIO_RT_PRIORITY).unwrap();
+            // SAFETY: plain queries of the calling thread (pid 0).
+            let (policy, prio) = unsafe {
+                let mut p: libc::sched_param = mem::zeroed();
+                libc::sched_getparam(0, &mut p);
+                (libc::sched_getscheduler(0), p.sched_priority)
+            };
+            assert_eq!(policy & !libc::SCHED_RESET_ON_FORK, libc::SCHED_RR);
+            assert_eq!(prio as u32, RADIO_RT_PRIORITY);
+            // threads it starts afterwards (OpenHMD's) stay normal
+            let child = thread::spawn(|| unsafe { libc::sched_getscheduler(0) })
+                .join()
+                .unwrap();
+            assert_eq!(child, libc::SCHED_OTHER);
+        })
+        .join()
+        .unwrap();
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::sched_getscheduler(0) },
+            libc::SCHED_OTHER,
+            "the test's own thread stays normal"
+        );
+    }
+
+    #[test]
+    fn locked_memory_stays_resident_once_touched() {
+        lock_memory().unwrap();
+        let v = vec![1u8; 4 << 20];
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let locked_kb: u64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmLck:"))
+            .unwrap()
+            .trim()
+            .trim_end_matches(" kB")
+            .parse()
+            .unwrap();
+        assert!(
+            locked_kb >= 4 << 10,
+            "VmLck {locked_kb} kB after touching 4 MB"
+        );
+        drop(v);
+    }
+
+    #[test]
+    fn hold_summary_splits_the_hold_into_its_parts() {
+        // 100 samples: held 1..=100 us; 10 us in OpenHMD's filter, 30 us in its whole update,
+        // 5 us reading back; one sample stuck 4 ms in the filter
+        let mut v: Vec<HoldParts> = (1..=100u64)
+            .map(|i| HoldParts {
+                held_ns: 1000 * i + 50_000,
+                filter_ns: 10_000,
+                update_ns: 30_000,
+                read_ns: 5_000,
+            })
+            .collect();
+        v[99] = HoldParts {
+            held_ns: 4_216_000,
+            filter_ns: 4_000_000,
+            update_ns: 4_020_000,
+            read_ns: 5_000,
+        };
+        assert_eq!(
+            hold_summary("left", &mut v),
+            "left: IMU sample held 0.10 ms median, 0.15 p99, 4.22 max (radio arrival to driver wake-up, 100 samples); \
+             p99/max in OpenHMD's IMU filter 0.01/4.00, rest of its update 0.02/0.02, reading it back 0.01/0.01, ours 0.11/0.19"
+        );
+    }
+}

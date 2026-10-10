@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite this repository."
+type: software
+title: "cv1touch: Rift CV1 Touch controllers for Linux SteamVR"
+authors:
+  - name: "Michael Krauty"
+repository-code: "https://github.com/michaelkrauty/cv1touch"
+license: Apache-2.0
+keywords:
+  - virtual reality
+  - optical tracking
+  - sensor fusion
+  - SteamVR
+  - Linux

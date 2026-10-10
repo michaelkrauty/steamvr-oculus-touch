@@ -1,0 +1,44 @@
+# Architecture
+
+```text
+CV1 headset radio / USB sensors
+          │
+          ▼
+Modified OpenHMD acquisition engine (C/C++)
+  radio reports, IMU, factory calibration, images, blobs
+          │
+          ▼
+cv1touchd (Rust)
+  optical association + error-state Kalman filter
+  bias estimation, recovery, prediction shaping
+          │
+          ├── local control socket / recording and replay
+          ▼
+Versioned shared memory (seqlocks + futex notification)
+          │
+          ▼
+Native SteamVR driver (C++)
+  poses, inputs, capacitive touch, battery, haptics
+```
+
+OpenHMD owns device discovery and USB/camera acquisition. The Rust tracker fuses gyroscope and accelerometer data with multi-camera LED observations; OpenHMD poses provide acquisition priors/fallback. The headset is used as a radio receiver and does not become a SteamVR display device. The driver is deliberately thin and shares the C ABI in `common/cv1touch_shm.h` with the daemon.
+
+## Coordinates and timestamps
+
+Factory LED geometry, per-camera optical coordinates, the calibrated tracking world, the SteamVR tracking universe, and the rendered controller model are different frames. Camera calibration supplies world-from-camera transforms; registration supplies SteamVR-from-world; render fitting supplies the controller-model offset. Orientation serialization uses XYZW quaternions. See the ABI headers and `src/calib` for units and transform direction.
+
+Host/device clock mapping and exposure-time compensation place measurements on a monotonic timeline. Published poses carry their sample time and velocities. The driver reports pose age to SteamVR, which performs its own prediction. Software delivery time, hardware radio cadence, optical exposure age, and display latency must not be combined into one misleading latency number.
+
+## Reliability boundaries
+
+Shared-memory slots use single-writer seqlocks. Alignment writers are serialized; hand ownership transfers between radio and fallback publishing. Driver readers reject incompatible mappings and stale heartbeats. Stale or disconnected controller samples release application inputs. Haptic/control sends use bounded local IPC and cannot deliver SIGPIPE to SteamVR. A separate daemon keeps device reconnects and tracking computation out of the SteamVR server.
+
+The daemon attempts bounded real-time priority through rtkit for selected transport threads and falls back with a diagnostic if policy denies it. By default it inherits the process's allowed CPUs. `CV1TOUCH_CPUS` is an optional explicit CPU-list override; invalid or unavailable CPUs are rejected rather than applying a development-machine topology. Avoid changing scheduling policy without measuring it under your real workload.
+
+## Expert use
+
+Build with `cargo build --locked --release`; install without services using `python3 scripts/install.py --no-service`. Run `cv1touchd` directly as your desktop user. The service is just a wrapper around this daemon. Use `--help` for diagnostic commands, calibration alternatives, explicit recording files, offline `track` replay, and predictor controls.
+
+Input injection is disabled by default. `test-inject on` permits bounded injection for ten minutes; `test-inject off` disarms it immediately. It is for integration tests and can affect applications currently receiving controller input. The socket and shared memory are local to the user's runtime environment; they are not network APIs.
+
+The acquisition engine currently supports four sensors and one controller pair. Other hardware drivers remain in the attributed upstream source tree but are not built or offered as supported cv1touch hardware. Future changes to the ABI or recording schema must update compatibility checks, readers, tests, and the changelog together.

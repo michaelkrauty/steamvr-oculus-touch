@@ -1,0 +1,157 @@
+/* cv1touch extensions to OpenHMD's Rift CV1 driver. Not part of upstream OpenHMD.
+ * All host timestamps are CLOCK_MONOTONIC nanoseconds. */
+#ifndef OPENHMD_CV1TOUCH_H
+#define OPENHMD_CV1TOUCH_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "openhmd.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* A calibrated sensor pose: camera -> world, OpenCV camera axes (x right, y down, z forward). */
+typedef struct ohmd_cv1touch_sensor_pose {
+	char serial[32];                   /* NUL-terminated; empty = unused slot */
+	float orient[4];                   /* x y z w */
+	float pos[3];                      /* metres */
+} ohmd_cv1touch_sensor_pose;
+
+/* Zero-initialised by ohmd_ctx_create(); every field's zero value is the cv1touch default. */
+typedef struct ohmd_cv1touch_config {
+	/* > 0: each update blocks up to this many ms for the next controller radio report, so a
+	 * dedicated update thread wakes as soon as controller data lands. 0: upstream polling. */
+	int radio_wait_ms;
+	/* Register the headset with the optical tracker. false: headset is radio + exposure sync only. */
+	bool hmd_tracking;
+	/* Do not light the headset's tracking LEDs. */
+	bool hmd_leds_off;
+	/* Rift sensor serials to leave closed (NUL-terminated; empty entries unused). */
+	char ignore_sensor_serials[8][32];
+	/* true: never place sensors at runtime (no provisional placement). Sensors listed in
+	 * fixed_poses track with that pose; any other sensor only observes (calibration capture). */
+	bool fixed_poses_only;
+	ohmd_cv1touch_sensor_pose fixed_poses[8];
+} ohmd_cv1touch_config;
+
+typedef struct ohmd_cv1touch_controller {
+	bool calibrated;                   /* factory calibration read and tracked device created */
+	uint64_t device_time_ns;           /* controller clock (unwrapped) of the newest IMU sample */
+	uint64_t received_host_ns;         /* host time the radio report carrying that sample was read */
+	uint64_t filter_ns;                /* time that sample spent in the engine's IMU update, lock wait included */
+	uint64_t last_pose_fix_device_ns;  /* newest accepted optical position fix, device clock; 0 = never */
+	uint64_t last_orient_fix_device_ns;
+	float view_orient[4];              /* x y z w: engine output pose (position hold + output filter) */
+	float view_pos[3];
+	float view_lin_vel[3];
+	float view_ang_vel[3];
+	float view_lin_acc[3];
+	float raw_orient[4];               /* unfiltered UKF state mapped to the device frame */
+	float raw_pos[3];
+	float pos_stddev[3];               /* sqrt(diag(P)), fusion frame */
+	float rot_stddev[3];
+	float gyro_raw[3];                 /* rad/s, IMU frame, bias not removed */
+	float gyro_bias[3];                /* UKF gyro bias estimate, IMU frame */
+	uint8_t buttons;                   /* 0x1 A/X, 0x2 B/Y, 0x4 Oculus (right) / Menu (left), 0x8 stick */
+	float trigger;
+	float grip;
+	float stick[2];
+	float cap[5];                      /* stick, b_y, trigger, a_x, thumbrest; 1.0 = calibrated touch level, unclamped */
+	int32_t device_id;                 /* OpenHMD device id: 1 right, 2 left */
+	float imu_accel[3];                /* newest IMU sample, factory-calibrated, IMU frame: m/s^2 */
+	float imu_gyro[3];                 /* same sample: rad/s */
+} ohmd_cv1touch_controller;
+
+typedef struct ohmd_cv1touch_sensor {
+	char serial[32];
+	bool have_camera_pose;
+	float camera_orient[4];            /* camera -> world */
+	float camera_pos[3];
+	uint32_t frames;                   /* cumulative frames released */
+	uint32_t pose_fixes[3];            /* cumulative accepted optical fixes per OpenHMD device id: 0 headset, 1 right, 2 left */
+	/* factory intrinsics, OpenCV fisheye model */
+	int32_t width, height;
+	float fx, fy, cx, cy;
+	float k[4];
+} ohmd_cv1touch_sensor;
+
+typedef struct ohmd_cv1touch_blob {
+	float x, y;
+	uint16_t width, height;
+	uint32_t area;
+	int32_t led_id;                    /* (OpenHMD device id << 8) | LED index, or negative if unlabelled */
+} ohmd_cv1touch_blob;
+
+typedef struct ohmd_cv1touch_led {
+	float pos[3];                      /* metres, controller model frame */
+	float dir[3];                      /* unit LED normal */
+} ohmd_cv1touch_led;                   /* 24 bytes */
+
+typedef struct ohmd_cv1touch_frame_device {
+	int32_t device_id;                 /* OpenHMD device id: 0 headset, 1 right, 2 left */
+	uint32_t match_flags;              /* RIFT_POSE_MATCH_* of the final evaluation: 0x1 good, 0x2 strong */
+	uint64_t device_time_ns;           /* device clock at this exposure */
+	int32_t matched_blobs;
+	int32_t visible_leds;
+	uint32_t pose_valid;               /* 1: cam_orient/cam_pos hold this frame's pose */
+	uint32_t reserved0;
+	float cam_orient[4];               /* object -> camera (OpenCV camera axes), x y z w */
+	float cam_pos[3];
+	float reserved1;
+} ohmd_cv1touch_frame_device;          /* 64 bytes */
+
+typedef struct ohmd_cv1touch_frame_info {
+	char serial[32];
+	uint64_t frame_start_host_ns;
+	uint32_t exposure_valid;
+	uint32_t exposure_count;           /* HMD exposure counter (16-bit, wraps), shared by synced sensors */
+	uint32_t exposure_hmd_ts;
+	uint32_t n_devices;
+	ohmd_cv1touch_frame_device devices[3];
+} ohmd_cv1touch_frame_info;            /* 248 bytes */
+
+#define OHMD_CV1TOUCH_REPORT_HMD 0
+#define OHMD_CV1TOUCH_REPORT_RADIO 1
+
+/* Called from sensor analysis threads with the sensor lock held: copy and return quickly. */
+typedef void (*ohmd_cv1touch_frame_cb)(void *user, const ohmd_cv1touch_frame_info *info,
+                                       int n_blobs, const ohmd_cv1touch_blob *blobs);
+/* Called from sensor analysis threads, just before the frame callback for the same frame, with its
+ * GRAY8 pixels (valid only during the call): copy what is needed and return quickly. */
+typedef void (*ohmd_cv1touch_image_cb)(void *user, const ohmd_cv1touch_frame_info *info, int width, int height,
+                                       int stride, const uint8_t *pixels);
+/* Called from the update thread for every HID report read from the headset or its radio. */
+typedef void (*ohmd_cv1touch_report_cb)(void *user, int source, uint64_t host_ns, const uint8_t *data, int len);
+
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, const ohmd_cv1touch_config *config);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
+OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device *device);
+
+/* A decoder for radio reports read through a second handle on the radio's hidraw node (each reader
+ * gets every report), for a thread of the daemon's own: it decodes on its own copy of each
+ * controller's state and never waits on the engine. Only factory calibration comes from the
+ * engine, once fetched; until then a controller's messages are skipped. Its device clocks are its
+ * own (they start at its first sample), so its samples' device times only compare among
+ * themselves. `device`: any device of the headset; the decoder must be freed before it closes. */
+typedef struct ohmd_cv1touch_radio_decoder ohmd_cv1touch_radio_decoder;
+OHMD_APIENTRYDLL ohmd_cv1touch_radio_decoder *OHMD_APIENTRY ohmd_cv1touch_radio_decoder_new(ohmd_device *device);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_free(ohmd_cv1touch_radio_decoder *dec);
+/* One radio report received at host time `received_ns`: fills `out[0..n)` (room for 2) with the
+ * IMU samples and inputs of its calibrated, non-empty Touch messages and returns n. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radio_decoder *dec, const unsigned char *buf, int size,
+		uint64_t received_ns, ohmd_cv1touch_controller *out);
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *device, ohmd_cv1touch_controller *out);
+/* The controller's factory LED model: number of LEDs written (0 until read over the radio), -1 on error. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *device, ohmd_cv1touch_led *out, int max);
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_count(ohmd_device *device);
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device, int index, ohmd_cv1touch_sensor *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

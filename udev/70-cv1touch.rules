@@ -1,0 +1,4 @@
+# Local active-seat access; no world-writable device nodes.
+# Install before 73-seat-late.rules so logind can apply the ACL.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2833", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="2833", TAG+="uaccess"

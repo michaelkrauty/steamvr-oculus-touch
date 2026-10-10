@@ -1,0 +1,5 @@
+/* vrserver loads the driver beside its own C++ runtime: export the factory and nothing else. */
+{
+	global: HmdDriverFactory;
+	local: *;
+};

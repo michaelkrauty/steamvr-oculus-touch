@@ -1,0 +1,32 @@
+#!/bin/bash
+# Live 2x2 view of the Rift sensors' raw frames, full resolution (2560x1920), from cv1touchd's
+# PipeWire streams (role "Rift Sensor"; "--annotated" uses the engine's blob-annotated "Rift
+# Tracking" streams instead, each twice as wide). Needs gst-plugin-pipewire.
+role="Rift Sensor"; w=1280
+[ "$1" = "--annotated" ] && { role="Rift Tracking"; w=2560; }
+mapfile -t nodes < <(pw-dump | python3 -c '
+import json, sys
+role = sys.argv[1]
+found = {}
+for o in json.load(sys.stdin):
+    p = (o.get("info") or {}).get("props") or {}
+    if p.get("media.role") == role and str(p.get("media.name", "")).startswith("openhmd-rift-sensor-"):
+        found[p["media.name"].rsplit("-", 1)[1]] = p["object.serial"]
+for serial in sorted(found):
+    print(serial, found[serial])
+' "$role")
+[ ${#nodes[@]} -eq 0 ] && { echo "no \"$role\" streams: is cv1touchd running (built with debugging_mode)?" >&2; exit 1; }
+args=(compositor name=c background=black)
+k=0
+for n in "${nodes[@]}"; do
+  args+=("sink_$k::xpos=$(( (k % 2) * w ))" "sink_$k::ypos=$(( (k / 2) * 960 ))")
+  k=$((k + 1))
+done
+args+=(! videoconvert ! autovideosink sync=false)
+k=0
+for n in "${nodes[@]}"; do
+  serial=${n% *}; id=${n#* }
+  args+=(pipewiresrc target-object=$id always-copy=true ! videoconvert ! textoverlay "text=$serial" valignment=top halignment=left "font-desc=Sans 20" ! queue max-size-buffers=2 leaky=downstream ! c.sink_$k)
+  k=$((k + 1))
+done
+exec gst-launch-1.0 -q "${args[@]}"

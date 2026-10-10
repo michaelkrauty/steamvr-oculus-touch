@@ -1,0 +1,62 @@
+option(
+	'examples',
+	type: 'array',
+	choices: [
+		'simple',
+		'opengl',
+		'',
+	],
+	value: [
+		'simple',
+	],
+)
+
+option(
+	'drivers',
+	type: 'array',
+	choices: [
+		'rift',
+		'rift-s',
+		'deepoon',
+		'psvr',
+		'vive',
+		'nolo',
+		'wmr',
+		'xgvr',
+		'vrtek',
+		'external',
+		'android',
+	],
+	value: [
+		'rift',
+		'rift-s',
+		'deepoon',
+		'psvr',
+		'vive',
+		'nolo',
+		'wmr',
+		'xgvr',
+		'vrtek',
+		'external',
+	],
+)
+
+option(
+	'hidapi',
+	type: 'combo',
+	choices: [
+		'auto',
+		'libusb',
+		'hidraw'
+	],
+	value: 'auto',
+)
+
+option(
+	'tests',
+	type: 'boolean',
+	value: true,
+)
+
+option('debugging_mode', type : 'boolean', value : false,
+       description: 'Enable developer HMD debugging mode')

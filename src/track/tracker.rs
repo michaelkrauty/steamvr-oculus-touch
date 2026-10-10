@@ -1,0 +1,1767 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Michael Krauty
+
+//! One controller's tracker. The filter keeps a short history of states so that a sensor frame,
+//! which arrives tens of milliseconds after its exposure, is applied at the exposure time and the
+//! IMU samples since are replayed. Acquisition takes the engine's pose and labels; tracking then
+//! associates blobs itself. Output is the newest IMU-propagated state, unsmoothed.
+
+use std::collections::VecDeque;
+
+use nalgebra::{Isometry3, UnitQuaternion, Vector2, Vector3};
+
+use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
+use super::vision::{self, Blob, Body, Camera, FitParams};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuSample {
+    /// Controller clock, ns.
+    pub t: u64,
+    /// Body rate, rad/s, and specific force, m/s^2, factory-calibrated.
+    pub gyro: Vector3<f64>,
+    pub accel: Vector3<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Params {
+    pub noise: Noise,
+    pub fit: FitParams,
+    /// m/s^2, along world -Y.
+    pub gravity: f64,
+    pub history_ns: u64,
+    /// Without an accepted update for this long, the position is lost.
+    pub lost_after_ns: u64,
+    /// Fewest engine-labelled LEDs to acquire from.
+    pub acquire_min_leds: usize,
+    /// Standard deviations at acquisition (rad, m, m/s, rad/s, m/s^2); biases carried over from
+    /// an earlier track keep their own.
+    pub acquire_sd: [f64; 5],
+    /// For this long after the last fix the propagated orientation is trusted to vet the engine's
+    /// pose at re-acquisition, which may turn from it by at most `acquire_max_turn_rad`.
+    pub orientation_memory_ns: u64,
+    pub acquire_max_turn_rad: f64,
+    /// IMU samples this far apart (normally 2 ms) are a discontinuity: the controller slept or
+    /// dropped out, may have moved meanwhile, and its clock may have jumped. The state is dropped
+    /// (the bias estimates kept) and the controller acquired afresh.
+    pub max_imu_gap_ns: u64,
+    /// After refusing the engine's poses for this long, the orientation memory is dropped: it is
+    /// the one that is wrong.
+    pub max_refusing_ns: u64,
+    /// Blobs this close to an LED of the other controller (as it is tracked at the same exposure)
+    /// are left to it, unless the engine labelled them as ours.
+    pub foreign_px: f64,
+    /// For this long after the last fix the dead-reckoned state is close enough for the
+    /// tracker's own (shift-search) association to re-lock without the engine.
+    pub relock_ns: u64,
+    /// A wrong lock (a pose that fits the LEDs but is turned from the truth) leaks gravity into the
+    /// filter, which drives the accelerometer bias off: beyond this from a remembered bias, or
+    /// beyond `max_accel_bias` without one (m/s^2), the track is dropped.
+    pub max_accel_bias_change: f64,
+    pub max_accel_bias: f64,
+    /// After a wrong lock, engine poses within `wrong_lock_turn_rad` of the dropped orientation
+    /// (carried on by the gyro) are refused for this long: the engine tends to offer it again.
+    pub wrong_lock_memory_ns: u64,
+    pub wrong_lock_turn_rad: f64,
+    /// At an acquisition with no orientation to check the engine's pose against, the pose is
+    /// tested against its ring aliases (`vision::Alias`) on the frame. Each hypothesis costs its
+    /// matched LEDs' squared residuals in units of `alias_sigma_px`, plus `alias_miss_cost` per
+    /// LED it predicts facing the sensor with no blob near, and per blob in its footprint it
+    /// leaves unexplained. The cheapest is taken when it leads by `alias_margin`; else the
+    /// acquisition waits for a clearer frame (for up to `max_refusing_ns`).
+    pub alias_sigma_px: f64,
+    pub alias_miss_cost: f64,
+    pub alias_margin: f64,
+    /// While the accelerometer holds steady (over `steady_window_ns`, every reading within
+    /// `steady_accel` of the mean, and the mean within `steady_accel` of g) it gives gravity's
+    /// direction in the controller to a few degrees (its bias, uncorrected, adds up to ~3): an
+    /// acquisition whose pose tilts further from it than `still_max_tilt_rad` is refused.
+    pub still_max_tilt_rad: f64,
+    pub steady_window_ns: u64,
+    pub steady_accel: f64,
+    /// The controller is still when, over the last `still_window_ns` of IMU, the gyro (less its
+    /// bias) stays within `still_gyro` rad/s of zero and its samples within `still_gyro_spread`
+    /// of their mean, and the accelerometer (less its bias) within `still_accel_spread` m/s^2 of
+    /// its mean, a mean `still_accel_g` from g. Then every `zupt_every_ns` the velocity is
+    /// measured as zero with `zupt_sigma` m/s: with too few LEDs to pin the depth, an unmodelled
+    /// hundredth of a m/s^2 otherwise builds into a drift of centimetres along the line of sight.
+    pub still_window_ns: u64,
+    pub still_gyro: f64,
+    pub still_gyro_spread: f64,
+    pub still_accel_spread: f64,
+    pub still_accel_g: f64,
+    pub zupt_every_ns: u64,
+    pub zupt_sigma: f64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            noise: Noise::default(),
+            fit: FitParams::default(),
+            gravity: 9.80665,
+            history_ns: 400_000_000,
+            lost_after_ns: 500_000_000,
+            acquire_min_leds: 5,
+            acquire_sd: [0.05, 0.03, 0.5, 0.02, 0.5],
+            orientation_memory_ns: 30_000_000_000,
+            acquire_max_turn_rad: 10f64.to_radians(),
+            max_imu_gap_ns: 100_000_000,
+            max_refusing_ns: 500_000_000,
+            foreign_px: 2.0,
+            relock_ns: 3_000_000_000,
+            max_accel_bias_change: 0.5,
+            max_accel_bias: 1.0,
+            wrong_lock_memory_ns: 2_000_000_000,
+            wrong_lock_turn_rad: 10f64.to_radians(),
+            // true poses fit at ~0.1 px, ring aliases at 0.3-1 px (2026-10-08 recordings: the
+            // true pose led every real alias by 23 or more)
+            alias_sigma_px: 0.25,
+            alias_miss_cost: 9.0,
+            alias_margin: 10.0,
+            // wrong poses taken while still were 9 and 15 degrees off it, the true ones 1 and 3
+            still_max_tilt_rad: 6f64.to_radians(),
+            steady_window_ns: 100_000_000,
+            steady_accel: 0.5,
+            still_window_ns: 200_000_000,
+            still_gyro: 0.03,
+            still_gyro_spread: 0.02,
+            still_accel_spread: 0.2,
+            still_accel_g: 0.15,
+            zupt_every_ns: 20_000_000,
+            zupt_sigma: 0.01,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stats {
+    pub frames: u64,
+    pub updates: u64,
+    pub leds_used: u64,
+    /// Frames in which the state predicts no LED facing the sensor.
+    pub not_visible: u64,
+    /// Frames with LEDs expected but too few matches, or a failed fit, while tracking.
+    pub too_few: u64,
+    pub rejected: u64,
+    pub acquisitions: u64,
+    pub failed_acquisitions: u64,
+    /// Engine poses refused at acquisition: their orientation disagrees with the gyro's.
+    pub refused_acquisitions: u64,
+    /// Frames applied behind a newer measurement (the later ones re-applied).
+    pub out_of_order: u64,
+    /// Later measurements that no longer fit after an out-of-order one, and were dropped.
+    pub dropped_on_rebuild: u64,
+    /// Frames older than the history.
+    pub too_old: u64,
+    /// IMU discontinuities (sleep, dropout) that reset the state.
+    pub imu_gaps: u64,
+    /// Re-locks after the position was lost, by the tracker's own association.
+    pub relocks: u64,
+    /// Tracks dropped for a runaway accelerometer bias.
+    pub wrong_locks: u64,
+    /// Acquisitions that took the engine's pose turned by a ring alias (see `vision::Alias`),
+    /// which fitted the frame clearly better.
+    pub alias_turns: u64,
+    /// Acquisitions put off because the engine's pose and an alias fitted the frame about as well.
+    pub ambiguous_acquisitions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Output {
+    /// Controller clock of the newest IMU sample.
+    pub t: u64,
+    pub world_from_model: Isometry3<f64>,
+    /// At the model origin, m/s.
+    pub vel: Vector3<f64>,
+    pub ang_vel_world: Vector3<f64>,
+    /// The filter's gyro bias, rad/s, body frame.
+    pub gyro_bias: Vector3<f64>,
+    /// The filter's accelerometer bias, m/s^2, body frame.
+    pub accel_bias: Vector3<f64>,
+    /// A recent optical fix holds the position. Without one the position is held where it was
+    /// last tracked, at rest (dead reckoning only feeds the re-lock): never published moving.
+    pub tracking: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Updated(usize),
+    Acquired(usize),
+    NotVisible,
+    Missed,
+    /// Not tracking and no usable engine pose.
+    Waiting,
+    TooOld,
+    /// The exposure is newer than the newest IMU sample: retry after more IMU.
+    Early,
+}
+
+/// Sensors the per-camera bookkeeping covers (camera indices beyond it are not tracked).
+pub const MAX_CAMERAS: usize = 8;
+
+/// How well one sensor agrees with the others: an exponentially weighted mean of the median
+/// pixel residual of its matched LEDs under a prior the other sensors set (another sensor updated
+/// the track within `CROSS_CHECK_NS`). A sensor that moved since calibration stands out.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CameraAgreement {
+    pub median_px: f64,
+    /// Weighted mean of the per-frame mean residual vector: noise averages out of it, a moved
+    /// sensor's consistent offset does not.
+    pub bias_px: Vector2<f64>,
+    pub samples: u64,
+}
+
+pub const CROSS_CHECK_NS: u64 = 25_000_000;
+const AGREEMENT_WEIGHT: f64 = 1.0 / 500.0;
+
+/// A measurement applied within the history, kept so that it can be applied again when an older
+/// frame arrives after it.
+#[derive(Debug, Clone)]
+struct Applied {
+    t: u64,
+    cam: Camera,
+    blobs: Vec<Blob>,
+    pairs: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Tracker {
+    pub params: Params,
+    pub body: Body,
+    /// The OpenHMD device id whose labels this controller's blobs carry.
+    pub device_id: i32,
+    history: VecDeque<(u64, Filter)>,
+    imu: VecDeque<ImuSample>,
+    /// Alongside `imu`: whether the controller was still at each sample (see `Params`), judged on
+    /// arrival so that a rebuild replays the same zero-velocity updates.
+    still: VecDeque<bool>,
+    applied: VecDeque<Applied>,
+    last_fix: u64,
+    /// Controller time of the last accepted update or acquisition (for the orientation check).
+    last_track: u64,
+    /// Bias estimates (and their covariance) kept across an IMU discontinuity.
+    saved_bias: Option<Filter>,
+    /// Sensors (bit per camera index) that have updated the track since its acquisition. A track
+    /// one sensor alone has seen may be off in depth by centimetres: only one confirmed by a second
+    /// sensor vets later acquisitions.
+    track_cameras: u64,
+    /// Controller time of the newest update of a confirmed track.
+    last_confirmed: u64,
+    /// When the current run of refused acquisitions began (0: none).
+    refusing_since: u64,
+    /// The model origin where it was last tracked (held while the position is lost).
+    held: Option<Vector3<f64>>,
+    /// The accelerometer bias remembered from an earlier run (`seed_biases`).
+    bias_ref: Option<Vector3<f64>>,
+    /// The biases the current track started from, restored when it turns out a wrong lock.
+    acquired_bias: Option<Filter>,
+    /// A dropped wrong lock's orientation, carried on by the gyro: (controller time, orientation,
+    /// refused until).
+    wrong_lock: Option<(u64, UnitQuaternion<f64>, u64)>,
+    /// The LED constellation's ring aliases, tested at acquisition.
+    aliases: Vec<vision::Alias>,
+    /// When the current run of acquisitions put off as ambiguous began (0: none).
+    ambiguous_since: u64,
+    /// The engine's labels for this controller come from a pose that disagrees with the track
+    /// (the last engine pose shown did, or the track was acquired turned from it): ignored as
+    /// hints until an engine pose agrees again. Its labels carry on from its own pose in frames
+    /// where it shows none.
+    engine_labels_off: bool,
+    /// Controller time of each sensor's newest update.
+    camera_last: [u64; MAX_CAMERAS],
+    pub agreement: [CameraAgreement; MAX_CAMERAS],
+    pub stats: Stats,
+    /// When set, every miss appends (LEDs predicted visible, of them with a blob within 3 px,
+    /// matched by the association, engine labels) to `misses`.
+    pub debug: bool,
+    pub misses: Vec<(usize, usize, usize, usize)>,
+    /// When `debug`: (matched, unexplained) of every accepted update.
+    pub fits: Vec<(usize, usize)>,
+}
+
+impl Tracker {
+    pub fn new(device_id: i32, body: Body, params: Params) -> Tracker {
+        let aliases = vision::ring_aliases(&body.leds);
+        Tracker {
+            params,
+            body,
+            device_id,
+            history: VecDeque::new(),
+            imu: VecDeque::new(),
+            still: VecDeque::new(),
+            applied: VecDeque::new(),
+            last_fix: 0,
+            last_track: 0,
+            saved_bias: None,
+            bias_ref: None,
+            acquired_bias: None,
+            wrong_lock: None,
+            aliases,
+            ambiguous_since: 0,
+            engine_labels_off: false,
+            track_cameras: 0,
+            last_confirmed: 0,
+            refusing_since: 0,
+            held: None,
+            camera_last: [0; MAX_CAMERAS],
+            agreement: [CameraAgreement::default(); MAX_CAMERAS],
+            stats: Stats::default(),
+            debug: false,
+            misses: Vec::new(),
+            fits: Vec::new(),
+        }
+    }
+
+    fn gravity(&self) -> Vector3<f64> {
+        Vector3::new(0.0, -self.params.gravity, 0.0)
+    }
+
+    pub fn newest_imu(&self) -> Option<u64> {
+        self.imu.back().map(|s| s.t)
+    }
+
+    /// Controller time of the newest optical fix, 0 before the first.
+    pub fn last_fix(&self) -> u64 {
+        self.last_fix
+    }
+
+    pub fn tracking(&self) -> bool {
+        self.last_fix != 0
+            && self
+                .history
+                .back()
+                .is_some_and(|&(t, _)| t.saturating_sub(self.last_fix) <= self.params.lost_after_ns)
+    }
+
+    pub fn imu(&mut self, s: ImuSample) {
+        if self.imu.back().is_some_and(|l| s.t <= l.t) {
+            return;
+        }
+        if self
+            .imu
+            .back()
+            .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
+        {
+            self.stats.imu_gaps += 1;
+            self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
+            self.history.clear();
+            self.imu.clear();
+            self.still.clear();
+            self.applied.clear();
+            self.last_fix = 0;
+            self.last_track = 0;
+            self.last_confirmed = 0;
+            self.track_cameras = 0;
+            self.refusing_since = 0;
+            self.held = None;
+        }
+        if let Some((t, q, until)) = self.wrong_lock {
+            let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
+            self.wrong_lock = (s.t < until).then(|| {
+                (
+                    s.t,
+                    q * UnitQuaternion::from_scaled_axis(
+                        (s.gyro - bg) * (s.t.saturating_sub(t) as f64 * 1e-9),
+                    ),
+                    until,
+                )
+            });
+        }
+        let still = self.is_still(&s);
+        self.imu.push_back(s);
+        self.still.push_back(still);
+        let g = self.gravity();
+        if let Some(&(t, mut f)) = self.history.back() {
+            f.propagate(
+                &s.gyro,
+                &s.accel,
+                (s.t - t) as f64 * 1e-9,
+                &g,
+                &self.params.noise,
+            );
+            self.zupt(&mut f, t, s.t, still);
+            self.history.push_back((s.t, f));
+        }
+        let cutoff = s.t.saturating_sub(self.params.history_ns);
+        while self.history.len() > 1 && self.history[1].0 <= cutoff {
+            self.history.pop_front();
+        }
+        let oldest = self.history.front().map_or(cutoff, |h| h.0.min(cutoff));
+        while self.imu.len() > 1 && self.imu[0].t <= oldest {
+            self.imu.pop_front();
+            self.still.pop_front();
+        }
+        while self.applied.front().is_some_and(|a| a.t < oldest) {
+            self.applied.pop_front();
+        }
+        self.note_held();
+    }
+
+    /// Whether the controller is still at sample `s`, from it and the samples before it.
+    fn is_still(&self, s: &ImuSample) -> bool {
+        let p = &self.params;
+        let Some(first) = self.imu.front() else {
+            return false;
+        };
+        if s.t.saturating_sub(first.t) < p.still_window_ns {
+            return false;
+        }
+        let (bg, ba) = self
+            .history
+            .back()
+            .map(|h| (h.1.x.bg, h.1.x.ba))
+            .or(self.saved_bias.map(|f| (f.x.bg, f.x.ba)))
+            .unwrap_or_default();
+        let from = s.t.saturating_sub(p.still_window_ns);
+        let win: Vec<&ImuSample> = self
+            .imu
+            .iter()
+            .filter(|x| x.t >= from)
+            .chain(std::iter::once(s))
+            .collect();
+        let n = win.len() as f64;
+        let gm = win.iter().map(|x| x.gyro).sum::<Vector3<f64>>() / n;
+        let am = win.iter().map(|x| x.accel).sum::<Vector3<f64>>() / n;
+        (gm - bg).norm() < p.still_gyro
+            && ((am - ba).norm() - p.gravity).abs() < p.still_accel_g
+            && win.iter().all(|x| {
+                (x.gyro - gm).norm() < p.still_gyro_spread
+                    && (x.accel - am).norm() < p.still_accel_spread
+            })
+    }
+
+    /// The zero-velocity update for the step from `t0` to `t1` (see `Params::zupt_sigma`).
+    fn zupt(&self, f: &mut Filter, t0: u64, t1: u64, still: bool) {
+        if still && t1 / self.params.zupt_every_ns != t0 / self.params.zupt_every_ns {
+            f.update_velocity(&Vector3::zeros(), self.params.zupt_sigma);
+        }
+    }
+
+    fn note_held(&mut self) {
+        if self.tracking() {
+            if let Some(&(_, f)) = self.history.back() {
+                self.held = Some(self.body.world_from_model(&f.x).translation.vector);
+            }
+        }
+    }
+
+    /// Starts the biases from an earlier run's estimates, trusted to `sd_gyro` rad/s and `sd_accel`
+    /// m/s^2: a controller's biases outlast a daemon restart, and learning the accelerometer's
+    /// from scratch takes tens of seconds of varied orientation. Only before the first fix.
+    pub fn seed_biases(
+        &mut self,
+        gyro: Vector3<f64>,
+        accel: Vector3<f64>,
+        sd_gyro: f64,
+        sd_accel: f64,
+    ) {
+        if !self.history.is_empty() || self.saved_bias.is_some() {
+            return;
+        }
+        let x = Nominal {
+            q: UnitQuaternion::identity(),
+            p: Vector3::zeros(),
+            v: Vector3::zeros(),
+            bg: gyro,
+            ba: accel,
+        };
+        let mut cov = Cov::zeros();
+        for i in 0..3 {
+            cov[(BG + i, BG + i)] = sd_gyro * sd_gyro;
+            cov[(BA + i, BA + i)] = sd_accel * sd_accel;
+        }
+        self.saved_bias = Some(Filter { x, cov });
+        self.bias_ref = Some(accel);
+    }
+
+    /// Whether the newest state's accelerometer bias ran off (see `Params::max_accel_bias_change`).
+    fn bias_ran_off(&self) -> bool {
+        let Some(&(_, f)) = self.history.back() else {
+            return false;
+        };
+        match self.bias_ref {
+            Some(r) => (f.x.ba - r).norm() > self.params.max_accel_bias_change,
+            None => f.x.ba.norm() > self.params.max_accel_bias,
+        }
+    }
+
+    /// Drops the track as a wrong lock: the biases go back to what it started from, the
+    /// orientation memory (the wrong orientation) is forgotten, and that orientation is refused
+    /// for a while.
+    fn drop_wrong_lock(&mut self) {
+        let Some(&(t, f)) = self.history.back() else {
+            return;
+        };
+        self.stats.wrong_locks += 1;
+        self.wrong_lock = Some((t, f.x.q, t + self.params.wrong_lock_memory_ns));
+        self.saved_bias = self.acquired_bias.or(self.saved_bias);
+        self.history.clear();
+        self.applied.clear();
+        self.last_fix = 0;
+        self.last_track = 0;
+        self.last_confirmed = 0;
+        self.track_cameras = 0;
+        self.refusing_since = 0;
+        self.held = None;
+    }
+
+    pub fn output(&self) -> Option<Output> {
+        let &(t, f) = self.history.back()?;
+        let s = self.imu.back()?;
+        let w = f.x.q * (s.gyro - f.x.bg);
+        let tracking = self.tracking();
+        let mut pose = self.body.world_from_model(&f.x);
+        let mut vel = f.x.v + w.cross(&(f.x.q * -self.body.imu_pos));
+        if !tracking {
+            // the gyro keeps the orientation; the position stays where it was last seen
+            if let Some(h) = self.held {
+                pose.translation.vector = h;
+            }
+            vel = Vector3::zeros();
+        }
+        Some(Output {
+            t,
+            world_from_model: pose,
+            vel,
+            ang_vel_world: w,
+            gyro_bias: f.x.bg,
+            accel_bias: f.x.ba,
+            tracking,
+        })
+    }
+
+    /// The filter at time `t` from the history: the index of the newest snapshot at or before it,
+    /// and that snapshot propagated to `t` with the IMU sample covering the gap. Every measurement
+    /// at or before that snapshot's time is in it; every later one is after `t`.
+    fn state_at(&self, t: u64) -> Option<(usize, Filter)> {
+        let k = self.history.partition_point(|&(ts, _)| ts <= t);
+        if k == 0 {
+            return None;
+        }
+        let (tk, mut f) = self.history[k - 1];
+        if t > tk {
+            let s = self.imu.iter().find(|s| s.t > tk)?;
+            f.propagate(
+                &s.gyro,
+                &s.accel,
+                (t - tk) as f64 * 1e-9,
+                &self.gravity(),
+                &self.params.noise,
+            );
+        }
+        Some((k - 1, f))
+    }
+
+    /// The filter at controller time `t`, when it is within the history and a fix holds the position.
+    pub fn filter_at(&self, t: u64) -> Option<Filter> {
+        (self.tracking() && t.saturating_sub(self.last_fix) <= self.params.lost_after_ns)
+            .then(|| self.state_at(t).map(|(_, f)| f))
+            .flatten()
+    }
+
+    /// Rebuilds the history after snapshot `k` with `first` (already fitted, at its time) and the
+    /// logged measurements after it, re-fitted with their matches, merged with the IMU samples.
+    fn rebuild(&mut self, k: usize, first: Applied, posterior: Filter) {
+        let later: Vec<Applied> = self
+            .applied
+            .iter()
+            .filter(|a| a.t > first.t)
+            .cloned()
+            .collect();
+        self.applied.retain(|a| a.t <= first.t);
+        self.history.truncate(k + 1);
+        let (g, n) = (self.gravity(), self.params.noise);
+        let (mut t, mut f) = (first.t, posterior);
+        self.history.push_back((t, f));
+        self.applied.push_back(first);
+        let imu: Vec<(ImuSample, bool)> = self
+            .imu
+            .iter()
+            .zip(&self.still)
+            .filter(|(s, _)| s.t > t)
+            .map(|(s, st)| (*s, *st))
+            .collect();
+        let (mut i, mut m) = (0, 0);
+        loop {
+            let next_m = later.get(m).map(|a| a.t);
+            let next_s = imu.get(i).map(|s| s.0.t);
+            match (next_m, next_s) {
+                (Some(tm), Some(ts)) if tm <= ts => {
+                    f.propagate(
+                        &imu[i].0.gyro,
+                        &imu[i].0.accel,
+                        (tm - t) as f64 * 1e-9,
+                        &g,
+                        &n,
+                    );
+                    t = tm;
+                    let a = &later[m];
+                    match vision::fit_pairs(
+                        &a.cam,
+                        &self.body,
+                        &f,
+                        &a.blobs,
+                        a.pairs.clone(),
+                        &self.params.fit,
+                    ) {
+                        Ok(fit) => {
+                            f = fit.updated.filter;
+                            self.applied.push_back(Applied {
+                                pairs: fit.pairs,
+                                ..a.clone()
+                            });
+                        }
+                        Err(_) => self.stats.dropped_on_rebuild += 1,
+                    }
+                    self.history.push_back((t, f));
+                    m += 1;
+                }
+                (_, Some(ts)) => {
+                    f.propagate(
+                        &imu[i].0.gyro,
+                        &imu[i].0.accel,
+                        (ts - t) as f64 * 1e-9,
+                        &g,
+                        &n,
+                    );
+                    self.zupt(&mut f, t, ts, imu[i].1);
+                    t = ts;
+                    self.history.push_back((t, f));
+                    i += 1;
+                }
+                // a measurement can't be newer than the newest IMU sample (frames wait for it)
+                (Some(_), None) | (None, None) => break,
+            }
+        }
+    }
+
+    /// One sensor frame whose exposure was at controller time `t_e`. `engine` is the engine's
+    /// world_from_model for this controller in this frame, when it found a strong one.
+    /// `foreign`: where the other controller's LEDs are in this frame, as it is tracked.
+    pub fn frame(
+        &mut self,
+        t_e: u64,
+        camera: usize,
+        cam: &Camera,
+        blobs: &[Blob],
+        engine: Option<Isometry3<f64>>,
+        foreign: &[Vector2<f64>],
+    ) -> Outcome {
+        if self.newest_imu().is_none_or(|n| t_e > n) {
+            return Outcome::Early;
+        }
+        self.stats.frames += 1;
+        // the other controller's blobs: labelled as another device, or on one of its LEDs
+        let own: Vec<Blob> = blobs
+            .iter()
+            .filter(|b| {
+                let ours = b.led_id >= 0 && b.led_id >> 8 == self.device_id;
+                let theirs = b.led_id >= 0 && !ours;
+                ours || (!theirs
+                    && !foreign
+                        .iter()
+                        .any(|f| (f - b.xy).norm() < self.params.foreign_px))
+            })
+            .copied()
+            .collect();
+        let blobs = &own[..];
+        let labelled: Vec<(usize, usize)> = blobs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.led_id >= 0
+                    && b.led_id >> 8 == self.device_id
+                    && ((b.led_id & 0xff) as usize) < self.body.leds.len()
+            })
+            .map(|(i, b)| ((b.led_id & 0xff) as usize, i))
+            .collect();
+        let relock = !self.tracking()
+            && self.last_fix != 0
+            && t_e.saturating_sub(self.last_fix) <= self.params.relock_ns;
+        if self.tracking() || relock {
+            let Some((k, prior)) = self.state_at(t_e) else {
+                self.stats.too_old += 1;
+                return Outcome::TooOld;
+            };
+            // the engine labels from its own pose: when that disagrees with the track's, they
+            // are a flip or a mislabel (off by one LED around the ring, say), not hints
+            if let Some(e) = engine {
+                self.engine_labels_off =
+                    e.rotation.angle_to(&prior.x.q) > self.params.acquire_max_turn_rad;
+            }
+            let hints: &[(usize, usize)] = if self.engine_labels_off {
+                &[]
+            } else {
+                &labelled
+            };
+            match vision::fit_frame(cam, &self.body, &prior, blobs, hints, &self.params.fit) {
+                Ok(fit) => {
+                    if self.debug {
+                        self.fits.push((fit.pairs.len(), fit.unexplained));
+                    }
+                    self.cross_check(t_e, camera, cam, blobs, &fit.pairs, &prior);
+                    if self.applied.back().is_some_and(|a| a.t > t_e) {
+                        self.stats.out_of_order += 1;
+                    }
+                    let n = fit.pairs.len();
+                    self.rebuild(
+                        k,
+                        Applied {
+                            t: t_e,
+                            cam: *cam,
+                            blobs: blobs.to_vec(),
+                            pairs: fit.pairs,
+                        },
+                        fit.updated.filter,
+                    );
+                    self.last_fix = self.last_fix.max(t_e);
+                    self.last_track = self.last_track.max(t_e);
+                    if relock {
+                        self.stats.relocks += 1;
+                        self.track_cameras = 1u64 << camera.min(63);
+                    } else {
+                        self.track_cameras |= 1u64 << camera.min(63);
+                    }
+                    if self.track_cameras.count_ones() >= 2 {
+                        self.last_confirmed = self.last_confirmed.max(t_e);
+                    }
+                    self.refusing_since = 0;
+                    if self.bias_ran_off() {
+                        self.drop_wrong_lock();
+                        return Outcome::Missed;
+                    }
+                    self.note_held();
+                    self.stats.updates += 1;
+                    self.stats.leds_used += n as u64;
+                    return Outcome::Updated(n);
+                }
+                // a failed re-lock falls through to the engine's acquisition below
+                Err(_) if relock => {}
+                Err(_)
+                    if vision::visible_leds(cam, &self.body, &prior.x, &self.params.fit.assoc)
+                        == 0 =>
+                {
+                    self.stats.not_visible += 1;
+                    return Outcome::NotVisible;
+                }
+                Err(miss) => {
+                    if self.debug {
+                        let (v, n, a) = vision::association_report(
+                            cam,
+                            &self.body,
+                            &prior,
+                            blobs,
+                            self.params.fit.update.sigma_px,
+                            &self.params.fit.assoc,
+                            3.0,
+                        );
+                        self.misses.push((v, n, a, labelled.len()));
+                    }
+                    match miss {
+                        vision::Miss::TooFew => self.stats.too_few += 1,
+                        vision::Miss::Rejected => self.stats.rejected += 1,
+                    }
+                    return Outcome::Missed;
+                }
+            }
+        }
+        let Some(world_from_model) = engine else {
+            return Outcome::Waiting;
+        };
+        if labelled.len() < self.params.acquire_min_leds {
+            return Outcome::Waiting;
+        }
+        let (k, carried) = match self.state_at(t_e) {
+            Some((k, f)) => (k, Some(f)),
+            None if self.history.is_empty() => (0, self.saved_bias),
+            None => {
+                self.stats.too_old += 1;
+                return Outcome::TooOld;
+            }
+        };
+        // the gyro keeps the orientation for a long while after the position is lost: an engine
+        // pose that disagrees with it is a flip or a mislabel
+        let memory = carried.filter(|_| {
+            self.last_confirmed != 0
+                && t_e.saturating_sub(self.last_confirmed) <= self.params.orientation_memory_ns
+        });
+        if let Some(f) = memory {
+            if f.x.q.angle_to(&world_from_model.rotation) > self.params.acquire_max_turn_rad {
+                if self.refusing_since == 0 {
+                    self.refusing_since = t_e;
+                }
+                if t_e.saturating_sub(self.refusing_since) < self.params.max_refusing_ns {
+                    self.stats.refused_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
+                self.last_confirmed = 0;
+            }
+        }
+        if self.wrong_lock.is_some_and(|(_, q, _)| {
+            q.angle_to(&world_from_model.rotation) < self.params.wrong_lock_turn_rad
+        }) {
+            self.stats.refused_acquisitions += 1;
+            return Outcome::Waiting;
+        }
+        self.refusing_since = 0;
+        let fit_params = FitParams {
+            min_leds: self.params.acquire_min_leds,
+            ..self.params.fit
+        };
+        // one hypothesis: a pose, and the engine's labels as they read under it. The labels seed
+        // it; our own association under that fit adds what they missed, and the frame is fused
+        // once, from the acquisition prior
+        let attempt = |pose: &Isometry3<f64>,
+                       pairs: Vec<(usize, usize)>|
+         -> Option<(Filter, vision::Fit)> {
+            let prior = self.acquisition_prior(pose, carried.as_ref());
+            let fit = vision::fit_pairs(cam, &self.body, &prior, blobs, pairs, &fit_params).ok()?;
+            let more = vision::merge_pairs(
+                fit.pairs.clone(),
+                &vision::associate(
+                    cam,
+                    &self.body,
+                    &fit.updated.filter,
+                    blobs,
+                    self.params.fit.update.sigma_px,
+                    &self.params.fit.assoc,
+                ),
+            );
+            let fit = if more.len() > fit.pairs.len() {
+                vision::fit_pairs(cam, &self.body, &prior, blobs, more, &self.params.fit)
+                    .unwrap_or(fit)
+            } else {
+                fit
+            };
+            Some((prior, fit))
+        };
+        let Some(mut chosen) = attempt(&world_from_model, labelled.clone()) else {
+            self.stats.failed_acquisitions += 1;
+            return Outcome::Waiting;
+        };
+        // nothing to check the engine's orientation against (a pickup after sleep, a first
+        // fix): a labelling off by one around the ring fits the frame almost as well, so its
+        // turns are tried on this frame too
+        let mut turned = false;
+        if memory.is_none() && !self.aliases.is_empty() {
+            let mut costs = vec![self.acquisition_cost(cam, blobs, &chosen.1)];
+            let mut best: Option<(f64, (Filter, vision::Fit))> = None;
+            for a in &self.aliases {
+                let pairs: Vec<(usize, usize)> = labelled
+                    .iter()
+                    .filter_map(|&(i, b)| a.led_at[i].map(|j| (j, b)))
+                    .collect();
+                if let Some(h) = attempt(&(world_from_model * a.turn), pairs) {
+                    let c = self.acquisition_cost(cam, blobs, &h.1);
+                    if c < costs[0] && best.as_ref().is_none_or(|b| c < b.0) {
+                        best = Some((c, h));
+                    }
+                    costs.push(c);
+                }
+            }
+            costs.sort_by(f64::total_cmp);
+            if costs.len() > 1 && costs[1] - costs[0] < self.params.alias_margin {
+                if self.ambiguous_since == 0 {
+                    self.ambiguous_since = t_e;
+                }
+                if t_e.saturating_sub(self.ambiguous_since) < self.params.max_refusing_ns {
+                    self.stats.ambiguous_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
+            }
+            if let Some((_, h)) = best {
+                chosen = h;
+                turned = true;
+            }
+        }
+        self.ambiguous_since = 0;
+        // lying still, the accelerometer knows which way is up
+        if let Some(up) = self.steady_up(t_e, carried.map_or(Vector3::zeros(), |f| f.x.ba)) {
+            if (chosen.0.x.q.inverse() * Vector3::y()).angle(&up) > self.params.still_max_tilt_rad {
+                self.stats.refused_acquisitions += 1;
+                return Outcome::Waiting;
+            }
+        }
+        // a turned pose can be the orientation of a lock just dropped as wrong
+        if turned
+            && self.wrong_lock.is_some_and(|(_, q, _)| {
+                q.angle_to(&chosen.0.x.q) < self.params.wrong_lock_turn_rad
+            })
+        {
+            self.stats.refused_acquisitions += 1;
+            return Outcome::Waiting;
+        }
+        if turned {
+            self.stats.alias_turns += 1;
+        }
+        self.engine_labels_off = turned;
+        let (prior, fit) = chosen;
+        let n = fit.pairs.len();
+        let applied = Applied {
+            t: t_e,
+            cam: *cam,
+            blobs: blobs.to_vec(),
+            pairs: fit.pairs,
+        };
+        let fresh = self.history.is_empty();
+        if fresh {
+            self.history.push_back((t_e, prior));
+            self.acquired_bias = carried;
+        }
+        // later measurements were made under the lost state: start clean from here
+        self.applied.retain(|a| a.t <= t_e);
+        self.rebuild(k, applied, fit.updated.filter);
+        if fresh {
+            self.history.pop_front();
+        }
+        self.last_fix = self.last_fix.max(t_e);
+        self.last_track = self.last_track.max(t_e);
+        self.track_cameras = 1u64 << camera.min(63);
+        self.note_held();
+        self.stats.acquisitions += 1;
+        Outcome::Acquired(n)
+    }
+
+    /// Updates the sensor's agreement with the others from this frame's residuals under the prior,
+    /// when another sensor set that prior moments ago.
+    fn cross_check(
+        &mut self,
+        t_e: u64,
+        camera: usize,
+        cam: &Camera,
+        blobs: &[Blob],
+        pairs: &[(usize, usize)],
+        prior: &Filter,
+    ) {
+        if camera >= MAX_CAMERAS {
+            return;
+        }
+        let others = (0..MAX_CAMERAS).any(|c| {
+            c != camera
+                && self.camera_last[c] != 0
+                && t_e.saturating_sub(self.camera_last[c]) <= CROSS_CHECK_NS
+                && self.camera_last[c] <= t_e
+        });
+        self.camera_last[camera] = self.camera_last[camera].max(t_e);
+        if !others || pairs.len() < 4 {
+            return;
+        }
+        let res = vision::residuals(cam, &self.body, blobs, pairs, &prior.x);
+        let mean = res.iter().map(|o| o.r).sum::<Vector2<f64>>() / res.len() as f64;
+        let mut r: Vec<f64> = res.iter().map(|o| o.r.norm()).collect();
+        r.sort_by(|a, b| a.total_cmp(b));
+        let median = r[r.len() / 2];
+        let a = &mut self.agreement[camera];
+        let w = if a.samples < 50 {
+            1.0 / (a.samples + 1) as f64
+        } else {
+            AGREEMENT_WEIGHT
+        };
+        a.median_px += w * (median - a.median_px);
+        a.bias_px += (mean - a.bias_px) * w;
+        a.samples += 1;
+    }
+
+    /// Gravity's direction in the controller at controller time `t`, less the bias `ba`, when the
+    /// accelerometer held steady before it (see `Params::still_max_tilt_rad`).
+    fn steady_up(&self, t: u64, ba: Vector3<f64>) -> Option<Vector3<f64>> {
+        let k = self.imu.partition_point(|s| s.t <= t);
+        let from = t.saturating_sub(self.params.steady_window_ns);
+        // the window must be covered: a sample at or before its start
+        if k == 0 || self.imu.front().is_none_or(|s| s.t > from) {
+            return None;
+        }
+        let win: Vec<&ImuSample> = self.imu.iter().take(k).filter(|s| s.t >= from).collect();
+        let mean = win.iter().map(|s| s.accel).sum::<Vector3<f64>>() / win.len() as f64;
+        let steady = win
+            .iter()
+            .all(|s| (s.accel - mean).norm() < self.params.steady_accel)
+            && ((mean - ba).norm() - self.params.gravity).abs() < self.params.steady_accel;
+        steady.then(|| (mean - ba).normalize())
+    }
+
+    /// How badly an acquisition hypothesis explains its frame (see `Params::alias_sigma_px`).
+    fn acquisition_cost(&self, cam: &Camera, blobs: &[Blob], fit: &vision::Fit) -> f64 {
+        let f = &fit.updated.filter;
+        let chi: f64 = vision::residuals(cam, &self.body, blobs, &fit.pairs, &f.x)
+            .iter()
+            .map(|r| (r.r.norm() / self.params.alias_sigma_px).powi(2))
+            .sum();
+        let (visible, near, _) = vision::association_report(
+            cam,
+            &self.body,
+            f,
+            blobs,
+            self.params.fit.update.sigma_px,
+            &self.params.fit.assoc,
+            3.0,
+        );
+        chi + self.params.alias_miss_cost * (visible.saturating_sub(near) + fit.unexplained) as f64
+    }
+
+    fn acquisition_prior(
+        &self,
+        world_from_model: &Isometry3<f64>,
+        carried: Option<&Filter>,
+    ) -> Filter {
+        let q = world_from_model.rotation;
+        let p = world_from_model * nalgebra::Point3::from(self.body.imu_pos);
+        let [rot, pos, vel, bg, ba] = self.params.acquire_sd;
+        let mut cov = Cov::zeros();
+        let mut x = Nominal {
+            q,
+            p: p.coords,
+            v: Vector3::zeros(),
+            bg: Vector3::zeros(),
+            ba: Vector3::zeros(),
+        };
+        for (block, sd) in [(ROT, rot), (POS, pos), (VEL, vel), (BG, bg), (BA, ba)] {
+            for i in 0..3 {
+                cov[(block + i, block + i)] = sd * sd;
+            }
+        }
+        if let Some(f) = carried {
+            x.bg = f.x.bg;
+            x.ba = f.x.ba;
+            cov.fixed_view_mut::<6, 6>(BG, BG)
+                .copy_from(&f.cov.fixed_view::<6, 6>(BG, BG));
+        }
+        Filter { x, cov }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calib::synth::{self, Motion, Rng};
+    use nalgebra::{Point3, UnitQuaternion, Vector2};
+
+    const G: f64 = 9.80665;
+
+    struct World {
+        cams: Vec<Camera>,
+        body: Body,
+        motion: Motion,
+        ba: Vector3<f64>,
+        bg: Vector3<f64>,
+    }
+
+    fn world(seed: u64) -> World {
+        let target = Vector3::new(0.0, 1.0, 0.0);
+        let cams = [
+            (Vector3::new(-2.0, 2.3, 1.8), true),
+            (Vector3::new(2.0, 2.3, 1.8), false),
+            (Vector3::new(0.3, 2.4, -2.2), true),
+        ]
+        .iter()
+        .map(|&(pos, flip)| Camera {
+            model: synth::camera_model(),
+            world_from_cam: synth::look_at(pos, target, flip),
+        })
+        .collect();
+        let mut rng = Rng::new(seed);
+        World {
+            cams,
+            body: Body {
+                leds: synth::touch_leds(),
+                imu_pos: Vector3::new(0.015, -0.012, 0.008),
+            },
+            motion: Motion::random(&mut rng, Vector3::new(0.0, 1.0, 0.0)),
+            ba: Vector3::new(0.02, 0.4, -0.05),
+            bg: Vector3::new(0.01, -0.005, 0.003),
+        }
+    }
+
+    fn imu(w: &World, t: f64) -> ImuSample {
+        ImuSample {
+            t: (1e9 + t * 1e9) as u64,
+            gyro: w.motion.gyro(t) + w.bg,
+            accel: w
+                .motion
+                .accel(t, &w.body.imu_pos, &Vector3::new(0.0, G, 0.0))
+                + w.ba,
+        }
+    }
+
+    fn sight(w: &World, cam: &Camera, t: f64, rng: &mut Rng, noise: f64) -> Vec<Blob> {
+        let pose = w.motion.pose(t);
+        (0..w.body.leds.len())
+            .filter_map(|i| {
+                let pc = cam.world_from_cam.inverse() * (pose * Point3::from(w.body.leds[i].pos));
+                let n =
+                    cam.world_from_cam.inverse().rotation * (pose.rotation * w.body.leds[i].dir);
+                if n.dot(&(-pc.coords)) / pc.coords.norm() < 0.3 {
+                    return None;
+                }
+                let uv =
+                    cam.model.project(&pc.coords)? + Vector2::new(rng.gauss(), rng.gauss()) * noise;
+                Some(Blob {
+                    xy: uv,
+                    led_id: (1 << 8) | i as i32,
+                })
+            })
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct Run {
+        /// No frames in this span.
+        blackout: Option<(f64, f64)>,
+        /// Each frame arrives 20 to 45 ms after its exposure instead of 25 ms, so sensors overtake
+        /// each other.
+        shuffle: bool,
+        /// The engine reports a pose turned 90 degrees in this span.
+        engine_flipped: Option<(f64, f64)>,
+        /// From this time on the engine gives neither poses nor labels.
+        engine_silent_after: Option<f64>,
+        /// Biases (gyro, accel) remembered from an earlier run.
+        seed: Option<(Vector3<f64>, Vector3<f64>)>,
+        /// From this time on the accelerometer reads this much more: the filter's bias runs off
+        /// the way it does under a wrong lock.
+        accel_jump: Option<(f64, Vector3<f64>)>,
+        /// The track is dropped as a wrong lock at this time.
+        drop_at: Option<f64>,
+    }
+
+    /// Motion: IMU at 500 Hz, three sensors at 52 Hz, frames arriving 25 ms after exposure.
+    /// Returns the position errors (m) of every output after the first second.
+    fn run(
+        w: &World,
+        seconds: f64,
+        pixel_noise: f64,
+        drop_cams_between: Option<(f64, f64)>,
+    ) -> (Tracker, Vec<f64>) {
+        run_with(
+            w,
+            seconds,
+            pixel_noise,
+            &Run {
+                blackout: drop_cams_between,
+                ..Run::default()
+            },
+        )
+    }
+
+    fn run_with(w: &World, seconds: f64, pixel_noise: f64, opts: &Run) -> (Tracker, Vec<f64>) {
+        let drop_cams_between = opts.blackout;
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        if let Some((bg, ba)) = opts.seed {
+            tr.seed_biases(bg, ba, 0.002, 0.03);
+        }
+        let mut rng = Rng::new(11);
+        // (exposure, arrival, camera, blobs)
+        let mut pending: Vec<(f64, f64, usize, Vec<Blob>)> = Vec::new();
+        let mut errors = Vec::new();
+        let (dt_imu, dt_frame, delay) = (0.002, 1.0 / 52.0, 0.025);
+        let mut next_frame = 0.01;
+        let mut t = 0.0;
+        let mut dropped = false;
+        while t < seconds {
+            t += dt_imu;
+            let mut s = imu(w, t);
+            if let Some((after, jump)) = opts.accel_jump.filter(|(after, _)| t >= *after) {
+                let _ = after;
+                s.accel += jump;
+            }
+            tr.imu(s);
+            if opts.drop_at.is_some_and(|d| t >= d) && !dropped {
+                dropped = true;
+                tr.drop_wrong_lock();
+            }
+            while next_frame <= t {
+                if !drop_cams_between.is_some_and(|(a, b)| next_frame >= a && next_frame < b) {
+                    for (c, cam) in w.cams.iter().enumerate() {
+                        let late = if opts.shuffle {
+                            rng.range(-0.005, 0.02)
+                        } else {
+                            0.0
+                        };
+                        pending.push((
+                            next_frame,
+                            next_frame + delay + late,
+                            c,
+                            sight(w, cam, next_frame, &mut rng, pixel_noise),
+                        ));
+                    }
+                }
+                next_frame += dt_frame;
+            }
+            let mut ready: Vec<_> = pending.iter().filter(|p| p.1 <= t).cloned().collect();
+            ready.sort_by(|a, b| a.1.total_cmp(&b.1));
+            pending.retain(|p| p.1 > t);
+            for (te, _, c, mut blobs) in ready {
+                let mut engine = Some(w.motion.pose(te));
+                if opts.engine_flipped.is_some_and(|(a, b)| te >= a && te < b) {
+                    engine = engine.map(|mut e| {
+                        e.rotation *= UnitQuaternion::from_scaled_axis(Vector3::new(
+                            0.0,
+                            std::f64::consts::FRAC_PI_2,
+                            0.0,
+                        ));
+                        e
+                    });
+                }
+                if opts.engine_silent_after.is_some_and(|a| te >= a) {
+                    engine = None;
+                    blobs.iter_mut().for_each(|b| b.led_id = -1);
+                }
+                tr.frame((1e9 + te * 1e9) as u64, c, &w.cams[c], &blobs, engine, &[]);
+            }
+            if t > 1.0 {
+                let Some(o) = tr.output() else { continue };
+                if o.tracking && !opts.engine_flipped.is_some_and(|(a, b)| t >= a && t < b) {
+                    errors.push(
+                        (o.world_from_model.translation.vector
+                            - w.motion.pose(t).translation.vector)
+                            .norm(),
+                    );
+                }
+            }
+        }
+        (tr, errors)
+    }
+
+    fn pct(v: &[f64], p: f64) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        s[((s.len() - 1) as f64 * p) as usize]
+    }
+
+    #[test]
+    fn tracks_a_swinging_controller_to_a_millimetre_with_late_frames() {
+        let w = world(3);
+        let (tr, errors) = run(&w, 10.0, 0.3, None);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(
+            errors.len() > 4000,
+            "tracked only {} outputs: {:?}",
+            errors.len(),
+            tr.stats
+        );
+        let (p50, p99) = (pct(&errors, 0.5), pct(&errors, 0.99));
+        assert!(
+            p50 < 1e-3 && p99 < 4e-3,
+            "p50 {p50} p99 {p99} {:?}",
+            tr.stats
+        );
+        let o = tr.output().unwrap();
+        let truth_v = (w.motion.pose(10.0 + 1e-4).translation.vector
+            - w.motion.pose(10.0 - 1e-4).translation.vector)
+            / 2e-4;
+        assert!(
+            (o.vel - truth_v).norm() < 0.03,
+            "velocity {:?} vs {truth_v:?}",
+            o.vel
+        );
+    }
+
+    #[test]
+    fn coasts_through_a_short_blackout_and_relocks_without_reacquiring() {
+        let w = world(4);
+        let (tr, errors) = run(&w, 6.0, 0.3, Some((3.0, 3.3)));
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(pct(&errors, 0.5) < 1e-3, "{:?}", tr.stats);
+    }
+
+    #[test]
+    fn frames_overtaking_each_other_are_all_used() {
+        let w = world(6);
+        let (tr, errors) = run_with(
+            &w,
+            8.0,
+            0.3,
+            &Run {
+                shuffle: true,
+                ..Run::default()
+            },
+        );
+        assert!(
+            tr.stats.out_of_order > 50 && tr.stats.too_old == 0,
+            "{:?}",
+            tr.stats
+        );
+        assert!(
+            tr.stats.dropped_on_rebuild < tr.stats.out_of_order / 20,
+            "{:?}",
+            tr.stats
+        );
+        assert!(
+            pct(&errors, 0.5) < 1e-3 && pct(&errors, 0.99) < 4e-3,
+            "p50 {} p99 {} {:?}",
+            pct(&errors, 0.5),
+            pct(&errors, 0.99),
+            tr.stats
+        );
+    }
+
+    /// A 1.5 s blackout loses the position; afterwards the engine helps no more (no poses, no
+    /// labels). The gyro-held orientation and the dead-reckoned position re-lock by themselves.
+    #[test]
+    fn relocks_after_a_blackout_without_the_engine() {
+        let w = world(9);
+        let (tr, errors) = run_with(
+            &w,
+            6.0,
+            0.3,
+            &Run {
+                blackout: Some((3.0, 4.5)),
+                engine_silent_after: Some(3.0),
+                ..Run::default()
+            },
+        );
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(tr.stats.relocks >= 1, "{:?}", tr.stats);
+        assert!(tr.tracking(), "{:?}", tr.stats);
+        // the first updates after the re-lock pull in the dead-reckoning error
+        assert!(
+            pct(&errors, 0.5) < 1e-3 && pct(&errors, 0.99) < 15e-3,
+            "p50 {} p99 {} {:?}",
+            pct(&errors, 0.5),
+            pct(&errors, 0.99),
+            tr.stats
+        );
+    }
+
+    /// After a blackout longer than the re-lock window the engine first reports a flipped pose;
+    /// the gyro-held orientation refuses it, and the right one is taken when it comes.
+    #[test]
+    fn a_flipped_engine_pose_is_refused_at_reacquisition() {
+        let w = world(7);
+        // longer than the re-lock window, so the engine's pose is needed
+        let (tr, errors) = run_with(
+            &w,
+            10.0,
+            0.3,
+            &Run {
+                blackout: Some((3.0, 6.5)),
+                engine_flipped: Some((3.0, 7.0)),
+                ..Run::default()
+            },
+        );
+        assert!(tr.stats.refused_acquisitions > 0, "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 2, "{:?}", tr.stats);
+        assert!(pct(&errors, 0.99) < 5e-3, "{:?}", tr.stats);
+    }
+
+    /// The controller sleeps 20 s and is turned a quarter turn before it wakes (its clock jumps);
+    /// the state is dropped rather than trusted, and the engine's pose is taken at once.
+    #[test]
+    fn a_wake_after_sleep_reacquires_at_once() {
+        let w = world(8);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut rng = Rng::new(2);
+        let feed =
+            |tr: &mut Tracker, rng: &mut Rng, t0: f64, t1: f64, clock_shift: f64, turn: f64| {
+                let mut t = t0;
+                let mut next_frame = t0;
+                let turned = |t: f64| {
+                    let mut p = w.motion.pose(t);
+                    p.rotation =
+                        UnitQuaternion::from_scaled_axis(Vector3::new(0.0, turn, 0.0)) * p.rotation;
+                    p
+                };
+                while t < t1 {
+                    t += 0.002;
+                    let mut s = imu(&w, t);
+                    s.t = (s.t as f64 + clock_shift * 1e9) as u64;
+                    s.gyro = w.motion.gyro(t) + w.bg; // body rates do not change with a turn of the world
+                    s.accel = turned(t).rotation.inverse()
+                        * (w.motion.pose(t).rotation * (s.accel - w.ba))
+                        + w.ba;
+                    tr.imu(s);
+                    while next_frame <= t - 0.025 {
+                        for (c, cam) in w.cams.iter().enumerate() {
+                            let pose = turned(next_frame);
+                            let blobs: Vec<Blob> = (0..w.body.leds.len())
+                                .filter_map(|i| {
+                                    let pc = cam.world_from_cam.inverse()
+                                        * (pose * Point3::from(w.body.leds[i].pos));
+                                    let n = cam.world_from_cam.inverse().rotation
+                                        * (pose.rotation * w.body.leds[i].dir);
+                                    (n.dot(&(-pc.coords)) / pc.coords.norm() > 0.3)
+                                        .then(|| {
+                                            cam.model.project(&pc.coords).map(|uv| Blob {
+                                                xy: uv
+                                                    + Vector2::new(rng.gauss(), rng.gauss()) * 0.3,
+                                                led_id: (1 << 8) | i as i32,
+                                            })
+                                        })
+                                        .flatten()
+                                })
+                                .collect();
+                            tr.frame(
+                                (1e9 + (next_frame + clock_shift) * 1e9) as u64,
+                                c,
+                                cam,
+                                &blobs,
+                                Some(pose),
+                                &[],
+                            );
+                        }
+                        next_frame += 1.0 / 52.0;
+                    }
+                }
+            };
+        feed(&mut tr, &mut rng, 0.0, 3.0, 0.0, 0.0);
+        assert!(tr.tracking());
+        // asleep from 3 s to 23 s; the clock comes back only 0.7 s on; meanwhile a quarter turn
+        feed(
+            &mut tr,
+            &mut rng,
+            23.0,
+            24.0,
+            -19.3,
+            std::f64::consts::FRAC_PI_2,
+        );
+        assert_eq!(tr.stats.imu_gaps, 1, "{:?}", tr.stats);
+        assert!(
+            tr.tracking() && tr.stats.refused_acquisitions == 0,
+            "{:?}",
+            tr.stats
+        );
+        let o = tr.output().unwrap();
+        let mut truth = w.motion.pose(24.0);
+        truth.rotation =
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.0, std::f64::consts::FRAC_PI_2, 0.0))
+                * truth.rotation;
+        let err = o.world_from_model.rotation.angle_to(&truth.rotation);
+        // (the turned scene's accelerometer ignores the turned lever-arm path: a degree is noise)
+        assert!(
+            err < 2f64.to_radians(),
+            "rotation error {err} {:?}",
+            tr.stats
+        );
+    }
+
+    /// Picked up after sleeping (no orientation to check against), and the engine's labels are off
+    /// by one LED around the ring: its pose is the real one turned ~28 degrees about the ring
+    /// axis, and fits the blobs almost as well. The tracker tests the turn back on the frame and
+    /// locks on the true pose instead of running on the wrong one until its bias runs off. Every
+    /// other frame the engine has labels but no confident pose to show they are off.
+    #[test]
+    fn an_engine_pose_off_by_one_led_around_the_ring_is_turned_back() {
+        let mut w = world(9);
+        let (leds, imu_pos) = synth::cv1_touch_left();
+        w.body = Body { leds, imu_pos };
+        let alias = vision::ring_aliases(&w.body.leds)[0].clone();
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut rng = Rng::new(3);
+        let (mut t, mut next_frame, mut worst_after_lock) = (0.0, 0.0, 0.0f64);
+        while t < 4.0 {
+            t += 0.002;
+            tr.imu(imu(&w, t));
+            while next_frame <= t - 0.025 {
+                let truth = w.motion.pose(next_frame);
+                let engine = truth * alias.turn.inverse();
+                for (c, cam) in w.cams.iter().enumerate() {
+                    // the true blobs, labelled as the LEDs the engine's turned pose puts there
+                    let blobs: Vec<Blob> = sight(&w, cam, next_frame, &mut rng, 0.3)
+                        .into_iter()
+                        .map(|b| {
+                            let j = (b.led_id & 0xff) as usize;
+                            let i = alias.led_at.iter().position(|x| *x == Some(j));
+                            Blob {
+                                led_id: i.map_or(-1, |i| (1 << 8) | i as i32),
+                                ..b
+                            }
+                        })
+                        .collect();
+                    let frame_no = (next_frame * 52.0).round() as usize;
+                    tr.frame(
+                        (1e9 + next_frame * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        (frame_no % 2 == 0).then_some(engine),
+                        &[],
+                    );
+                }
+                next_frame += 1.0 / 52.0;
+            }
+            if let Some(o) = tr.output().filter(|o| o.tracking) {
+                let truth = w.motion.pose((o.t as f64 - 1e9) * 1e-9);
+                worst_after_lock =
+                    worst_after_lock.max(o.world_from_model.rotation.angle_to(&truth.rotation));
+            }
+        }
+        assert!(
+            tr.tracking() && tr.stats.acquisitions >= 1,
+            "{:?}",
+            tr.stats
+        );
+        assert_eq!(tr.stats.wrong_locks, 0, "{:?}", tr.stats);
+        assert!(tr.stats.alias_turns >= 1, "{:?}", tr.stats);
+        assert!(
+            worst_after_lock < 3f64.to_radians(),
+            "worst {:.1} deg {:?}",
+            worst_after_lock.to_degrees(),
+            tr.stats
+        );
+    }
+
+    /// Lost (no frames for 3 s, the engine silent, no re-lock): the published position stays
+    /// where it was last tracked, at rest, while the orientation keeps following the gyro.
+    #[test]
+    fn a_lost_position_is_held_not_dead_reckoned() {
+        let w = world(10);
+        let mut tr = Tracker::new(
+            1,
+            w.body.clone(),
+            Params {
+                relock_ns: 0,
+                ..Params::default()
+            },
+        );
+        let mut rng = Rng::new(4);
+        let mut t = 0.0;
+        let mut next = 0.01;
+        let mut held = None;
+        while t < 6.0 {
+            t += 0.002;
+            tr.imu(imu(&w, t));
+            while next <= t - 0.025 && next < 3.0 {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs = sight(&w, cam, next, &mut rng, 0.3);
+                    tr.frame(
+                        (1e9 + next * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        Some(w.motion.pose(next)),
+                        &[],
+                    );
+                }
+                next += 1.0 / 52.0;
+            }
+            if t > 3.6 {
+                let o = tr.output().unwrap();
+                assert!(!o.tracking && o.vel.norm() == 0.0);
+                let p = o.world_from_model.translation.vector;
+                assert_eq!(*held.get_or_insert(p), p, "the held position moved");
+                assert!(
+                    o.world_from_model
+                        .rotation
+                        .angle_to(&w.motion.pose(t).rotation)
+                        < 0.02,
+                    "the orientation stopped following the gyro"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_accepted_update_ends_a_run_of_refusals() {
+        let w = world(11);
+        let (mut tr, _) = run_with(&w, 2.0, 0.3, &Run::default());
+        tr.refusing_since = 123;
+        let te = tr.newest_imu().unwrap() - 30_000_000;
+        let tsec = (te as f64 - 1e9) * 1e-9;
+        let mut rng = Rng::new(1);
+        let blobs = sight(&w, &w.cams[0], tsec, &mut rng, 0.3);
+        assert!(matches!(
+            tr.frame(te, 0, &w.cams[0], &blobs, None, &[]),
+            Outcome::Updated(_)
+        ));
+        assert_eq!(tr.refusing_since, 0);
+    }
+
+    /// Biases remembered from an earlier run are right from the first fix; learned from scratch,
+    /// the accelerometer's are still off a few hundred milliseconds in.
+    #[test]
+    fn remembered_biases_hold_from_the_first_fix() {
+        let w = world(5);
+        let seeded = Run {
+            seed: Some((
+                w.bg + Vector3::new(5e-4, 0.0, -5e-4),
+                w.ba + Vector3::new(0.01, -0.01, 0.0),
+            )),
+            ..Run::default()
+        };
+        let (tr, _) = run_with(&w, 0.3, 0.3, &seeded);
+        let x = tr.history.back().unwrap().1.x;
+        assert!(
+            (x.ba - w.ba).norm() < 0.025 && (x.bg - w.bg).norm() < 2e-3,
+            "seeded: bg {:?} ba {:?}",
+            x.bg,
+            x.ba
+        );
+        let (tr, _) = run(&w, 0.3, 0.3, None);
+        let x = tr.history.back().unwrap().1.x;
+        assert!(
+            (x.ba - w.ba).norm() > 0.05,
+            "learned from scratch already: ba {:?}",
+            x.ba
+        );
+    }
+
+    /// An accelerometer bias the filter drives far from where it started is a wrong lock (a pose
+    /// that fits the LEDs but not gravity): the track is dropped and the biases it corrupted are not
+    /// kept.
+    #[test]
+    fn a_runaway_accelerometer_bias_drops_the_track() {
+        let w = world(5);
+        // from a cold start the bias is free to run (acquisition sd 0.5 m/s^2)
+        let opts = Run {
+            accel_jump: Some((0.0, Vector3::new(3.0, 0.0, 0.0))),
+            ..Run::default()
+        };
+        let (tr, _) = run_with(&w, 2.0, 0.3, &opts);
+        assert!(tr.stats.wrong_locks >= 1, "{:?}", tr.stats);
+        assert!(
+            tr.saved_bias.is_none_or(|f| f.x.ba.norm() < 0.6),
+            "kept the runaway bias {:?}",
+            tr.saved_bias.map(|f| f.x.ba)
+        );
+    }
+
+    /// After a wrong lock the engine tends to offer the same wrong pose again: poses agreeing with
+    /// the dropped orientation (carried on by the gyro) are refused for a while.
+    #[test]
+    fn a_dropped_orientation_is_refused_for_a_while() {
+        let w = world(5);
+        let (tr, errors) = run_with(
+            &w,
+            4.0,
+            0.3,
+            &Run {
+                drop_at: Some(1.5),
+                ..Run::default()
+            },
+        );
+        assert_eq!(tr.stats.wrong_locks, 1);
+        assert!(tr.stats.refused_acquisitions > 0, "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 2, "{:?}", tr.stats);
+        assert!(tr.tracking(), "tracking again once the memory expired");
+        // no tracked outputs between the drop and the memory's end
+        assert!(
+            errors.len()
+                < ((4.0 - 1.0 - 2.0) / 0.002) as usize + 50 + ((1.5 - 1.0) / 0.002) as usize,
+            "{} outputs",
+            errors.len()
+        );
+    }
+
+    /// A controller lying still does not drift while the sensors lose it, even with its
+    /// accelerometer bias misjudged: the IMU itself says it is still.
+    #[test]
+    fn a_still_controller_holds_still_out_of_sight() {
+        let mut w = world(5);
+        w.motion = Motion::still(Vector3::new(0.1, 1.0, -0.2), [0.3, -0.5, 0.2]);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        tr.seed_biases(w.bg, w.ba + Vector3::new(0.1, 0.0, -0.05), 1e-4, 1e-3);
+        let mut rng = Rng::new(3);
+        let (dt, frame) = (0.002, 1.0 / 52.0);
+        let (mut t, mut next) = (0.0, 0.01);
+        while t < 3.5 {
+            t += dt;
+            tr.imu(imu(&w, t));
+            // sensors see it for 2 s, then lose it
+            while next <= t && next < 2.0 {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs = sight(&w, cam, next, &mut rng, 0.3);
+                    tr.frame(
+                        (1e9 + next * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        Some(w.motion.pose(next)),
+                        &[],
+                    );
+                }
+                next += frame;
+            }
+        }
+        let f = tr.history.back().unwrap().1;
+        let drift = (tr.body.world_from_model(&f.x).translation.vector
+            - w.motion.pose(t).translation.vector)
+            .norm();
+        assert!(
+            drift < 0.005,
+            "drifted {:.1} mm in 1.5 s out of sight",
+            drift * 1e3
+        );
+    }
+
+    /// Lying on its side, still: the synthetic ring looks exactly the same turned 45 degrees about
+    /// its axis (three LEDs on), and the engine offers that turn with its labels to match. Nothing
+    /// in a frame tells them apart; gravity does, and the turned pose is refused.
+    #[test]
+    fn a_still_controller_refuses_a_pose_that_disagrees_with_gravity() {
+        let mut w = world(6);
+        w.motion = Motion::still(
+            Vector3::new(0.1, 1.0, -0.2),
+            [0.0, 0.0, std::f64::consts::FRAC_PI_2],
+        );
+        let turned = |t: f64| {
+            w.motion.pose(t)
+                * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 45f64.to_radians())
+        };
+        let n = w.body.leds.len();
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut rng = Rng::new(4);
+        let (mut t, mut next) = (0.0, 0.5);
+        while t < 2.0 {
+            t += 0.002;
+            tr.imu(imu(&w, t));
+            while next <= t {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs: Vec<Blob> = sight(&w, cam, next, &mut rng, 0.3)
+                        .into_iter()
+                        .map(|b| Blob {
+                            led_id: (1 << 8) | (((b.led_id & 0xff) as usize + 3) % n) as i32,
+                            ..b
+                        })
+                        .collect();
+                    tr.frame(
+                        (1e9 + next * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        Some(turned(next)),
+                        &[],
+                    );
+                }
+                next += 1.0 / 52.0;
+            }
+        }
+        assert_eq!(tr.stats.acquisitions, 0, "{:?}", tr.stats);
+        assert!(tr.stats.refused_acquisitions > 0, "{:?}", tr.stats);
+        // the true pose, still lying there, is taken at once
+        while t < 2.5 {
+            t += 0.002;
+            tr.imu(imu(&w, t));
+            while next <= t {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs = sight(&w, cam, next, &mut rng, 0.3);
+                    tr.frame(
+                        (1e9 + next * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        Some(w.motion.pose(next)),
+                        &[],
+                    );
+                }
+                next += 1.0 / 52.0;
+            }
+        }
+        assert!(
+            tr.tracking() && tr.stats.acquisitions == 1 && tr.stats.wrong_locks == 0,
+            "{:?}",
+            tr.stats
+        );
+    }
+
+    #[test]
+    fn biases_converge() {
+        let w = world(5);
+        let (tr, _) = run(&w, 20.0, 0.3, None);
+        let x = tr.history.back().unwrap().1.x;
+        assert!(
+            (x.bg - w.bg).norm() < 2e-3 && (x.ba - w.ba).norm() < 0.05,
+            "bg {:?} ba {:?}",
+            x.bg,
+            x.ba
+        );
+    }
+}
