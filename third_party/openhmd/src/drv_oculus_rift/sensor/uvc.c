@@ -601,13 +601,18 @@ int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 	int ret;
 	int i;
 
+	/* libusb holds its event-waiter lock while invoking iso_transfer_cb. Its last
+	 * transfer may be retrying a failed submit until video_running clears. Publish
+	 * stop before disabling the endpoint or acquiring that lock, otherwise each
+	 * thread waits for the other forever. video_running is atomic for this handoff. */
+	stream->video_running = false;
+
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, 0);
 	if (ret) {
 		LOGW("Failed to clear USB alt setting to 0 for sensor errno %d (%s)", errno, strerror(errno));
 	}
 
 	libusb_lock_event_waiters(stream->usb_ctx);
-	stream->video_running = false;
 
 	/* Wait for active transfers to finish */
 	while (stream->active_transfers > 0) {

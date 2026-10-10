@@ -3,6 +3,7 @@
 
 #include <libusb.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include "../ohmd-video.h"
 #include "../rift-sensor-usb.h"
@@ -55,7 +56,8 @@ struct rift_sensor_uvc_stream {
 	libusb_context *usb_ctx;
 	libusb_device_handle *devh;
 
-	bool video_running;
+	/* Stop must be visible to callbacks before the stopping thread takes libusb locks. */
+	atomic_bool video_running;
 	ohmd_video_frame **alloced_frames;
 	int n_alloced_frames;
 };

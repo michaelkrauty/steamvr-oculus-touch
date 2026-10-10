@@ -7,3 +7,5 @@ Most source is under Boost Software License 1.0; dual-license files are used und
 Local changes expose a bounded CV1 acquisition API, controller/radio decoding, factory geometry, timestamps, raw/labelled observations, optional PipeWire views, fixed calibrated camera poses, radio-only headset operation, and more resilient camera transfers. Tracking for cv1touch is performed in Rust. Native dependencies are resolved from the system; OpenCV 4 and 5 discovery is supported. The small nxjson UTF-8 encoder is replaced with an independently written Unicode-scalar encoder and boundary tests.
 
 Compare this snapshot against the pinned upstream commit to inspect the complete modification set. Subsequent release changes are tracked in this repository. Preserve upstream notices when modifying or extracting code.
+
+The UVC stream stop flag is atomic and is cleared before changing the USB alternate setting or taking libusb's event-waiter lock. This allows a retrying completion callback to retire its transfer and prevents a shutdown lock cycle; `test_uvc_shutdown` exercises that path without devices.

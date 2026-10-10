@@ -15,3 +15,4 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Installation and runtime dependencies on a developer's checkout and CPU topology.
 - First-time headset registration without an existing alignment file.
 - Concurrent alignment writes, stale controller inputs, and SIGPIPE on driver control sends.
+- USB camera shutdown deadlock that could stall daemon restarts.
