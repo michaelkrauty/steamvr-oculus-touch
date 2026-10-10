@@ -6,12 +6,13 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         rust: ["1.85.0", stable]
     env:
       CARGO_BUILD_JOBS: 4
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config meson ninja-build clang libclang-dev libhidapi-dev libusb-1.0-0-dev libopencv-dev libjpeg-dev libpipewire-0.3-dev libspa-0.2-dev
       - name: Install Rust

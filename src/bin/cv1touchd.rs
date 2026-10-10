@@ -2505,6 +2505,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires sufficient RLIMIT_MEMLOCK or CAP_IPC_LOCK for mlockall"]
     fn locked_memory_stays_resident_once_touched() {
         lock_memory().unwrap();
         let v = vec![1u8; 4 << 20];

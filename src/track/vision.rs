@@ -470,7 +470,7 @@ pub fn associate_shifted(
             }
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     let Some(&(best, d)) = scored.first() else {
         return Vec::new();
     };

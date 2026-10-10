@@ -347,7 +347,7 @@ fn catch_interrupts() {
     // SAFETY: installing an async-signal-safe handler (one atomic store).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_interrupt as usize;
+        sa.sa_sigaction = on_interrupt as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             libc::sigaction(sig, &sa, std::ptr::null_mut());
