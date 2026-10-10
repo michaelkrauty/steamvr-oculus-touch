@@ -31,3 +31,9 @@ test('radio_decode', test_radio_decode)
 test_uvc_layout = executable('test_uvc_layout', 'test_uvc_layout.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift' / 'sensor')])
 test('uvc_layout', test_uvc_layout)
+# Deterministic callback/stop lock inversion; no device access.
+test_uvc_shutdown = executable('test_uvc_shutdown', 'test_uvc_shutdown.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [threads_dep, dependency('libusb-1.0')],
+  link_args: ['-Wl,--gc-sections'])
+test('uvc_shutdown', test_uvc_shutdown, timeout: 10)
