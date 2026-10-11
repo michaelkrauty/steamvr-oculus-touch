@@ -27,7 +27,7 @@ int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *transfer)
 int LIBUSB_CALL libusb_set_interface_alt_setting(libusb_device_handle *dev, int interface, int alt)
 {
 	(void)dev;
-	CHECK(interface == 1 && alt == 0);
+	CHECK(interface == 1 && (alt == 0 || alt == 1));
 	return 0;
 }
 
@@ -56,8 +56,9 @@ int LIBUSB_CALL libusb_wait_for_event(libusb_context *ctx, struct timeval *tv)
 	return 0;
 }
 
-void ohmd_lock_mutex(ohmd_mutex *mutex) { (void)mutex; CHECK(false); }
-void ohmd_unlock_mutex(ohmd_mutex *mutex) { (void)mutex; CHECK(false); }
+void ohmd_lock_mutex(ohmd_mutex *mutex) { CHECK(mutex == (void *)1); }
+void ohmd_unlock_mutex(ohmd_mutex *mutex) { CHECK(mutex == (void *)1); }
+void ohmd_destroy_mutex(ohmd_mutex *mutex) { CHECK(mutex == (void *)1); }
 
 void ohmd_sleep(double seconds)
 {
@@ -75,6 +76,45 @@ static void *complete_transfers(void *unused)
 		CHECK(pthread_mutex_unlock(&waiters) == 0);
 	}
 	return NULL;
+}
+
+static int allocation_count, fail_allocation;
+void *ohmd_allocfn(ohmd_context *ctx, const char *message, size_t n)
+{
+    (void)ctx; (void)message;
+    if (++allocation_count == fail_allocation) return NULL;
+    return calloc(1, n);
+}
+static void outstanding_frame_lifetime(void)
+{
+    struct rift_sensor_uvc_stream s = {0};
+    s.alt_setting = 1; s.frame_size = 16;
+    allocation_count = fail_allocation = 0;
+    CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == 0);
+    CHECK(rift_sensor_uvc_stream_stop(&s) == 0);
+    CHECK(s.alloced_frames != NULL && s.n_alloced_frames == 5);
+    /* An analyser may still access and return this frame after transfers stop. */
+    s.frames_lock = (void *)1;
+    ohmd_video_frame *frame = s.free_frames[--s.n_free_frames];
+    frame->data[0] = 42;
+    rift_sensor_uvc_stream_release_frame(frame, &s);
+    CHECK(s.n_free_frames == 5);
+    CHECK(rift_sensor_uvc_stream_clear(&s) == 0);
+    CHECK(s.alloced_frames == NULL && s.n_alloced_frames == 0);
+}
+
+static void startup_allocation_failures(void)
+{
+    for (int fail = 1; fail <= 12; fail++) {
+        struct rift_sensor_uvc_stream s = {0};
+        s.alt_setting = 1; s.frame_size = 16;
+        allocation_count = 0; fail_allocation = fail;
+        CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == -ENOMEM);
+        CHECK(!s.video_running && s.active_transfers == 0);
+        CHECK(rift_sensor_uvc_stream_clear(&s) == 0);
+        CHECK(!s.alloced_frames && !s.free_frames);
+        CHECK(s.n_alloced_frames == 0 && s.active_transfers == 0);
+    }
 }
 
 int main(void)
@@ -96,6 +136,8 @@ int main(void)
 	CHECK(pthread_join(worker, NULL) == 0);
 	CHECK(!stream.video_running && stream.active_transfers == 0);
 	CHECK(stream.n_parked == 5);
+	outstanding_frame_lifetime();
+	startup_allocation_failures();
 	alarm(0);
 	puts("test_uvc_shutdown: ok");
 	return 0;

@@ -95,6 +95,7 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_ctx_destroy(ohmd_context* ctx)
 		ohmd_destroy_mutex(ctx->update_mutex);
 	}
 
+	cv1touch_sensor_config_clear(&ctx->cv1touch_sensors);
 	free(ctx);
 }
 
@@ -716,6 +717,14 @@ ohmd_status ohmd_require_version(int major, int minor, int patch)
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, const ohmd_cv1touch_config *config)
 {
 	ctx->cv1touch_config = *config;
+}
+
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_configure_sensors(ohmd_context *ctx,
+        const char (*ignored)[32], size_t ignored_count,
+        const ohmd_cv1touch_sensor_pose *poses, size_t pose_count)
+{
+    if (!ctx || ctx->num_active_devices != 0) return -1;
+    return cv1touch_sensor_config_set(&ctx->cv1touch_sensors, ignored, ignored_count, poses, pose_count);
 }
 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user)

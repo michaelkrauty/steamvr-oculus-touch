@@ -10,9 +10,8 @@
 //! comes from a least-squares slope over the last few milliseconds of rates, and only above aiming
 //! speeds: a steady hand gets exactly the velocities it had.
 //!
-//! Measured on recorded play (eval-1791516631), 25 ms ahead while moving: rotation error p90
-//! 2.02 -> 1.26 deg, p99 5.84 -> 4.08; position p90 2.69 -> 1.29 mm, p99 7.94 -> 3.64; better
-//! than plain at every horizon 15-35 ms and every percentile through p99.9.
+//! Prediction shaping depends on motion and prediction horizon. Validate it with independent
+//! captures for a new setup; development fits do not establish a general accuracy benchmark.
 
 use std::collections::VecDeque;
 

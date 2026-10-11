@@ -48,11 +48,11 @@ pub struct SensorPose {
 pub struct EngineOptions {
     pub radio_wait_ms: i32,
     pub hmd_leds_off: bool,
-    /// Rift sensor serials to leave closed (at most 8).
+    /// Rift sensor serials to leave closed.
     pub ignore_sensors: Vec<String>,
     /// Never place sensors at runtime; sensors without a fixed pose only observe.
     pub fixed_poses_only: bool,
-    /// Calibrated sensor poses (at most 8).
+    /// Calibrated sensor poses, copied into native context ownership before discovery.
     pub fixed_poses: Vec<SensorPose>,
 }
 
@@ -64,26 +64,51 @@ fn copy_cstr(dst: &mut [c_char], s: &str) {
 }
 
 pub fn build_config(opts: &EngineOptions) -> ffi::ohmd_cv1touch_config {
-    let mut cfg = ffi::ohmd_cv1touch_config {
+    ffi::ohmd_cv1touch_config {
         radio_wait_ms: opts.radio_wait_ms,
         hmd_tracking: false,
         hmd_leds_off: opts.hmd_leds_off,
         fixed_poses_only: opts.fixed_poses_only,
         ..Default::default()
-    };
-    for (slot, serial) in cfg
-        .ignore_sensor_serials
-        .iter_mut()
-        .zip(&opts.ignore_sensors)
+    }
+}
+
+struct SensorConfig {
+    ignored: Vec<[c_char; 32]>,
+    poses: Vec<ffi::ohmd_cv1touch_sensor_pose>,
+}
+
+fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
+    fn serial(s: &str) -> Result<[c_char; 32], String> {
+        if s.is_empty() || s.len() > 31 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err("sensor serials must contain 1 to 31 ASCII letters or digits".into());
+        }
+        let mut out = [0; 32];
+        copy_cstr(&mut out, s);
+        Ok(out)
+    }
+    if opts.ignore_sensors.len() > c_int::MAX as usize
+        || opts.fixed_poses.len() > c_int::MAX as usize
     {
-        copy_cstr(slot, serial);
+        return Err("sensor configuration exceeds native index range".into());
     }
-    for (slot, p) in cfg.fixed_poses.iter_mut().zip(&opts.fixed_poses) {
-        copy_cstr(&mut slot.serial, &p.serial);
-        slot.orient = p.orient;
-        slot.pos = p.pos;
-    }
-    cfg
+    let ignored = opts
+        .ignore_sensors
+        .iter()
+        .map(|s| serial(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let poses = opts
+        .fixed_poses
+        .iter()
+        .map(|p| {
+            Ok(ffi::ohmd_cv1touch_sensor_pose {
+                serial: serial(&p.serial)?,
+                orient: p.orient,
+                pos: p.pos,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(SensorConfig { ignored, poses })
 }
 
 /// Engine callbacks. `frame` runs on sensor analysis threads with the sensor lock held and
@@ -177,6 +202,7 @@ pub fn sensor_serial(s: &Sensor) -> String {
 impl Engine {
     /// Probes and opens both Touch controllers with OpenHMD's auto-update thread disabled.
     pub fn open(opts: &EngineOptions, sink: Arc<dyn EngineSink>) -> Result<Engine, String> {
+        let sensors = build_sensor_config(opts)?;
         // SAFETY: FFI into OpenHMD; every pointer passed is valid for the call, and `sink` outlives
         // the context (freed in Drop after ohmd_ctx_destroy joins the engine's threads).
         unsafe {
@@ -193,6 +219,16 @@ impl Engine {
             };
             let cfg = build_config(opts);
             ffi::ohmd_cv1touch_configure(ctx, &cfg);
+            if ffi::ohmd_cv1touch_configure_sensors(
+                ctx,
+                sensors.ignored.as_ptr(),
+                sensors.ignored.len(),
+                sensors.poses.as_ptr(),
+                sensors.poses.len(),
+            ) != 0
+            {
+                return Err("native sensor configuration rejected (invalid/duplicate entry or allocation failure)".into());
+            }
             ffi::ohmd_cv1touch_set_frame_callback(ctx, Some(frame_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_image_callback(ctx, Some(image_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_report_callback(ctx, Some(report_cb), sink as *mut c_void);
@@ -442,10 +478,33 @@ mod tests {
         };
         let cfg = build_config(&opts);
         assert!(cfg.fixed_poses_only && cfg.hmd_leds_off && cfg.radio_wait_ms == 2);
-        assert_eq!(cstr_field(&cfg.ignore_sensor_serials[0]), "WMTD000000004");
-        assert_eq!(cstr_field(&cfg.fixed_poses[0].serial), "WMTD000000001");
-        assert_eq!(cfg.fixed_poses[0].pos, [1.0, 2.0, 3.0]);
-        assert_eq!(cstr_field(&cfg.fixed_poses[1].serial), "");
+        let sensors = build_sensor_config(&opts).unwrap();
+        assert_eq!(cstr_field(&sensors.ignored[0]), "WMTD000000004");
+        assert_eq!(cstr_field(&sensors.poses[0].serial), "WMTD000000001");
+        assert_eq!(sensors.poses[0].pos, [1.0, 2.0, 3.0]);
+        assert_eq!(sensors.poses.len(), 1);
+    }
+
+    #[test]
+    fn all_sensor_configuration_entries_are_marshaled_without_truncation() {
+        let mut opts = EngineOptions::default();
+        for i in 0..65 {
+            opts.ignore_sensors.push(format!("TEST{i:06}"));
+            opts.fixed_poses.push(SensorPose {
+                serial: format!("POSE{i:06}"),
+                orient: [0., 0., 0., 1.],
+                pos: [i as f32, 0., 0.],
+            });
+        }
+        let sensors = build_sensor_config(&opts).unwrap();
+        assert_eq!(sensors.ignored.len(), 65);
+        assert_eq!(sensors.poses.len(), 65);
+        assert_eq!(cstr_field(&sensors.ignored[64]), "TEST000064");
+        assert_eq!(sensors.poses[64].pos[0], 64.);
+        for bad in ["", "bad/name", "01234567890123456789012345678901é"] {
+            opts.ignore_sensors[0] = bad.into();
+            assert!(build_sensor_config(&opts).is_err());
+        }
     }
 
     #[test]

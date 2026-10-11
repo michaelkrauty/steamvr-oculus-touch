@@ -36,6 +36,8 @@ pub struct Replay {
     pub misses: [Vec<(usize, usize, usize, usize)>; 2],
     pub fits: [Vec<(usize, usize)>; 2],
     pub frames_skipped: u64,
+    /// Pending frames evicted by each registered camera's bounded backlog.
+    pub frames_dropped: u64,
     pub events: Vec<FrameEvent>,
     pub probes: Vec<Probe>,
     /// Each sensor's agreement with the others at the end (see `Pipeline::camera_agreement`).
@@ -144,6 +146,7 @@ pub fn replay(
         out.fits[hand] = p.tracker(hand).map_or_else(Vec::new, |t| t.fits.clone());
     }
     out.frames_skipped = p.frames_skipped;
+    out.frames_dropped = p.frames_dropped;
     out.agreement = p.camera_agreement();
     out.events = std::mem::take(&mut p.events);
     out.probes = std::mem::take(&mut p.probes);

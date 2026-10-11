@@ -26,8 +26,8 @@ use crate::shm::{HAND_LEFT, HAND_RIGHT};
 pub const HMD_SENSORS_REPORT: u8 = 11;
 
 /// How much later than the headset's the controllers' IMU samples are stamped: the radio link's
-/// fastest delivery plus the IMU's own filtering, beyond the headset's report delay. Measured from
-/// the images alone (eval-1791513601, 2026-10-08): over frames turning faster than 3 rad/s, the
+/// fastest delivery plus the IMU's own filtering, beyond the headset's report delay. Estimated from
+/// development image alignment: over frames turning faster than 3 rad/s, the
 /// predicted LEDs land nearest the blobs at +3.9 to 4.0 ms. Exposures are mapped this much later
 /// into a controller's clock, and published poses are stamped this much earlier than their IMU
 /// sample's arrival-based time, so that SteamVR predicts from when the controller was there.
@@ -86,7 +86,7 @@ impl Default for Options {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameEvent {
     pub hand: usize,
-    /// Index of the sensor in serial order.
+    /// Stable sensor ID assigned when its serial is first registered.
     pub camera: usize,
     /// Exposure, controller clock and host clock.
     pub t_e: u64,
@@ -135,18 +135,26 @@ struct Pending {
     engine: Option<Isometry3<f64>>,
 }
 
+#[derive(Clone, Copy)]
+struct RegisteredCamera {
+    id: usize,
+    camera: Camera,
+}
+
 pub struct Pipeline {
     pub opts: Options,
     hmd_clock: LinearClock,
     hmd_stamps: Unwrap32,
     clocks: [LinearClock; 2],
     trackers: [Option<Tracker>; 2],
-    cams: BTreeMap<String, Camera>,
+    cams: BTreeMap<String, RegisteredCamera>,
     pending: [Vec<Pending>; 2],
     probing: [Vec<(u64, Vec<Blob>)>; 2],
     latest: [Option<Stamped>; 2],
     /// Frames before the headset clock had a fit, or from sensors without a pose.
     pub frames_skipped: u64,
+    /// Pending frames evicted by the per-camera two-frame limit, summed across hands.
+    pub frames_dropped: u64,
     pub events: Vec<FrameEvent>,
     pub probes: Vec<Probe>,
 }
@@ -164,20 +172,29 @@ impl Pipeline {
             probing: [Vec::new(), Vec::new()],
             latest: [None, None],
             frames_skipped: 0,
+            frames_dropped: 0,
             events: Vec::new(),
             probes: Vec::new(),
         }
     }
 
-    /// A sensor and its calibrated pose (camera -> world, OpenCV axes).
+    /// Registers a sensor and its calibrated pose (camera -> world, OpenCV axes).
+    /// IDs remain stable across pose updates and later metadata, including replay registration.
     pub fn sensor(&mut self, serial: &str, model: CameraModel, world_from_cam: Isometry3<f64>) {
-        self.cams.insert(
-            serial.to_string(),
-            Camera {
-                model,
-                world_from_cam,
-            },
-        );
+        let camera = Camera {
+            model,
+            world_from_cam,
+        };
+        if let Some(registered) = self.cams.get_mut(serial) {
+            registered.camera = camera;
+            return;
+        }
+        let id = self.cams.len();
+        self.cams
+            .insert(serial.to_string(), RegisteredCamera { id, camera });
+        for tracker in self.trackers.iter_mut().flatten() {
+            tracker.register_camera();
+        }
     }
 
     pub fn has_body(&self, hand: usize) -> bool {
@@ -190,7 +207,12 @@ impl Pipeline {
             return;
         };
         if self.trackers[hand].is_none() {
-            let mut tr = Tracker::new(device_id, Body { leds, imu_pos }, self.opts.params);
+            let mut tr = Tracker::new(
+                device_id,
+                Body { leds, imu_pos },
+                self.opts.params,
+                self.cams.len(),
+            );
             tr.debug = self.opts.trace;
             if let Some((g, a)) = self.opts.seed_biases[hand] {
                 tr.seed_biases(
@@ -224,12 +246,11 @@ impl Pipeline {
     /// combined: (serial, median residual px, |bias| px, samples).
     pub fn camera_agreement(&self) -> Vec<(String, f64, f64, u64)> {
         self.cams
-            .keys()
-            .enumerate()
-            .map(|(i, serial)| {
+            .iter()
+            .map(|(serial, camera)| {
                 let (mut sum, mut bias, mut n) = (0.0, Vector2::zeros(), 0u64);
                 for tr in self.trackers.iter().flatten() {
-                    if let Some(a) = tr.agreement.get(i) {
+                    if let Some(a) = tr.agreement.get(camera.id) {
                         sum += a.median_px * a.samples as f64;
                         bias += a.bias_px * a.samples as f64;
                         n += a.samples;
@@ -341,20 +362,19 @@ impl Pipeline {
     /// One sensor frame from the engine.
     pub fn frame(&mut self, info: &FrameInfo, blobs: &[crate::engine::Blob]) {
         let serial = cstr_field(&info.serial);
-        let camera = self
-            .cams
-            .keys()
-            .position(|s| *s == serial)
-            .unwrap_or(usize::MAX);
-        let cam = self.cams.get(&serial).copied();
+        let registered = self.cams.get(&serial).copied();
         let exposure = self
             .hmd_stamps
             .relative(info.exposure_hmd_ts)
             .and_then(|e| self.hmd_clock.to_host(e));
-        let (Some(cam), Some(exposure), true) = (cam, exposure, info.exposure_valid != 0) else {
+        let (Some(registered), Some(exposure), true) =
+            (registered, exposure, info.exposure_valid != 0)
+        else {
             self.frames_skipped += 1;
             return;
         };
+        let camera = registered.id;
+        let cam = registered.camera;
         let list: Vec<Blob> = blobs
             .iter()
             .map(|b| Blob {
@@ -383,6 +403,8 @@ impl Pipeline {
                         && d.match_flags & MATCH_STRONG != 0
                 })
                 .map(|d| cam.world_from_cam * iso_from_xyzw(d.cam_orient, d.cam_pos));
+            // Bound each registered camera independently: a fast producer cannot evict another
+            // camera's sole pending frame. Drop its oldest exposure, including a late incoming one.
             let at = self.pending[hand].partition_point(|p| p.t_e <= t_e);
             self.pending[hand].insert(
                 at,
@@ -396,6 +418,19 @@ impl Pipeline {
                     engine,
                 },
             );
+            if self.pending[hand]
+                .iter()
+                .filter(|p| p.camera == camera)
+                .count()
+                > 2
+            {
+                let oldest = self.pending[hand]
+                    .iter()
+                    .position(|p| p.camera == camera)
+                    .unwrap();
+                self.pending[hand].remove(oldest);
+                self.frames_dropped += 1;
+            }
             self.drain(hand);
         }
     }
@@ -457,10 +492,6 @@ impl Pipeline {
             }
             pending.remove(0);
         }
-        // a frame whose exposure the IMU never reaches (the controller went to sleep) must not pile up
-        if pending.len() > 64 {
-            pending.drain(..pending.len() - 64);
-        }
     }
 }
 
@@ -505,6 +536,25 @@ mod tests {
     /// the published stamp less the headset link's delay: stamps are meant to be the motion's own
     /// time, as near as the headset's clock can tell it.
     fn run_with(seconds: f64, gap: Option<(f64, f64)>, imu_delay: u64) -> (Vec<(f64, f64)>, bool) {
+        let (errors, stale, _, _) = run_with_sensors(seconds, gap, imu_delay, 3, None);
+        (errors, stale)
+    }
+
+    type Simulation = (
+        Vec<(f64, f64)>,
+        bool,
+        Pipeline,
+        crate::calib::file::CalibrationFile,
+    );
+
+    fn run_with_sensors(
+        seconds: f64,
+        gap: Option<(f64, f64)>,
+        imu_delay: u64,
+        camera_count: usize,
+        recording: Option<&crate::recorder::Recorder>,
+    ) -> Simulation {
+        use crate::recorder::{self, as_bytes, slice_bytes};
         let mut rng = Rng::new(5);
         let motion = Motion::random(&mut rng, Vector3::new(0.0, 1.0, 0.0));
         let leds = synth::touch_leds();
@@ -514,8 +564,11 @@ mod tests {
             (Vector3::new(-2.0, 2.3, 1.8), true),
             (Vector3::new(2.0, 2.3, 1.8), false),
             (Vector3::new(0.3, 2.4, -2.2), true),
+            (Vector3::new(-1.5, 2.2, -1.7), false),
+            (Vector3::new(1.5, 2.2, -1.7), true),
         ]
         .iter()
+        .take(camera_count)
         .map(|&(p, flip)| synth::look_at(p, target, flip))
         .collect();
         let model = synth::camera_model();
@@ -523,10 +576,52 @@ mod tests {
         // the offset makes it exact here
         let mut p = Pipeline::new(Options {
             exposure_offset_ns: imu_delay as i64 - HMD_DELAY as i64,
+            trace: recording.is_some(),
             ..Options::default()
         });
+        let mut calibration = crate::calib::file::CalibrationFile::example();
+        calibration.sensors.clear();
         for (i, w) in cams.iter().enumerate() {
             p.sensor(&format!("SENSOR{i}"), model, *w);
+            let (orient_xyzw, pos) = crate::calib::iso_to_xyzw(w);
+            calibration.sensors.push(crate::calib::file::SensorEntry {
+                serial: format!("SENSOR{i}"),
+                orient_xyzw,
+                pos,
+                rms_px: 0.0,
+                observations: 1,
+            });
+            if let Some(rec) = recording {
+                let sensor = recorder::SensorInfo {
+                    serial: serial(i),
+                    width: model.width as i32,
+                    height: model.height as i32,
+                    fx: model.fx as f32,
+                    fy: model.fy as f32,
+                    cx: model.cx as f32,
+                    cy: model.cy as f32,
+                    k: model.k.map(|v| v as f32),
+                    ..Default::default()
+                };
+                rec.write(recorder::SENSOR_INFO, H0, &[as_bytes(&sensor)]);
+            }
+        }
+        if let Some(rec) = recording {
+            let model: Vec<_> = leds
+                .iter()
+                .map(|l| recorder::LedEntry {
+                    pos: l.pos.map(|v| v as f32).into(),
+                    dir: l.dir.map(|v| v as f32).into(),
+                })
+                .collect();
+            rec.write(
+                recorder::LED_MODEL,
+                H0,
+                &[
+                    &recorder::led_model_prefix(DEVICE_RIGHT, model.len()),
+                    slice_bytes(&model),
+                ],
+            );
         }
         p.body(crate::calib::DEVICE_RIGHT, leds.clone(), imu_pos);
         let mut evs: Vec<(u64, Ev)> = Vec::new();
@@ -607,9 +702,44 @@ mod tests {
         let (mut errors, mut stale) = (Vec::new(), false);
         for (at, ev) in evs {
             match ev {
-                Ev::Hmd(host, us) => p.hmd_clock_sample(host, us),
-                Ev::Frame(info, blobs) => p.frame(&info, &blobs),
+                Ev::Hmd(host, us) => {
+                    if let Some(rec) = recording {
+                        let mut report = [0u8; 64];
+                        report[0] = HMD_SENSORS_REPORT;
+                        report[8..12].copy_from_slice(&us.to_le_bytes());
+                        rec.write(recorder::RAW_REPORT, host, &[&0u32.to_le_bytes(), &report]);
+                    }
+                    p.hmd_clock_sample(host, us);
+                }
+                Ev::Frame(info, blobs) => {
+                    if let Some(rec) = recording {
+                        rec.write(
+                            recorder::FRAME_OBS,
+                            at,
+                            &[as_bytes(&*info), slice_bytes(&blobs)],
+                        );
+                    }
+                    p.frame(&info, &blobs);
+                }
                 Ev::Imu(dev, recv, gyro, accel) => {
+                    if let Some(rec) = recording {
+                        let state = crate::shm::ControllerState {
+                            device_time_ns: dev,
+                            received_host_ns: recv,
+                            imu_gyro: gyro.map(|v| v as f32).into(),
+                            imu_accel: accel.map(|v| v as f32).into(),
+                            ..Default::default()
+                        };
+                        rec.write(
+                            recorder::CONTROLLER_STATE,
+                            recv,
+                            &[
+                                &(HAND_RIGHT as u32).to_le_bytes(),
+                                &0u32.to_le_bytes(),
+                                as_bytes(&state),
+                            ],
+                        );
+                    }
                     let s = p.imu(HAND_RIGHT, dev, recv, gyro, accel);
                     let t = (at - H0) as f64 * 1e-9;
                     // stale: something stamped before the gap still published after it
@@ -630,7 +760,43 @@ mod tests {
                 }
             }
         }
-        (errors, stale)
+        (errors, stale, p, calibration)
+    }
+
+    #[test]
+    fn dynamic_sensors_fifth_camera_survives_recording_and_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "cv1t-five-sensor-replay-{}.rec",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let recorder = crate::recorder::Recorder::new(4 << 20);
+        recorder.start(&path, H0).unwrap();
+        let (_, _, p, calibration) = run_with_sensors(1.5, None, IMU_DELAY, 5, Some(&recorder));
+        let stats = recorder.stop();
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.write_errors, 0);
+        let participates = |event: &FrameEvent| {
+            event.camera == 4 && matches!(event.outcome, Outcome::Updated(_) | Outcome::Acquired(_))
+        };
+        assert!(
+            p.events.iter().any(participates),
+            "fifth sensor never updated pipeline"
+        );
+        let replay = super::super::replay::replay(
+            &path,
+            &calibration,
+            &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+            &p.opts,
+        )
+        .unwrap();
+        assert_eq!(replay.agreement.len(), 5);
+        assert!(
+            replay.events.iter().any(participates),
+            "fifth sensor never updated replay"
+        );
+        assert!(!replay.hands[HAND_RIGHT].is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -675,5 +841,98 @@ mod tests {
             "max error after re-acquisition {}",
             after.iter().copied().fold(0.0, f64::max)
         );
+    }
+    #[test]
+    fn dynamic_sensors_registration_keeps_existing_identity() {
+        let mut p = Pipeline::new(Options::default());
+        p.sensor("Z", synth::camera_model(), Isometry3::identity());
+        p.body(DEVICE_RIGHT, synth::touch_leds(), Vector3::zeros());
+        p.trackers[HAND_RIGHT].as_mut().unwrap().agreement[0].samples = 7;
+        p.sensor("A", synth::camera_model(), Isometry3::identity());
+        assert_eq!(
+            p.camera_agreement()
+                .into_iter()
+                .find(|a| a.0 == "Z")
+                .unwrap()
+                .3,
+            7
+        );
+        p.sensor(
+            "Z",
+            synth::camera_model(),
+            Isometry3::translation(1.0, 0.0, 0.0),
+        );
+        assert_eq!(p.camera_agreement().len(), 2);
+    }
+
+    #[test]
+    fn dynamic_sensors_pending_backlog_keeps_every_registered_camera() {
+        let mut p = Pipeline::new(Options {
+            trace: true,
+            ..Options::default()
+        });
+        for camera in 0..65 {
+            p.sensor(
+                &format!("SENSOR{camera}"),
+                synth::camera_model(),
+                Isometry3::identity(),
+            );
+        }
+        p.body(DEVICE_RIGHT, synth::touch_leds(), Vector3::zeros());
+        p.hmd_clock_sample(H0, hmd_us(H0));
+        p.imu(
+            HAND_RIGHT,
+            H0 - C0,
+            H0,
+            Vector3::zeros(),
+            Vector3::y() * 9.8,
+        );
+        for camera in 0..65 {
+            let info = FrameInfo {
+                serial: serial(camera),
+                exposure_valid: 1,
+                exposure_hmd_ts: hmd_us(H0 + 10_000_000),
+                ..Default::default()
+            };
+            p.frame(&info, &[]);
+        }
+        assert_eq!(p.pending[HAND_RIGHT].len(), 65);
+        for _ in 0..100 {
+            let info = FrameInfo {
+                serial: serial(64),
+                exposure_valid: 1,
+                exposure_hmd_ts: hmd_us(H0 + 20_000_000),
+                ..Default::default()
+            };
+            p.frame(&info, &[]);
+        }
+        for camera in 0..65 {
+            let count = p.pending[HAND_RIGHT]
+                .iter()
+                .filter(|p| p.camera == camera)
+                .count();
+            assert!((1..=2).contains(&count), "camera {camera}: {count} queued");
+        }
+        assert_eq!(p.frames_dropped, 99);
+        // An out-of-order old frame must not evict the newest observations for that sensor.
+        let old = FrameInfo {
+            serial: serial(64),
+            exposure_valid: 1,
+            exposure_hmd_ts: hmd_us(H0 + 5_000_000),
+            ..Default::default()
+        };
+        p.frame(&old, &[]);
+        assert_eq!(p.frames_dropped, 100);
+        p.imu(
+            HAND_RIGHT,
+            H0 + 30_000_000 - C0,
+            H0 + 30_000_000,
+            Vector3::zeros(),
+            Vector3::y() * 9.8,
+        );
+        assert!(p.pending[HAND_RIGHT].is_empty());
+        let serviced: std::collections::BTreeSet<_> =
+            p.events.iter().map(|event| event.camera).collect();
+        assert_eq!(serviced.len(), 65);
     }
 }

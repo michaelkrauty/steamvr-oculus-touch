@@ -386,6 +386,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	int packet_size;
 
 	stream->frames_lock = ohmd_create_mutex(ohmd_ctx);
+	if (!stream->frames_lock) return -ENOMEM;
 	stream->ohmd_ctx = ohmd_ctx;
 	stream->usb_ctx = usb_ctx;
 	stream->devh = devh;
@@ -533,6 +534,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 			stream->transfer[i]->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
 		}
 
+        if (!buf) return -ENOMEM;
 		libusb_fill_iso_transfer(stream->transfer[i], devh,
 					 bEndpointAddress, buf, transfer_size,
 					 num_packets, iso_transfer_cb, stream,
@@ -549,11 +551,14 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
 {
 	int ret, i;
 
-	assert (!stream->video_running);
+	/* A stopped stream retains buffers until its consumers have joined and clear runs. */
+	if (stream->video_running || stream->alloced_frames || stream->free_frames) return -EBUSY;
 
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, stream->alt_setting);
 	if (ret) {
-		printf("Failed to set interface alt setting %d\n", stream->alt_setting);
+		LOGE("Failed to set USB interface 1 alt setting %d: %s (%d)",
+			stream->alt_setting, libusb_error_name(ret), ret);
+		LOGE("Check kernel USB logs; if bandwidth is exhausted, move this sensor to a different USB host controller");
 		return ret;
 	}
 
@@ -566,40 +571,49 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
 	/* Allocate frames and put on the free list */
 	stream->alloced_frames = ohmd_alloc(stream->ohmd_ctx, min_frames * sizeof (ohmd_video_frame *));
 	stream->free_frames = ohmd_alloc(stream->ohmd_ctx, min_frames * sizeof (ohmd_video_frame *));
+    stream->n_alloced_frames = stream->n_free_frames = 0;
+    if (!stream->alloced_frames || !stream->free_frames) goto allocation_failed;
 
 	for (i = 0; i < min_frames; i++) {
 		ohmd_video_frame *frame = ohmd_alloc(stream->ohmd_ctx, sizeof (ohmd_video_frame));
+        if (!frame) goto allocation_failed;
 		frame->data = ohmd_alloc(stream->ohmd_ctx, stream->frame_size);
+        if (!frame->data) { free(frame); goto allocation_failed; }
 		frame->data_block_size = stream->frame_size;
 		frame->data_size = 0;
 
 		frame->releasefn = (ohmd_video_frame_release_func) rift_sensor_uvc_stream_release_frame;
 		frame->owner = stream;
 		stream->alloced_frames[i] = stream->free_frames[i] = frame;
+        stream->n_alloced_frames++;
 	}
 	stream->n_free_frames = stream->n_alloced_frames = min_frames;
 
 	/* Submit transfers; any parked when the stream last stopped go in with the rest */
 	stream->n_parked = 0;
+    /* Completion callbacks share this lock: do not expose a partial active count. */
+    libusb_lock_event_waiters(stream->usb_ctx);
+    stream->active_transfers = 0;
 	for (int i = 0; i < stream->num_transfers; i++) {
 		ret = libusb_submit_transfer(stream->transfer[i]);
 		if (ret < 0) {
 			LOGE("failed to submit iso transfer %d. Error %d errno %d", i, ret, errno);
-			stream->active_transfers = i;
-
+            libusb_unlock_event_waiters(stream->usb_ctx);
 			rift_sensor_uvc_stream_stop(stream);
 			return ret;
 		}
+        stream->active_transfers++;
 	}
-
-	stream->active_transfers = stream->num_transfers;
+    libusb_unlock_event_waiters(stream->usb_ctx);
 	return 0;
+allocation_failed:
+	rift_sensor_uvc_stream_stop(stream);
+	return -ENOMEM;
 }
 
 int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 {
 	int ret;
-	int i;
 
 	/* libusb holds its event-waiter lock while invoking iso_transfer_cb. Its last
 	 * transfer may be retrying a failed submit until video_running clears. Publish
@@ -622,14 +636,6 @@ int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 	}
 	libusb_unlock_event_waiters(stream->usb_ctx);
 
-	/* Free frames */
-	for (i = 0; i < stream->n_alloced_frames; i++) {
-		ohmd_video_frame *frame = stream->alloced_frames[i];
-		free(frame->data);
-		free(frame);
-	}
-	free(stream->alloced_frames);
-	free(stream->free_frames);
 
 	return 0;
 }
@@ -638,6 +644,20 @@ int rift_sensor_uvc_stream_clear (struct rift_sensor_uvc_stream *stream)
 {
 	int i;
 	assert(!stream->video_running);
+
+	/* Analysis workers can own frames after USB stops. The device is cleared only
+	 * after its owner joins those workers, so reclaim the frame storage here. */
+	/* Free frames */
+	for (i = 0; i < stream->n_alloced_frames; i++) {
+		ohmd_video_frame *frame = stream->alloced_frames[i];
+		free(frame->data);
+		free(frame);
+	}
+	free(stream->alloced_frames);
+	free(stream->free_frames);
+	stream->alloced_frames = stream->free_frames = NULL;
+	stream->n_alloced_frames = stream->n_free_frames = 0;
+
 
 	if (stream->transfer != NULL) {
 		for (i = 0; i < stream->num_transfers; i++) {

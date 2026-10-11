@@ -36,7 +36,6 @@
 
 #define ASSERT_MSG(_v, label, ...) if(!(_v)){ fprintf(stderr, __VA_ARGS__); goto label; }
 
-#define MAX_SENSORS 4
 
 /* Number of IMU observations we accumulate before output */
 #define RIFT_MAX_PENDING_IMU_OBSERVATIONS 1000
@@ -64,7 +63,6 @@
 #define MIN_POS_ERROR 0.1
 
 typedef struct rift_tracked_device_priv rift_tracked_device_priv;
-typedef struct rift_tracker_pose_report rift_tracker_pose_report;
 typedef struct rift_tracker_pose_delay_slot rift_tracker_pose_delay_slot;
 
 typedef struct rift_tracked_device_imu_observation rift_tracked_device_imu_observation;
@@ -79,12 +77,6 @@ struct rift_tracked_device_imu_observation {
 	vec3f mag;
 };
 
-struct rift_tracker_pose_report {
-		bool report_used; /* TRUE if this report has been integrated */
-		posef pose;
-		rift_pose_metrics score;
-};
-
 struct rift_tracker_pose_delay_slot {
 	int slot_id;		/* Index of the slot */
 	bool valid;			/* true if the exposure info was set */
@@ -92,11 +84,8 @@ struct rift_tracker_pose_delay_slot {
 
 	uint64_t device_time_ns; /* Device time this slot is currently tracking */
 
-	/* rift_tracked_device_model_pose_update stores the observed poses here */
-	int n_pose_reports;
-	rift_tracker_pose_report pose_reports[MAX_SENSORS];
-	/* Number of reports we used from the supplied ones */
-	int n_used_reports;
+	/* Whether any camera supplied a pose used by this delayed state. */
+	bool had_used_report;
 };
 
 /* Internal full tracked device struct */
@@ -164,8 +153,8 @@ struct rift_tracker_ctx_s
 	int exposure_history_size;
 	rift_tracker_exposure_info exposure_history[NUM_EXPOSURE_HISTORY];
 
-	rift_sensor_ctx *sensors[MAX_SENSORS];
-	uint8_t n_sensors;
+	rift_sensor_ctx **sensors;
+	size_t n_sensors, sensor_capacity;
 
 	rift_tracked_device_priv devices[RIFT_MAX_TRACKED_DEVICES];
 	uint8_t n_devices;
@@ -282,16 +271,19 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 {
 	rift_tracker_ctx *tracker_ctx = NULL;
 	int ret, i;
-	libusb_device **devs;
+	libusb_device **devs = NULL;
 
 	tracker_ctx = ohmd_alloc(ohmd_ctx, sizeof (rift_tracker_ctx));
+	if (!tracker_ctx) return NULL;
 	tracker_ctx->ohmd_ctx = ohmd_ctx;
 	tracker_ctx->tracker_lock = ohmd_create_mutex(ohmd_ctx);
+	if (!tracker_ctx->tracker_lock) goto fail;
 
 	for (i = 0; i < RIFT_MAX_TRACKED_DEVICES; i++) {
 		rift_tracked_device_priv *dev = tracker_ctx->devices + i;
 		dev->index = i;
 		dev->device_lock = ohmd_create_mutex(ohmd_ctx);
+		if (!dev->device_lock) goto fail;
 	}
 
 	ret = libusb_init(&tracker_ctx->usb_ctx);
@@ -306,6 +298,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	/* Start USB event thread */
 	tracker_ctx->usb_completed = false;
 	tracker_ctx->usb_thread = ohmd_create_thread (ohmd_ctx, uvc_handle_events, tracker_ctx);
+	if (!tracker_ctx->usb_thread) goto fail;
 
 	for (i = 0; devs[i]; ++i) {
 		struct libusb_device_descriptor desc;
@@ -324,34 +317,47 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 			continue;
 		}
 
-		sprintf ((char *) serial, "UNKNOWN");
-		serial[32] = '\0';
-
-		if (desc.iSerialNumber) {
-			ret = libusb_get_string_descriptor_ascii(usb_devh, desc.iSerialNumber, serial, 32);
-			if (ret < 0)
-				fprintf (stderr, "Failed to read the Rift Sensor Serial number.\n");
-		}
-
-		/* cv1touch: leave sensors on the ignore list closed (they would use up MAX_SENSORS slots) */
-		bool cv1touch_ignored = false;
-		for (int k = 0; k < 8; k++)
-			if (ohmd_ctx->cv1touch_config.ignore_sensor_serials[k][0] &&
-			    strncmp(ohmd_ctx->cv1touch_config.ignore_sensor_serials[k], (const char *) serial, 32) == 0)
-				cv1touch_ignored = true;
-		if (cv1touch_ignored) {
-			LOGI("Ignoring Rift Sensor %s (cv1touch ignore list)", serial);
-			libusb_close(usb_devh);
-			continue;
-		}
-		rift_sensor_device *sensor_device = rift_sensor_usb_new (ohmd_ctx, tracker_ctx->n_sensors, (char *) serial, tracker_ctx->usb_ctx, usb_devh, radio_id);
+        memset(serial, 0, sizeof serial);
+        ret = desc.iSerialNumber ? libusb_get_string_descriptor_ascii(
+            usb_devh, desc.iSerialNumber, serial, 32) : -1;
+        if (ret <= 0 || ret >= 32 || !cv1touch_sensor_serial_valid((const char *)serial)) {
+            LOGW("Ignoring Rift Sensor with unreadable or invalid serial");
+            libusb_close(usb_devh);
+            continue;
+        }
+        bool duplicate = false;
+        for (size_t k = 0; k < tracker_ctx->n_sensors; k++)
+            if (!strcmp(rift_sensor_serial_no(tracker_ctx->sensors[k]), (const char *)serial))
+                duplicate = true;
+        if (duplicate) {
+            LOGW("Ignoring duplicate Rift Sensor identity");
+            libusb_close(usb_devh);
+            continue;
+        }
+        if (cv1touch_sensor_ignored(&ohmd_ctx->cv1touch_sensors,
+                &ohmd_ctx->cv1touch_config, (const char *)serial)) {
+            LOGI("Ignoring Rift Sensor %s (configured ignore list)", serial);
+            libusb_close(usb_devh);
+            continue;
+        }
+        /* Reserve before creating workers. Pointer-array growth never moves sensor objects. */
+        if (tracker_ctx->n_sensors >= INT_MAX) { libusb_close(usb_devh); goto fail; }
+        if (tracker_ctx->n_sensors == tracker_ctx->sensor_capacity) {
+            size_t capacity = tracker_ctx->sensor_capacity ? tracker_ctx->sensor_capacity * 2 : 4;
+            if (capacity > INT_MAX) capacity = INT_MAX;
+            if (capacity > SIZE_MAX / sizeof(*tracker_ctx->sensors)) { libusb_close(usb_devh); goto fail; }
+            void *next = realloc(tracker_ctx->sensors, capacity * sizeof(*tracker_ctx->sensors));
+            if (!next) { libusb_close(usb_devh); goto fail; }
+            tracker_ctx->sensors=next; tracker_ctx->sensor_capacity=capacity;
+        }
+		rift_sensor_device *sensor_device = rift_sensor_usb_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, tracker_ctx->usb_ctx, usb_devh, radio_id);
 
 		if (sensor_device == NULL) {
 			LOGW("Failed to open Rift Sensor USB device %s\n", serial);
 			continue;
 		}
 
-		rift_sensor_ctx *sensor_ctx = rift_sensor_new (ohmd_ctx, tracker_ctx->n_sensors, (char *) serial, sensor_device, tracker_ctx);
+		rift_sensor_ctx *sensor_ctx = rift_sensor_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, sensor_device, tracker_ctx);
 		if (sensor_ctx == NULL) {
 			LOGW("Failed to open Rift Sensor analyser for %s\n", serial);
 			continue;
@@ -359,27 +365,28 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 
 		tracker_ctx->sensors[tracker_ctx->n_sensors] = sensor_ctx;
 		tracker_ctx->n_sensors++;
-		if (tracker_ctx->n_sensors == MAX_SENSORS) {
-			LOGI("Found the maximum number of supported sensors: %d.\n", MAX_SENSORS);
-			break;
-		}
+
 	}
 	libusb_free_device_list(devs, 1);
-
-	printf ("Opened %u Rift Sensor cameras\n", tracker_ctx->n_sensors);
+	devs = NULL;
 
 	/* Loop over the sensors we found and start the video flowing */
-	for (i = 0; i < tracker_ctx->n_sensors; i++) {
-		rift_sensor_ctx *sensor = tracker_ctx->sensors[i];
+    for (i = 0; i < (int)tracker_ctx->n_sensors;) {
+        rift_sensor_ctx *sensor = tracker_ctx->sensors[i];
+        if (!rift_sensor_start(sensor)) {
+            LOGW("Failed to start video stream for sensor %s\n", rift_sensor_serial_no(sensor));
+            rift_sensor_free(sensor);
+            tracker_ctx->n_sensors--;
+            memmove(tracker_ctx->sensors+i, tracker_ctx->sensors+i+1,
+                    (tracker_ctx->n_sensors-(size_t)i)*sizeof(*tracker_ctx->sensors));
+        } else i++;
+    }
 
-		if (!rift_sensor_start (sensor)) {
-			LOGW("Failed to start video stream for sensor %s\n", rift_sensor_serial_no (sensor));
-		}
-	}
-
+	printf ("Started %zu Rift Sensor cameras\n", tracker_ctx->n_sensors);
 	return tracker_ctx;
 
 fail:
+	if (devs) libusb_free_device_list(devs, 1);
 	if (tracker_ctx)
 		rift_tracker_free (tracker_ctx);
 	return NULL;
@@ -578,17 +585,18 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 			ohmd_pw_debug_stream_free (dev->debug_metadata);
 
 		rift_kalman_6dof_clear(&dev->ukf_fusion);
-		ohmd_destroy_mutex (dev->device_lock);
+		if (dev->device_lock) ohmd_destroy_mutex (dev->device_lock);
 	}
 
 	/* Stop USB event thread */
 	tracker_ctx->usb_completed = true;
-	ohmd_destroy_thread (tracker_ctx->usb_thread);
+	if (tracker_ctx->usb_thread) ohmd_destroy_thread (tracker_ctx->usb_thread);
 
 	if (tracker_ctx->usb_ctx)
 		libusb_exit (tracker_ctx->usb_ctx);
 
-	ohmd_destroy_mutex (tracker_ctx->tracker_lock);
+	if (tracker_ctx->tracker_lock) ohmd_destroy_mutex (tracker_ctx->tracker_lock);
+	free(tracker_ctx->sensors);
 	free (tracker_ctx);
 }
 
@@ -828,17 +836,7 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 
 		frame_fusion_slot = slot->slot_id;
 
-		if (slot->n_pose_reports < MAX_SENSORS) {
-			rift_tracker_pose_report *report = slot->pose_reports + slot->n_pose_reports;
-
-			report->report_used = update_position;
-			report->pose = imu_pose;
-			report->score = *score;
-
-			if (update_position)
-				slot->n_used_reports++;
-			slot->n_pose_reports++;
-		}
+		slot->had_used_report |= update_position;
 	}
 
 	rift_tracked_device_send_debug_printf(dev, local_ts, "{ \"type\": \"pose\", \"local-ts\": %llu, "
@@ -1003,7 +1001,7 @@ reclaim_delay_slot(rift_tracked_device_priv *dev)
 
 		/* If a slot already received a pose observation, use that one */
 		/* FIXME: Check that the poses were integrated, and integrate them as-needed if not */
-		if (slot->valid && slot->n_used_reports > 0)
+		if (slot->valid && slot->had_used_report)
 			return slot;
 	}
 
@@ -1062,8 +1060,7 @@ rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, rift_tracked_
 		slot->device_time_ns = dev_info->device_time_ns;
 		slot->valid = true;
 		slot->use_count = 0;
-		slot->n_pose_reports = 0;
-		slot->n_used_reports = 0;
+		slot->had_used_report = false;
 
 		LOGD ("Assigning free delay slot %d for dev %d, ts %llu", slot->slot_id, dev->base.id, (unsigned long long) dev->device_time_ns);
 		dev_info->fusion_slot = slot->slot_id;
@@ -1169,7 +1166,7 @@ void rift_tracked_device_get_export(rift_tracked_device *dev_base, rift_tracked_
 
 int rift_tracker_get_sensor_count(rift_tracker_ctx *ctx)
 {
-	return ctx->n_sensors;
+	return (int)ctx->n_sensors;
 }
 
 int rift_tracker_get_sensor_info(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor *out)

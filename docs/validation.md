@@ -8,6 +8,8 @@ The release work adds clean-build and relocated-install checks, regression tests
 
 Input calibration regressions cover endpoint and stick normalization, controller identity changes, stale or incomplete captures, disconnect release, malformed configuration, and save/reload rollback. The input test checks the corresponding SteamVR axis or button instead of accepting unrelated movement. Validate measured endpoints and in-app delivery on your own controllers after calibration.
 
+Dynamic-sensor regressions exercise acquisition/configuration through 65 synthetic sensors, high-index camera tracking and distinct-camera confirmation, complete diagnostics beyond the shared-memory prefix, bounded fair work queues, and allocation/shutdown failure paths. These software tests do not establish physical capacity at those counts; real USB bandwidth, CPU load, and camera coverage remain setup-dependent.
+
 ## Measurement interpretation
 
 Development captures compared tracked controller poses to a rigidly attached SteamVR reference and checked cross-camera/Touch-to-Touch consistency. A reference's own errors, non-rigid attachment, changed room setup, clock alignment, and fit/test overlap can dominate the residual. Tracking is not established as more accurate than another controller merely because a fitted residual is small.

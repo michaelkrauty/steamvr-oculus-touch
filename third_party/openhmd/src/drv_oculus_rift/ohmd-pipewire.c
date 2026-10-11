@@ -24,6 +24,7 @@ typedef struct ohmd_pw_base_stream_s ohmd_pw_base_stream;
 
 struct ohmd_pw_global_data_s {
 	int use_count;
+	bool thread_started;
 
 	struct pw_loop *loop;
 	struct pw_thread_loop *thread;
@@ -132,21 +133,27 @@ static ohmd_pw_global_data *ohmd_pipewire_global_init()
 	}
 
 	gdata = ohmd_pw_global_data_ptr = calloc(sizeof(ohmd_pw_global_data), 1);
+	if (gdata == NULL)
+		return NULL;
 	gdata->use_count = 1;
 
 	pw_init(NULL, NULL);
 
 	gdata->loop = pw_loop_new(NULL);
+	if (!gdata->loop) goto fail;
 	gdata->thread = pw_thread_loop_new_full(gdata->loop, "pipewire-loop", NULL);
+	if (!gdata->thread) goto fail;
 	gdata->context = pw_context_new(gdata->loop, NULL, 0);
+	if (!gdata->context) goto fail;
 	gdata->pw_core = pw_context_connect(gdata->context, NULL, 0);
 
-	if (pw_thread_loop_start(gdata->thread) != 0) {
-			ohmd_pipewire_global_deinit();
-			return NULL;
-	}
-
-	return gdata;
+    if (!gdata->pw_core) goto fail;
+    if (pw_thread_loop_start(gdata->thread) != 0) goto fail;
+    gdata->thread_started = true;
+    return gdata;
+fail:
+    ohmd_pipewire_global_deinit();
+    return NULL;
 }
 
 static void ohmd_pipewire_global_deinit()
@@ -162,11 +169,12 @@ static void ohmd_pipewire_global_deinit()
 	if (gdata->use_count > 0)
 		return;
 
-	pw_thread_loop_stop(gdata->thread);
+	if (gdata->thread_started) pw_thread_loop_stop(gdata->thread);
 
-	pw_context_destroy(gdata->context);
-	pw_thread_loop_destroy(gdata->thread);
-	pw_loop_destroy(gdata->loop);
+	if (gdata->pw_core) pw_core_disconnect(gdata->pw_core);
+	if (gdata->context) pw_context_destroy(gdata->context);
+	if (gdata->thread) pw_thread_loop_destroy(gdata->thread);
+	if (gdata->loop) pw_loop_destroy(gdata->loop);
 
 	free (gdata);
 	ohmd_pw_global_data_ptr = NULL;
@@ -193,6 +201,7 @@ ohmd_pw_video_stream_new (const char *stream_id, const char *stream_role, ohmd_p
 
 	/* Create data store */
 	ret = calloc (sizeof(ohmd_pw_video_stream), 1);
+	if (!ret) goto fail;
 	base = (ohmd_pw_base_stream *)(ret);
 
 	base->gdata = gdata;
@@ -211,6 +220,7 @@ ohmd_pw_video_stream_new (const char *stream_id, const char *stream_role, ohmd_p
 					PW_KEY_MEDIA_CATEGORY, "Source",
 					PW_KEY_MEDIA_ROLE, stream_role,
 					NULL));
+	if (!base->stream) { pw_thread_loop_unlock(gdata->thread); goto fail; }
 
 	enum spa_video_format spa_format;
 
@@ -224,7 +234,8 @@ ohmd_pw_video_stream_new (const char *stream_id, const char *stream_role, ohmd_p
 			spa_format = SPA_VIDEO_FORMAT_RGB;
 			break;
 		default:
-			return NULL;
+			pw_thread_loop_unlock(gdata->thread);
+			goto fail;
 	}
 
 	params[0] = spa_pod_builder_add_object(&b,
@@ -237,16 +248,22 @@ ohmd_pw_video_stream_new (const char *stream_id, const char *stream_role, ohmd_p
 
 	pw_stream_add_listener(base->stream, &base->listener, &video_stream_events, ret);
 
-	pw_stream_connect(base->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+	int result = pw_stream_connect(base->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
 			PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
 
 	pw_thread_loop_unlock(gdata->thread);
+	if (result < 0) goto fail;
 	return ret;
 
 fail:
-	if (ret)
-		free (ret);
-	return NULL;
+    if (base && base->stream) {
+        pw_thread_loop_lock(gdata->thread);
+        pw_stream_destroy(base->stream);
+        pw_thread_loop_unlock(gdata->thread);
+    }
+    free(ret);
+    if (gdata) ohmd_pipewire_global_deinit();
+    return NULL;
 }
 
 void ohmd_pw_stream_free_common (ohmd_pw_base_stream *s)
@@ -386,6 +403,7 @@ ohmd_pw_debug_stream *ohmd_pw_debug_stream_new (const char *stream_id, const cha
 
 	/* Create data store */
 	ret = calloc (sizeof(ohmd_pw_debug_stream), 1);
+	if (!ret) goto fail;
 	base = (ohmd_pw_base_stream *)(ret);
 
 	base->gdata = gdata;
@@ -399,6 +417,7 @@ ohmd_pw_debug_stream *ohmd_pw_debug_stream_new (const char *stream_id, const cha
 					PW_KEY_MEDIA_CATEGORY, "Source",
 					PW_KEY_MEDIA_ROLE, stream_role,
 					NULL));
+	if (!base->stream) { pw_thread_loop_unlock(gdata->thread); goto fail; }
 
 	params[0] = spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
@@ -407,16 +426,22 @@ ohmd_pw_debug_stream *ohmd_pw_debug_stream_new (const char *stream_id, const cha
 
 	pw_stream_add_listener(base->stream, &base->listener, &debug_stream_events, ret);
 
-	pw_stream_connect(base->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+	int result = pw_stream_connect(base->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
 			PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
 
 	pw_thread_loop_unlock(gdata->thread);
+	if (result < 0) goto fail;
 	return ret;
 
 fail:
-	if (ret)
-		free (ret);
-	return NULL;
+    if (base && base->stream) {
+        pw_thread_loop_lock(gdata->thread);
+        pw_stream_destroy(base->stream);
+        pw_thread_loop_unlock(gdata->thread);
+    }
+    free(ret);
+    if (gdata) ohmd_pipewire_global_deinit();
+    return NULL;
 }
 
 bool ohmd_pw_debug_stream_connected (ohmd_pw_debug_stream *s)

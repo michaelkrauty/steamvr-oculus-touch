@@ -7,6 +7,8 @@ Start with `cv1touch doctor`, `cv1touch status --json`, and `journalctl --user -
 | Daemon not reachable | Check `systemctl --user status cv1touchd`; for manual runs check the runtime directory and socket permissions. Only one daemon may run per user. |
 | No controllers | Wake them with a button, check batteries, and confirm they are paired to the connected CV1 headset. Headset USB and hidraw access are both required. |
 | No sensor frames | Check device ACLs, cables, USB bandwidth, and kernel transfer errors. Restart the daemon after fixing USB transport; do not calibrate with a missing sensor. |
+| New sensor missing or unplaced | Restart after attachment; compare `sensor_total` with the expected count and inspect USB open/start errors. If its frames advance but `placed` is zero, [calibrate the added sensor](setup.md#add-or-remove-sensors). |
+| Camera backlog grows or frames are discarded | Inspect `camera_queue` in status JSON. Work queues are bounded per sensor; sustained drops indicate insufficient processing capacity or contention. Check USB errors and spread cameras across available controllers. |
 | Rotation works, position is lost | Check sensor views, optical occlusion, calibration, and overlapping coverage. Rotation-only output is not a valid position fix. |
 | Controllers translated/rotated from the headset space | Repeat headset registration after checking gravity levelling and headset tracking. `cv1touch universe` reports base-station disagreement. |
 | Rendered controller is offset despite good tracking | Run `fit-render` with a recording containing both factory LED models, then reload alignment. Check that native SteamVR contains the CV1 models. |

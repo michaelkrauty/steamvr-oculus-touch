@@ -83,6 +83,23 @@ Camera calibration estimates the sensors' poses in a shared world. Registration 
 
 Sensor movement requires recalibration or `calibrate refine`/`calibrate place` with a new observable capture. A new SteamVR room setup or a substantial non-rigid base-station re-solve can require repeating headset registration. See [troubleshooting](troubleshooting.md).
 
+## Add or remove sensors
+
+Connect each new sensor, then restart `cv1touchd`. Check `cv1touch status --json`: `sensor_total` should match the number admitted, every sensor's `frames` counter should advance, and a new uncalibrated sensor has `placed: 0`. There is no fixed sensor-count limit. USB transport, memory, and processing capacity still apply; distribute cameras across available USB controllers and check the logs if an open or stream start fails. To leave particular cameras closed, pass `--ignore-sensor SERIAL` to the daemon; the option is repeatable.
+
+For a fresh layout, repeat camera calibration, gravity levelling, and SteamVR registration as above. To add just one sensor while retaining an existing calibrated room, capture both controllers moving in the new sensor's view while the calibrated sensors also see them:
+
+```sh
+cv1touch record start /tmp/cv1touch-add-sensor.rec
+# Move both controllers with varied orientations in overlapping views, then:
+cv1touch record stop
+cv1touch calibrate place SERIAL /tmp/cv1touch-add-sensor.rec
+```
+
+Replace `SERIAL` with the new sensor's value from status. Inspect the fit first; repeat with `--write` only when the fit succeeds, then restart the daemon. This adds the sensor in the existing coordinate frame and preserves the other camera poses. Keep the capture and inspect tracking after the change. Removing a temporary sensor does not require deleting its calibration; disconnected entries remain available if you reconnect it. Restart after changing attached hardware.
+
+The live status board lists every sensor. `camera_queue.dropped_frames` and `camera_queue.pending_frames_dropped` expose discarded stale work when processing falls behind. Sustained drops or stopped counters warrant checking USB load, camera placement, and CPU contention before increasing the camera count.
+
 ## Upgrade
 
 Quit SteamVR, update the clone, run `python3 scripts/install.py`, then restart the service:

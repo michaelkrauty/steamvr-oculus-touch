@@ -28,6 +28,18 @@ int main(void)
 	ohmd_cv1touch_config cfg = { .radio_wait_ms = 2, .hmd_tracking = false, .hmd_leds_off = true };
 	snprintf(cfg.ignore_sensor_serials[0], sizeof cfg.ignore_sensor_serials[0], "%s", "WMTD000000000");
 	ohmd_cv1touch_configure(ctx, &cfg);
+    char ignored[65][32];
+    ohmd_cv1touch_sensor_pose poses[65] = {0};
+    for (int i = 0; i < 65; i++) {
+        snprintf(ignored[i], sizeof ignored[i], "TEST%06d", i);
+        snprintf(poses[i].serial, sizeof poses[i].serial, "TEST%06d", i);
+        poses[i].orient[3] = 1;
+    }
+    CHECK(ohmd_cv1touch_configure_sensors(NULL, ignored, 65, poses, 65) == -1);
+    CHECK(ohmd_cv1touch_configure_sensors(ctx, ignored, 65, poses, 65) == 0);
+    CHECK(ohmd_cv1touch_configure_sensors(ctx, NULL, 1, NULL, 0) == -1);
+    CHECK(ohmd_cv1touch_configure_sensors(ctx, NULL, 0, NULL, 0) == 0);
+    CHECK(ohmd_cv1touch_configure_sensors(ctx, ignored, 65, poses, 65) == 0);
 	ohmd_cv1touch_set_frame_callback(ctx, on_frame, NULL);
 	ohmd_cv1touch_set_report_callback(ctx, on_report, NULL);
 	CHECK(ohmd_cv1touch_get_io_errors(NULL) == 0);

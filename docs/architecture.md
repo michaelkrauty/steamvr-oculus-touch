@@ -43,4 +43,10 @@ Build with `cargo build --locked --release`; install without services using `pyt
 
 Input injection is disabled by default. `test-inject on` permits bounded injection for ten minutes; `test-inject off` disarms it immediately. It is for integration tests and can affect applications currently receiving controller input. The socket and shared memory are local to the user's runtime environment; they are not network APIs.
 
-The acquisition engine currently supports four sensors and one controller pair. Other hardware drivers remain in the attributed upstream source tree but are not built or offered as supported cv1touch hardware. Future changes to the ABI or recording schema must update compatibility checks, readers, tests, and the changelog together.
+The acquisition engine discovers sensors dynamically and supports one controller pair. Sensor identities and tracking state are dynamically sized; there is no fixed camera-count cap. Two pending frames per admitted camera and a bounded clock queue prevent a stalled consumer from accumulating unlimited work, with round-robin camera service and visible drop counters. Other hardware drivers remain in the attributed upstream source tree but are not built or offered as supported cv1touch hardware. Future changes to the ABI or recording schema must update compatibility checks, readers, tests, and the changelog together.
+
+## Sensor diagnostics and compatibility
+
+`cv1touch status --json` returns every admitted sensor in `sensors`, with `sensor_total` and camera queue/drop counters. The live status board uses this complete list. A newly attached sensor needs a daemon restart; a sensor without a calibrated pose can record observations but does not contribute to the Rust pose estimate until calibrated. Failed USB opens/starts are logged, and stalled streams are visible as non-advancing frame counters.
+
+The controller/alignment shared-memory ABI remains version 3. Its eight sensor slots are a legacy diagnostic prefix, not a tracking limit. `sensor_shm_count` and `sensor_shm_truncated` describe that prefix explicitly. Use control JSON for the full list; the status board warns when it must fall back to shared memory. Recording records already identify sensors individually by serial, so the recording schema is unchanged.

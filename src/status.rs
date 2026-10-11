@@ -30,6 +30,42 @@ const TOUCHES: [(&str, u32); 7] = [
 ];
 const HAND_NAMES: [&str; 2] = ["left", "right"];
 
+/// Decode the complete sensor list from control JSON, independently of the
+/// fixed-size compatibility block in controller shared memory.
+pub fn sensors_from_status(value: &serde_json::Value) -> Result<Vec<SensorStatus>, String> {
+    #[derive(serde::Deserialize)]
+    struct SensorSummary {
+        serial: String,
+        placed: u32,
+        frames: u32,
+        fixes: [u32; 2],
+    }
+    let entries: Vec<SensorSummary> = serde_json::from_value(value["sensors"].clone())
+        .map_err(|e| format!("invalid sensor diagnostics: {e}"))?;
+    if value["sensor_total"]
+        .as_u64()
+        .is_some_and(|n| n != entries.len() as u64)
+    {
+        return Err("sensor count disagrees with the complete sensor list".into());
+    }
+    entries
+        .into_iter()
+        .map(|s| {
+            if s.serial.is_empty() || s.serial.len() >= 32 || s.serial.contains('\0') {
+                return Err("invalid sensor serial in diagnostics".into());
+            }
+            let mut out = SensorStatus {
+                placed: s.placed,
+                frames: s.frames,
+                pose_fixes: s.fixes,
+                ..Default::default()
+            };
+            crate::shm::set_serial(&mut out, &s.serial);
+            Ok(out)
+        })
+        .collect()
+}
+
 fn state_text(s: &ControllerState) -> &'static str {
     if s.flags & FLAG_CALIBRATED == 0 {
         "not paired / never seen"
@@ -158,6 +194,35 @@ mod tests {
             touches: TOUCH_TRIGGER,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn complete_control_diagnostics_render_every_sensor_beyond_the_shm_prefix() {
+        let value = serde_json::json!({"sensor_total": 65, "sensors": (0..65).map(|i|
+            serde_json::json!({"serial": format!("camera-{i}"), "placed": 1,
+                "frames": i + 1, "fixes": [i, i + 2]})).collect::<Vec<_>>()});
+        let sensors = sensors_from_status(&value).unwrap();
+        assert_eq!(sensors.len(), 65);
+        assert_eq!(sensors[64].frames, 65);
+        assert_eq!(serial_str(&sensors[64]), "camera-64");
+        let text = render(
+            &[ControllerState::default(); 2],
+            &sensors,
+            &HashMap::new(),
+            0.0,
+            1,
+        );
+        assert_eq!(
+            text.lines().filter(|s| s.starts_with("sensor ")).count(),
+            65
+        );
+        assert!(text.contains("sensor camera-64:"));
+        let mut invalid = value.clone();
+        invalid["sensor_total"] = serde_json::json!(66);
+        assert!(sensors_from_status(&invalid).is_err());
+        invalid = value;
+        invalid["sensors"][64]["fixes"] = serde_json::json!([1]);
+        assert!(sensors_from_status(&invalid).is_err());
     }
 
     #[test]
