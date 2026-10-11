@@ -4,7 +4,7 @@ Use first-generation Oculus Rift CV1 Touch controllers in SteamVR on Linux, with
 
 SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
 
-**Status:** early release, tested on one Linux installation with one left/right controller pair and four CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. This project is independent of Meta, Oculus, and Valve.
+**Status:** early release, tested on one Linux installation with one left/right controller pair and up to five CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. This project is independent of Meta, Oculus, and Valve.
 
 ## Hardware and software
 

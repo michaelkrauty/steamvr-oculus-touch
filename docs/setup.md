@@ -98,7 +98,7 @@ cv1touch calibrate place SERIAL /tmp/cv1touch-add-sensor.rec
 
 Replace `SERIAL` with the new sensor's value from status. Inspect the fit first; repeat with `--write` only when the fit succeeds, then restart the daemon. This adds the sensor in the existing coordinate frame and preserves the other camera poses. Keep the capture and inspect tracking after the change. Removing a temporary sensor does not require deleting its calibration; disconnected entries remain available if you reconnect it. Restart after changing attached hardware.
 
-The live status board lists every sensor. `camera_queue.dropped_frames` and `camera_queue.pending_frames_dropped` expose discarded stale work when processing falls behind. Sustained drops or stopped counters warrant checking USB load, camera placement, and CPU contention before increasing the camera count.
+The live status board lists every sensor. `camera_queue.dropped_frames` counts evictions from the bounded camera callback queues. `camera_queue.pending_frames_dropped` counts deferred frame copies evicted separately for each hand while waiting for its IMU samples; it can rise normally when a controller is idle or asleep, even with no callback backlog. Compare counter changes while both controllers are awake and moving. If drops persist during motion, inspect active-hand tracking, IMU/radio timing, and CPU load; stopped sensor frame counters also warrant checking USB transport.
 
 ## Upgrade
 

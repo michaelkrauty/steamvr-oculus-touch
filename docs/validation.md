@@ -10,6 +10,8 @@ Input calibration regressions cover endpoint and stick normalization, controller
 
 Dynamic-sensor regressions exercise acquisition/configuration through 65 synthetic sensors, high-index camera tracking and distinct-camera confirmation, complete diagnostics beyond the shared-memory prefix, bounded fair work queues, and allocation/shutdown failure paths. These software tests do not establish physical capacity at those counts; real USB bandwidth, CPU load, and camera coverage remain setup-dependent.
 
+A fifth physical sensor was added to the calibrated four-sensor room. All five recorded concurrent camera streams, and the added camera was calibrated in the existing coordinate frame without modifying the original four camera poses. The owner confirmed alignment and smooth in-app movement with five sensors; diagnostics observed all 29 daemon inputs, all 26 inputs supported by the legacy SteamVR interface, and both haptic responses. Its first USB hub placement exceeded available bandwidth; moving it to a separate USB path allowed all five streams to run. This validates that configuration, not a universal five-camera USB capacity guarantee.
+
 ## Measurement interpretation
 
 Development captures compared tracked controller poses to a rigidly attached SteamVR reference and checked cross-camera/Touch-to-Touch consistency. A reference's own errors, non-rigid attachment, changed room setup, clock alignment, and fit/test overlap can dominate the residual. Tracking is not established as more accurate than another controller merely because a fitted residual is small.
