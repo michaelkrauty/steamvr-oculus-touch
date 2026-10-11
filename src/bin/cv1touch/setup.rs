@@ -449,6 +449,26 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_fitted_dependencies(
+    stage: Stage,
+    before: &Inspection,
+    after: &Inspection,
+) -> Result<(), String> {
+    if after.generation != before.generation || after.identities != before.identities {
+        return Err("daemon or controller identities changed during fitting; stage remains incomplete, previous backups retained".into());
+    }
+    if stage == Stage::Render && after.snapshot.render_sources != before.snapshot.render_sources {
+        return Err(
+            "render source meshes changed during fitting; stage remains incomplete, repeat the fit"
+                .into(),
+        );
+    }
+    if stage == Stage::Registration && after.snapshot.camera != before.snapshot.camera {
+        return Err("camera world changed during registration fitting; stage remains incomplete, repeat the fit".into());
+    }
+    Ok(())
+}
+
 fn run_stage(
     stage: Stage,
     inspection: &Inspection,
@@ -540,16 +560,7 @@ fn run_stage(
         return Err("stage did not complete; previous backups and capture paths retained. Rerun setup when ready.".into());
     }
     let mut next = inspect(checkpoint);
-    if next.generation != inspection.generation || next.identities != inspection.identities {
-        return Err("daemon or controller identities changed during fitting; stage remains incomplete, previous backups retained".into());
-    }
-    if stage == Stage::Render && next.snapshot.render_sources != inspection.snapshot.render_sources
-    {
-        return Err(
-            "render source meshes changed during fitting; stage remains incomplete, repeat the fit"
-                .into(),
-        );
-    }
+    verify_fitted_dependencies(stage, inspection, &next)?;
     for path in &recordings {
         if path.is_file() {
             next.snapshot.recordings.insert(path.clone());
@@ -642,5 +653,50 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
             eprintln!("cv1touch: {error}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn saved() -> Inspection {
+        let valid = || Artifact::Valid("a".repeat(64));
+        Inspection {
+            snapshot: Snapshot {
+                camera: valid(),
+                registration: valid(),
+                render: valid(),
+                render_sources: valid(),
+                inputs: valid(),
+                recordings: BTreeSet::new(),
+                blocked: BTreeMap::new(),
+            },
+            checks: vec![],
+            unplaced: vec![],
+            identities: Some(["1".repeat(32), "2".repeat(32)]),
+            generation: Some(1),
+        }
+    }
+    #[test]
+    fn registration_cannot_complete_against_a_world_changed_during_fit() {
+        let before = saved();
+        let mut after = saved();
+        after.snapshot.camera = Artifact::Valid("b".repeat(64));
+        assert!(verify_fitted_dependencies(Stage::Registration, &before, &after).is_err());
+        assert!(verify_fitted_dependencies(Stage::Render, &before, &after).is_ok());
+        assert!(verify_fitted_dependencies(Stage::Registration, &before, &before).is_ok());
+    }
+    #[test]
+    fn render_cannot_complete_against_replaced_meshes_or_controllers() {
+        let before = saved();
+        let mut after = saved();
+        after.snapshot.render_sources = Artifact::Valid("b".repeat(64));
+        assert!(verify_fitted_dependencies(Stage::Render, &before, &after).is_err());
+        after = saved();
+        after.identities.as_mut().unwrap()[1] = "3".repeat(32);
+        assert!(verify_fitted_dependencies(Stage::Render, &before, &after).is_err());
+        after = saved();
+        after.generation = Some(2);
+        assert!(verify_fitted_dependencies(Stage::Registration, &before, &after).is_err());
     }
 }
