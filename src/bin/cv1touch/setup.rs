@@ -666,8 +666,23 @@ impl ButtonEdges {
     }
 }
 
-const REGISTRATION_PREPARATION: &str = "Headset registration preparation: bring the tracked headset within easy reach. Keep SteamVR running and confirm the headset is tracking. Wake both Touch controllers. Before putting on the headset, test left X and right A: release then press the requested button to receive a gentle buzz; release then press it again ONLY if you felt that buzz. Right B cancels, and Ctrl+C remains available.
-After confirming both hands, put on the headset. Release then press right A when ready for the 10-second positioning countdown. Both controllers give one gentle pulse each second. Hold both Touch controllers firmly against the headset without covering its tracking sensors or the Touch rings. Keep their relative positions rigid, with no slipping. A distinct DOUBLE stronger buzz means recording has actually started. Make two slow turns each way, then nod and tilt repeatedly. Release then press right A to finish (or press Enter); right B cancels without installing a fit. Recording also stops after 150 seconds. A longer gentle buzz means recording has stopped. If a requested test buzz is not felt, cancel and fix haptics before continuing.";
+const REGISTRATION_PREPARATION: &str = "Step: headset registration
+Keep SteamVR running and confirm the headset is tracking.
+Bring the headset and both controllers within reach.
+
+Position: hold both Touch controllers firmly against the headset.
+Keep the headset's tracking sensors and the Touch rings uncovered.
+Keep the controllers rigid against the headset, with no slipping.
+
+Start: put on the headset, then release and press A on the right controller.
+Both controllers pulse once per second during the 10-second positioning countdown.
+A distinct DOUBLE stronger buzz signals that recording has started.
+
+Motion: after the double buzz, make two slow turns each way, then nod and tilt repeatedly.
+
+Finish: release and press A on the right controller, or press Enter.
+B on the right controller cancels without installing a fit; Ctrl+C also interrupts.
+Recording stops after 150 seconds at most. A longer gentle buzz signals it has stopped.";
 
 fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
     if interrupted() {
@@ -727,7 +742,7 @@ fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
         .is_some_and(|buttons| buttons & cv1touch::hand::BTN_B != 0)
     {
         return Err(
-            "registration cancelled with right B; capture retained if started, no fit installed"
+            "registration cancelled with B on the right controller; capture retained if started, no fit installed"
                 .into(),
         );
     }
@@ -780,15 +795,19 @@ fn confirm_registration_controls_with(
     mut buzz: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {
     for (hand, button, name) in [
-        (HAND_LEFT, cv1touch::hand::BTN_X, "left X"),
-        (HAND_RIGHT, cv1touch::hand::BTN_A, "right A"),
+        (HAND_LEFT, cv1touch::hand::BTN_X, "X on the left controller"),
+        (
+            HAND_RIGHT,
+            cv1touch::hand::BTN_A,
+            "A on the right controller",
+        ),
     ] {
         human_action(&format!(
             "Next action: release then press {name} for a gentle test buzz."
         ));
         press(hand, button)?;
         buzz(hand)?;
-        human_action(&format!("Next action: release then press {name} again ONLY if you felt that buzz; right B cancels."));
+        human_action(&format!("Next action: release then press {name} again ONLY if you felt that buzz; B on the right controller cancels."));
         press(hand, button)?;
     }
     Ok(())
@@ -991,12 +1010,12 @@ fn run_stage(
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
-                    human_action(&format!("Next action: verify button and haptic feedback before putting on the headset.\n{REGISTRATION_PREPARATION}"));
+                    human_action("Step: controls and haptic check\nKeep the headset off and wake both controllers.\nConfirm each test buzz only if you feel it.\nIf a buzz is missing, cancel and fix haptics before continuing.\nB on the right controller cancels; Ctrl+C also interrupts.");
                     confirm_registration_controls_with(
                         |hand, button| wait_registration_press(inspection, hand, button),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
                     )?;
-                    human_action("Next action: put on the headset. Release then press right A to begin the haptic positioning countdown; right B cancels.");
+                    human_action(REGISTRATION_PREPARATION);
                     wait_registration_press(inspection, HAND_RIGHT, cv1touch::hand::BTN_A)
                 },
                 || registration_countdown(inspection),
@@ -1033,7 +1052,7 @@ fn run_stage(
                         before: inspection,
                         edges: ButtonEdges::new(shm::now_ns()),
                     };
-                    capture_free_named_with_feedback(150, "Keep both Touch controllers firmly against the headset without slipping or covering its tracking sensors. Make two slow turns each way, then nod and tilt repeatedly. Release then press right A to finish, or press Enter. Right B cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
+                    capture_free_named_with_feedback(150, "Position: keep both controllers rigid against the headset, with its tracking sensors and the Touch rings uncovered.\nMotion: make two slow turns each way, then nod and tilt repeatedly.\nFinish: release and press A on the right controller, or press Enter. B on the right controller cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
                     Ok((rec, base))
                 },
             )?;
@@ -1262,7 +1281,7 @@ mod tests {
                                 Ok(())
                             }
                         },
-                        || Err("right B or interrupt cancelled countdown".into()),
+                        || Err("B on the right controller or interrupt cancelled countdown".into()),
                     )
                 },
                 |_| Ok(()),

@@ -25,6 +25,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Pending setup stages retain missing or invalid artifact diagnostics instead of offering adoption of unavailable settings.
 - Guided headset registration explains preparation before recording and waits for a deliberate button press and haptic countdown, so users can get into position without watching the terminal.
 - Guided capture validates recording acknowledgements and scopes cleanup to its own recording when a start reply is lost.
+- Guided calibration prompts identify buttons by controller, state when input sampling begins, and separate the control checks from headset instructions.
 
 ## [0.1.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) - 2026-10-10
 

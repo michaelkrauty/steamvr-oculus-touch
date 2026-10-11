@@ -1805,10 +1805,10 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
         let mut phases: [[Vec<RawInput>; 4]; 2] =
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
         for (phase, (prompt, seconds, minimum)) in [
-            ("Both Touch controllers: release triggers and grips, let both thumbsticks center.\nKeep all controls neutral for 2 seconds after Enter.", 2, 30),
-            ("Both Touch controllers: pull both triggers fully and hold for 2 seconds after Enter.\nKeep grips released and thumbsticks centered.", 2, 30),
-            ("Both Touch controllers: release triggers, squeeze both grips fully and hold for 2 seconds after Enter.\nKeep thumbsticks centered.", 2, 30),
-            ("Both Touch controllers: release grips. After Enter, roll BOTH thumbsticks around their FULL outer edges\ncontinuously for 10 seconds, covering forward, back, left and right. Keep them at the edges.", 10, 150),
+            ("Input calibration 1/4: neutral controls.\nRelease both triggers and grips; let both thumbsticks center.\nPress Enter, then leave all controls untouched until 'Done' appears (2 seconds).", 2, 30),
+            ("Input calibration 2/4: triggers.\nKeep both grips released and both thumbsticks centered.\nPress Enter first. Immediately pull both triggers fully and keep them held until 'Done' appears (2 seconds).", 2, 30),
+            ("Input calibration 3/4: grips.\nKeep both triggers released and both thumbsticks centered.\nPress Enter first. Immediately squeeze both grips fully and keep them held until 'Done' appears (2 seconds).", 2, 30),
+            ("Input calibration 4/4: thumbsticks.\nRelease both triggers and grips.\nPress Enter first. Immediately move BOTH thumbsticks in full circles along their outer edges until 'Done' appears (10 seconds).\nCover forward, back, left and right; keep the sticks against their outer edges.", 10, 150),
         ].into_iter().enumerate() {
             input_enter(prompt)?;
             let samples = collect_inputs(&identities, &mut last_ns, seconds, minimum)?;
