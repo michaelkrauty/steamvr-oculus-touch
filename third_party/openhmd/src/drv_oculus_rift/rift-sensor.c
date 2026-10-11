@@ -461,6 +461,16 @@ rift_sensor_start(rift_sensor_ctx *sensor)
 	return rift_sensor_device_start_video (sensor->dev, NUM_CAPTURE_BUFFERS + 1, frame_captured_cb, sensor);
 }
 
+void rift_sensor_request_stop(rift_sensor_ctx *sensor)
+{
+	rift_sensor_device_request_stop(sensor->dev);
+}
+
+void rift_sensor_retry(rift_sensor_ctx *sensor, uint64_t now_ns)
+{
+	rift_sensor_device_retry(sensor->dev, now_ns);
+}
+
 void
 rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 {

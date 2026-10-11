@@ -24,12 +24,15 @@ static void *test_realloc(void *p, size_t n) {
 #define rift_sensor_new fake_sensor_new
 #define rift_sensor_start fake_sensor_start
 #define rift_sensor_free fake_sensor_free
+#define rift_sensor_request_stop fake_sensor_request_stop
+#define rift_sensor_retry fake_sensor_retry
 #define rift_sensor_get_cv1touch_info fake_sensor_info
 #define rift_sensor_serial_no fake_sensor_serial
 #include "rift-tracker.c"
 #include "test_util.h"
 
 static int requested, live, starts, released, handles;
+static int expected_stops, stop_requests, retries;
 static int fail_descriptor, fail_serial, duplicate_serial, fail_open,
     fail_device, fail_analyser, fail_start, fail_alloc, alloc_calls, fail_mutex,
     mutex_calls, fail_thread;
@@ -38,6 +41,7 @@ struct fake_sensor {
   int id;
   char serial[32];
   libusb_device_handle *handle;
+  bool stopping;
 };
 int fake_usb_init(libusb_context **ctx) {
   *ctx = (void *)1;
@@ -130,8 +134,22 @@ bool fake_sensor_start(rift_sensor_ctx *sensor) {
   starts++;
   return ((struct fake_sensor *)sensor)->id != fail_start - 1;
 }
+void fake_sensor_request_stop(rift_sensor_ctx *sensor) {
+  struct fake_sensor *s = (void *)sensor;
+  CHECK(!s->stopping);
+  s->stopping = true;
+  stop_requests++;
+}
+void fake_sensor_retry(rift_sensor_ctx *sensor, uint64_t now_ns) {
+  CHECK(sensor && now_ns == 123);
+  retries++;
+}
 void fake_sensor_free(rift_sensor_ctx *sensor) {
   CHECK(sensor);
+  if (expected_stops) {
+    CHECK(stop_requests == expected_stops);
+    CHECK(((struct fake_sensor *)sensor)->stopping);
+  }
   live--;
   released++;
   fake_close(((struct fake_sensor *)sensor)->handle);
@@ -176,7 +194,14 @@ int main(void) {
       CHECK(rift_tracker_get_sensor_info(tr, i, &info) == 0);
       CHECK(info.serial[0]);
     }
+    retries = 0;
+    rift_tracker_retry_video(tr, 123);
+    CHECK(retries == requested);
+    expected_stops = requested;
+    stop_requests = 0;
     rift_tracker_free(tr);
+    CHECK(stop_requests == requested);
+    expected_stops = 0;
     CHECK(live == 0 && released == requested && handles == 0);
   }
   /* Full context configuration reaches discovery beyond the legacy eighth

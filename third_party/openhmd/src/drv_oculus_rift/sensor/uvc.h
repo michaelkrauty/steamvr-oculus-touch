@@ -46,9 +46,10 @@ struct rift_sensor_uvc_stream {
 	int num_transfers;
 	struct libusb_transfer **transfer;
 	int active_transfers;
-	/* Transfers whose resubmit failed, waiting for a sibling's completion to retry them */
+	/* Failed submissions, retried by the engine even if every transfer is parked */
 	struct libusb_transfer **parked;
 	int n_parked;
+	uint64_t retry_after_ns; /* engine thread only */
 
 	rift_sensor_uvc_stream_frame_cb frame_cb;
 	void *frame_cb_data;
@@ -75,6 +76,8 @@ int rift_sensor_uvc_stream_clear (rift_sensor_uvc_stream *stream);
 int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_frames,
 	rift_sensor_uvc_stream_frame_cb frame_cb, void *frame_cb_data);
 
+void rift_sensor_uvc_stream_request_stop(rift_sensor_uvc_stream *stream);
+void rift_sensor_uvc_stream_retry(rift_sensor_uvc_stream *stream, uint64_t now_ns);
 int rift_sensor_uvc_stream_stop(rift_sensor_uvc_stream *stream);
 
 /* This can only be called safely either before the stream is started

@@ -75,6 +75,8 @@ struct rift_sensor_analysis_frame {
 /* Consumes dev on success and failure. */
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_device *dev, rift_tracker_ctx *tracker);
+void rift_sensor_request_stop(rift_sensor_ctx *sensor_ctx);
+void rift_sensor_retry(rift_sensor_ctx *sensor_ctx, uint64_t now_ns);
 void rift_sensor_free (rift_sensor_ctx *sensor_ctx);
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor);
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out);

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-/* Exercise the real callback/stop functions with libusb's callback lock contract.
- * No USB devices are opened. Failed resubmits park five transfers; the sixth retries
- * while holding the event-waiter lock, exactly as a libusb completion callback does. */
+/* Exercise real callbacks, retry maintenance and stop with libusb's callback
+ * lock contract. No USB devices are opened. Every failed completion must return,
+ * even when no sibling transfer remains, so a peer can stop independently. */
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -14,6 +14,7 @@
 
 static pthread_mutex_t waiters = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int submissions;
+static atomic_bool submit_ok;
 static struct rift_sensor_uvc_stream stream;
 static struct libusb_transfer transfers[6];
 
@@ -21,7 +22,7 @@ int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *transfer)
 {
 	(void)transfer;
 	atomic_fetch_add(&submissions, 1);
-	return LIBUSB_ERROR_IO;
+	return submit_ok ? 0 : LIBUSB_ERROR_IO;
 }
 
 int LIBUSB_CALL libusb_set_interface_alt_setting(libusb_device_handle *dev, int interface, int alt)
@@ -37,8 +38,7 @@ void LIBUSB_CALL libusb_lock_event_waiters(libusb_context *ctx)
 	struct timespec deadline;
 	CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
 	deadline.tv_sec += 2;
-	/* Baseline deadlocks here: stop has not cleared video_running, and the
-	 * retrying callback cannot release this lock until that flag is cleared. */
+	/* A callback may not hold this lock indefinitely waiting for its own stop. */
 	CHECK(pthread_mutex_timedlock(&waiters, &deadline) == 0);
 }
 
@@ -132,10 +132,40 @@ int main(void)
 	CHECK(pthread_create(&worker, NULL, complete_transfers, NULL) == 0);
 	while (atomic_load(&submissions) < 6)
 		ohmd_sleep(0.0005);
-	CHECK(rift_sensor_uvc_stream_stop(&stream) == 0);
+	/* An earlier sensor is torn down while its peer owns the callback lock.
+	 * This also models cleanup after an individual sensor fails startup. */
+	struct rift_sensor_uvc_stream earlier = {0};
+	earlier.video_running = true;
+	CHECK(rift_sensor_uvc_stream_stop(&earlier) == 0);
 	CHECK(pthread_join(worker, NULL) == 0);
-	CHECK(!stream.video_running && stream.active_transfers == 0);
-	CHECK(stream.n_parked == 5);
+	CHECK(stream.video_running && stream.active_transfers == 0);
+	CHECK(stream.n_parked == 6);
+
+	/* Persistent failure attempts only once per maintenance interval. */
+	rift_sensor_uvc_stream_retry(&stream, 1);
+	CHECK(atomic_load(&submissions) == 7);
+	rift_sensor_uvc_stream_retry(&stream, 2);
+	CHECK(atomic_load(&submissions) == 7);
+	CHECK(stream.n_parked == 6 && stream.active_transfers == 0);
+	/* Once the transport recovers, all parked transfers resume without a
+	 * callback, a new frame, or a daemon/device reopen. */
+	submit_ok = true;
+	rift_sensor_uvc_stream_retry(&stream, 10000001);
+	CHECK(atomic_load(&submissions) == 13);
+	CHECK(stream.n_parked == 0 && stream.active_transfers == 6);
+
+	/* Two-phase stop first publishes flags without waiting on USB locks. */
+	CHECK(pthread_mutex_lock(&waiters) == 0);
+	rift_sensor_uvc_stream_request_stop(&earlier);
+	rift_sensor_uvc_stream_request_stop(&stream);
+	CHECK(!earlier.video_running && !stream.video_running);
+	for (int i = 0; i < 6; i++)
+		iso_transfer_cb(&transfers[i]);
+	CHECK(pthread_mutex_unlock(&waiters) == 0);
+	CHECK(rift_sensor_uvc_stream_stop(&stream) == 0);
+	rift_sensor_uvc_stream_retry(&stream, 20000001);
+	CHECK(atomic_load(&submissions) == 13);
+	CHECK(stream.active_transfers == 0);
 	outstanding_frame_lifetime();
 	startup_allocation_failures();
 	alarm(0);

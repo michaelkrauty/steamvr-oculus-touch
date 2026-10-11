@@ -27,12 +27,16 @@ typedef struct rift_sensor_usb_device rift_sensor_usb_device;
 static bool rift_sensor_usb_start (rift_sensor_device *device, uint8_t min_frames, rift_sensor_device_frame_cb frame_cb, void *cb_data);
 static void rift_sensor_usb_stop (rift_sensor_device *device);
 static void rift_sensor_usb_free (rift_sensor_device *device);
+static void rift_sensor_usb_request_stop(rift_sensor_device *device);
+static void rift_sensor_usb_retry(rift_sensor_device *device, uint64_t now_ns);
 
 static rift_sensor_device_funcs usb_device_funcs =
 {
 	rift_sensor_usb_start,
 	rift_sensor_usb_stop,
 	rift_sensor_usb_free,
+	rift_sensor_usb_request_stop,
+	rift_sensor_usb_retry,
 };
 
 struct rift_sensor_usb_device
@@ -270,6 +274,19 @@ static bool rift_sensor_usb_start(rift_sensor_device *base_dev, uint8_t min_fram
 	return true;
 fail:
 	return false;
+}
+
+static void rift_sensor_usb_request_stop(rift_sensor_device *device)
+{
+	rift_sensor_usb_device *dev = (rift_sensor_usb_device *)device;
+	rift_sensor_uvc_stream_request_stop(&dev->uvc_stream);
+}
+
+static void rift_sensor_usb_retry(rift_sensor_device *device, uint64_t now_ns)
+{
+	rift_sensor_usb_device *dev = (rift_sensor_usb_device *)device;
+	if (dev->stream_started)
+		rift_sensor_uvc_stream_retry(&dev->uvc_stream, now_ns);
 }
 
 void

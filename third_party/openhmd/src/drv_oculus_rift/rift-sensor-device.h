@@ -35,6 +35,10 @@ struct rift_sensor_device_funcs {
 	bool (*start) (rift_sensor_device *device, uint8_t min_frames, rift_sensor_device_frame_cb frame_cb, void *cb_data);
 	void (*stop) (rift_sensor_device *device);
 	void (*free) (rift_sensor_device *device);
+	/* Must return without waiting for callbacks, locks or device I/O. */
+	void (*request_stop) (rift_sensor_device *device);
+	/* Engine thread only, outside tracker/sensor locks. */
+	void (*retry) (rift_sensor_device *device, uint64_t now_ns);
 };
 
 struct rift_sensor_device {
@@ -45,6 +49,8 @@ struct rift_sensor_device {
 #define rift_sensor_device_start_video(d,min_frames,frame_cb,frame_cb_data) \
 		(d)->funcs->start((d), (min_frames), (frame_cb), (frame_cb_data))
 
+#define rift_sensor_device_request_stop(d) (d)->funcs->request_stop((d))
+#define rift_sensor_device_retry(d, now) (d)->funcs->retry((d), (now))
 #define rift_sensor_device_stop_video(d) (d)->funcs->stop((d))
 #define rift_sensor_device_free(d) (d)->funcs->free((d))
 

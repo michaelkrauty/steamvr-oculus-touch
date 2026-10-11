@@ -537,6 +537,9 @@ static void update_hmd(rift_hmd_t *priv)
 	bool got_a_msg = false;
 	uint64_t start = ohmd_monotonic_get(priv->ctx);
 
+	/* Independent of incoming radio/video data, including fully parked streams. */
+	rift_tracker_retry_video(priv->tracker_ctx,
+		ohmd_monotonic_conv(start, ohmd_monotonic_per_sec(priv->ctx), 1000000000));
 	update_hmd_outputs(priv, start);
 
 	/* cv1touch: wait briefly for the next radio report so a dedicated update thread wakes as

@@ -25,6 +25,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - First-time headset registration without an existing alignment file.
 - Concurrent alignment writes, stale controller inputs, and SIGPIPE on driver control sends.
 - USB camera shutdown deadlock that could stall daemon restarts.
+- Multi-camera teardown blocked by a peer's USB retry loop; fully parked streams now recover through bounded engine-side retries.
 - Camera allocation/startup failure cleanup and frame-buffer lifetime during shutdown.
 - Fixed-size cross-camera state, high-index camera aliasing, and camera queue starvation under load.
 - Out-of-range analog inputs after factory calibration drift; SteamVR output now stays within its normalized ranges.

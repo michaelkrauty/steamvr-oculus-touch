@@ -27,6 +27,8 @@ bool rift_tracker_frame_captured (rift_tracker_ctx *ctx, uint64_t local_ts, uint
 void rift_tracker_frame_release (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t frame_local_ts, rift_tracker_exposure_info *info, const char *source);
 
 void rift_tracker_free (rift_tracker_ctx *ctx);
+/* Engine thread only, outside sensor/tracker locks. */
+void rift_tracker_retry_video(rift_tracker_ctx *ctx, uint64_t now_ns);
 
 void rift_tracked_device_imu_update(rift_tracked_device *dev, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field);
 void rift_tracked_device_get_view_pose(rift_tracked_device *dev, posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel);

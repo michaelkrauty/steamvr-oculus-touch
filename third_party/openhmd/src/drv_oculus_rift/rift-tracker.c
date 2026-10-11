@@ -564,6 +564,13 @@ rift_tracker_frame_release (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t f
 	ohmd_unlock_mutex (ctx->tracker_lock);
 }
 
+void rift_tracker_retry_video(rift_tracker_ctx *ctx, uint64_t now_ns)
+{
+	if (ctx)
+		for (size_t i = 0; i < ctx->n_sensors; i++)
+			rift_sensor_retry(ctx->sensors[i], now_ns);
+}
+
 void
 rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 {
@@ -571,6 +578,11 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 
 	if (!tracker_ctx)
 		return;
+
+	/* Signal every stream before the first blocking drain. Sensor workers keep
+	 * their frame storage until each sensor's normal stop/join/free completes. */
+	for (i = 0; i < tracker_ctx->n_sensors; i++)
+		rift_sensor_request_stop(tracker_ctx->sensors[i]);
 
 	for (i = 0; i < tracker_ctx->n_sensors; i++) {
 		rift_sensor_ctx *sensor_ctx = tracker_ctx->sensors[i];

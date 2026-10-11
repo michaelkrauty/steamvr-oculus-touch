@@ -328,51 +328,17 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 		process_payload(stream, payload, payload_len);
 	}
 
-	/* Resubmit transfer. A submit fails transiently when the kernel cannot find the transfer's
-	 * contiguous buffer (usbfs kmallocs it on every submit) under memory pressure, and a transfer
-	 * given up on is gone for good: once a sensor's last one goes its video stops. A failed one
-	 * waits in parked[] for the next completion of a sibling still in flight, so the event thread,
-	 * which serves every sensor, does not sleep on it; only a stream's last transfer in flight,
-	 * with no sibling left to retry it, is retried here until it goes through */
+	/* Never wait inside a completion callback: libusb holds its context-wide
+	 * event-waiter lock, so retrying here can block every camera and teardown.
+	 * The engine update retries parked transfers even when none remain in flight. */
 	ret = libusb_submit_transfer(transfer);
-	if (ret >= 0) {
-		resubmit_parked(stream);
+	if (ret >= 0)
 		return;
-	}
-	if (ret == LIBUSB_ERROR_NO_DEVICE) {
-		stream->active_transfers--;
-		return;
-	}
-	int err = errno;
-	if (stream->active_transfers > 1) {
-		LOGW("Parked USB xfer: %s (%s)", libusb_error_name(ret), strerror(err));
+	if (ret != LIBUSB_ERROR_NO_DEVICE) {
+		LOGW("Parked USB xfer: %s", libusb_error_name(ret));
 		stream->parked[stream->n_parked++] = transfer;
-		stream->active_transfers--;
-		return;
 	}
-
-	for (i = 1; ; i++) {
-		/* Sleep 0.5ms between retries */
-		ohmd_sleep(0.0005);
-		if (!stream->video_running) {
-			/* Not resubmitting. Reduce transfer count */
-			stream->active_transfers--;
-			return;
-		}
-
-		ret = libusb_submit_transfer(transfer);
-		if (ret >= 0 || ret == LIBUSB_ERROR_NO_DEVICE)
-			break;
-	}
-
-	if (ret < 0) {
-		LOGE("Failed to resubmit USB after %d attempts: %s", i + 1, libusb_error_name(ret));
-		stream->active_transfers--;
-	}
-	else {
-		LOGW("Resubmitted the last USB xfer in flight after %d attempts (first failure: %s)", i + 1, strerror(err));
-		resubmit_parked(stream);
-	}
+	stream->active_transfers--;
 }
 
 int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
@@ -611,15 +577,32 @@ allocation_failed:
 	return -ENOMEM;
 }
 
+/* The engine thread owns stream lifetime; callbacks and maintenance serialize
+ * parked/active counts under libusb's event-waiter lock. No sensor/tracker lock
+ * is held by the caller, so callbacks may finish acquiring those locks. */
+void rift_sensor_uvc_stream_retry(rift_sensor_uvc_stream *stream, uint64_t now_ns)
+{
+	if (now_ns < stream->retry_after_ns)
+		return;
+	/* At most one retry batch per 10 ms (less than a 52 Hz camera period).
+	 * Failed batches stop at the first failure; no sleeps or unbounded retries. */
+	stream->retry_after_ns = now_ns + 10000000;
+	libusb_lock_event_waiters(stream->usb_ctx);
+	resubmit_parked(stream);
+	libusb_unlock_event_waiters(stream->usb_ctx);
+}
+
+void rift_sensor_uvc_stream_request_stop(rift_sensor_uvc_stream *stream)
+{
+	stream->video_running = false;
+}
+
 int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 {
 	int ret;
 
-	/* libusb holds its event-waiter lock while invoking iso_transfer_cb. Its last
-	 * transfer may be retrying a failed submit until video_running clears. Publish
-	 * stop before disabling the endpoint or acquiring that lock, otherwise each
-	 * thread waits for the other forever. video_running is atomic for this handoff. */
-	stream->video_running = false;
+	/* Nonblocking stop requests can be broadcast before any stream drains. */
+	rift_sensor_uvc_stream_request_stop(stream);
 
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, 0);
 	if (ret) {
