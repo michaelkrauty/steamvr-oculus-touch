@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! cv1touch: CLI for cv1touchd. Subcommands: status, haptic, record, rec-summary, pace, calibration,
 //! calibrate, consistency.

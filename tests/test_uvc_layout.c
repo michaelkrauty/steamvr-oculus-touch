@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* A sensor stream's isochronous transfers cover two frames' worth of packets: the USB thread can
  * stall that long (125 us per packet) before the controller runs out of queued transfers and every

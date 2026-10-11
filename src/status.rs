@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Text rendering of the live status board (`cv1touch status`).
 

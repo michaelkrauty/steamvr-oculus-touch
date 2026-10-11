@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 /* Real optional-debug ownership paths, with no PipeWire server or worker
  * threads. */
 #include "test_util.h"

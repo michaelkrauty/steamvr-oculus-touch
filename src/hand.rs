@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Converts one engine controller snapshot into the published shared-memory state: connection and
 //! standby detection, position-hold window, per-hand button mapping, capacitive touch hysteresis

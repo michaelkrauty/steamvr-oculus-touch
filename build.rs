@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Build the pinned native engine in Cargo's profile-specific output directory.
 use std::{

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Michael Krauty
+# Copyright 2026 michaelkrauty
 """Build and install cv1touch for the current user, or remove managed files."""
 
 import argparse

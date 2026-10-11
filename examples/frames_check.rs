@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! frames_check BASE [--png DIR S...]: for a capture recorded with frames and SteamVR's Touch poses
 //! (`eval-capture --free N --frames`), each frame our tracker had the Touch in: the LEDs projected

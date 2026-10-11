@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Safe wrapper over the vendored OpenHMD engine. Not Send: create and use it on one thread
 //! (OpenHMD does no locking with its auto-update thread disabled).

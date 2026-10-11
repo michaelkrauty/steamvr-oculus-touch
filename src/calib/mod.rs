@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Phase 3a calibration: camera-only wand bundle adjustment with gravity (spec "Calibration
 //! (jig-free)", sources 2 and 3). Poses are nalgebra isometries named `a_from_b`, mapping

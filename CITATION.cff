@@ -3,7 +3,7 @@ message: "If you use this software, please cite this repository."
 type: software
 title: "SteamVR Oculus Touch: Rift CV1 controllers for Linux SteamVR"
 authors:
-  - name: "Michael Krauty"
+  - name: "michaelkrauty"
 repository-code: "https://github.com/michaelkrauty/steamvr-oculus-touch"
 license: Apache-2.0
 keywords:

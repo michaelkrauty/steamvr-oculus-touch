@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 /* Exercise the real headset open/cleanup path when tracker construction fails.
  * All HID operations and tracker creation are synthetic; no devices are opened. */
 #define rift_tracker_new fake_tracker_new

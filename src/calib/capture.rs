@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Calibration input from a cv1touch recording (format v2): sensor intrinsics, controller LED
 //! models, per-exposure LED sightings grouped across the synchronised sensors, and each

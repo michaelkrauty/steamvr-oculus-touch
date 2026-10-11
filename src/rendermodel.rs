@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! The SteamVR CV1 Touch render models against the tracked LED model: SteamVR draws
 //! `oculus_cv1_controller_left/right` at the device pose, the engine tracks the factory LED frame.

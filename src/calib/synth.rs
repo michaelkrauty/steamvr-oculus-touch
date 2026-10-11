@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Deterministic synthetic calibration scenes for tests: three wall-mounted sensors near the
 //! ceiling looking at the play space (two upside down, as mounted), a Touch-like LED ring, noisy

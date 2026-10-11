@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Joint calibration from a rig capture: the Touches fixed to a Lighthouse-tracked Index
 //! controller and held still in many orientations (`cv1touch eval-capture --free`). In every hold

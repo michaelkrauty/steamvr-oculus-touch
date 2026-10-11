@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Michael Krauty
+# Copyright 2026 michaelkrauty
 # Build and run hardware-independent Rust and native regressions.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

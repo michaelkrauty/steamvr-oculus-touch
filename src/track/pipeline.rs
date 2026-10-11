@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Everything between the engine's raw inputs and the trackers' outputs: clock fits, exposure
 //! timing, frame queueing and the per-controller trackers. The daemon feeds it live; `replay`

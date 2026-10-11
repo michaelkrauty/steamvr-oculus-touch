@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Velocities shaped for SteamVR's prediction. SteamVR extrapolates a pose to the time a frame is
 //! shown (some 15-35 ms after the IMU sample) at constant velocity: its docs say it ignores the

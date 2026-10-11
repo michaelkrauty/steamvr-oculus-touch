@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Accuracy and latency against Lighthouse truth. A Touch is fixed to an Index controller (a jig)
 //! and the Index pose is sampled from SteamVR at high rate while the daemon records. The poses the

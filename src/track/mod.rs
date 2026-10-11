@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Phase 4 tracker: a per-controller error-state Kalman filter fusing the IMU with every sensor's
 //! LED blobs by reprojection (design: docs/notes/phase4-tracker-design.md). Poses are nalgebra

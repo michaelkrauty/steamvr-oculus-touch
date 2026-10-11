@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Fixed (calibrated) sensor poses are looked up by exact serial; orientation is normalised. */
 #include <string.h>

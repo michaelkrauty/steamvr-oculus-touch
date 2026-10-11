@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Re-poses a sensor against the tracker (see `replay::Options::probe_sensor`). A sensor that has
 //! moved since calibration disagrees with the others by a pixel or more; the controller poses

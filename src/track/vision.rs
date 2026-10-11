@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! One sensor frame against one controller: LED projection with Jacobians, blob association by
 //! Mahalanobis gating under the prior, and the robust update that fuses the matched blobs.

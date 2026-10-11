@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Cross-sensor consistency of a recording under a calibration. In every exposure where two
 //! calibrated sensors each found a controller's camera-relative pose, each implies a world pose;

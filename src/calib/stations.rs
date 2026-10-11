@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Registration from the Lighthouse base stations. The Rift sensors catch the stations' laser
 //! sweeps as brief blobs at fixed image positions; SteamVR knows each station's pose in its raw

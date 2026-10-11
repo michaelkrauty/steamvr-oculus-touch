@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Device clock -> host CLOCK_MONOTONIC as a line fitted to the lower envelope of (device stamp,
 //! host receive time) pairs. Every report arrives after a variable transport delay, so the fastest

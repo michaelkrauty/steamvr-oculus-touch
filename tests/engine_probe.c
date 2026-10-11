@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Live hardware check for the cv1touch engine API. Not a unit test: needs the headset (USB),
  * Rift sensors and both Touch controllers awake.

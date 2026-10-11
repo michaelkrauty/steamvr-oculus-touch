@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Laser-sweep streaks must not become LED candidates: blobwatch keeps round LED-like blobs and
  * drops long thin ones (seen on a sensor with a strong view of Lighthouse sweeps). */

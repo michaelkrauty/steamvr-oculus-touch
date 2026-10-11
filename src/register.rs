@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Quick registration of the cv1touch world to Lighthouse raw space (spec "Quick registration
 //! (Phase 2)"): the user holds a Touch against a Lighthouse-tracked controller and moves the pair.

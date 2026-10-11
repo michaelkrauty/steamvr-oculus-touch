@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Explicit input calibration in factory-normalized coordinates; raw values stay available
 //! to the calibration wizard. Stored identities bind each hand to its physical controller.

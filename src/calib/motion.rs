@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Gravity from motion. While a controller is tracked continuously, its camera-measured positions
 //! must match its accelerometer integrated twice, rotated by its orientation, minus gravity:

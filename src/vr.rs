@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Minimal OpenVR client (a background application) over the C API, loaded at runtime from
 //! libopenvr_api.so: device list, raw-universe poses and properties. Used by `cv1touch register`

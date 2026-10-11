@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! One controller's tracker. The filter keeps a short history of states so that a sensor frame,
 //! which arrives tens of milliseconds after its exposure, is applied at the exposure time and the

@@ -14,6 +14,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Original-code copyright notices and software citation identify the maintainer by GitHub username.
 - Linux CI uses a dedicated runner for trusted private-repository changes and GitHub-hosted runners for public repositories and fork pull requests.
 - Project and repository renamed to SteamVR Oculus Touch (`steamvr-oculus-touch`); command names and configuration paths remain compatible.
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Factory IMU calibration: the offset must be subtracted (upstream computed raw - offset into a
  * variable it then overwrote, so offsets were never applied), then the 3x3 matrix applied. */

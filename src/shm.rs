@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Shared-memory transport between cv1touchd (single writer) and readers (SteamVR driver, tools).
 //! Layout: common/cv1touch_shm.h via bindgen. Hand slots and the sensor block are seqlock-protected;

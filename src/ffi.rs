@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Raw bindings (bindgen) to OpenHMD, the cv1touch engine extensions and the shared-memory ABI.
 #![allow(

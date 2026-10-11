@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Bounded camera ingress. Each admitted sensor keeps its two newest frames, and
 //! round-robin service prevents a fast camera from displacing a slower camera.

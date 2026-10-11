@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! The world's up from static holds. Over holds in many orientations a Touch's accelerometer
 //! calibrates itself (every hold reads the same |g|), and then measures the direction of gravity

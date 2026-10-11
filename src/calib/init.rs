@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Initial sensor poses from the engine's per-frame camera-relative poses. When two sensors see a
 //! controller in the same exposure, cam_a_from_obj * (cam_b_from_obj)^-1 is one sample of their

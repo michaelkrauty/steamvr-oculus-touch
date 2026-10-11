@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Boundary and invalid-scalar regressions for nxjson's UTF-8 encoder. */
 #include <stdint.h>

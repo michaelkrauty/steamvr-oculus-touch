@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Error-state Kalman filter for one controller: prediction from each IMU sample, and an iterated,
 //! robust update from pixel residuals. No data association here (see `vision`).

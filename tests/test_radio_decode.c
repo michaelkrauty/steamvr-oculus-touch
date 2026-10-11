@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* A Touch message decoded the way the engine decodes it (rift-cv1touch-touch.h), which the radio
  * thread's decoder repeats on its own copy of the controller's state: sample timing (stamped with

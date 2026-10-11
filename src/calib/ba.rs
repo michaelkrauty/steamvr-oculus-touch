@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Bundle adjustment over sensor poses and per-sample controller poses, all in the reference
 //! sensor's frame (fixed at identity: no gauge freedom; metric scale from the factory LED model).

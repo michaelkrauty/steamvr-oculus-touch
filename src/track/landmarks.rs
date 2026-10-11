@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Landmarks: static infrared sources each sensor sees at fixed pixels (the Lighthouse base
 //! stations' laser sweeps, any other emitter that stays put). A sensor that is knocked moves all

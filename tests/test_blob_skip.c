@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* The dark-pixel skip (16 pixels at a time) must find exactly the blobs the pixel-by-pixel scan
  * finds: random frames with blobs, noise up to and around the threshold, and widths that are not

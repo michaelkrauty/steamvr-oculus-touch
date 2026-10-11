@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Controller clock → host CLOCK_MONOTONIC. Each observation satisfies host = device + offset + delay
 //! with delay ≥ 0, so the minimum of (host − device) over a sliding two-window span estimates the

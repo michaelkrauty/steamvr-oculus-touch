@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! cv1touchd: owns the Rift CV1 headset radio and sensors through the vendored OpenHMD engine and
 //! publishes both Touch controllers' state to shared memory.

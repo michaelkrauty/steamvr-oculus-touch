@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Each controller's IMU biases, remembered across daemon restarts. The accelerometer's take tens
 //! of seconds of varied orientation to learn from scratch (Touch R's reads 0.45 m/s^2 high on one

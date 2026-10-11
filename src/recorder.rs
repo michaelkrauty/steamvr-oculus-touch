@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Session recordings, format v2 (little-endian).
 //! File header (32 B): magic "CV1TREC\0", u32 version, u32 header_size = 32, u64 start_host_ns, u64 0.

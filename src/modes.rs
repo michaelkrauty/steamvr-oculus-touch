@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Tracking modes and the engine options each implies. Provisional: Phase 1 runtime placement.
 //! Capture: no placement, every sensor only observes (calibration capture). Calibrated: fixed

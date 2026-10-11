@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Alignment of the tracked controllers with SteamVR: the quick Lighthouse registration
 //! (registration.json, from `cv1touch register`) and the render-model offsets

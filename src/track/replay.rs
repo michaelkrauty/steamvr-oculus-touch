@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Offline replay of a cv1touchd recording through the tracking pipeline, in the order the daemon
 //! wrote the records: a frame's record is written after its image processing, so frames reach the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Controller orientation from the gyro: a body-frame track per IMU stream, and a filter that keeps
 //! an engine pose only when the controller's other poses in the same sensor agree with it through

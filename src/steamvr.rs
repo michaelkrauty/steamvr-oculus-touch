@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Installing the cv1touch SteamVR driver: the driver directory (manifest + library), its
 //! registration with SteamVR's `vrpathreg`, and `activateMultipleDrivers` in steamvr.vrsettings

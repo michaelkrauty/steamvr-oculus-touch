@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Exercise the real callback/stop functions with libusb's callback lock contract.
  * No USB devices are opened. Failed resubmits park five transfers; the sixth retries

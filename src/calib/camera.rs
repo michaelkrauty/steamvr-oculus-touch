@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Rift CV1 sensor camera model: OpenCV fisheye (Kannala-Brandt, k1..k4, zero skew) with the
 //! factory intrinsics the engine reads from each sensor's flash.

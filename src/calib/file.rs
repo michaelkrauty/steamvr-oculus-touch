@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! calibration.json: each sensor's world pose (camera -> world, OpenCV camera axes) plus residuals
 //! and provenance. Loaded by cv1touchd at startup and on `calibration load`.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* cv1touch shared-memory ABI between cv1touchd (single writer) and its readers (SteamVR driver,
  * tools). All host timestamps are CLOCK_MONOTONIC ns. This header is the single definition:

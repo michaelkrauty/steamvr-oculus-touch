@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! A Touch controller's factory IMU position. The engine reads each controller's calibration JSON
 //! over the radio and caches it in OpenHMD's config directory (rift-touch-config-<hash>.bin); the

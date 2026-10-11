@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 #include <stdlib.h>
 static int realloc_calls, fail_realloc;
 static void *test_realloc(void *p, size_t n) {

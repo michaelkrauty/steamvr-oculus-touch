@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Recording analysis for live verification: per-window connection/position fractions,
 //! receive→publish latency, and standby (connected→disconnected) detection delays.

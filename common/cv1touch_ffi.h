@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 /* Umbrella header for Rust bindgen: OpenHMD, the cv1touch engine extensions and the shm ABI. */
 #include <openhmd.h>

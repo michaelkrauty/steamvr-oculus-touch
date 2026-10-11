@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Michael Krauty
+// Copyright 2026 michaelkrauty
 
 //! Calibration solve: confident engine sightings -> gyro-consistency filter -> robust initial
 //! poses -> vision-only bundle adjustment with a tightening rejection schedule -> gravity from the
