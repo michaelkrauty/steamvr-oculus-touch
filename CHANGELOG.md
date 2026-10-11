@@ -9,7 +9,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Development `cv1touch setup` guide for camera, gravity, render, input, and headset-registration stages, with a private resumable journal and dependency-aware reuse.
 - Read-only `setup --check` and `setup --check --json` reports; explicit visual-verification/adoption of legacy calibration without discarding its files.
 - Controller-button and haptic checks before headset registration, with a button-started haptic countdown and B on the right controller to cancel the capture.
-- Headset registration ends its recording by itself once the person has turned, nodded and tilted enough, and stops it with three quick buzzes when a controller turns on the headset by more than about 3 degrees within a second (or on any other problem); the retry prompt, or `setup --no-slip-check`, turns the slip check off.
+- Headset registration ends its recording by itself once the person has turned, nodded and tilted enough, and stops it with three quick haptic pulses when a controller turns on the headset by more than about 3 degrees within a second (or on any other problem); the retry prompt, or `setup --no-slip-check`, turns the slip check off.
 - `cv1touchd` status names its shared-memory segment (`shm`).
 
 ### Changed
@@ -17,7 +17,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Guided input calibration captures both hands in four shared phases, reducing timed capture to 16 seconds while retaining freshness, identity, travel, and save/reload checks.
 - An accepted fresh guided camera solve completes gravity alignment from the same motion capture; separate still-hold gravity refinement remains available.
 - Guided input calibration precedes headset registration, leaving headset movement as the final physical setup step.
-- The setup guide reads like a checklist: plain stage names (sensor positions, floor level, controller model, buttons and sticks, headset alignment), checks explained only when they fail, Enter/`q` (and `k` to keep unverified saved settings) instead of typed words, one result line per stage with solver output in a log, and an immediate retry after a failure. Captures start with A on the right controller as well as Enter, timed steps are marked by a controller buzz and a speaker beep, and input calibration records each step as soon as both hands are in position.
+- The setup guide reads like a checklist: plain stage names (sensor positions, floor level, controller model, buttons and sticks, headset alignment), checks explained only when they fail, Enter/`q` (and `k` to keep unverified saved settings) instead of typed words, one result line per stage with solver output in a log, and an immediate retry after a failure. Captures start with A on the right controller as well as Enter, timed steps are marked by a controller haptic pulse and a speaker beep, and input calibration records each step as soon as both hands are in position.
 
 ### Fixed
 

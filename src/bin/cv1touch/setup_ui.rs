@@ -264,11 +264,11 @@ pub(super) fn result_summary(stage: Stage, installed: Option<&serde_json::Value>
             if mm.is_empty() {
                 "done".into()
             } else {
-                format!("fit {}", mm.join(", "))
+                format!("matches within {}", mm.join(", "))
             }
         }
         Stage::Registration => match (num(&v["pos_rms_mm"]), num(&v["rot_rms_deg"])) {
-            (Some(mm), Some(deg)) => format!("fit {mm:.1} mm, {deg:.2}°"),
+            (Some(mm), Some(deg)) => format!("lined up within {mm:.1} mm, {deg:.2}°"),
             _ => "done".into(),
         },
         Stage::Gravity => "level".into(),
@@ -454,12 +454,12 @@ mod tests {
         let registration = serde_json::json!({"pos_rms_mm": 1.94, "rot_rms_deg": 0.234});
         assert_eq!(
             result_summary(Stage::Registration, Some(&registration)),
-            "fit 1.9 mm, 0.23°"
+            "lined up within 1.9 mm, 0.23°"
         );
         let render = serde_json::json!({"hands": [{"hand": "left", "rms_mm": 0.41}, {"hand": "right", "rms_mm": 0.38}]});
         assert_eq!(
             result_summary(Stage::Render, Some(&render)),
-            "fit left 0.4 mm, right 0.4 mm"
+            "matches within left 0.4 mm, right 0.4 mm"
         );
         assert_eq!(result_summary(Stage::Camera, None), "done");
         assert_eq!(

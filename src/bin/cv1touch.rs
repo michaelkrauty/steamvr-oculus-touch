@@ -1610,7 +1610,7 @@ fn start_line(line: &str) -> Option<bool> {
 }
 
 /// The setup guide's introduction to input calibration.
-const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and stick travels, so SteamVR gets their full range.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
+const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
 
 /// The four input calibration steps, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

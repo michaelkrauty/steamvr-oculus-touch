@@ -587,11 +587,11 @@ fn timed_window(seconds: u64) -> Result<(), String> {
 
 const START: &str = "Press A on the right controller (or Enter) to start.";
 
-const CAMERA_MOTION: &str = "The sensors work out where they are by watching the controllers' LEDs; a controller seen by two\nsensors at once ties those two together. For 60 seconds, until the double beep, wave both controllers\nslowly through the whole play space: high and low, near and far, twisting your wrists, so every\nsensor sees them, often two at once.";
+const CAMERA_MOTION: &str = "This works out where each of your Rift sensors is in the room. The sensors find their places by\nwatching the lights in the controllers' rings, and moments when two sensors see a controller at\nonce matter most. For 60 seconds, until the double beep, slowly wave both controllers around\nthe whole play area: high and low, close to each sensor and far from it, turning your wrists so\nthe rings face every way.";
 
-const GRAVITY_HOLDS: &str = "A controller's accelerometer shows which way is down, but only while it is held still, and holds\nin many orientations separate that from the accelerometer's own error. The sensors must see the\nrings, to know which way each controller faces.\nHold both controllers still in 12 different orientations, tilting AND rolling them between holds.\nFor each: get still, press A (or Enter), and stay still until the double beep (3 s).";
+const GRAVITY_HOLDS: &str = "This finds which way is down, so the floor in VR is level. Each controller can feel gravity, but\nonly while it is held perfectly still, and only accurately when that is done in many different\npositions. Keep the rings where the sensors can see them.\nDo this 12 times: turn and tilt both controllers into a new position, hold them still, press A\n(or Enter), and keep them still until the double beep (3 seconds).";
 
-const RENDER_WAKE: &str = "Each controller reports where its LEDs sit; the guide fits SteamVR's 3D model of the\ncontroller to them. Nothing to aim or hold: keep both controllers awake (move them now and\nthen) for 5 seconds, until the double beep.";
+const RENDER_WAKE: &str = "This lines up the controller you see in VR with the real one: each controller reports where its\nlights are, and the guide moves SteamVR's 3D model to match. Nothing to aim or hold: just keep\nboth controllers awake (move them a little now and then) for 5 seconds, until the double beep.";
 
 fn timed_capture(
     stage: Stage,
@@ -646,7 +646,7 @@ impl Drop for RestoreCamera {
 
 fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     if interrupted() {
-        return Err("setup interrupted; capture retained and no fit installed".into());
+        return Err("setup interrupted; your previous calibration is unchanged".into());
     }
     let ids = inspection
         .identities
@@ -657,7 +657,10 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     PairedInputPhase::new([0, 0]).observe(&raw, ids, shm::now_ns())?;
     let status = read_status().ok_or("daemon unavailable after capture")?;
     if inspection.generation.is_none() || status["generation"].as_u64() != inspection.generation {
-        return Err("daemon restarted during capture; recording retained, no fit installed".into());
+        return Err(
+            "cv1touchd restarted during the recording; your previous calibration is unchanged"
+                .into(),
+        );
     }
     if status["recording"] != false {
         return Err("recording is still active; finish it before fitting".into());
@@ -666,7 +669,7 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
         let now = setup::fingerprint(&file::default_path()).map_err(|e| e.to_string())?;
         if &now != before {
             return Err(
-                "camera calibration changed during capture; recording retained, no fit installed"
+                "the sensor calibration changed during the recording; your previous calibration is unchanged"
                     .into(),
             );
         }
@@ -683,13 +686,10 @@ fn verify_fitted_dependencies(
         return Err("daemon or controller identities changed during fitting; stage remains incomplete, previous backups retained".into());
     }
     if stage == Stage::Render && after.snapshot.render_sources != before.snapshot.render_sources {
-        return Err(
-            "render source meshes changed during fitting; stage remains incomplete, repeat the fit"
-                .into(),
-        );
+        return Err("SteamVR's controller model files changed meanwhile; try again".into());
     }
     if stage == Stage::Registration && after.snapshot.camera != before.snapshot.camera {
-        return Err("camera world changed during registration fitting; stage remains incomplete, repeat the fit".into());
+        return Err("the sensor calibration changed meanwhile; try again".into());
     }
     Ok(())
 }
@@ -927,29 +927,34 @@ impl ButtonEdges {
 }
 
 const REGISTRATION_PREPARATION: &str =
-    "Headset alignment: wearing the headset, you hold the controllers against it and turn, nod
-and tilt your head for about a minute, so the fit learns where the controllers sit on the
-headset. Read all of this now; you won't see the screen with the headset on.
+    "Headset alignment: this lines up the controllers' tracking with the headset's, so in VR the
+controllers appear exactly where your hands are. You'll wear the headset and hold both
+controllers against it while you turn around and move your head, for about a minute.
+Read all of this now: you won't see this screen with the headset on.
   1. Put on the headset (SteamVR running).
-  2. Press one controller firmly against each side of the headset, left on the left, rings
-     and the headset's sensors uncovered. Keep them exactly there until the end: if one
-     moves, the fit is wrong.
-  3. Press A (right thumb). 10 buzzes follow, one a second: time to settle your grip after
-     the press. Nothing is recorded yet.
-  4. Double buzz: recording starts. Turn around in place:
-     two full turns one way, then two the other way, about 5 to 10 seconds per turn,
-     until a single buzz.
-  5. Then nod (look up and down) and tilt (ear toward each shoulder) as far as is
-     comfortable, a few times each, until a long buzz: done, take off the headset.
-Three quick buzzes instead: the recording stopped early (a controller slipped, B was pressed,
-or something went wrong); take off the headset and read the screen. B (right controller)
-cancels at any time.";
+  2. Press the real controllers firmly against the outside of the headset: the left controller
+     against the left side, the right controller against the right side. Keep your hands off
+     the controllers' rings and the headset's sensors. From now until the end, the controllers
+     must not slide or twist on the headset: if one does, the calibration fails and you start
+     this step again.
+  3. Press A on the right controller with your thumb. You'll feel a 10-second countdown via
+     controller haptic pulses, one a second. Nothing is recorded yet: use the 10 seconds to
+     press both controllers firmly back into place, in case pressing A moved them.
+  4. Two quick pulses: recording starts. Slowly turn your whole body around on the spot:
+     two full circles to your left, then two to your right, 5 to 10 seconds per circle.
+     Keep turning until you feel a single pulse.
+  5. Then look up and down, and tilt your head toward each shoulder, as far as is comfortable,
+     a few times each, until you feel one long pulse: done. Take off the headset.
+If you feel three quick pulses instead, the recording stopped early (a controller slid on the
+headset, you pressed B, or something else went wrong): take off the headset and read this
+screen. B on the right controller cancels at any time. What you see in the headset during this
+step doesn't matter.";
 
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
 fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
     if interrupted() {
-        return Err("registration interrupted; no fit installed".into());
+        return Err("interrupted; your previous calibration is unchanged".into());
     }
     let reply = control::request(
         &control::socket_path(),
@@ -971,9 +976,7 @@ fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
     )
     .map_err(|e| e.to_string())?;
     if before.generation.is_none() || status["generation"].as_u64() != before.generation {
-        return Err(
-            "daemon restarted during registration preparation or capture; no fit installed".into(),
-        );
+        return Err("cv1touchd restarted; your previous calibration is unchanged".into());
     }
     let sensors = status::sensors_from_status(&status)?;
     if status["mode"] != "calibrated"
@@ -983,14 +986,16 @@ fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
         || sensors.iter().map(shm::serial_str).collect::<BTreeSet<_>>() != before.sensors
     {
         return Err(
-            "camera engine or sensor placement changed during registration; no fit installed"
+            "the sensors or their calibration changed; your previous calibration is unchanged"
                 .into(),
         );
     }
     if before.snapshot.camera
         != Artifact::Valid(setup::fingerprint(&file::default_path()).map_err(|e| e.to_string())?)
     {
-        return Err("camera world changed during registration; no fit installed".into());
+        return Err(
+            "the sensor calibration changed; your previous calibration is unchanged".into(),
+        );
     }
     Ok(raw)
 }
@@ -1011,10 +1016,7 @@ fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
         .buttons
         .is_some_and(|buttons| buttons & cv1touch::hand::BTN_B != 0)
     {
-        return Err(
-            "registration cancelled with B on the right controller; capture retained if started, no fit installed"
-                .into(),
-        );
+        return Err("cancelled with B; your previous calibration is unchanged".into());
     }
     Ok(raw)
 }
@@ -1111,7 +1113,7 @@ fn confirm_registration_controls_with(
         human_action(&format!("  Press {name}."));
         press(hand, button, name)?;
         buzz(hand)?;
-        human_action(&format!("  Felt the buzz? Press {key} again."));
+        human_action(&format!("  Felt the pulse? Press {key} again."));
         press(hand, button, name)?;
     }
     Ok(())
@@ -1232,7 +1234,7 @@ impl<'a> RegistrationFeedback<'a> {
         self.edges.observe(&raw, ids, shm::now_ns())?;
         match self.capture.cue() {
             Cue::Slipped(hand, deg) => Err(format!(
-                "the {} controller slipped against the headset ({deg:.0}°); no fit installed",
+                "the {} controller slid on the headset (it turned {deg:.0}°); your previous calibration is unchanged",
                 ["left", "right"][hand]
             )),
             Cue::Turned => registration_buzz(1, 0.25, 160., 0.65).map(|()| false),
@@ -1394,7 +1396,7 @@ fn run_stage(
                 || {
                     // the recording reads the controllers' poses: fail now, not after the countdown
                     touch_reader()?;
-                    human_action("Button check (B on the right controller cancels at any point):");
+                    human_action("Button and pulse check: with the headset on you'll press A and go by haptic pulses, so first\nmake sure both work. B on the right controller cancels at any point.");
                     confirm_registration_controls_with(
                         |hand, button, name| wait_preparation_press(inspection, hand, button, name),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
@@ -1441,7 +1443,7 @@ fn run_stage(
                         RegistrationFeedback::new(inspection, SLIP_CHECK.load(Ordering::Relaxed));
                     let captured = capture_free_named_with_feedback(
                         150,
-                        "Recording: two turns one way, two the other; after the single buzz, nod and tilt until the long buzz. B cancels.",
+                        "Recording: two circles left, two right; after the single pulse, look up and down and tilt your head until the long pulse. B cancels.",
                         false,
                         Some(&base),
                         Some(&mut feedback),
@@ -1449,7 +1451,7 @@ fn run_stage(
                     SLIPPED.store(feedback.capture.slipped(), Ordering::Relaxed);
                     captured.map_err(|code| {
                         feedback.error.take().unwrap_or_else(|| {
-                            format!("headset capture failed ({code}); capture retained, no fit installed")
+                            format!("the recording failed ({code}); your previous calibration is unchanged")
                         })
                     })?;
                     Ok((rec, base))
@@ -1474,7 +1476,7 @@ fn run_stage(
         return Err("interrupted; earlier settings and the capture are kept".into());
     }
     if code != 0 {
-        return Err(log.failure("the fit was rejected; earlier settings and the capture are kept"));
+        return Err(log.failure("the calibration failed; your previous calibration is unchanged"));
     }
     if matches!(stage, Stage::Camera | Stage::Gravity) {
         wait_reload(inspection, "calibrated")?;
@@ -1854,14 +1856,23 @@ mod tests {
         raw.hands[0].received_host_ns -= 1;
         assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
     }
+    /// `text` with its line breaks and indents as single spaces.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn every_timed_step_says_what_it_measures_and_when_it_ends() {
         for (text, why) in [
-            (CAMERA_MOTION, "work out where they are"),
-            (GRAVITY_HOLDS, "which way is down"),
-            (RENDER_WAKE, "3D model"),
-            (INPUTS_GUIDE, "how far each trigger, grip and stick travels"),
+            (CAMERA_MOTION, "where each of your Rift sensors is"),
+            (GRAVITY_HOLDS, "so the floor in VR is level"),
+            (
+                RENDER_WAKE,
+                "lines up the controller you see in VR with the real one",
+            ),
+            (INPUTS_GUIDE, "a full pull reads as a full pull"),
         ] {
+            let text = one_line(text);
             assert!(text.contains(why), "{text}");
             assert!(text.contains("double beep"), "{text}");
         }
@@ -1873,29 +1884,35 @@ mod tests {
     #[test]
     fn headset_instructions_say_everything_before_the_headset_goes_on() {
         // once the headset is on the screen is out of sight: what to hold, when, how to move,
-        // what each buzz means and why, and how it ends must all be read beforehand
+        // what each pulse means and why, and how it ends must all be read beforehand, in plain
+        // words for someone who has never calibrated anything
         for needed in [
-            "won't see the screen",
-            "against each side",
-            "10 buzzes",
-            "settle your grip",
+            "won't see this screen",
+            "in VR the controllers appear exactly where your hands are",
+            "real controllers",
+            "the calibration fails",
+            "10-second countdown via controller haptic pulses",
             "Nothing is recorded yet",
-            "Double buzz: recording starts",
-            "two full turns one way, then two the other way",
-            "seconds per turn",
-            "single buzz",
-            "nod (look up and down)",
-            "tilt (ear toward each shoulder)",
-            "long buzz: done",
-            "Three quick buzzes",
-            "slipped",
+            "Two quick pulses: recording starts",
+            "two full circles to your left, then two to your right",
+            "seconds per circle",
+            "single pulse",
+            "look up and down",
+            "tilt your head toward each shoulder",
+            "one long pulse: done",
+            "three quick pulses",
             "cancels at any time",
+            "What you see in the headset during this step doesn't matter",
         ] {
-            assert!(REGISTRATION_PREPARATION.contains(needed), "{needed}");
+            assert!(
+                one_line(REGISTRATION_PREPARATION).contains(needed),
+                "{needed}"
+            );
         }
-        // nothing in this step is measured while still: asking for stillness only raises the
-        // question of why
-        assert!(!REGISTRATION_PREPARATION.contains("still"));
+        // jargon, and asking for stillness nothing here measures
+        for vague in ["fit", "settle", "grip", "still", "buzz"] {
+            assert!(!REGISTRATION_PREPARATION.contains(vague), "{vague}");
+        }
         assert!(!countdown_line(3).contains("still"));
         assert_eq!(countdown_line(3), "\r  recording starts in  3 s ");
         // it finishes by itself: pressing anything while holding the controllers to the
