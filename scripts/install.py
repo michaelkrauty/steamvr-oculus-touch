@@ -55,7 +55,7 @@ def service_text(binary):
     executable = str(binary).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     return (
         "[Unit]\nDescription=Rift CV1 Touch controller tracking\n"
-        "Documentation=https://github.com/michaelkrauty/cv1touch\n\n"
+        "Documentation=https://github.com/michaelkrauty/steamvr-oculus-touch\n\n"
         f'[Service]\nExecStart=:"{executable}"\n'
         "Restart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n"
     )

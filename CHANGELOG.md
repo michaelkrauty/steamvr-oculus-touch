@@ -11,6 +11,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Pinned OpenVR SDK, attributed modified OpenHMD source, build and test automation.
 - Guided per-controller input calibration for trigger/grip endpoints and thumbstick centers/full travel, with live reload and factory reset.
 
+### Changed
+
+- Project and repository renamed to SteamVR Oculus Touch (`steamvr-oculus-touch`); command names and configuration paths remain compatible.
+
 ### Fixed
 
 - Installation and runtime dependencies on a developer's checkout and CPU topology.

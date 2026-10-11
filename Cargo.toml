@@ -5,9 +5,9 @@ edition = "2021"
 rust-version = "1.85"
 publish = false
 license = "Apache-2.0"
-repository = "https://github.com/michaelkrauty/cv1touch"
+repository = "https://github.com/michaelkrauty/steamvr-oculus-touch"
 readme = "README.md"
-description = "Rift CV1 Touch controller tracking daemon and tools"
+description = "SteamVR Oculus Touch: Rift CV1 controller tracking daemon and tools"
 
 [dependencies]
 libc = "0.2"

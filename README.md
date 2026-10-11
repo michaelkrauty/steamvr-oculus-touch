@@ -1,8 +1,8 @@
-# cv1touch
+# SteamVR Oculus Touch
 
 Use first-generation Oculus Rift CV1 Touch controllers in SteamVR on Linux, without the Oculus runtime.
 
-cv1touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
+SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
 
 **Status:** early release, tested on one Linux installation with one left/right controller pair and four CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. This project is independent of Meta, Oculus, and Valve.
 
@@ -21,8 +21,8 @@ This repository supplies controllers, not a CV1 display/headset driver. Sandboxe
 Quit SteamVR before installing. Install the build dependencies from [setup](docs/setup.md#build-dependencies), then:
 
 ```sh
-git clone https://github.com/michaelkrauty/cv1touch.git
-cd cv1touch
+git clone https://github.com/michaelkrauty/steamvr-oculus-touch.git
+cd steamvr-oculus-touch
 python3 scripts/install.py
 ```
 
@@ -46,7 +46,7 @@ The initial doctor check reports missing calibration/alignment until setup is co
 - [Validation and measurement limits](docs/validation.md)
 - [Contributing](CONTRIBUTING.md)
 
-Run `cv1touch --help` for the full command list. You can run the binaries directly, use a custom installation prefix, control the daemon over its local socket, and replay recordings offline. Service management is optional.
+The command-line tools are named `cv1touch` and `cv1touchd`. Run `cv1touch --help` for the full command list. You can run the binaries directly, use a custom installation prefix, control the daemon over its local socket, and replay recordings offline. Service management is optional.
 
 ## Limitations
 
@@ -54,4 +54,4 @@ Tracking needs camera visibility. Occlusion, too few visible LEDs, or insufficie
 
 ## License and credits
 
-Original cv1touch work is available under the [Apache License 2.0](LICENSE). Vendored components retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). In particular, this project builds on the substantial CV1 acquisition and tracking work in [OpenHMD](https://github.com/OpenHMD/OpenHMD) and [Jan Schmidt's OpenHMD fork](https://github.com/thaytan/OpenHMD/tree/rift-kalman-filter), and uses Valve's [OpenVR SDK](https://github.com/ValveSoftware/openvr). SteamVR's installed profiles and render models are used at runtime and are not redistributed.
+Original SteamVR Oculus Touch work is available under the [Apache License 2.0](LICENSE). Vendored components retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). In particular, this project builds on the substantial CV1 acquisition and tracking work in [OpenHMD](https://github.com/OpenHMD/OpenHMD) and [Jan Schmidt's OpenHMD fork](https://github.com/thaytan/OpenHMD/tree/rift-kalman-filter), and uses Valve's [OpenVR SDK](https://github.com/ValveSoftware/openvr). SteamVR's installed profiles and render models are used at runtime and are not redistributed.
