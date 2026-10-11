@@ -5271,10 +5271,13 @@ mod tests {
         let mut timestamp = 1_000_000_000;
         for phase_index in 0..4 {
             let mut phase = PairedInputPhase::new(last);
-            for i in 0..fixtures[0][phase_index].len() {
+            for (left, right) in fixtures[0][phase_index]
+                .iter()
+                .zip(&fixtures[1][phase_index])
+            {
                 timestamp += 10;
                 let mut readings = RawInputs {
-                    hands: std::array::from_fn(|hand| fixtures[hand][phase_index][i].clone()),
+                    hands: [left.clone(), right.clone()],
                 };
                 for (hand, sample) in readings.hands.iter_mut().enumerate() {
                     sample.received_host_ns = timestamp + hand as u64;
