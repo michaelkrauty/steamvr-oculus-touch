@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
-    # Persistent private runner: execute only this repository's own branches.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Scheduling only: remove persistent runners before publication (CONTRIBUTING.md).
+    if: github.event.repository.private == true && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, Linux, X64, steamvr-oculus-touch]
     timeout-minutes: 60
     strategy:
@@ -40,10 +40,10 @@ jobs:
       - name: Build and test
         run: scripts/check.sh
 
-  check-fork:
-    # Fork code must never execute on the persistent private runner.
+  check-hosted:
+    # Public repositories and fork PRs use disposable GitHub-hosted runners.
     # Hosted capacity is required; an unavailable hosted job remains visibly pending/failed.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    if: github.event.repository.private != true || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
