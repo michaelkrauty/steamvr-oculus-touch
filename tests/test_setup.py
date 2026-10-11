@@ -284,6 +284,14 @@ class SetupTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
+    def test_guide_does_not_claim_completion_while_the_daemon_ignores_the_saved_setup(self):
+        self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        self.loaded_configuration = False
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("not using the saved setup", output)
+        self.assertNotIn("Saved setup is complete", output)
+
     def test_pending_engine_reload_blocks_capture_despite_advancing_old_streams(self):
         directory = self.fixtures()
         self.terminal_guide("keep\n" * 4)

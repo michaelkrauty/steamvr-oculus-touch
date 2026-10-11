@@ -308,6 +308,8 @@ fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) ->
 }
 
 fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
+    // not flushed: a stray Enter here only advances to a step that itself waits for a deliberate
+    // start (go_signal, input_gate and the recordings discard typed-ahead input)
     human_action(prompt);
     io::stdout().flush().map_err(|e| e.to_string())?;
     loop {
@@ -377,24 +379,36 @@ impl StageLog {
         else {
             return f();
         };
-        // SAFETY: plain descriptor duplication; the saved copies are restored and closed below.
+        /// Puts stdout and stderr back however `f` ends, a panic included.
+        struct Restore([i32; 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = io::stdout().flush();
+                // SAFETY: restoring and closing descriptors this guard owns.
+                unsafe {
+                    libc::dup2(self.0[0], 1);
+                    libc::dup2(self.0[1], 2);
+                    libc::close(self.0[0]);
+                    libc::close(self.0[1]);
+                }
+            }
+        }
+        // SAFETY: plain descriptor duplication; the copies are owned by `Restore` or closed here.
         let saved = unsafe { [libc::dup(1), libc::dup(2)] };
         if saved.contains(&-1) {
+            for fd in saved.into_iter().filter(|&fd| fd >= 0) {
+                // SAFETY: closing a descriptor just duplicated.
+                unsafe { libc::close(fd) };
+            }
             return f();
         }
+        let _restore = Restore(saved);
+        // SAFETY: redirecting our own stdout/stderr to the log; `_restore` undoes it.
         unsafe {
             libc::dup2(log.as_raw_fd(), 1);
             libc::dup2(log.as_raw_fd(), 2);
         }
-        let out = f();
-        let _ = io::stdout().flush();
-        unsafe {
-            libc::dup2(saved[0], 1);
-            libc::dup2(saved[1], 2);
-            libc::close(saved[0]);
-            libc::close(saved[1]);
-        }
-        out
+        f()
     }
 
     /// The last error the stage reported, for the one-line failure.
@@ -407,11 +421,12 @@ impl StageLog {
     }
 
     fn failure(&self, fallback: &str) -> String {
-        format!(
-            "{} (details: {})",
-            self.last_error().unwrap_or_else(|| fallback.to_owned()),
-            self.path.display()
-        )
+        let error = self.last_error().unwrap_or_else(|| fallback.to_owned());
+        if self.path.is_file() {
+            format!("{error} (details: {})", self.path.display())
+        } else {
+            error
+        }
     }
 }
 
@@ -522,6 +537,7 @@ impl PressA {
 
 /// Shows `prompt` and waits for A on the right controller or Enter; q at the terminal stops.
 fn go_signal(prompt: &str) -> Result<(), String> {
+    discard_typed_ahead();
     human_action(prompt);
     let mut a = PressA::new();
     loop {
@@ -544,10 +560,11 @@ fn go_signal(prompt: &str) -> Result<(), String> {
             {
                 return Err("setup requires an interactive terminal; input closed".into());
             }
-            if matches!(line.trim(), "q" | "quit") {
-                return Err("stopped; nothing was recorded".into());
+            match start_line(&line) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err("stopped; nothing was recorded".into()),
+                None => println!("  (Enter or A starts, q quits)"),
             }
-            return Ok(());
         }
         if raw_inputs().is_ok_and(|raw| a.pressed(&raw, shm::now_ns())) {
             return Ok(());
@@ -1057,9 +1074,11 @@ fn wait_preparation_press(
 fn readiness_change(shown: [bool; 2], waiting: [bool; 2], name: &str) -> Option<String> {
     let names = ["left", "right"];
     if let Some(hand) = (0..2).find(|&h| waiting[h] && !shown[h]) {
+        // never "any button": B on the right controller cancels
         return Some(format!(
-            "  The {} controller is asleep: press any button on it.",
-            names[hand]
+            "  The {} controller is asleep: press {} or its trigger to wake it.",
+            names[hand],
+            ["X", "A"][hand]
         ));
     }
     (shown.contains(&true) && !waiting.contains(&true))
@@ -1097,14 +1116,21 @@ fn registration_countdown_with(
     mut tick: impl FnMut(usize) -> Result<(), String>,
     mut second: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
-    for remaining in (1..=10).rev() {
-        print!("\r  getting in position: {remaining:>2} s ");
-        let _ = io::stdout().flush();
-        tick(HAND_LEFT)?;
-        tick(HAND_RIGHT)?;
-        second()?;
+    let result = (|| {
+        for remaining in (1..=10).rev() {
+            print!("\r  getting in position: {remaining:>2} s ");
+            let _ = io::stdout().flush();
+            tick(HAND_LEFT)?;
+            tick(HAND_RIGHT)?;
+            second()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // end the countdown line before the error
+        println!();
     }
-    Ok(())
+    result
 }
 
 fn registration_countdown(before: &Inspection) -> Result<(), String> {
@@ -1358,7 +1384,8 @@ fn run_stage(
                 }
             })
         }
-        Stage::Inputs => calibrate_inputs_with(None, false, true),
+        // its own errors say what went wrong (a controller asleep, travel too short)
+        Stage::Inputs => calibrate_inputs_result(None, false, true).map(|()| 0)?,
     };
     if interrupted() {
         return Err("interrupted; earlier settings and the capture are kept".into());
@@ -1446,6 +1473,24 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                 println!("\n{}\n", ui::checklist(&stage_reports, &g));
             }
             let Some(report) = stage_reports.iter().find(|r| r.state != State::Ready) else {
+                if let Some(c) = inspection
+                    .checks
+                    .iter()
+                    .find(|c| c.name == "tracking_configuration" && !c.ok)
+                {
+                    println!(
+                        "{} The daemon is not using the saved setup yet: {}",
+                        g.fail, c.detail
+                    );
+                    if ask(
+                        "Fix that, then press Enter to check again (q: quit).",
+                        false,
+                    )? == ui::Answer::Quit
+                    {
+                        return Err("setup is saved but the daemon has not loaded it".into());
+                    }
+                    continue;
+                }
                 human_action("Saved setup is complete. Check both hands in SteamVR: position, buttons and haptics.");
                 return Ok(());
             };
@@ -1475,7 +1520,9 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     Stage::Camera | Stage::Gravity | Stage::Render | Stage::Registration
                 );
             match ask(&ui::stage_prompt(report.stage, can_adopt), can_adopt)? {
-                ui::Answer::Quit => return Ok(()),
+                ui::Answer::Quit => {
+                    return Err("setup stopped before finishing; completed stages are kept".into())
+                }
                 ui::Answer::Keep => {
                     setup::adopt(report.stage, &inspection.snapshot, &mut checkpoint)?;
                     persist(&checkpoint)?;
@@ -1704,6 +1751,15 @@ mod tests {
     fn readiness_lines_only_on_a_dropout_and_the_recovery() {
         let name = "A on the right controller";
         assert_eq!(readiness_change([false; 2], [false; 2], name), None);
+        let left = readiness_change([false; 2], [true, false], name).unwrap();
+        let right = readiness_change([false; 2], [false, true], name).unwrap();
+        assert!(
+            left.contains("press X or its trigger") && right.contains("press A or its trigger")
+        );
+        assert!(
+            !left.contains("any button") && !right.contains("any button"),
+            "B would cancel"
+        );
         assert!(readiness_change([false; 2], [true, false], name)
             .unwrap()
             .contains("left controller is asleep"));

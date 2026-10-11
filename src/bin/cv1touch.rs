@@ -1582,6 +1582,22 @@ fn measured_inputs(
     })
 }
 
+/// Drops whatever was typed before a prompt, so an Enter pressed during a capture cannot answer
+/// the next question or start the next step.
+fn discard_typed_ahead() {
+    // SAFETY: plain terminal ioctl on stdin; harmlessly fails when stdin is not a terminal.
+    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+}
+
+/// A line typed at a start prompt: Some(true) Enter starts, Some(false) quit, None ask again.
+fn start_line(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => Some(true),
+        "q" | "quit" | "exit" => Some(false),
+        _ => None,
+    }
+}
+
 /// The four input calibration steps, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalStep {
@@ -1616,7 +1632,7 @@ impl CalStep {
                 CalStep::Rest => h.trigger < 0.15 && h.grip < 0.15 && stick < 0.25,
                 CalStep::Triggers => h.trigger > 0.75 && h.grip < 0.5,
                 CalStep::Grips => h.grip > 0.75 && h.trigger < 0.5,
-                CalStep::Sticks => stick > 0.6,
+                CalStep::Sticks => stick > 0.6 && h.trigger < 0.5 && h.grip < 0.5,
             }
     }
 
@@ -1663,6 +1679,7 @@ impl InPosition {
 /// Waits until both hands hold `step`'s position (or Enter, offered after a while for controls
 /// that never reach the expected travel).
 fn input_gate(step: CalStep) -> Result<(), String> {
+    discard_typed_ahead();
     let start = Instant::now();
     let mut gate = InPosition::default();
     let mut hinted = false;
@@ -1686,7 +1703,11 @@ fn input_gate(step: CalStep) -> Result<(), String> {
             {
                 return Err("input calibration needs an interactive terminal; input closed".into());
             }
-            return Ok(());
+            match start_line(&line) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err("input calibration stopped; no calibration saved".into()),
+                None => println!("      (Enter records now, q quits)"),
+            }
         }
         if gate.update(step, &raw_inputs()?, shm::now_ns()) {
             return Ok(());
@@ -1935,11 +1956,26 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
 /// `guided`: the setup guide's version: each step records as soon as both hands are in position,
 /// with buzzes instead of Enter, and nothing printed but the steps.
 fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
+    match calibrate_inputs_result(out, reset, guided) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            if interrupted() {
+                130
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// `calibrate_inputs_with`, the error as the guide shows it.
+fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Result<(), String> {
     catch_interrupts();
     let path = out
         .map(Path::to_path_buf)
         .unwrap_or_else(cv1touch::input_calibration::default_path);
-    let result = (|| -> Result<(), String> {
+    (|| -> Result<(), String> {
         if reset {
             write_input_calibration(&path, None, Some(&mut reload_inputs))?;
             println!("Input calibration reset; factory input mapping reloaded.");
@@ -2018,18 +2054,7 @@ fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
             }
         }
         Ok(())
-    })();
-    match result {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("cv1touch: {error}");
-            if interrupted() {
-                130
-            } else {
-                1
-            }
-        }
-    }
+    })()
 }
 
 /// The Oculus Touch profile's legacy input mapping (axis 0 joystick, 1 trigger, 2 grip;
@@ -2694,6 +2719,8 @@ fn capture_free_named_with_feedback(
     };
     // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
     let chatty = feedback.is_none();
+    // an Enter typed before the recording started must not end it
+    discard_typed_ahead();
     if chatty {
         println!(
             "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
@@ -5427,6 +5454,18 @@ mod tests {
             trigger,
             grip,
             stick,
+        }
+    }
+
+    #[test]
+    fn only_enter_starts_a_step_and_quit_works_in_any_case() {
+        assert_eq!(start_line("\n"), Some(true));
+        assert_eq!(start_line("  "), Some(true));
+        for quit in ["q", "Q", "quit", "EXIT\n"] {
+            assert_eq!(start_line(quit), Some(false), "{quit}");
+        }
+        for again in ["n", "no", "yes", "qq", "x"] {
+            assert_eq!(start_line(again), None, "{again}");
         }
     }
 
