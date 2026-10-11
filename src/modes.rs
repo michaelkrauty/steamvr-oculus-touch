@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! Tracking modes and the engine options each implies. Provisional: Phase 1 runtime placement.
+//! Tracking modes and the engine options each implies. Provisional: runtime sensor placement.
 //! Capture: no placement, every sensor only observes (calibration capture). Calibrated: fixed
 //! sensor poses from a calibration file.
 
@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn provisional_is_phase_1_behaviour() {
+    fn provisional_uses_runtime_sensor_placement() {
         let o = provisional(&EngineOptions {
             fixed_poses_only: true,
             fixed_poses: CalibrationFile::example().sensor_poses(),

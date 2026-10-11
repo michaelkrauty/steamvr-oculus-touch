@@ -3,9 +3,9 @@
 
 //! Initial sensor poses from the engine's per-frame camera-relative poses. When two sensors see a
 //! controller in the same exposure, cam_a_from_obj * (cam_b_from_obj)^-1 is one sample of their
-//! relative pose. Wrong-but-confident matches (Phase 1's flipped placement) are outliers, so each
-//! pair is averaged robustly, and sensors are chained to the reference along the best-supported
-//! pairs (maximum spanning tree by inlier count).
+//! relative pose. Incorrect high-confidence pose matches are outliers, so each pair is averaged
+//! robustly, and sensors are chained to the reference along the best-supported pairs
+//! (maximum spanning tree by inlier count).
 
 use std::collections::BTreeMap;
 

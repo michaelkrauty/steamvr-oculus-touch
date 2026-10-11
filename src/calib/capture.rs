@@ -141,7 +141,9 @@ pub fn from_records(records: impl IntoIterator<Item = Record>) -> Result<Capture
         }
     }
     if sensors.is_empty() {
-        return Err("recording has no sensor info (record it with a Phase 3a cv1touchd)".into());
+        return Err(
+            "recording has no sensor info (record a new capture with the current cv1touchd)".into(),
+        );
     }
     if leds.is_empty() {
         return Err("recording has no controller LED models (were the controllers awake?)".into());

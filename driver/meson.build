@@ -1,4 +1,4 @@
-# SteamVR driver: a thin C++ shim over the shared-memory ABI (spec "SteamVR driver").
+# SteamVR driver: a thin C++ shim over the shared-memory ABI.
 openvr_dep = declare_dependency(include_directories: include_directories('../third_party/openvr/headers', is_system: true))
 driver_inc = include_directories('../common', 'src')
 driver_common = files('src/log.cpp', 'src/shm_client.cpp', 'src/pose.cpp', 'src/inputs.cpp', 'src/haptics.cpp', 'src/stations.cpp')

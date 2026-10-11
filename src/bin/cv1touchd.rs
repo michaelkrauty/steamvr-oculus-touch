@@ -28,13 +28,13 @@ use cv1touch::track::predict::{ShapeParams, VelocityShaper};
 use cv1touch::track::tracker::Stats;
 use cv1touch::{align, calib, ffi, input_calibration, modes, track};
 
-/// Decided by the Task 4 live check, see docs/notes/hmd-leds.md.
+/// Disable headset tracking LEDs by default while retaining the headset radio for Touch.
 const DEFAULT_HMD_LEDS_OFF: bool = true;
 const IO_FAILURES_BEFORE_REOPEN: u32 = 50;
 const SENSOR_PUBLISH_NS: u64 = 250_000_000;
 const RECORDER_RING_BYTES: usize = 64 << 20;
-/// Pixels at or below this are the sensors' dark noise (WMTD000000001 speckles up to ~10) and are
-/// not recorded; blobs start at the engine's threshold of 36, so their halos are kept.
+/// Pixels at or below this are treated as sensor dark noise and are not recorded;
+/// blobs start at the engine's threshold of 36, so their halos are kept.
 const RAW_FRAME_FLOOR: u8 = 7;
 const MAX_CLIENTS: usize = 16;
 

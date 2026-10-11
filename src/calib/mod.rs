@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! Phase 3a calibration: camera-only wand bundle adjustment with gravity (spec "Calibration
-//! (jig-free)", sources 2 and 3). Poses are nalgebra isometries named `a_from_b`, mapping
-//! b-coordinates into a-coordinates. Camera frames use OpenCV axes (x right, y down, z forward).
+//! Camera-only wand bundle adjustment with gravity. Poses are nalgebra isometries named
+//! `a_from_b`, mapping b-coordinates into a-coordinates. Camera frames use OpenCV axes
+//! (x right, y down, z forward).
 
 pub mod ba;
 pub mod camera;

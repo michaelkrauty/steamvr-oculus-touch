@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! Quick registration of the cv1touch world to Lighthouse raw space (spec "Quick registration
-//! (Phase 2)"): the user holds a Touch against a Lighthouse-tracked controller and moves the pair.
+//! Quick registration of the cv1touch world to Lighthouse raw space: the user holds a Touch
+//! against a Lighthouse-tracked controller and moves the pair.
 //! With L_i the reference controller's raw pose and C_i the Touch's world pose at the same instant,
 //! L_i * Y = X * C_i for X = lighthouse_from_world and Y = reference_from_touch (the hand-held
 //! offset). Rotation from a hand-eye solve on relative motions, translation by linear least
