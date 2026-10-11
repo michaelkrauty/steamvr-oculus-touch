@@ -191,7 +191,26 @@ fn status_board(shm_name: &str) -> i32 {
             };
         }
         let r = reader.as_ref().unwrap();
-        let sensors = r.sensors().unwrap_or_default();
+        let complete = control::request(
+            &control::socket_path(),
+            "status",
+            Duration::from_millis(200),
+        )
+        .ok()
+        .and_then(|reply| {
+            serde_json::from_str::<serde_json::Value>(reply.strip_prefix("ok ")?).ok()
+        })
+        .filter(|v| v["generation"].as_u64() == Some(r.generation()));
+        let (sensors, sensor_note) = match complete.as_ref().map(status::sensors_from_status) {
+            Some(Ok(sensors)) => {
+                let note = if complete.as_ref().unwrap()["sensor_total"].as_u64().is_none() {
+                    "Legacy daemon diagnostics may show only the first eight sensors."
+                } else { "" };
+                (sensors, note)
+            }
+            _ => (r.sensors().unwrap_or_default(),
+                "Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors)."),
+        };
         let mut rates = HashMap::new();
         for s in &sensors {
             let key = shm::serial_str(s);
@@ -213,6 +232,9 @@ fn status_board(shm_name: &str) -> i32 {
             "\x1b[H\x1b[2J{}",
             status::render(&hands, &sensors, &rates, age, r.generation())
         );
+        if !sensor_note.is_empty() {
+            println!("{sensor_note}");
+        }
         let _ = io::stdout().flush();
         thread::sleep(Duration::from_millis(200));
     }

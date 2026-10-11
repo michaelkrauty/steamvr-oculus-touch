@@ -4,6 +4,7 @@
 #define OPENHMD_CV1TOUCH_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "openhmd.h"
@@ -126,6 +127,13 @@ typedef void (*ohmd_cv1touch_image_cb)(void *user, const ohmd_cv1touch_frame_inf
 typedef void (*ohmd_cv1touch_report_cb)(void *user, int source, uint64_t host_ns, const uint8_t *data, int len);
 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, const ohmd_cv1touch_config *config);
+/* Complete lists, copied transactionally into the context. Call before opening devices.
+ * Overrides the legacy inline eight-entry lists. Serials must be unique within each list,
+ * 1..31 ASCII alphanumeric characters; poses must be finite with unit quaternions.
+ * Returns -1 on invalid input/allocation or if a device is already open. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_configure_sensors(ohmd_context *ctx,
+        const char (*ignored)[32], size_t ignored_count,
+        const ohmd_cv1touch_sensor_pose *poses, size_t pose_count);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);

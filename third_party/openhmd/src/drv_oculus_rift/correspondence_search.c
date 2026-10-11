@@ -79,6 +79,7 @@ correspondence_search_t *
 correspondence_search_new(rift_sensor_camera_params *camera_calib)
 {
     correspondence_search_t *cs = calloc(1, sizeof (correspondence_search_t));
+    if (!cs) return NULL;
     cs->calib = camera_calib;
     return cs;
 }

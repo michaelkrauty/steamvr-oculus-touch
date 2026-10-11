@@ -20,6 +20,8 @@
 #define CV1T_SHM_NAME "/cv1touch"
 #define CV1T_SHM_MAGIC 0x54315643u /* "CV1T" little-endian */
 #define CV1T_SHM_VERSION 3u
+/* Legacy sensor diagnostics prefix; complete diagnostics are available via control JSON.
+ * This is not a tracking/acquisition limit. Keep the controller/alignment ABI fixed. */
 #define CV1T_MAX_SENSORS 8
 
 enum { CV1T_HAND_LEFT = 0, CV1T_HAND_RIGHT = 1, CV1T_HAND_COUNT = 2 };
@@ -125,7 +127,7 @@ typedef struct cv1t_shm {
 	uint64_t generation;     /* random per daemon start */
 	uint64_t heartbeat_host_ns;
 	uint32_t daemon_pid;
-	uint32_t sensor_count;   /* protected by sensor_seq */
+	uint32_t sensor_count;   /* compatibility prefix count, protected by sensor_seq */
 	uint32_t sensor_seq;
 	uint32_t reserved;
 	cv1t_slot hands[CV1T_HAND_COUNT];

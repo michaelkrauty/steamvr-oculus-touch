@@ -72,6 +72,7 @@ struct rift_sensor_analysis_frame {
 	uint64_t long_analysis_finish_ts;
 };
 
+/* Consumes dev on success and failure. */
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_device *dev, rift_tracker_ctx *tracker);
 void rift_sensor_free (rift_sensor_ctx *sensor_ctx);

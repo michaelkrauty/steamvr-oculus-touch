@@ -5,6 +5,8 @@
 //! and provenance. Loaded by cv1touchd at startup and on `calibration load`.
 
 use std::collections::HashSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ use crate::engine::SensorPose;
 
 pub const FORMAT: &str = "cv1touch-calibration";
 pub const VERSION: u32 = 1;
+/// Resource bound on serialized calibration, independent of the sensor count.
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensorEntry {
@@ -94,11 +98,8 @@ impl CalibrationFile {
         if self.format != FORMAT || self.version != VERSION {
             return Err(format!("unsupported calibration format {:?} version {} (expected {FORMAT:?} version {VERSION})", self.format, self.version));
         }
-        if self.sensors.is_empty() || self.sensors.len() > 8 {
-            return Err(format!(
-                "calibration lists {} sensors (expected 1-8)",
-                self.sensors.len()
-            ));
+        if self.sensors.is_empty() {
+            return Err("calibration lists no sensors (expected at least one)".into());
         }
         let mut seen = HashSet::new();
         for s in &self.sensors {
@@ -192,9 +193,40 @@ pub fn default_path() -> PathBuf {
 }
 
 pub fn load(path: &Path) -> Result<CalibrationFile, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // O_NONBLOCK makes a FIFO fail the regular-file check instead of blocking daemon reload.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: calibration must be a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "{}: calibration exceeds {MAX_FILE_BYTES} byte limit",
+            path.display()
+        ));
+    }
+    // Bound reads as well as metadata: another writer may grow the file after the size check.
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "{}: calibration exceeds {MAX_FILE_BYTES} byte limit",
+            path.display()
+        ));
+    }
     let f: CalibrationFile =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     f.validate()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(f)
@@ -208,6 +240,12 @@ pub fn save(path: &Path, f: &CalibrationFile) -> Result<Option<PathBuf>, String>
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(f).map_err(|e| e.to_string())? + "\n";
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "{}: calibration exceeds {MAX_FILE_BYTES} byte limit",
+            path.display()
+        ));
+    }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let backup = if path.exists() {
@@ -312,5 +350,66 @@ mod tests {
             missing_from(&prev, &["WMTD000000001".into()]),
             vec!["WMTD000000002".to_string()]
         );
+    }
+    #[test]
+    fn dynamic_sensors_round_trip_nine_and_sixty_five() {
+        for count in [9, 65] {
+            let path = tmp(&format!("dynamic-{count}"));
+            let mut f = CalibrationFile::example();
+            f.sensors = (0..count)
+                .map(|i| {
+                    let mut sensor = f.sensors[0].clone();
+                    sensor.serial = format!("TEST{i:04}");
+                    sensor
+                })
+                .collect();
+            save(&path, &f).unwrap();
+            assert_eq!(load(&path).unwrap(), f);
+            f.sensors[count - 1].serial = f.sensors[0].serial.clone();
+            assert!(f.validate().unwrap_err().contains("duplicate"));
+            f.sensors[count - 1].serial = "UNIQUE".into();
+            f.sensors[count - 1].pos[0] = f32::NAN;
+            assert!(f.validate().is_err());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn dynamic_sensors_reject_oversized_file_before_parsing() {
+        let path = tmp("oversized");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let error = load(&path).unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn dynamic_sensors_reject_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let path = tmp("fifo");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and points inside this test's temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (send, receive) = mpsc::channel();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || send.send(load(&reader_path)).unwrap());
+        let result = receive.recv_timeout(Duration::from_secs(3));
+        if result.is_err() {
+            // Release a regressed blocking reader so the test can fail without hanging CI.
+            use std::io::Write;
+            if let Ok(mut writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            {
+                let _ = writer.write_all(b"{}");
+            }
+        }
+        reader.join().unwrap();
+        assert!(result.unwrap().unwrap_err().contains("regular file"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

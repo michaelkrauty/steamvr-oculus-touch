@@ -26,6 +26,7 @@ pub use ffi::cv1t_sensor_status as SensorStatus;
 pub const DEFAULT_NAME: &str = "/cv1touch";
 pub const HAND_LEFT: usize = ffi::CV1T_HAND_LEFT as usize;
 pub const HAND_RIGHT: usize = ffi::CV1T_HAND_RIGHT as usize;
+/// Fixed legacy diagnostics capacity, not an acquisition or tracking limit.
 pub const MAX_SENSORS: usize = ffi::CV1T_MAX_SENSORS as usize;
 const READ_TRIES: usize = 1000;
 

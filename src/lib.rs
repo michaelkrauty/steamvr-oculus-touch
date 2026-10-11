@@ -22,3 +22,5 @@ pub mod steamvr;
 pub mod summary;
 pub mod track;
 pub mod vr;
+
+pub mod frame_queue;

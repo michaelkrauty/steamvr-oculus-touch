@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
+use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{Hand, HandConfig};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
@@ -44,11 +45,7 @@ enum TrackerKind {
     OpenHmd,
 }
 
-/// Inputs for the tracking pipeline, copied out of the engine callbacks in arrival order.
-enum TrackIn {
-    HmdClock(u64, u32),
-    Frame(Box<engine::FrameInfo>, Vec<Blob>),
-}
+type QueuedFrame = (Box<engine::FrameInfo>, Vec<Blob>);
 
 #[derive(Clone, Copy)]
 struct Haptic {
@@ -145,8 +142,11 @@ struct Daemon {
     mode: Mutex<String>,
     reopen: AtomicBool,
     tracker: TrackerKind,
-    track_in: Mutex<Vec<TrackIn>>,
+    track_in: Mutex<FrameQueue<QueuedFrame>>,
+    /// Complete sensor diagnostics; the SHM block is only a compatibility prefix.
+    sensors: Mutex<Vec<SensorStatus>>,
     track_stats: Mutex<[(Stats, bool); 2]>,
+    pending_frames_dropped: std::sync::atomic::AtomicU64,
     /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
     landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
     /// How the Lighthouse universe moved since the registration (see `universe_watch`), with
@@ -375,10 +375,11 @@ impl EngineSink for Daemon {
             );
         }
         if self.tracker == TrackerKind::Rust {
-            self.track_in
-                .lock()
-                .unwrap()
-                .push(TrackIn::Frame(Box::new(*info), blobs.to_vec()));
+            self.track_in.lock().unwrap().push_frame(
+                &engine::cstr_field(&info.serial),
+                info.frame_start_host_ns,
+                (Box::new(*info), blobs.to_vec()),
+            );
             self.wake_radio();
         }
     }
@@ -428,10 +429,7 @@ impl EngineSink for Daemon {
         }
         if self.tracker == TrackerKind::Rust && source == 0 {
             if let Some(us) = pipeline::hmd_report_timestamp(data) {
-                self.track_in
-                    .lock()
-                    .unwrap()
-                    .push(TrackIn::HmdClock(ts, us));
+                self.track_in.lock().unwrap().push_clock(ts, us);
             }
         }
     }
@@ -442,6 +440,8 @@ fn log(msg: impl AsRef<str>) {
 }
 
 fn publish_disconnected(d: &Daemon) {
+    d.track_in.lock().unwrap().register([]);
+    d.pending_frames_dropped.store(0, Ordering::Relaxed);
     d.inputs.lock().unwrap().latest = Default::default();
     let now = shm::now_ns();
     for h in [HAND_LEFT, HAND_RIGHT] {
@@ -454,9 +454,14 @@ fn publish_disconnected(d: &Daemon) {
             },
         );
     }
-    d.shm.publish_sensors(&[]);
+    publish_sensor_snapshot(d, &[]);
     d.shm.signal();
     d.shm.heartbeat(now);
+}
+
+fn publish_sensor_snapshot(d: &Daemon, sensors: &[SensorStatus]) {
+    *d.sensors.lock().unwrap() = sensors.to_vec();
+    d.shm.publish_sensors(sensors);
 }
 
 fn sensor_status(s: &engine::Sensor) -> SensorStatus {
@@ -724,6 +729,7 @@ fn engine_main(d: Arc<Daemon>) {
         ));
         make_usb_thread_realtime();
         let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
+        d.track_in.lock().unwrap().register(open.iter().cloned());
         for serial in modes::unposed_sensors(&opts, &open) {
             log(format!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)"));
         }
@@ -1005,7 +1011,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         }
         if now >= next_sensors {
             let sensors: Vec<SensorStatus> = e.sensors().iter().map(sensor_status).collect();
-            d.shm.publish_sensors(&sensors);
+            publish_sensor_snapshot(d, &sensors);
             next_sensors = now + SENSOR_PUBLISH_NS;
             if d.rec.active() {
                 write_session_info(d, e);
@@ -1111,7 +1117,6 @@ fn radio_main(
     let mut holds = HoldStats::default();
     let mut newest: [Option<engine::Controller>; 2] = [None; 2];
     let mut last_publish = [0u64; 2];
-    let mut queue: std::collections::VecDeque<TrackIn> = Default::default();
     let mut next_stats = 0u64;
     let mut buf = [0u8; 64];
     let (radio_fd, wake_fd) = (radio.as_raw_fd(), d.radio_wake.as_raw_fd());
@@ -1135,7 +1140,7 @@ fn radio_main(
             libc::poll(
                 fds.as_mut_ptr(),
                 2,
-                if queue.is_empty() {
+                if d.track_in.lock().unwrap().is_empty() {
                     RADIO_IDLE_WAKE_MS
                 } else {
                     0
@@ -1231,25 +1236,20 @@ fn radio_main(
             biases.seed(&mut pipe, b.hand, &b.leds);
             link.hands.request(b.hand);
         }
-        // the camera frames, one per pass (with the headset clock samples queued before it)
-        queue.extend(mem::take(&mut *d.track_in.lock().unwrap()));
-        let dropped = trim_frame_backlog(&mut queue);
-        if dropped > 0 {
-            log(format!(
-                "radio thread dropped {dropped} camera frame(s) it could not keep up with"
-            ));
+        // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
+        // consumer's queue. Release the ingress lock before any tracking work.
+        let (clocks, frame) = {
+            let mut ingress = d.track_in.lock().unwrap();
+            (ingress.take_clocks(), ingress.pop_frame())
+        };
+        for (host, us) in clocks {
+            pipe.hmd_clock_sample(host, us);
         }
-        while let Some(item) = queue.pop_front() {
-            match item {
-                TrackIn::HmdClock(host, us) => pipe.hmd_clock_sample(host, us),
-                TrackIn::Frame(info, blobs) => {
-                    if let Some(w) = watch.as_mut() {
-                        w.frame(d, &info, &blobs);
-                    }
-                    pipe.frame(&info, &blobs);
-                    break;
-                }
+        if let Some((info, blobs)) = frame {
+            if let Some(w) = watch.as_mut() {
+                w.frame(d, &info, &blobs);
             }
+            pipe.frame(&info, &blobs);
         }
         // a hand whose controller went quiet still gets its state refreshed (it times out)
         let now = shm::now_ns();
@@ -1284,6 +1284,8 @@ fn radio_main(
         }
         rest.if_due(now);
         if now >= next_stats {
+            d.pending_frames_dropped
+                .store(pipe.frames_dropped, Ordering::Relaxed);
             *d.track_stats.lock().unwrap() = [HAND_LEFT, HAND_RIGHT].map(|h| {
                 (
                     pipe.stats(h),
@@ -1314,29 +1316,6 @@ impl Drop for RadioExit<'_> {
             self.d.reopen.store(true, Ordering::Release);
         }
     }
-}
-
-/// Frames the radio thread lets queue before it drops the oldest: about 150 ms of four sensors,
-/// a backlog it would not work off without running too long unblocked (see `Rest`).
-const RADIO_MAX_QUEUED_FRAMES: usize = 32;
-
-/// Drops the oldest camera frames past `RADIO_MAX_QUEUED_FRAMES` (the headset clock samples stay:
-/// they are cheap and keep the clock map current). Returns how many went.
-fn trim_frame_backlog(queue: &mut std::collections::VecDeque<TrackIn>) -> usize {
-    let frames = queue
-        .iter()
-        .filter(|i| matches!(i, TrackIn::Frame(..)))
-        .count();
-    let mut excess = frames.saturating_sub(RADIO_MAX_QUEUED_FRAMES);
-    let dropped = excess;
-    queue.retain(|i| {
-        if excess > 0 && matches!(i, TrackIn::Frame(..)) {
-            excess -= 1;
-            return false;
-        }
-        true
-    });
-    dropped
 }
 
 /// How long the radio thread may run without sleeping before it sleeps a moment of its own:
@@ -1539,7 +1518,7 @@ fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
 
 fn status_json(d: &Daemon) -> String {
     let hands = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap_or_default());
-    let sensors = d.shm.sensors().unwrap_or_default();
+    let sensors = d.sensors.lock().unwrap().clone();
     let st = d.rec.stats();
     let al = d.shm.alignment().unwrap_or_default();
     let hands_json: Vec<String> = hands
@@ -1553,22 +1532,25 @@ fn status_json(d: &Daemon) -> String {
             )
         })
         .collect();
-    let sensors_json: Vec<String> = sensors
+    let shifts = d.landmark_shifts.lock().unwrap();
+    let sensors_json: Vec<serde_json::Value> = sensors
         .iter()
         .map(|s| {
-            format!(
-                "{{\"serial\":\"{}\",\"placed\":{},\"frames\":{},\"fixes\":[{},{}],\"landmark_shift\":{}}}",
-                shm::serial_str(s),
-                s.placed,
-                s.frames,
-                s.pose_fixes[HAND_LEFT],
-                s.pose_fixes[HAND_RIGHT],
-                d.landmark_shifts.lock().unwrap().get(&shm::serial_str(s)).map_or("null".to_string(), |(x, y, n)| format!("{{\"dx\":{x:.3},\"dy\":{y:.3},\"landmarks\":{n}}}"))
-            )
+            let serial = shm::serial_str(s);
+            let shift = shifts
+                .get(&serial)
+                .map(|(x, y, n)| serde_json::json!({"dx": x, "dy": y, "landmarks": n}));
+            serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
+            "fixes": s.pose_fixes, "camera_orient": s.camera_orient, "camera_pos": s.camera_pos,
+            "landmark_shift": shift})
         })
         .collect();
+    drop(shifts);
+    let mut queue = serde_json::to_value(d.track_in.lock().unwrap().stats()).unwrap();
+    queue["pending_frames_dropped"] =
+        serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":[{}]}}",
+        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         d.tracker,
         d.mode.lock().unwrap(),
@@ -1582,7 +1564,11 @@ fn status_json(d: &Daemon) -> String {
         st.dropped,
         st.write_errors,
         hands_json.join(","),
-        sensors_json.join(",")
+        serde_json::to_string(&sensors_json).unwrap(),
+        sensors.len(),
+        sensors.len().min(shm::MAX_SENSORS),
+        sensors.len() > shm::MAX_SENSORS,
+        serde_json::to_string(&queue).unwrap(),
     )
 }
 
@@ -2274,8 +2260,10 @@ fn main() {
         mode: Mutex::new(mode),
         reopen: AtomicBool::new(false),
         tracker,
-        track_in: Mutex::new(Vec::new()),
+        track_in: Mutex::new(FrameQueue::default()),
+        sensors: Mutex::new(Vec::new()),
         track_stats: Mutex::new([(Stats::default(), false); 2]),
+        pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
         universe_shift: Mutex::new(None),
         universe_recheck: AtomicBool::new(false),
@@ -2336,6 +2324,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_daemon() -> Daemon {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "/cv1t-dynamic-status-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        Daemon {
+            shm: ShmWriter::create(&name, 1).unwrap(),
+            rec: Recorder::new(4096),
+            quit: AtomicBool::new(false),
+            haptics: Mutex::new([None; 2]),
+            session: Mutex::new(Default::default()),
+            opts: Mutex::new(Default::default()),
+            mode: Mutex::new("calibrated".into()),
+            reopen: AtomicBool::new(false),
+            tracker: TrackerKind::Rust,
+            track_in: Mutex::new(FrameQueue::default()),
+            sensors: Mutex::new(Vec::new()),
+            track_stats: Mutex::new([(Stats::default(), false); 2]),
+            pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
+            landmark_shifts: Mutex::new(Default::default()),
+            universe_shift: Mutex::new(None),
+            universe_recheck: AtomicBool::new(false),
+            driver_stations: Mutex::new(None),
+            universe_watch_on: AtomicBool::new(true),
+            shaping_on: AtomicBool::new(true),
+            record_frames: AtomicBool::new(false),
+            extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
+            battery: [
+                std::sync::atomic::AtomicI32::new(-1),
+                std::sync::atomic::AtomicI32::new(-1),
+            ],
+            radio_wake: eventfd().unwrap(),
+            radio_on: AtomicBool::new(false),
+            inject: Injection::default(),
+            inputs: Mutex::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn authoritative_status_reports_all_sensors_and_an_explicit_shm_prefix() {
+        let d = status_daemon();
+        let sensors: Vec<_> = (0..65)
+            .map(|i| {
+                let mut s = SensorStatus {
+                    frames: i + 1,
+                    ..Default::default()
+                };
+                shm::set_serial(&mut s, &format!("synthetic-camera-{i}"));
+                s
+            })
+            .collect();
+        publish_sensor_snapshot(&d, &sensors);
+        let reply = status_json(&d);
+        let v: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(v["sensors"].as_array().unwrap().len(), 65);
+        assert_eq!(v["sensor_total"], 65);
+        assert_eq!(v["sensor_shm_count"], 8);
+        assert_eq!(v["sensor_shm_truncated"], true);
+        assert_eq!(v["sensors"][64]["frames"], 65);
+        assert_eq!(d.shm.sensors().unwrap().len(), 8);
+        publish_disconnected(&d);
+        let reply = status_json(&d);
+        let v: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(v["sensor_total"], 0);
+        assert!(v["sensors"].as_array().unwrap().is_empty());
+    }
 
     fn input_config() -> input_calibration::CalibrationFile {
         use input_calibration::{CalibrationFile, Endpoint, HandCalibration, StickAxis};
@@ -2551,44 +2610,6 @@ mod tests {
         // once the radio thread is gone (after its last publish) the engine has every hand again
         o.radio_exit();
         assert!(o.engine_publishes(HAND_LEFT) && o.engine_publishes(HAND_RIGHT));
-    }
-
-    #[test]
-    fn a_backlog_of_frames_drops_the_oldest_and_keeps_the_clock_samples() {
-        let frame = |t: u64| {
-            TrackIn::Frame(
-                Box::new(engine::FrameInfo {
-                    frame_start_host_ns: t,
-                    ..Default::default()
-                }),
-                Vec::new(),
-            )
-        };
-        let mut q: std::collections::VecDeque<TrackIn> = Default::default();
-        for t in 0..(RADIO_MAX_QUEUED_FRAMES as u64 + 3) {
-            q.push_back(TrackIn::HmdClock(t, t as u32));
-            q.push_back(frame(t));
-        }
-        assert_eq!(trim_frame_backlog(&mut q), 3);
-        let frames: Vec<u64> = q
-            .iter()
-            .filter_map(|i| {
-                if let TrackIn::Frame(f, _) = i {
-                    Some(f.frame_start_host_ns)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(frames.len(), RADIO_MAX_QUEUED_FRAMES);
-        assert_eq!(frames[0], 3, "the oldest go");
-        assert_eq!(
-            q.iter()
-                .filter(|i| matches!(i, TrackIn::HmdClock(..)))
-                .count(),
-            RADIO_MAX_QUEUED_FRAMES + 3
-        );
-        assert_eq!(trim_frame_backlog(&mut q), 0);
     }
 
     #[test]

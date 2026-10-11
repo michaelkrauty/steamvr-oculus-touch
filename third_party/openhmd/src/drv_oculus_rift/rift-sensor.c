@@ -368,6 +368,7 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	int i;
 
 	sensor_ctx = ohmd_alloc(ohmd_ctx, sizeof (rift_sensor_ctx));
+	if (!sensor_ctx) { rift_sensor_device_free(dev); return NULL; }
 
 	sensor_ctx->ohmd_ctx = ohmd_ctx;
 	sensor_ctx->dev = dev;
@@ -379,6 +380,7 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	sensor_ctx->long_analysis_busy = false;
 
 	sensor_ctx->sensor_lock = ohmd_create_mutex(ohmd_ctx);
+	if (!sensor_ctx->sensor_lock) goto fail;
 
 	/* Initialise frame queues */
 	INIT_QUEUE(&sensor_ctx->capture_frame_q);
@@ -388,9 +390,11 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	/* Conds we use to wake queue waiters */
 	sensor_ctx->fast_analysis_q_cond = ohmd_create_cond(ohmd_ctx);
 	sensor_ctx->long_analysis_q_cond = ohmd_create_cond(ohmd_ctx);
+	if (!sensor_ctx->fast_analysis_q_cond || !sensor_ctx->long_analysis_q_cond) goto fail;
 
 	/* Allocate capture frame buffers */
 	sensor_ctx->frames = ohmd_alloc(ohmd_ctx, NUM_CAPTURE_BUFFERS * sizeof (rift_sensor_analysis_frame));
+	if (!sensor_ctx->frames) goto fail;
 	for (i = 0; i < NUM_CAPTURE_BUFFERS; i++) {
 			rift_sensor_analysis_frame *frame = sensor_ctx->frames + i;
 			frame->id = i;
@@ -405,15 +409,18 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_camera_params *calib = &sensor_ctx->dev->calib;
 
 	sensor_ctx->bw = blobwatch_new(calib->is_cv1 ? BLOB_THRESHOLD_CV1 : BLOB_THRESHOLD_DK2);
+	if (!sensor_ctx->bw) goto fail;
 
 	rift_pose_finder_init(&sensor_ctx->pf, calib, (rift_pose_finder_cb) handle_found_pose, sensor_ctx);
+	if (!sensor_ctx->pf.cs) goto fail;
 
 	/* cv1touch: a calibrated sensor starts with its fixed pose; with fixed_poses_only, the others
 	 * never place themselves and only observe (calibration capture). */
 	{
 		posef fixed;
 		sensor_ctx->pf.cv1touch_allow_placement = !ohmd_ctx->cv1touch_config.fixed_poses_only;
-		if (cv1touch_fixed_pose_lookup(&ohmd_ctx->cv1touch_config, sensor_ctx->serial_no, &fixed)) {
+		if (cv1touch_fixed_pose_lookup_list(ohmd_ctx->cv1touch_sensors.configured ? ohmd_ctx->cv1touch_sensors.poses : ohmd_ctx->cv1touch_config.fixed_poses,
+                ohmd_ctx->cv1touch_sensors.configured ? ohmd_ctx->cv1touch_sensors.pose_count : 8, sensor_ctx->serial_no, &fixed)) {
 			rift_pose_finder_set_camera_pose(&sensor_ctx->pf, &fixed);
 			LOGI("Sensor %d (%s) uses its calibrated pose", sensor_ctx->id, sensor_ctx->serial_no);
 		}
@@ -430,17 +437,22 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	if (sensor_ctx->debug_vid) {
 		/* Allocate an RGB debug frame, twice the width of the input */
 		sensor_ctx->debug_frame = ohmd_alloc(ohmd_ctx, 2 * 3 * calib->width * calib->height);
+		if (!sensor_ctx->debug_frame) goto fail;
 	}
 
 	/* Start analysis threads */
 	sensor_ctx->shutdown = false;
 	sensor_ctx->fast_analysis_thread = ohmd_create_thread (ohmd_ctx, fast_analysis_thread, sensor_ctx);
 	sensor_ctx->long_analysis_thread = ohmd_create_thread (ohmd_ctx, long_analysis_thread, sensor_ctx);
+	if (!sensor_ctx->fast_analysis_thread || !sensor_ctx->long_analysis_thread) goto fail;
 
 
 	LOGV("Sensor %d ready\n", id);
 
 	return sensor_ctx;
+fail:
+	rift_sensor_free(sensor_ctx);
+	return NULL;
 }
 
 bool
@@ -459,11 +471,13 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 		rift_sensor_device_stop_video(sensor_ctx->dev);
 
 	/* Shut down analysis threads */
-	ohmd_lock_mutex(sensor_ctx->sensor_lock);
-	sensor_ctx->shutdown = true;
-	ohmd_cond_broadcast(sensor_ctx->fast_analysis_q_cond);
-	ohmd_cond_broadcast(sensor_ctx->long_analysis_q_cond);
-	ohmd_unlock_mutex(sensor_ctx->sensor_lock);
+    if (sensor_ctx->sensor_lock) {
+        ohmd_lock_mutex(sensor_ctx->sensor_lock);
+        sensor_ctx->shutdown = true;
+        if (sensor_ctx->fast_analysis_q_cond) ohmd_cond_broadcast(sensor_ctx->fast_analysis_q_cond);
+        if (sensor_ctx->long_analysis_q_cond) ohmd_cond_broadcast(sensor_ctx->long_analysis_q_cond);
+        ohmd_unlock_mutex(sensor_ctx->sensor_lock);
+    }
 
 	if (sensor_ctx->fast_analysis_thread)
 		ohmd_destroy_thread(sensor_ctx->fast_analysis_thread);

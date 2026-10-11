@@ -194,10 +194,9 @@ pub enum Outcome {
     TooOld,
     /// The exposure is newer than the newest IMU sample: retry after more IMU.
     Early,
+    /// The camera is not part of this tracker's registered roster.
+    UnknownCamera,
 }
-
-/// Sensors the per-camera bookkeeping covers (camera indices beyond it are not tracked).
-pub const MAX_CAMERAS: usize = 8;
 
 /// How well one sensor agrees with the others: an exponentially weighted mean of the median
 /// pixel residual of its matched LEDs under a prior the other sensors set (another sensor updated
@@ -241,10 +240,10 @@ pub struct Tracker {
     last_track: u64,
     /// Bias estimates (and their covariance) kept across an IMU discontinuity.
     saved_bias: Option<Filter>,
-    /// Sensors (bit per camera index) that have updated the track since its acquisition. A track
-    /// one sensor alone has seen may be off in depth by centimetres: only one confirmed by a second
-    /// sensor vets later acquisitions.
-    track_cameras: u64,
+    /// First registered camera to update this acquisition, and whether another confirmed it.
+    /// A track seen by one sensor may be off in depth: only a distinct second sensor vets it.
+    track_camera: Option<usize>,
+    track_confirmed: bool,
     /// Controller time of the newest update of a confirmed track.
     last_confirmed: u64,
     /// When the current run of refused acquisitions began (0: none).
@@ -268,8 +267,8 @@ pub struct Tracker {
     /// where it shows none.
     engine_labels_off: bool,
     /// Controller time of each sensor's newest update.
-    camera_last: [u64; MAX_CAMERAS],
-    pub agreement: [CameraAgreement; MAX_CAMERAS],
+    camera_last: Vec<u64>,
+    pub agreement: Vec<CameraAgreement>,
     pub stats: Stats,
     /// When set, every miss appends (LEDs predicted visible, of them with a blob within 3 px,
     /// matched by the association, engine labels) to `misses`.
@@ -280,7 +279,7 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new(device_id: i32, body: Body, params: Params) -> Tracker {
+    pub fn new(device_id: i32, body: Body, params: Params, camera_count: usize) -> Tracker {
         let aliases = vision::ring_aliases(&body.leds);
         Tracker {
             params,
@@ -299,17 +298,24 @@ impl Tracker {
             aliases,
             ambiguous_since: 0,
             engine_labels_off: false,
-            track_cameras: 0,
+            track_camera: None,
+            track_confirmed: false,
             last_confirmed: 0,
             refusing_since: 0,
             held: None,
-            camera_last: [0; MAX_CAMERAS],
-            agreement: [CameraAgreement::default(); MAX_CAMERAS],
+            camera_last: vec![0; camera_count],
+            agreement: vec![CameraAgreement::default(); camera_count],
             stats: Stats::default(),
             debug: false,
             misses: Vec::new(),
             fits: Vec::new(),
         }
+    }
+
+    /// Adds one camera admitted by the owning pipeline; arbitrary frame IDs never grow storage.
+    pub(super) fn register_camera(&mut self) {
+        self.camera_last.push(0);
+        self.agreement.push(CameraAgreement::default());
     }
 
     fn gravity(&self) -> Vector3<f64> {
@@ -351,7 +357,8 @@ impl Tracker {
             self.last_fix = 0;
             self.last_track = 0;
             self.last_confirmed = 0;
-            self.track_cameras = 0;
+            self.track_camera = None;
+            self.track_confirmed = false;
             self.refusing_since = 0;
             self.held = None;
         }
@@ -500,7 +507,8 @@ impl Tracker {
         self.last_fix = 0;
         self.last_track = 0;
         self.last_confirmed = 0;
-        self.track_cameras = 0;
+        self.track_camera = None;
+        self.track_confirmed = false;
         self.refusing_since = 0;
         self.held = None;
     }
@@ -647,6 +655,9 @@ impl Tracker {
         engine: Option<Isometry3<f64>>,
         foreign: &[Vector2<f64>],
     ) -> Outcome {
+        if camera >= self.camera_last.len() {
+            return Outcome::UnknownCamera;
+        }
         if self.newest_imu().is_none_or(|n| t_e > n) {
             return Outcome::Early;
         }
@@ -718,11 +729,14 @@ impl Tracker {
                     self.last_track = self.last_track.max(t_e);
                     if relock {
                         self.stats.relocks += 1;
-                        self.track_cameras = 1u64 << camera.min(63);
+                        self.track_camera = Some(camera);
+                        self.track_confirmed = false;
                     } else {
-                        self.track_cameras |= 1u64 << camera.min(63);
+                        self.track_confirmed |=
+                            self.track_camera.is_some_and(|first| first != camera);
+                        self.track_camera.get_or_insert(camera);
                     }
-                    if self.track_cameras.count_ones() >= 2 {
+                    if self.track_confirmed {
                         self.last_confirmed = self.last_confirmed.max(t_e);
                     }
                     self.refusing_since = 0;
@@ -916,7 +930,8 @@ impl Tracker {
         }
         self.last_fix = self.last_fix.max(t_e);
         self.last_track = self.last_track.max(t_e);
-        self.track_cameras = 1u64 << camera.min(63);
+        self.track_camera = Some(camera);
+        self.track_confirmed = false;
         self.note_held();
         self.stats.acquisitions += 1;
         Outcome::Acquired(n)
@@ -933,10 +948,10 @@ impl Tracker {
         pairs: &[(usize, usize)],
         prior: &Filter,
     ) {
-        if camera >= MAX_CAMERAS {
+        if camera >= self.camera_last.len() {
             return;
         }
-        let others = (0..MAX_CAMERAS).any(|c| {
+        let others = (0..self.camera_last.len()).any(|c| {
             c != camera
                 && self.camera_last[c] != 0
                 && t_e.saturating_sub(self.camera_last[c]) <= CROSS_CHECK_NS
@@ -1144,7 +1159,7 @@ mod tests {
 
     fn run_with(w: &World, seconds: f64, pixel_noise: f64, opts: &Run) -> (Tracker, Vec<f64>) {
         let drop_cams_between = opts.blackout;
-        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
         if let Some((bg, ba)) = opts.seed {
             tr.seed_biases(bg, ba, 0.002, 0.03);
         }
@@ -1348,7 +1363,7 @@ mod tests {
     #[test]
     fn a_wake_after_sleep_reacquires_at_once() {
         let w = world(8);
-        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
         let mut rng = Rng::new(2);
         let feed =
             |tr: &mut Tracker, rng: &mut Rng, t0: f64, t1: f64, clock_shift: f64, turn: f64| {
@@ -1444,7 +1459,7 @@ mod tests {
         let (leds, imu_pos) = synth::cv1_touch_left();
         w.body = Body { leds, imu_pos };
         let alias = vision::ring_aliases(&w.body.leds)[0].clone();
-        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
         let mut rng = Rng::new(3);
         let (mut t, mut next_frame, mut worst_after_lock) = (0.0, 0.0, 0.0f64);
         while t < 4.0 {
@@ -1511,6 +1526,7 @@ mod tests {
                 relock_ns: 0,
                 ..Params::default()
             },
+            w.cams.len(),
         );
         let mut rng = Rng::new(4);
         let mut t = 0.0;
@@ -1647,7 +1663,7 @@ mod tests {
     fn a_still_controller_holds_still_out_of_sight() {
         let mut w = world(5);
         w.motion = Motion::still(Vector3::new(0.1, 1.0, -0.2), [0.3, -0.5, 0.2]);
-        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
         tr.seed_biases(w.bg, w.ba + Vector3::new(0.1, 0.0, -0.05), 1e-4, 1e-3);
         let mut rng = Rng::new(3);
         let (dt, frame) = (0.002, 1.0 / 52.0);
@@ -1697,7 +1713,7 @@ mod tests {
                 * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 45f64.to_radians())
         };
         let n = w.body.leds.len();
-        let mut tr = Tracker::new(1, w.body.clone(), Params::default());
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
         let mut rng = Rng::new(4);
         let (mut t, mut next) = (0.0, 0.5);
         while t < 2.0 {
@@ -1763,5 +1779,89 @@ mod tests {
             x.bg,
             x.ba
         );
+    }
+    #[test]
+    fn dynamic_sensors_high_ids_confirm_and_receive_diagnostics() {
+        let mut w = world(5);
+        w.motion = Motion::still(Vector3::new(0.1, 1.0, -0.2), [0.3, -0.5, 0.2]);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 65);
+        let mut rng = Rng::new(3);
+        let mut accepted = [0; 3];
+        for tick in 1..400 {
+            let t = tick as f64 * 0.002;
+            tr.imu(imu(&w, t));
+            if tick % 10 == 0 {
+                for (slot, camera) in [8, 63, 64].into_iter().enumerate() {
+                    let cam = &w.cams[slot];
+                    let blobs = sight(&w, cam, t, &mut rng, 0.0);
+                    if matches!(
+                        tr.frame(
+                            (1e9 + t * 1e9) as u64,
+                            camera,
+                            cam,
+                            &blobs,
+                            Some(w.motion.pose(t)),
+                            &[]
+                        ),
+                        Outcome::Acquired(_) | Outcome::Updated(_)
+                    ) {
+                        accepted[slot] += 1;
+                    }
+                }
+            }
+        }
+        assert!(accepted.iter().all(|n| *n > 2), "{accepted:?}");
+        for camera in [8, 63, 64] {
+            assert!(
+                tr.agreement.get(camera).is_some_and(|a| a.samples > 0),
+                "camera {camera}"
+            );
+        }
+        assert!(tr.last_confirmed > 0);
+    }
+
+    #[test]
+    fn dynamic_sensors_63_and_64_are_distinct_confirmations() {
+        let mut w = world(5);
+        w.motion = Motion::still(Vector3::new(0.1, 1.0, -0.2), [0.3, -0.5, 0.2]);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 65);
+        let mut rng = Rng::new(3);
+        for tick in 1..400 {
+            let t = tick as f64 * 0.002;
+            tr.imu(imu(&w, t));
+            if tick % 10 == 0 {
+                let slot = usize::from(tick >= 200);
+                let camera = 63 + slot;
+                let cam = &w.cams[slot];
+                let blobs = sight(&w, cam, t, &mut rng, 0.0);
+                tr.frame(
+                    (1e9 + t * 1e9) as u64,
+                    camera,
+                    cam,
+                    &blobs,
+                    Some(w.motion.pose(t)),
+                    &[],
+                );
+            }
+            if tick == 199 {
+                assert!(tr.stats.updates > 2, "single sensor never tracked");
+                assert_eq!(tr.last_confirmed, 0, "one sensor cannot confirm itself");
+            }
+        }
+        assert!(
+            tr.last_confirmed > 0,
+            "second high-index sensor must confirm the first"
+        );
+    }
+
+    #[test]
+    fn dynamic_sensors_unknown_id_does_not_allocate_or_enter_tracking() {
+        let w = world(5);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let count = tr.agreement.len();
+        let out = tr.frame(1, usize::MAX, &w.cams[0], &[], None, &[]);
+        assert_eq!(out, Outcome::UnknownCamera);
+        assert_eq!(tr.agreement.len(), count);
+        assert_eq!(tr.stats.frames, 0);
     }
 }

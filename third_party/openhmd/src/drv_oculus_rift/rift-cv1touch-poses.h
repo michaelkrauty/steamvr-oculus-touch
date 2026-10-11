@@ -8,10 +8,10 @@
 #include "openhmd_cv1touch.h"
 #include "../omath.h"
 
-static inline bool cv1touch_fixed_pose_lookup(const ohmd_cv1touch_config *cfg, const char *serial, posef *out)
+static inline bool cv1touch_fixed_pose_lookup_list(const ohmd_cv1touch_sensor_pose *poses, size_t count, const char *serial, posef *out)
 {
-	for (int i = 0; i < 8; i++) {
-		const ohmd_cv1touch_sensor_pose *p = cfg->fixed_poses + i;
+	for (size_t i = 0; i < count; i++) {
+		const ohmd_cv1touch_sensor_pose *p = poses + i;
 
 		if (p->serial[0] == '\0' || strncmp(p->serial, serial, sizeof p->serial) != 0)
 			continue;
@@ -26,6 +26,10 @@ static inline bool cv1touch_fixed_pose_lookup(const ohmd_cv1touch_config *cfg, c
 		return true;
 	}
 	return false;
+}
+
+static inline bool cv1touch_fixed_pose_lookup(const ohmd_cv1touch_config *cfg, const char *serial, posef *out) {
+    return cv1touch_fixed_pose_lookup_list(cfg->fixed_poses, 8, serial, out);
 }
 
 #endif

@@ -1276,6 +1276,10 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 
 	// Find and attach Rift sensors if available
 	priv->tracker_ctx = rift_tracker_new (driver->ctx, priv->radio_address);
+	if (priv->tracker_ctx == NULL) {
+		ohmd_set_error(driver->ctx, "Failed to create Rift sensor tracker");
+		goto cleanup;
+	}
 
 	/* Configure the rift device in the tracker */
 	quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};

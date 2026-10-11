@@ -119,6 +119,8 @@ struct ohmd_device {
 };
 
 
+#include "cv1touch-sensor-config.h"
+
 struct ohmd_context {
 	ohmd_driver* drivers[16];
 	int num_drivers;
@@ -139,6 +141,7 @@ struct ohmd_context {
 	char config_dir[OHMD_STR_SIZE];
 	/* cv1touch extensions (zero-initialised by ohmd_ctx_create) */
 	ohmd_cv1touch_config cv1touch_config;
+	cv1touch_sensor_config cv1touch_sensors;
 	ohmd_cv1touch_frame_cb cv1touch_frame_cb;
 	void *cv1touch_frame_user;
 	ohmd_cv1touch_image_cb cv1touch_image_cb;
