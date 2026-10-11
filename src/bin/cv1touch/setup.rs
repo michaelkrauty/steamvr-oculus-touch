@@ -587,7 +587,11 @@ fn timed_window(seconds: u64) -> Result<(), String> {
 
 const START: &str = "Press A on the right controller (or Enter) to start.";
 
-const CAMERA_MOTION: &str = "For 60 seconds, wave both controllers slowly through the whole play space:\nhigh and low, near and far, twisting your wrists. Every sensor should see them, often two at once.";
+const CAMERA_MOTION: &str = "The sensors work out where they are by watching the controllers' LEDs; a controller seen by two\nsensors at once ties those two together. For 60 seconds, until the double beep, wave both controllers\nslowly through the whole play space: high and low, near and far, twisting your wrists, so every\nsensor sees them, often two at once.";
+
+const GRAVITY_HOLDS: &str = "A controller's accelerometer shows which way is down, but only while it is held still, and holds\nin many orientations separate that from the accelerometer's own error. The sensors must see the\nrings, to know which way each controller faces.\nHold both controllers still in 12 different orientations, tilting AND rolling them between holds.\nFor each: get still, press A (or Enter), and stay still until the double beep (3 s).";
+
+const RENDER_WAKE: &str = "Each controller reports where its LEDs sit; the guide fits SteamVR's 3D model of the\ncontroller to them. Nothing to aim or hold: keep both controllers awake (move them now and\nthen) for 5 seconds, until the double beep.";
 
 fn timed_capture(
     stage: Stage,
@@ -597,7 +601,7 @@ fn timed_capture(
     let rec = capture_path(stage, checkpoint)?;
     let mut guard = guided_start_recording(&rec, false)?;
     let result = if gravity {
-        human_action("Hold both controllers still in 12 different orientations: tilt AND roll them between holds, rings visible.\nFor each one: hold still, press A (or Enter), and keep still until the double beep (3 s).");
+        human_action(GRAVITY_HOLDS);
         (1..=12).try_for_each(|hold| -> Result<(), String> {
             go_signal(&format!(
                 "  Hold {hold}/12: still, in a new orientation, then A."
@@ -605,10 +609,7 @@ fn timed_capture(
             timed_window(3)
         })
     } else if stage == Stage::Render {
-        go_signal(&format!(
-            "Wake both controllers and keep them awake for 5 seconds.\n{START}"
-        ))
-        .and_then(|()| timed_window(5))
+        go_signal(&format!("{RENDER_WAKE}\n{START}")).and_then(|()| timed_window(5))
     } else {
         go_signal(&format!("{CAMERA_MOTION}\n{START}")).and_then(|()| timed_window(60))
     };
@@ -926,17 +927,23 @@ impl ButtonEdges {
 }
 
 const REGISTRATION_PREPARATION: &str =
-    "Headset alignment: wearing the headset, you hold the controllers against it and move your
-head for about a minute. Read all of this now; you won't see the screen with the headset on.
+    "Headset alignment: wearing the headset, you hold the controllers against it and turn, nod
+and tilt your head for about a minute, so the fit learns where the controllers sit on the
+headset. Read all of this now; you won't see the screen with the headset on.
   1. Put on the headset (SteamVR running).
-  2. Hold one controller firmly against each side of the headset, rings and the headset's
-     sensors uncovered. Don't let them slip: the fit measures where they sit on the headset.
-  3. Press A, then keep still through 10 buzzes.
-  4. After the double buzz, turn around slowly in place, two full turns each way,
+  2. Press one controller firmly against each side of the headset, left on the left, rings
+     and the headset's sensors uncovered. Keep them exactly there until the end: if one
+     moves, the fit is wrong.
+  3. Press A (right thumb). 10 buzzes follow, one a second: time to settle your grip after
+     the press. Nothing is recorded yet.
+  4. Double buzz: recording starts. Turn around in place:
+     two full turns one way, then two the other way, about 5 to 10 seconds per turn,
      until a single buzz.
-  5. Then nod and tilt your head a few times, until a long buzz: done, take off the headset.
-Three quick buzzes instead: the recording stopped (a controller slipped, or something else
-went wrong); take off the headset and read the screen. B cancels at any time.";
+  5. Then nod (look up and down) and tilt (ear toward each shoulder) as far as is
+     comfortable, a few times each, until a long buzz: done, take off the headset.
+Three quick buzzes instead: the recording stopped early (a controller slipped, B was pressed,
+or something went wrong); take off the headset and read the screen. B (right controller)
+cancels at any time.";
 
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
@@ -1110,13 +1117,18 @@ fn confirm_registration_controls_with(
     Ok(())
 }
 
+/// The countdown's line on screen, `remaining` seconds before the recording starts.
+fn countdown_line(remaining: usize) -> String {
+    format!("\r  recording starts in {remaining:>2} s ")
+}
+
 fn registration_countdown_with(
     mut tick: impl FnMut(usize) -> Result<(), String>,
     mut second: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     let result = (|| {
         for remaining in (1..=10).rev() {
-            print!("\r  hold still: {remaining:>2} s ");
+            print!("{}", countdown_line(remaining));
             let _ = io::stdout().flush();
             tick(HAND_LEFT)?;
             tick(HAND_RIGHT)?;
@@ -1429,7 +1441,7 @@ fn run_stage(
                         RegistrationFeedback::new(inspection, SLIP_CHECK.load(Ordering::Relaxed));
                     let captured = capture_free_named_with_feedback(
                         150,
-                        "Recording: two slow turns each way; after the single buzz, nod and tilt until the long buzz. B cancels.",
+                        "Recording: two turns one way, two the other; after the single buzz, nod and tilt until the long buzz. B cancels.",
                         false,
                         Some(&base),
                         Some(&mut feedback),
@@ -1843,24 +1855,49 @@ mod tests {
         assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
     }
     #[test]
+    fn every_timed_step_says_what_it_measures_and_when_it_ends() {
+        for (text, why) in [
+            (CAMERA_MOTION, "work out where they are"),
+            (GRAVITY_HOLDS, "which way is down"),
+            (RENDER_WAKE, "3D model"),
+            (INPUTS_GUIDE, "how far each trigger, grip and stick travels"),
+        ] {
+            assert!(text.contains(why), "{text}");
+            assert!(text.contains("double beep"), "{text}");
+        }
+        for step in CalStep::ALL {
+            assert!(step.guided().contains("until the double beep"), "{step:?}");
+        }
+    }
+
+    #[test]
     fn headset_instructions_say_everything_before_the_headset_goes_on() {
         // once the headset is on the screen is out of sight: what to hold, when, how to move,
-        // what each buzz means and how it ends must all be read beforehand
+        // what each buzz means and why, and how it ends must all be read beforehand
         for needed in [
             "won't see the screen",
             "against each side",
-            "keep still through 10 buzzes",
-            "After the double buzz",
-            "two full turns each way",
+            "10 buzzes",
+            "settle your grip",
+            "Nothing is recorded yet",
+            "Double buzz: recording starts",
+            "two full turns one way, then two the other way",
+            "seconds per turn",
             "single buzz",
-            "nod and tilt",
+            "nod (look up and down)",
+            "tilt (ear toward each shoulder)",
             "long buzz: done",
             "Three quick buzzes",
             "slipped",
-            "B cancels",
+            "cancels at any time",
         ] {
             assert!(REGISTRATION_PREPARATION.contains(needed), "{needed}");
         }
+        // nothing in this step is measured while still: asking for stillness only raises the
+        // question of why
+        assert!(!REGISTRATION_PREPARATION.contains("still"));
+        assert!(!countdown_line(3).contains("still"));
+        assert_eq!(countdown_line(3), "\r  recording starts in  3 s ");
         // it finishes by itself: pressing anything while holding the controllers to the
         // headset risks moving them
         assert!(!REGISTRATION_PREPARATION.contains("to finish"));

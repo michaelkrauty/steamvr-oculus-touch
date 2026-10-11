@@ -1609,6 +1609,9 @@ fn start_line(line: &str) -> Option<bool> {
     }
 }
 
+/// The setup guide's introduction to input calibration.
+const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and stick travels, so SteamVR gets their full range.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
+
 /// The four input calibration steps, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalStep {
@@ -1660,9 +1663,13 @@ impl CalStep {
     /// What the guide asks for (numbered by the caller).
     fn guided(self) -> &'static str {
         match self {
-            CalStep::Rest => "Let go of both triggers, grips and sticks.",
-            CalStep::Triggers => "Pull both triggers all the way and hold them.",
-            CalStep::Grips => "Let go of the triggers and squeeze both grips fully.",
+            CalStep::Rest => "Let go of both triggers, grips and sticks, until the double beep.",
+            CalStep::Triggers => {
+                "Pull both triggers all the way and hold them there until the double beep."
+            }
+            CalStep::Grips => {
+                "Let go of the triggers and squeeze both grips fully until the double beep."
+            }
             CalStep::Sticks => "Let go of the grips and circle both sticks around their outer edges until the double beep.",
         }
     }
@@ -1993,9 +2000,7 @@ fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Res
             return Ok(());
         }
         if guided {
-            human_action(
-                "Do each step; it records as soon as you are in position (Enter also starts it).",
-            );
+            human_action(INPUTS_GUIDE);
         } else {
             input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
         }
