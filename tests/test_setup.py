@@ -31,6 +31,7 @@ class SetupTests(unittest.TestCase):
         self.commands = []
         self.configured = False
         self.loaded_configuration = True
+        self.engine_ready = True
         self.awake = False
         self.counter = 10
         self.extra_sensor = False
@@ -67,7 +68,7 @@ class SetupTests(unittest.TestCase):
                     if self.extra_sensor:
                         sensors.append({"serial": "CAMNEW", "placed": 0, "frames": self.counter,
                                         "fixes": [0, 0]})
-                    reply = {"generation": 1, "mode": "calibrated" if self.configured else "provisional",
+                    reply = {"generation": 1, "engine_ready": self.engine_ready, "mode": "calibrated" if self.configured else "provisional",
                              "recording": False, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
                              "alignment": {"registration": self.configured and self.loaded_configuration,
                                            "render": [self.configured and self.loaded_configuration] * 2},
@@ -279,6 +280,47 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(report["ready"])
         loaded = next(check for check in report["checks"] if check["name"] == "tracking_configuration")
         self.assertFalse(loaded["ok"])
+        self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_pending_engine_reload_blocks_capture_despite_advancing_old_streams(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        path = directory / "calibration.json"
+        value = json.loads(path.read_text())
+        value["sensors"][0]["pos"] = [0.1, 0, 0]
+        path.write_text(json.dumps(value))
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        self.engine_ready = False
+        result = self.cli("--check", "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["stages"][0]["state"], "blocked")
+        self.assertIn("initializing or reloading", report["stages"][0]["reason"])
+        output = self.terminal_guide(expected_code=1)
+        self.assertIn("initializing or reloading", output)
+        self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_legacy_daemon_checks_work_but_guided_reload_requires_ready_marker(self):
+        directory = self.fixtures()
+        self.engine_ready = None
+        self.terminal_guide("keep\n" * 4)
+        result = self.cli("--check", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        path = directory / "calibration.json"
+        value = json.loads(path.read_text())
+        value["sensors"][0]["pos"] = [0.1, 0, 0]
+        path.write_text(json.dumps(value))
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        output = self.terminal_guide("new\n", expected_code=1)
+        self.assertIn("matching cv1touchd", output)
+        self.assertIn("no capture was started", output)
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)

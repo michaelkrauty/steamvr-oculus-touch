@@ -22,6 +22,8 @@ struct Inspection {
     unplaced: Vec<String>,
     identities: Option<[String; 2]>,
     generation: Option<u64>,
+    sensors: BTreeSet<String>,
+    engine_ready: Option<bool>,
 }
 
 fn journal_path() -> PathBuf {
@@ -198,7 +200,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         Check { name: "daemon", ok: second.is_some(), detail: "Start cv1touchd with access to the CV1 USB devices.".into() },
         Check { name: "sensor_streams", ok: streaming, detail: "Every connected sensor must deliver advancing frames; check USB access/bandwidth if stopped.".into() },
         Check { name: "controllers_awake", ok: fresh, detail: "Wake both Touch controllers with a face button before a capture.".into() },
-        Check { name: "idle", ok: !recording && normal_mode, detail: "Finish any active recording or calibration before starting the guide.".into() },
+        Check { name: "idle", ok: !recording && normal_mode && second.as_ref().is_none_or(|v| v["engine_ready"] != false), detail: "Wait for engine initialization/reload and finish any active recording or capture before starting the guide.".into() },
         Check { name: "steamvr_assets", ok: runtime_ok && steamvr::driver_assets().is_ok(), detail: "Install the driver and native SteamVR runtime before setup; start SteamVR before headset registration.".into() },
         Check { name: "sensor_coverage", ok: unplaced.is_empty() && !sensors.is_empty(), detail: "New connected sensors need placement; disconnected saved sensors can remain in the calibration.".into() },
         Check { name: "render_geometry", ok: matches!(render_sources, Artifact::Valid(_)), detail: "Both controller identities and installed SteamVR meshes must be valid.".into() },
@@ -214,6 +216,8 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
     ] {
         let reason = if second.is_none() {
             Some("daemon unavailable")
+        } else if second.as_ref().is_some_and(|v| v["engine_ready"] == false) {
+            Some("tracking engine is initializing or reloading; wait for it to resume")
         } else if recording || !normal_mode {
             Some("daemon is busy; finish its active operation first")
         } else if !fresh {
@@ -255,6 +259,8 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         unplaced,
         identities: identities.filter(|_| known_identities),
         generation: second.as_ref().and_then(|v| v["generation"].as_u64()),
+        sensors: sensors.iter().map(shm::serial_str).collect(),
+        engine_ready: second.as_ref().and_then(|v| v["engine_ready"].as_bool()),
     }
 }
 
@@ -469,11 +475,143 @@ fn verify_fitted_dependencies(
     Ok(())
 }
 
+// Calibration load acknowledges the requested mode before the engine reopens.
+// Require two samples in the applied mode: counters reset during reopen, so compare the
+// new stream with itself rather than requiring it to exceed pre-reload counters.
+fn wait_reload_with(
+    before: &Inspection,
+    expected_mode: &str,
+    timeout: Duration,
+    mut sample: impl FnMut() -> Result<(Option<serde_json::Value>, Option<RawInputs>, u64), String>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut pause: impl FnMut(),
+) -> Result<(), String> {
+    let generation = before
+        .generation
+        .ok_or("daemon generation unavailable before reload")?;
+    let ids = before
+        .identities
+        .as_ref()
+        .ok_or("controller identities unavailable before reload")?;
+    if before.sensors.is_empty() {
+        return Err("connected sensor set unavailable before reload".into());
+    }
+    let mut previous: Option<BTreeMap<String, u32>> = None;
+    while elapsed() < timeout {
+        let (status, raw, now_ns) = sample()?;
+        if elapsed() >= timeout {
+            break;
+        }
+        if status
+            .as_ref()
+            .and_then(|v| v["generation"].as_u64())
+            .is_some_and(|g| g != generation)
+        {
+            return Err("daemon restarted during reload; stage remains incomplete".into());
+        }
+        if status
+            .as_ref()
+            .is_some_and(|v| v["engine_ready"].as_bool().is_none())
+        {
+            return Err("guided reload requires a matching cv1touchd with engine readiness diagnostics; stage remains incomplete".into());
+        }
+        if let Some(raw) = &raw {
+            for (hand, expected) in raw.hands.iter().zip(ids) {
+                let known = hand.identity.len() == 32
+                    && hand
+                        .identity
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if known && &hand.identity != expected {
+                    return Err(
+                        "physical controller changed during reload; stage remains incomplete"
+                            .into(),
+                    );
+                }
+            }
+        }
+        let fresh = raw.as_ref().is_some_and(|raw| {
+            input_identities_match(raw, ids).is_ok()
+                && PairedInputPhase::new([0, 0])
+                    .observe(raw, ids, now_ns)
+                    .is_ok()
+        });
+        let sensors = status
+            .as_ref()
+            .filter(|v| {
+                v["generation"].as_u64() == Some(generation)
+                    && v["mode"] == expected_mode
+                    && v["engine_ready"] == true
+                    && v["recording"] == false
+            })
+            .and_then(|v| status::sensors_from_status(v).ok());
+        let current = sensors
+            .filter(|sensors| {
+                !sensors.is_empty()
+                    && (expected_mode != "calibrated"
+                        || sensors.iter().all(|sensor| sensor.placed != 0))
+                    && sensors.iter().map(shm::serial_str).collect::<BTreeSet<_>>()
+                        == before.sensors
+                    && sensors.len() == before.sensors.len()
+            })
+            .map(|sensors| {
+                sensors
+                    .into_iter()
+                    .map(|sensor| (shm::serial_str(&sensor), sensor.frames))
+                    .collect::<BTreeMap<_, _>>()
+            });
+        if let Some(current) = current {
+            if fresh
+                && previous.as_ref().is_some_and(|old| {
+                    current
+                        .iter()
+                        .all(|(serial, frames)| old.get(serial).is_some_and(|prior| frames > prior))
+                })
+            {
+                return Ok(());
+            }
+            previous = Some(current);
+        } else {
+            previous = None;
+        }
+        pause();
+    }
+    Err(format!("timed out waiting for {expected_mode} sensor streams and awake matching controllers after reload; stage remains incomplete, rerun setup when ready"))
+}
+
+fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
+    println!(
+        "Waiting for tracking to resume. Keep both Touch controllers awake with a face button."
+    );
+    let start = std::time::Instant::now();
+    wait_reload_with(
+        before,
+        expected_mode,
+        Duration::from_secs(30),
+        || {
+            if interrupted() {
+                return Err("setup interrupted during reload; stage remains incomplete".into());
+            }
+            let status = read_status();
+            let raw = raw_inputs().ok();
+            if interrupted() {
+                return Err("setup interrupted during reload; stage remains incomplete".into());
+            }
+            Ok((status, raw, shm::now_ns()))
+        },
+        || start.elapsed(),
+        || thread::sleep(Duration::from_millis(100)),
+    )
+}
+
 fn run_stage(
     stage: Stage,
     inspection: &Inspection,
     checkpoint: &mut Checkpoint,
 ) -> Result<(), String> {
+    if matches!(stage, Stage::Camera | Stage::Gravity) && inspection.engine_ready.is_none() {
+        return Err("guided reload requires a matching cv1touchd with engine readiness diagnostics; no capture was started".into());
+    }
     let old = checkpoint.clone();
     let preserve = stage == Stage::Camera
         && !inspection.unplaced.is_empty()
@@ -499,7 +637,7 @@ fn run_stage(
             if send("calibration capture") != 0 {
                 return Err("cannot enter camera capture mode".into());
             }
-            wait_for_mode("capture", Duration::from_secs(30))?;
+            wait_reload(inspection, "capture")?;
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
@@ -558,6 +696,9 @@ fn run_stage(
     };
     if code != 0 || interrupted() {
         return Err("stage did not complete; previous backups and capture paths retained. Rerun setup when ready.".into());
+    }
+    if matches!(stage, Stage::Camera | Stage::Gravity) {
+        wait_reload(inspection, "calibrated")?;
     }
     let mut next = inspect(checkpoint);
     verify_fitted_dependencies(stage, inspection, &next)?;
@@ -675,7 +816,136 @@ mod tests {
             unplaced: vec![],
             identities: Some(["1".repeat(32), "2".repeat(32)]),
             generation: Some(1),
+            sensors: BTreeSet::from(["CAMTEST".into()]),
+            engine_ready: Some(true),
         }
+    }
+    fn reload_sample(generation: u64, frames: u32) -> serde_json::Value {
+        serde_json::json!({"generation": generation, "mode": "calibrated", "recording": false, "engine_ready": true,
+            "sensors": [{"serial": "CAMTEST", "placed": 1, "frames": frames, "fixes": [0,0]}]})
+    }
+    fn reload_inputs() -> RawInputs {
+        RawInputs {
+            hands: std::array::from_fn(|hand| RawInput {
+                identity: (hand + 1).to_string().repeat(32),
+                connected: true,
+                received_host_ns: 1_000_000_000,
+                trigger: 0.,
+                grip: 0.,
+                stick: [0.; 2],
+            }),
+        }
+    }
+    fn simulated_engine(
+        expected_mode: &str,
+        samples: Vec<(Option<serde_json::Value>, Option<RawInputs>)>,
+    ) -> Result<(), String> {
+        let mut samples = samples.into_iter();
+        let tick = std::cell::Cell::new(0);
+        wait_reload_with(
+            &saved(),
+            expected_mode,
+            Duration::from_secs(1),
+            || {
+                let (status, raw) = samples.next().unwrap_or((None, None));
+                Ok((status, raw, 1_000_000_010))
+            },
+            || Duration::from_millis(tick.get()),
+            || tick.set(tick.get() + 100),
+        )
+    }
+    fn simulated_reload(
+        samples: Vec<(Option<serde_json::Value>, Option<RawInputs>)>,
+    ) -> Result<(), String> {
+        simulated_engine("calibrated", samples)
+    }
+    #[test]
+    fn reload_acknowledgement_must_survive_transient_disconnected_publication() {
+        let disconnected = serde_json::json!({"generation": 1, "mode": "calibrated", "recording": false, "engine_ready": false, "sensors": []});
+        let mut cleared = reload_inputs();
+        for hand in &mut cleared.hands {
+            hand.identity.clear();
+            hand.connected = false;
+        }
+        assert!(simulated_reload(vec![
+            (Some(disconnected), Some(cleared)),
+            (Some(reload_sample(1, 1)), Some(reload_inputs())),
+            (Some(reload_sample(1, 2)), Some(reload_inputs())),
+        ])
+        .is_ok());
+    }
+    #[test]
+    fn capture_mode_waits_for_applied_engine_without_requiring_placed_sensors() {
+        let samples = (1..3)
+            .map(|frames| {
+                let mut status = reload_sample(1, frames);
+                status["mode"] = "capture".into();
+                status["sensors"][0]["placed"] = 0.into();
+                (Some(status), Some(reload_inputs()))
+            })
+            .collect();
+        assert!(simulated_engine("capture", samples).is_ok());
+    }
+    #[test]
+    fn reload_outage_or_stopped_streams_time_out() {
+        assert!(simulated_reload(vec![]).unwrap_err().contains("timed out"));
+        let stopped = (0..10)
+            .map(|_| (Some(reload_sample(1, 1)), Some(reload_inputs())))
+            .collect();
+        assert!(simulated_reload(stopped).unwrap_err().contains("timed out"));
+    }
+    #[test]
+    fn reload_requires_matching_daemon_readiness_capability() {
+        let mut legacy = reload_sample(1, 1);
+        legacy.as_object_mut().unwrap().remove("engine_ready");
+        assert!(
+            simulated_reload(vec![(Some(legacy), Some(reload_inputs()))])
+                .unwrap_err()
+                .contains("matching cv1touchd")
+        );
+    }
+    #[test]
+    fn reload_cannot_accept_old_engine_frames_before_reopen_applied() {
+        let samples = (1..11)
+            .map(|frames| {
+                let mut status = reload_sample(1, frames);
+                status["engine_ready"] = false.into();
+                (Some(status), Some(reload_inputs()))
+            })
+            .collect();
+        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
+    }
+    #[test]
+    fn reload_restart_or_replaced_controller_is_fatal() {
+        assert!(
+            simulated_reload(vec![(Some(reload_sample(2, 1)), Some(reload_inputs()))])
+                .unwrap_err()
+                .contains("restarted")
+        );
+        let mut replaced = reload_inputs();
+        replaced.hands[1].identity = "3".repeat(32);
+        assert!(
+            simulated_reload(vec![(Some(reload_sample(1, 1)), Some(replaced))])
+                .unwrap_err()
+                .contains("controller changed")
+        );
+    }
+    #[test]
+    fn reload_requires_original_sensor_set_and_fresh_inputs() {
+        let mut changed = reload_sample(1, 1);
+        changed["sensors"][0]["serial"] = "NEWCAM".into();
+        let samples = (0..10)
+            .map(|_| (Some(changed.clone()), Some(reload_inputs())))
+            .collect();
+        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
+        let samples = (1..11)
+            .map(|frames| {
+                let mut asleep = reload_inputs();
+                asleep.hands[0].connected = false;
+                (Some(reload_sample(1, frames)), Some(asleep))
+            })
+            .collect();
+        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
     }
     #[test]
     fn registration_cannot_complete_against_a_world_changed_during_fit() {

@@ -18,6 +18,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Failed camera captures recover provisional tracking when the previous calibration is malformed; rejected reloads attempt recovery and report failure.
 - Cancelled render, registration, gravity, placement, and refinement fits do not install their computed settings.
 - Guided registration bootstraps a fresh fit after camera-world changes instead of depending on an obsolete saved transform.
+- Guided camera/gravity handoffs wait for the requested engine configuration, advancing sensor streams, and fresh data from the same controllers before continuing.
 
 ## [0.1.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) - 2026-10-10
 

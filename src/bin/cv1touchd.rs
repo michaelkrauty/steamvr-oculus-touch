@@ -139,6 +139,9 @@ struct Daemon {
     /// Sensor intrinsics and LED models still to be written into the active recording.
     session: Mutex<recorder::SessionInfo>,
     opts: Mutex<EngineOptions>,
+    /// Options revision requested under the opts lock, and revision actually opened.
+    engine_requested: std::sync::atomic::AtomicU64,
+    engine_applied: std::sync::atomic::AtomicU64,
     mode: Mutex<String>,
     reopen: AtomicBool,
     tracker: TrackerKind,
@@ -440,6 +443,7 @@ fn log(msg: impl AsRef<str>) {
 }
 
 fn publish_disconnected(d: &Daemon) {
+    d.engine_applied.store(0, Ordering::Release);
     d.track_in.lock().unwrap().register([]);
     d.pending_frames_dropped.store(0, Ordering::Relaxed);
     d.inputs.lock().unwrap().latest = Default::default();
@@ -708,7 +712,7 @@ fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
 fn engine_main(d: Arc<Daemon>) {
     let mut last_err = String::new();
     while !d.quit.load(Ordering::Acquire) {
-        let opts = d.opts.lock().unwrap().clone();
+        let (opts, revision) = requested_engine_options(&d);
         let mut e = match Engine::open(&opts, d.clone()) {
             Ok(e) => e,
             Err(err) => {
@@ -721,6 +725,7 @@ fn engine_main(d: Arc<Daemon>) {
                 continue;
             }
         };
+        d.engine_applied.store(revision, Ordering::Release);
         last_err.clear();
         d.session.lock().unwrap().reset(); // sensors may differ after a reopen
         log(format!(
@@ -1517,6 +1522,7 @@ fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
 }
 
 fn status_json(d: &Daemon) -> String {
+    let engine_ready = engine_is_ready(d);
     let hands = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap_or_default());
     let sensors = d.sensors.lock().unwrap().clone();
     let st = d.rec.stats();
@@ -1550,10 +1556,11 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         d.tracker,
         d.mode.lock().unwrap(),
+        engine_ready,
         d.inputs.lock().unwrap().status(),
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
@@ -1752,9 +1759,24 @@ fn current_opts(d: &Daemon) -> EngineOptions {
     d.opts.lock().unwrap().clone()
 }
 
+fn requested_engine_options(d: &Daemon) -> (EngineOptions, u64) {
+    let opts = d.opts.lock().unwrap();
+    (opts.clone(), d.engine_requested.load(Ordering::Acquire))
+}
+
+fn engine_is_ready(d: &Daemon) -> bool {
+    let _opts = d.opts.lock().unwrap();
+    let requested = d.engine_requested.load(Ordering::Acquire);
+    requested != 0 && d.engine_applied.load(Ordering::Acquire) == requested
+}
+
 /// Installs new engine options; the engine thread reopens the engine with them.
 fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
-    *d.opts.lock().unwrap() = opts;
+    {
+        let mut current = d.opts.lock().unwrap();
+        *current = opts;
+        d.engine_requested.fetch_add(1, Ordering::AcqRel);
+    }
     *d.mode.lock().unwrap() = mode.to_string();
     d.reopen.store(true, Ordering::Release);
     format!("ok {mode}")
@@ -2257,6 +2279,8 @@ fn main() {
         haptics: Mutex::new([None; 2]),
         session: Mutex::new(recorder::SessionInfo::default()),
         opts: Mutex::new(opts),
+        engine_requested: std::sync::atomic::AtomicU64::new(1),
+        engine_applied: std::sync::atomic::AtomicU64::new(0),
         mode: Mutex::new(mode),
         reopen: AtomicBool::new(false),
         tracker,
@@ -2339,6 +2363,8 @@ mod tests {
             haptics: Mutex::new([None; 2]),
             session: Mutex::new(Default::default()),
             opts: Mutex::new(Default::default()),
+            engine_requested: std::sync::atomic::AtomicU64::new(1),
+            engine_applied: std::sync::atomic::AtomicU64::new(0),
             mode: Mutex::new("calibrated".into()),
             reopen: AtomicBool::new(false),
             tracker: TrackerKind::Rust,
@@ -2363,6 +2389,38 @@ mod tests {
             inject: Injection::default(),
             inputs: Mutex::new(Default::default()),
         }
+    }
+
+    #[test]
+    fn status_does_not_report_the_engine_ready_before_initialization() {
+        let d = status_daemon();
+        let reply = status_json(&d);
+        let value: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["engine_ready"], false);
+    }
+
+    #[test]
+    fn reload_acknowledgement_cannot_confirm_old_engine_options() {
+        let d = status_daemon();
+        let (_, first) = requested_engine_options(&d);
+        d.engine_applied.store(first, Ordering::Release);
+        assert!(engine_is_ready(&d));
+        assert_eq!(
+            switch_mode(&d, Default::default(), "calibrated"),
+            "ok calibrated"
+        );
+        assert_eq!(*d.mode.lock().unwrap(), "calibrated");
+        assert!(!engine_is_ready(&d));
+        // An older open can finish after a newer request without satisfying it.
+        d.engine_applied.store(first, Ordering::Release);
+        assert!(!engine_is_ready(&d));
+        let (_, latest) = requested_engine_options(&d);
+        assert_ne!(latest, first);
+        d.engine_applied.store(latest, Ordering::Release);
+        assert!(engine_is_ready(&d));
+        publish_disconnected(&d);
+        assert!(!engine_is_ready(&d));
     }
 
     #[test]
