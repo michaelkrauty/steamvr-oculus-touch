@@ -62,7 +62,11 @@ fn state_words(report: &StageReport) -> String {
         State::Stale => format!("needs redoing ({})", report.reason),
         State::Unknown => "saved earlier, not verified".into(),
         State::Invalid => format!("saved file unusable ({})", report.reason),
-        State::Blocked => format!("waiting: {}", report.reason),
+        // the report's reason is "what blocks it; its own state": the blocker is what to act on
+        State::Blocked => format!(
+            "waiting: {}",
+            report.reason.split("; ").next().unwrap_or(&report.reason)
+        ),
     }
 }
 
@@ -274,6 +278,18 @@ mod tests {
             &Glyphs::for_terminal(true),
         );
         assert_eq!(dumb, "  [!] Sensor positions  waiting: start the daemon");
+        let waiting = checklist(
+            &[report(
+                Stage::Inputs,
+                State::Blocked,
+                "wake both controllers with a face button; artifact is missing",
+            )],
+            &g,
+        );
+        assert_eq!(
+            waiting,
+            "  ✗ Buttons and sticks  waiting: wake both controllers with a face button"
+        );
     }
 
     #[test]
