@@ -1,6 +1,6 @@
 # Third-party notices
 
-The root Apache 2.0 license covers original cv1touch code and local modifications only to the extent the author may license them. It does not replace third-party licenses or remove their copyright notices. Source headers retain individual authorship.
+The root Apache 2.0 license covers original SteamVR Oculus Touch code and local modifications only to the extent the author may license them. It does not replace third-party licenses or remove their copyright notices. Source headers retain individual authorship.
 
 ## Vendored source
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=Rift CV1 Touch controller tracking
-Documentation=https://github.com/michaelkrauty/cv1touch
+Documentation=https://github.com/michaelkrauty/steamvr-oculus-touch
 
 [Service]
 ExecStart=%h/.local/bin/cv1touchd

@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible cv1touch problem
+description: Report a reproducible SteamVR Oculus Touch problem
 title: "bug: "
 labels: [bug]
 body:
