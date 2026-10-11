@@ -286,7 +286,7 @@ impl Recorder {
     /// writer remains a matching session until it is joined; another session is untouched.
     pub fn stop_if(&self, path: &Path) -> Option<Stats> {
         let mut writer = self.writer.lock().unwrap();
-        if !writer.as_ref().is_some_and(|(owned, _)| owned == path) {
+        if writer.as_ref().is_none_or(|(owned, _)| owned != path) {
             return None;
         }
         Some(self.stop_locked(&mut writer))
