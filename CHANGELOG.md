@@ -8,7 +8,9 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - Development `cv1touch setup` guide for camera, gravity, render, input, and headset-registration stages, with a private resumable journal and dependency-aware reuse.
 - Read-only `setup --check` and `setup --check --json` reports; explicit visual-verification/adoption of legacy calibration without discarding its files.
-- Controller-button and haptic checks before headset registration, with a button-started haptic countdown and controller controls to finish or cancel the capture.
+- Controller-button and haptic checks before headset registration, with a button-started haptic countdown and B on the right controller to cancel the capture.
+- Headset registration ends its recording by itself once the person has turned, nodded and tilted enough, and stops it with three quick buzzes when a controller turns on the headset by more than about 3 degrees within a second (or on any other problem); the retry prompt, or `setup --no-slip-check`, turns the slip check off.
+- `cv1touchd` status names its shared-memory segment (`shm`).
 
 ### Changed
 

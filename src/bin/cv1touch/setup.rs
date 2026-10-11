@@ -3,6 +3,7 @@
 
 //! Interactive orchestration; the library planner has no hardware side effects.
 use super::*;
+use cv1touch::headset_watch::{Cue, HeadsetCapture};
 use cv1touch::input_calibration;
 use cv1touch::setup::{self, Artifact, Checkpoint, Snapshot, Stage, State};
 use serde::Serialize;
@@ -340,14 +341,7 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
             if allowed.contains(&answer.as_str()) {
                 return Ok(answer);
             }
-            human_action(&if allowed.contains(&"") {
-                format!(
-                    "Press Enter{}, or q to quit.",
-                    if allowed.contains(&"k") { ", k" } else { "" }
-                )
-            } else {
-                format!("Enter {}.", allowed.join(" / "))
-            });
+            human_action(&ui::hint(allowed));
         }
     }
 }
@@ -472,18 +466,14 @@ fn installed(stage: Stage) -> Option<serde_json::Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// Asks at a stage prompt: Enter starts, q quits, k keeps (where offered).
-fn ask(prompt: &str, can_keep: bool) -> Result<ui::Answer, String> {
-    let keys: &[&str] = if can_keep {
-        &[
-            "", "new", "start", "s", "y", "yes", "k", "keep", "q", "quit", "exit",
-        ]
-    } else {
-        &["", "new", "start", "s", "y", "yes", "q", "quit", "exit"]
-    };
-    let line = choice(prompt, keys)?;
-    ui::answer(&line, can_keep).ok_or_else(|| "unrecognised answer".to_string())
+/// Asks at a prompt for one of the `offered` answers.
+fn ask(prompt: &str, offered: &[ui::Answer]) -> Result<ui::Answer, String> {
+    let keys: Vec<&str> = offered.iter().flat_map(|a| a.words()).copied().collect();
+    let line = choice(prompt, &keys)?;
+    ui::answer(&line, offered).ok_or_else(|| "unrecognised answer".to_string())
 }
+
+const START_OR_QUIT: &[ui::Answer] = &[ui::Answer::Start, ui::Answer::Quit];
 
 fn persist(checkpoint: &Checkpoint) -> Result<(), String> {
     setup::save(&journal_path(), checkpoint).map_err(|e| format!("setup journal: {e}"))
@@ -943,8 +933,10 @@ head for about a minute. Read all of this now; you won't see the screen with the
      sensors uncovered. Don't let them slip: the fit measures where they sit on the headset.
   3. Press A, then keep still through 10 buzzes.
   4. After the double buzz, turn around slowly in place, two full turns each way,
-     then nod and tilt your head a few times.
-  5. Press A to finish (B cancels). It also stops by itself after 150 s, with a long buzz.";
+     until a single buzz.
+  5. Then nod and tilt your head a few times, until a long buzz: done, take off the headset.
+Three quick buzzes instead: the recording stopped (a controller slipped, or something else
+went wrong); take off the headset and read the screen. B cancels at any time.";
 
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
@@ -1159,54 +1151,115 @@ fn registration_countdown(before: &Inspection) -> Result<(), String> {
     )
 }
 
+/// Whether the headset alignment watches for a controller slipping: `setup --no-slip-check`, or
+/// the answer to a slip, turns it off for the rest of the guide.
+pub(super) static SLIP_CHECK: AtomicBool = AtomicBool::new(true);
+/// Set when the last headset alignment stopped because a controller slipped.
+static SLIPPED: AtomicBool = AtomicBool::new(false);
+
+/// `pulses` buzzes of `seconds` in both controllers, 0.1 s apart.
+fn registration_buzz(
+    pulses: u32,
+    seconds: f32,
+    frequency: f32,
+    amplitude: f32,
+) -> Result<(), String> {
+    for pulse in 0..pulses {
+        if pulse > 0 {
+            thread::sleep(Duration::from_secs_f32(seconds + 0.1));
+        }
+        for hand in [HAND_LEFT, HAND_RIGHT] {
+            registration_haptic(hand, seconds, frequency, amplitude)?;
+        }
+    }
+    Ok(())
+}
+
+/// The headset recording: stops by itself once the person has turned, nodded and tilted enough
+/// (a long buzz), or with three quick buzzes when a controller moves on the headset (with the slip
+/// check), B cancels, or anything else goes wrong.
 struct RegistrationFeedback<'a> {
     before: &'a Inspection,
     edges: ButtonEdges,
+    capture: HeadsetCapture,
+    /// What ended the recording early, in the person's words.
+    error: Option<String>,
 }
-impl RegistrationFeedback<'_> {
-    fn rearm_finish(&mut self, now_ns: u64) {
-        self.edges = ButtonEdges::new(now_ns);
+
+impl<'a> RegistrationFeedback<'a> {
+    fn new(before: &'a Inspection, slip_check: bool) -> Self {
+        Self {
+            before,
+            edges: ButtonEdges::new(shm::now_ns()),
+            capture: HeadsetCapture::new(slip_check),
+            error: None,
+        }
+    }
+
+    /// Keeps the first error, and tells the person wearing the headset at once: three quick
+    /// buzzes, whatever went wrong.
+    fn noted<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
+        if let Err(error) = &result {
+            if self.error.is_none() {
+                self.error = Some(error.clone());
+                // the error says what matters; a buzz that fails too adds nothing
+                let _ = registration_buzz(3, 0.1, 160., 0.8);
+            }
+        }
+        result
+    }
+
+    fn check(&mut self) -> Result<bool, String> {
+        let raw = registration_inputs(self.before)?;
+        let ids = self
+            .before
+            .identities
+            .as_ref()
+            .ok_or("controller identities unavailable")?;
+        // the controllers stay awake and their samples keep moving forward
+        self.edges.observe(&raw, ids, shm::now_ns())?;
+        match self.capture.cue() {
+            Cue::Slipped(hand, deg) => Err(format!(
+                "the {} controller slipped against the headset ({deg:.0}°); no fit installed",
+                ["left", "right"][hand]
+            )),
+            Cue::Turned => registration_buzz(1, 0.25, 160., 0.65).map(|()| false),
+            Cue::Done => Ok(true),
+            Cue::Recording => Ok(false),
+        }
     }
 }
 
 impl CaptureFeedback for RegistrationFeedback<'_> {
     fn before_start(&mut self) -> Result<(), String> {
-        let raw = registration_inputs(self.before)?;
-        let ids = self
-            .before
-            .identities
-            .as_ref()
-            .ok_or("controller identities unavailable")?;
-        self.edges.observe(&raw, ids, shm::now_ns())?;
-        Ok(())
+        let result = registration_inputs(self.before).and_then(|raw| {
+            let ids = self
+                .before
+                .identities
+                .as_ref()
+                .ok_or("controller identities unavailable")?;
+            self.edges.observe(&raw, ids, shm::now_ns()).map(|_| ())
+        });
+        self.noted(result)
     }
     fn started(&mut self) -> Result<(), String> {
-        for pulse in 0..2 {
-            for hand in [HAND_LEFT, HAND_RIGHT] {
-                registration_haptic(hand, 0.15, 160., 0.65)?;
-            }
-            if pulse == 0 {
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
-        // Start ACK and both start-cue pulses must precede any finish-button edge.
-        self.rearm_finish(shm::now_ns());
-        Ok(())
+        let result = registration_buzz(2, 0.15, 160., 0.65);
+        self.noted(result)
+    }
+    fn pose(&mut self, frame: &PoseFrame) {
+        self.capture.push(frame.t_ns, frame.hmd, frame.touch);
     }
     fn poll(&mut self) -> Result<bool, String> {
-        let raw = registration_inputs(self.before)?;
-        let ids = self
-            .before
-            .identities
-            .as_ref()
-            .ok_or("controller identities unavailable")?;
-        Ok(self.edges.observe(&raw, ids, shm::now_ns())?[HAND_RIGHT] & cv1touch::hand::BTN_A != 0)
+        let result = self.check();
+        self.noted(result)
     }
     fn stopped(&mut self) -> Result<(), String> {
-        for hand in [HAND_LEFT, HAND_RIGHT] {
-            registration_haptic(hand, 0.3, 80., 0.45)?;
+        // a recording stopped by an error has had its three buzzes
+        if self.error.is_some() {
+            return Ok(());
         }
-        Ok(())
+        let result = registration_buzz(1, 0.7, 80., 0.45);
+        self.noted(result)
     }
 }
 
@@ -1327,6 +1380,8 @@ fn run_stage(
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
+                    // the recording reads the controllers' poses: fail now, not after the countdown
+                    touch_reader()?;
                     human_action("Button check (B on the right controller cancels at any point):");
                     confirm_registration_controls_with(
                         |hand, button, name| wait_preparation_press(inspection, hand, button, name),
@@ -1370,11 +1425,21 @@ fn run_stage(
                         );
                     }
                     print!("\r                            \r");
-                    let mut feedback = RegistrationFeedback {
-                        before: inspection,
-                        edges: ButtonEdges::new(shm::now_ns()),
-                    };
-                    capture_free_named_with_feedback(150, "Recording: turn slowly twice each way, then nod and tilt. Keep the controllers from slipping.\nA to finish (or Enter), B to cancel.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
+                    let mut feedback =
+                        RegistrationFeedback::new(inspection, SLIP_CHECK.load(Ordering::Relaxed));
+                    let captured = capture_free_named_with_feedback(
+                        150,
+                        "Recording: two slow turns each way; after the single buzz, nod and tilt until the long buzz. B cancels.",
+                        false,
+                        Some(&base),
+                        Some(&mut feedback),
+                    );
+                    SLIPPED.store(feedback.capture.slipped(), Ordering::Relaxed);
+                    captured.map_err(|code| {
+                        feedback.error.take().unwrap_or_else(|| {
+                            format!("headset capture failed ({code}); capture retained, no fit installed")
+                        })
+                    })?;
                     Ok((rec, base))
                 },
             )?;
@@ -1466,6 +1531,8 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
         // the stage list shows at the start and again after a failure; a finished stage is one
         // result line, then the next prompt
         let mut show_list = true;
+        // a stage the person chose to try again starts without asking twice
+        let mut retry = None;
         loop {
             let inspection = inspect(&checkpoint);
             let views = check_views(&inspection);
@@ -1490,7 +1557,7 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     );
                     if ask(
                         "Fix that, then press Enter to check again (q: quit).",
-                        false,
+                        START_OR_QUIT,
                     )? == ui::Answer::Quit
                     {
                         return Err("setup is saved but the daemon has not loaded it".into());
@@ -1512,7 +1579,7 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                 show_list = true;
                 if ask(
                     "Fix that, then press Enter to check again (q: quit).",
-                    false,
+                    START_OR_QUIT,
                 )? == ui::Answer::Quit
                 {
                     return Err("setup stopped before finishing; completed stages are kept".into());
@@ -1525,7 +1592,17 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     report.stage,
                     Stage::Camera | Stage::Gravity | Stage::Render | Stage::Registration
                 );
-            match ask(&ui::stage_prompt(report.stage, can_adopt), can_adopt)? {
+            let offered: &[ui::Answer] = if can_adopt {
+                &[ui::Answer::Start, ui::Answer::Keep, ui::Answer::Quit]
+            } else {
+                START_OR_QUIT
+            };
+            let answer = if retry.take() == Some(report.stage) {
+                ui::Answer::Start
+            } else {
+                ask(&ui::stage_prompt(report.stage, can_adopt), offered)?
+            };
+            match answer {
                 ui::Answer::Quit => {
                     return Err("setup stopped before finishing; completed stages are kept".into())
                 }
@@ -1534,7 +1611,8 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     persist(&checkpoint)?;
                     println!("{} {}: kept", g.done, ui::stage_name(report.stage));
                 }
-                ui::Answer::Start => {
+                // (Unwatched is offered only after a slip, and turns the check off there)
+                ui::Answer::Start | ui::Answer::Unwatched => {
                     // Recheck live prerequisites after the user has prepared the hardware.
                     let current = inspect(&checkpoint);
                     if let Some(reason) = current.snapshot.blocked.get(&report.stage) {
@@ -1555,11 +1633,22 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                             if interrupted() {
                                 return Err("setup interrupted; completed stages are kept".into());
                             }
-                            if ask("Enter: try again   q: quit", false)? == ui::Answer::Quit {
-                                return Err(format!(
-                                    "{name} not finished; completed stages are kept"
-                                ));
+                            let slipped = SLIPPED.swap(false, Ordering::Relaxed);
+                            let offered: &[ui::Answer] = if slipped {
+                                &[ui::Answer::Start, ui::Answer::Unwatched, ui::Answer::Quit]
+                            } else {
+                                START_OR_QUIT
+                            };
+                            match ask(ui::retry_prompt(slipped), offered)? {
+                                ui::Answer::Quit => {
+                                    return Err(format!(
+                                        "{name} not finished; completed stages are kept"
+                                    ))
+                                }
+                                ui::Answer::Unwatched => SLIP_CHECK.store(false, Ordering::Relaxed),
+                                ui::Answer::Start | ui::Answer::Keep => {}
                             }
+                            retry = Some(report.stage);
                         }
                     }
                 }
@@ -1756,20 +1845,25 @@ mod tests {
     #[test]
     fn headset_instructions_say_everything_before_the_headset_goes_on() {
         // once the headset is on the screen is out of sight: what to hold, when, how to move,
-        // how long and how to finish must all be read beforehand
+        // what each buzz means and how it ends must all be read beforehand
         for needed in [
             "won't see the screen",
             "against each side",
             "keep still through 10 buzzes",
             "After the double buzz",
             "two full turns each way",
+            "single buzz",
             "nod and tilt",
-            "Press A to finish",
+            "long buzz: done",
+            "Three quick buzzes",
+            "slipped",
             "B cancels",
-            "150 s",
         ] {
             assert!(REGISTRATION_PREPARATION.contains(needed), "{needed}");
         }
+        // it finishes by itself: pressing anything while holding the controllers to the
+        // headset risks moving them
+        assert!(!REGISTRATION_PREPARATION.contains("to finish"));
         // its cues are the controllers' haptics: buzzes; beeps are the speakers
         assert!(!REGISTRATION_PREPARATION.contains("beep"));
     }
@@ -2002,39 +2096,6 @@ mod tests {
         after = saved();
         after.sensors.insert("NEWCAM".into());
         assert!(verify_registration_preparation(&before, &after).is_err());
-    }
-    #[test]
-    fn recording_finish_requires_release_press_after_start_cue() {
-        let before = saved();
-        let ids = before.identities.as_ref().unwrap();
-        let mut feedback = RegistrationFeedback {
-            before: &before,
-            edges: ButtonEdges::new(0),
-        };
-        let mut raw = reload_inputs();
-        feedback.edges.observe(&raw, ids, 1_000_000_010).unwrap();
-        feedback.rearm_finish(1_000_000_100);
-        // A pressed before the recorder acknowledgement/start cue is queued, not a finish.
-        raw.hands[HAND_RIGHT].buttons = Some(cv1touch::hand::BTN_A);
-        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_050;
-        assert_eq!(
-            feedback.edges.observe(&raw, ids, 1_000_000_110).unwrap()[HAND_RIGHT],
-            0
-        );
-        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_120;
-        assert_eq!(
-            feedback.edges.observe(&raw, ids, 1_000_000_130).unwrap()[HAND_RIGHT],
-            0
-        );
-        raw.hands[HAND_RIGHT].buttons = Some(0);
-        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_140;
-        feedback.edges.observe(&raw, ids, 1_000_000_150).unwrap();
-        raw.hands[HAND_RIGHT].buttons = Some(cv1touch::hand::BTN_A);
-        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_160;
-        assert_eq!(
-            feedback.edges.observe(&raw, ids, 1_000_000_170).unwrap()[HAND_RIGHT],
-            cv1touch::hand::BTN_A
-        );
     }
     fn reload_sample(generation: u64, frames: u32) -> serde_json::Value {
         serde_json::json!({"generation": generation, "mode": "calibrated", "recording": false, "engine_ready": true,

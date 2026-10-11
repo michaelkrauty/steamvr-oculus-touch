@@ -167,15 +167,52 @@ pub(super) fn checks_pass(checks: &[CheckView]) -> bool {
 pub(super) enum Answer {
     Start,
     Keep,
+    /// Try the headset alignment again without watching for a controller slipping.
+    Unwatched,
     Quit,
 }
 
-pub(super) fn answer(line: &str, can_keep: bool) -> Option<Answer> {
-    match line.trim().to_ascii_lowercase().as_str() {
-        "" | "new" | "start" | "s" | "y" | "yes" => Some(Answer::Start),
-        "k" | "keep" if can_keep => Some(Answer::Keep),
-        "q" | "quit" | "exit" => Some(Answer::Quit),
-        _ => None,
+impl Answer {
+    /// What can be typed for it.
+    pub(super) fn words(self) -> &'static [&'static str] {
+        match self {
+            Answer::Start => &["", "new", "start", "s", "y", "yes"],
+            Answer::Keep => &["k", "keep"],
+            Answer::Unwatched => &["d"],
+            Answer::Quit => &["q", "quit", "exit"],
+        }
+    }
+}
+
+/// The `offered` answer `line` gives, if any.
+pub(super) fn answer(line: &str, offered: &[Answer]) -> Option<Answer> {
+    let line = line.trim().to_ascii_lowercase();
+    offered
+        .iter()
+        .copied()
+        .find(|a| a.words().contains(&line.as_str()))
+}
+
+/// What to type, for someone who typed something else at a prompt allowing `allowed`.
+pub(super) fn hint(allowed: &[&str]) -> String {
+    if allowed.contains(&"") {
+        let extra: String = ["k", "d"]
+            .iter()
+            .filter(|key| allowed.contains(key))
+            .map(|key| format!(", {key}"))
+            .collect();
+        format!("Press Enter{extra}, or q to quit.")
+    } else {
+        format!("Enter {}.", allowed.join(" / "))
+    }
+}
+
+/// The prompt after a failed stage; `slipped`: a controller slipped during the headset alignment.
+pub(super) fn retry_prompt(slipped: bool) -> &'static str {
+    if slipped {
+        "Enter: try again   d: try again without the slip check   q: quit"
+    } else {
+        "Enter: try again   q: quit"
     }
 }
 
@@ -378,12 +415,25 @@ mod tests {
 
     #[test]
     fn enter_starts_and_keep_is_offered_only_where_it_applies() {
-        assert_eq!(answer("\n", false), Some(Answer::Start));
-        assert_eq!(answer("new", false), Some(Answer::Start));
-        assert_eq!(answer("Q", true), Some(Answer::Quit));
-        assert_eq!(answer("k", true), Some(Answer::Keep));
-        assert_eq!(answer("keep", false), None);
-        assert_eq!(answer("banana", true), None);
+        use Answer::*;
+        assert_eq!(answer("\n", &[Start, Quit]), Some(Start));
+        assert_eq!(answer("new", &[Start, Quit]), Some(Start));
+        assert_eq!(answer("Q", &[Start, Keep, Quit]), Some(Quit));
+        assert_eq!(answer("k", &[Start, Keep, Quit]), Some(Keep));
+        assert_eq!(answer("keep", &[Start, Quit]), None);
+        assert_eq!(answer("banana", &[Start, Keep, Quit]), None);
+        assert_eq!(answer("d", &[Start, Unwatched, Quit]), Some(Unwatched));
+        assert_eq!(answer("d", &[Start, Quit]), None);
+        assert_eq!(retry_prompt(false), "Enter: try again   q: quit");
+        // what a wrong key gets told
+        assert_eq!(hint(&["", "s", "q"]), "Press Enter, or q to quit.");
+        assert_eq!(hint(&["", "k", "q"]), "Press Enter, k, or q to quit.");
+        assert_eq!(hint(&["", "d", "q"]), "Press Enter, d, or q to quit.");
+        assert_eq!(hint(&["a", "b"]), "Enter a / b.");
+        assert_eq!(
+            retry_prompt(true),
+            "Enter: try again   d: try again without the slip check   q: quit"
+        );
         assert_eq!(
             stage_prompt(Stage::Registration, false),
             "Headset alignment (~3 min). Enter: start   q: quit"

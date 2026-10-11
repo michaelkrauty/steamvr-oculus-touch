@@ -1558,8 +1558,9 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
+        serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         d.mode.lock().unwrap(),
         engine_ready,
@@ -2428,6 +2429,16 @@ mod tests {
         assert!(!d.record_frames.load(Ordering::Acquire));
         assert_eq!(handle(&d, &stop), "ok not-matching");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn status_names_the_shared_memory_the_poses_are_in() {
+        let d = status_daemon();
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        let name = value["shm"].as_str().unwrap();
+        assert!(name.starts_with("/cv1t-dynamic-status-"), "{name}");
+        assert!(shm::ShmReader::open(name).is_ok());
     }
 
     #[test]

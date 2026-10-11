@@ -48,7 +48,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -852,6 +852,17 @@ Quick Lighthouse registration: about 60 s, paced by beeps (press Enter to start)
   both, so they move as one. Move the pair slowly through the play space, and keep turning it:
   roll, pitch and yaw your wrist through as many orientations as you can. Keep both controllers
   where the sensors and the base stations can see them. Slow and steady beats fast.";
+
+/// cv1touchd's shared memory, by the name its status gives (older daemons: the default).
+fn touch_reader() -> Result<ShmReader, String> {
+    let status = status_json().ok_or("cannot read cv1touchd status")?;
+    let name = status["shm"].as_str().unwrap_or(shm::DEFAULT_NAME);
+    let reader = ShmReader::open(name).map_err(|e| format!("cannot read controller poses: {e}"))?;
+    if status["generation"].as_u64() != Some(reader.generation()) {
+        return Err("cv1touchd restarted; no recording started".into());
+    }
+    Ok(reader)
+}
 
 /// A Touch pose worth pairing: awake, with an optical fix in the last 100 ms, carried to `now`.
 fn touch_sample(st: &shm::ControllerState, now: u64) -> Option<nalgebra::Isometry3<f64>> {
@@ -2590,10 +2601,21 @@ fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGua
     Ok(scoped)
 }
 
+/// The headset's orientation (SteamVR) and each Touch's (cv1touchd) at one instant.
+struct PoseFrame {
+    t_ns: u64,
+    hmd: nalgebra::UnitQuaternion<f64>,
+    touch: [Option<nalgebra::UnitQuaternion<f64>>; 2],
+}
+
+/// A guided capture's hooks. An error from one ends the capture with Err(1); the hook reports
+/// it in its own words.
 trait CaptureFeedback {
     fn before_start(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// Every pose frame, in order, before the `poll` that follows it.
+    fn pose(&mut self, _frame: &PoseFrame) {}
     fn started(&mut self) -> Result<(), String>;
     fn poll(&mut self) -> Result<bool, String>;
     fn stopped(&mut self) -> Result<(), String>;
@@ -2648,9 +2670,19 @@ fn capture_free_named_with_feedback(
         eprintln!("cv1touch: {e}");
         return Err(1);
     }
-    if let Some(hook) = feedback.as_mut() {
-        if let Err(error) = hook.before_start() {
+    // the Touches as cv1touchd tracks them, for the feedback: SteamVR's copy may be paused
+    let (reader, frames_out, frames_in) = if feedback.is_some() {
+        let reader = touch_reader().map_err(|error| {
             eprintln!("cv1touch: {error}; no recording started");
+            1
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel::<PoseFrame>();
+        (Some(reader), Some(tx), Some(rx))
+    } else {
+        (None, None, None)
+    };
+    if let Some(hook) = feedback.as_mut() {
+        if hook.before_start().is_err() {
             return Err(1);
         }
         if interrupted() {
@@ -2677,12 +2709,17 @@ fn capture_free_named_with_feedback(
             let mut tracks: BTreeMap<String, Vec<[f64; 8]>> = BTreeMap::new();
             let mut kinds: BTreeMap<String, String> = BTreeMap::new();
             let mut serials: Vec<Option<String>> = Vec::new();
+            let mut hmd_index = None;
             let mut next_scan = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let now = shm::now_ns();
                 if now >= next_scan {
                     let devs = client.devices();
                     serials = vec![None; 64];
+                    hmd_index = devs
+                        .iter()
+                        .find(|d| d.class == vr::CLASS_HMD)
+                        .map(|d| d.index as usize);
                     // every Lighthouse device (controllers, the headset, the base stations), and our
                     // Touches as SteamVR shows them
                     for d in devs.iter().filter(|d| {
@@ -2704,13 +2741,29 @@ fn capture_free_named_with_feedback(
                     }
                     next_scan = now + 500_000_000;
                 }
-                for (i, p) in client.raw_poses().iter().enumerate() {
+                let raw = client.raw_poses();
+                for (i, p) in raw.iter().enumerate() {
                     if let (Some(p), Some(Some(serial))) = (p, serials.get(i)) {
                         tracks
                             .entry(serial.clone())
                             .or_default()
                             .push(eval::truth_row(now, p));
                     }
+                }
+                if let (Some(out), Some(reader), Some(Some(hmd))) =
+                    (&frames_out, &reader, hmd_index.and_then(|i| raw.get(i)))
+                {
+                    let touch = [HAND_LEFT, HAND_RIGHT].map(|hand| {
+                        reader
+                            .hand(hand)
+                            .filter(|st| st.flags & cv1touch::hand::FLAG_CONNECTED != 0)
+                            .map(|st| register::extrapolate(&st, now).rotation)
+                    });
+                    let _ = out.send(PoseFrame {
+                        t_ns: now,
+                        hmd: hmd.rotation,
+                        touch,
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -2736,6 +2789,9 @@ fn capture_free_named_with_feedback(
             break;
         }
         if let Some(hook) = feedback.as_mut() {
+            for frame in frames_in.iter().flat_map(|rx| rx.try_iter()) {
+                hook.pose(&frame);
+            }
             match hook.poll() {
                 Ok(true) => break,
                 Ok(false) => {}
@@ -2863,11 +2919,7 @@ fn capture_free_named_with_feedback(
             truth_path.display()
         );
     }
-    if let Some(error) = feedback_error {
-        let _ = writeln!(
-            io::stderr(),
-            "cv1touch: {error}; capture retained, no registration fit installed"
-        );
+    if feedback_error.is_some() {
         return Err(1);
     }
     if !stopped_ok {
@@ -5280,6 +5332,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["setup"] => guided_setup::run(false, false),
+        ["setup", "--no-slip-check"] => {
+            guided_setup::SLIP_CHECK.store(false, Ordering::Relaxed);
+            guided_setup::run(false, false)
+        }
         ["setup", "--check"] => guided_setup::run(true, false),
         ["setup", "--check", "--json"] | ["setup", "--json", "--check"] => guided_setup::run(true, true),
         ["status"] => status_board(shm::DEFAULT_NAME),

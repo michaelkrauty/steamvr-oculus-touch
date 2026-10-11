@@ -88,10 +88,10 @@ class SetupTests(unittest.TestCase):
         return subprocess.run([BINARY, "setup", *args], env=self.env, cwd=self.root,
                               input="", capture_output=True, text=True, timeout=15)
 
-    def terminal_guide(self, answers="", expected_code=0):
+    def terminal_guide(self, answers="", expected_code=0, args=()):
         master, slave = pty.openpty()
         try:
-            process = subprocess.Popen([BINARY, "setup"], env=self.env, cwd=self.root,
+            process = subprocess.Popen([BINARY, "setup", *args], env=self.env, cwd=self.root,
                                        stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if answers:
                 os.write(master, answers.encode())
@@ -283,6 +283,12 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_the_slip_check_can_be_turned_off_for_the_whole_guide(self):
+        self.fixtures()
+        output = self.terminal_guide("q\n", expected_code=1, args=("--no-slip-check",))
+        self.assertIn("Sensor positions", output)
+        self.assertNotIn("usage:", output)
 
     def test_guide_does_not_claim_completion_while_the_daemon_ignores_the_saved_setup(self):
         self.fixtures()
