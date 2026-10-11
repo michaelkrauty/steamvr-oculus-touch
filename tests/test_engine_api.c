@@ -41,6 +41,11 @@ int main(void)
 	CHECK(ohmd_cv1touch_get_led_model(NULL, leds, 4) == -1);
 	ohmd_cv1touch_controller c;
 	CHECK(ohmd_cv1touch_get_controller(NULL, &c) == -1);
+	char identity[33] = "sentinel";
+	CHECK(ohmd_cv1touch_get_controller_identity(NULL, identity, sizeof identity) == -1);
+	CHECK(identity[0] == '\0');
+	CHECK(ohmd_cv1touch_get_controller_identity(NULL, NULL, 33) == -1);
+	CHECK(ohmd_cv1touch_get_controller_identity(NULL, identity, 32) == -1);
 	ohmd_ctx_destroy(ctx);
 	return 0;
 }

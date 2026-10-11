@@ -11,6 +11,7 @@ pub mod engine;
 pub mod eval;
 pub mod ffi;
 pub mod hand;
+pub mod input_calibration;
 pub mod modes;
 pub mod recorder;
 pub mod register;

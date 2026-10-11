@@ -25,7 +25,7 @@ use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, H
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
 use cv1touch::track::predict::{ShapeParams, VelocityShaper};
 use cv1touch::track::tracker::Stats;
-use cv1touch::{align, calib, ffi, modes, track};
+use cv1touch::{align, calib, ffi, input_calibration, modes, track};
 
 /// Decided by the Task 4 live check, see docs/notes/hmd-leds.md.
 const DEFAULT_HMD_LEDS_OFF: bool = true;
@@ -59,6 +59,80 @@ struct Haptic {
 
 type StationPoses = Vec<(String, nalgebra::Isometry3<f64>)>;
 type TimedStationPoses = (u64, StationPoses);
+
+/// Latest factory-normalized input samples. Keep these before output correction so a second
+/// calibration measures the hardware rather than the result of the first calibration.
+#[derive(Clone, Default, serde::Serialize)]
+struct RawInputs {
+    identity: String,
+    connected: bool,
+    received_host_ns: u64,
+    trigger: f32,
+    grip: f32,
+    stick: [f32; 2],
+}
+
+#[derive(Default)]
+struct InputRuntime {
+    calibration: Option<input_calibration::CalibrationFile>,
+    error: Option<String>,
+    latest: [RawInputs; 2],
+}
+
+impl InputRuntime {
+    fn set_identity(&mut self, hand: usize, identity: String) {
+        if self.latest[hand].identity != identity {
+            // Never associate the previous device's sample with the new device's identity.
+            self.latest[hand] = RawInputs {
+                identity,
+                ..Default::default()
+            };
+        }
+    }
+
+    fn calibration_applies(&self, hand: usize) -> bool {
+        self.calibration.as_ref().is_some_and(|c| {
+            !self.latest[hand].identity.is_empty()
+                && c.hands[hand].identity == self.latest[hand].identity
+        })
+    }
+
+    fn apply(&mut self, hand: usize, state: &mut ControllerState) {
+        let raw = &mut self.latest[hand];
+        raw.connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
+        raw.received_host_ns = state.received_host_ns;
+        raw.trigger = state.trigger;
+        raw.grip = state.grip;
+        raw.stick = state.stick;
+        let values = if !raw.connected {
+            // Zero in factory coordinates can be a partial press after calibration. A dropout
+            // must therefore release inputs explicitly, without passing through calibration.
+            (0.0, 0.0, [0.0; 2])
+        } else if let Some(c) = &self.calibration {
+            c.apply(hand, &raw.identity, raw.trigger, raw.grip, raw.stick)
+        } else {
+            input_calibration::factory_values(raw.trigger, raw.grip, raw.stick)
+        };
+        (state.trigger, state.grip, state.stick) = values;
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configured": self.calibration.is_some(),
+            "calibrated": [self.calibration_applies(0), self.calibration_applies(1)],
+            "error": self.error,
+        })
+    }
+}
+
+fn reload_inputs(runtime: &Mutex<InputRuntime>, path: &std::path::Path) -> Result<(), String> {
+    // Parse and validate before taking the publication lock; errors retain the last good state.
+    let calibration = input_calibration::load(path)?;
+    let mut runtime = runtime.lock().unwrap();
+    runtime.calibration = calibration;
+    runtime.error = None;
+    Ok(())
+}
 
 struct Daemon {
     shm: ShmWriter,
@@ -100,6 +174,7 @@ struct Daemon {
     radio_on: AtomicBool,
     /// Input injection for automated tests.
     inject: Injection,
+    inputs: Mutex<InputRuntime>,
 }
 
 impl Daemon {
@@ -367,6 +442,7 @@ fn log(msg: impl AsRef<str>) {
 }
 
 fn publish_disconnected(d: &Daemon) {
+    d.inputs.lock().unwrap().latest = Default::default();
     let now = shm::now_ns();
     for h in [HAND_LEFT, HAND_RIGHT] {
         d.shm.publish_hand(
@@ -882,6 +958,9 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         for h in [HAND_LEFT, HAND_RIGHT] {
             let read_from = shm::now_ns();
             let Some(c) = e.controller(h) else { continue };
+            if let Some(identity) = e.controller_identity(h) {
+                d.inputs.lock().unwrap().set_identity(h, identity);
+            }
             link.engine_view.lock().unwrap()[h] = Some(c);
             if !link.hands.engine_publishes(h) {
                 continue;
@@ -1372,6 +1451,7 @@ fn publish_hand_state(
             }
         }
     }
+    d.inputs.lock().unwrap().apply(h, &mut state);
     d.inject.apply(h, now, &mut state);
     d.shm.publish_hand(h, &state);
     if d.rec.active() {
@@ -1488,10 +1568,11 @@ fn status_json(d: &Daemon) -> String {
         })
         .collect();
     format!(
-        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":[{}]}}",
+        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":[{}]}}",
         d.shm.generation(),
         d.tracker,
         d.mode.lock().unwrap(),
+        d.inputs.lock().unwrap().status(),
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
@@ -1541,6 +1622,23 @@ fn handle(d: &Daemon, line: &str) -> String {
             )
         }
         Ok(Command::Status) => status_json(d),
+        Ok(Command::Inputs) => {
+            let inputs = d.inputs.lock().unwrap();
+            format!(
+                "ok {}",
+                serde_json::json!({
+                    "hands": inputs.latest,
+                    "calibrated": [inputs.calibration_applies(0), inputs.calibration_applies(1)],
+                    "error": inputs.error,
+                })
+            )
+        }
+        Ok(Command::InputsReload) => {
+            match reload_inputs(&d.inputs, &input_calibration::default_path()) {
+                Ok(()) => "ok input calibration reloaded".into(),
+                Err(error) => format!("err {error}"),
+            }
+        }
         Ok(Command::CalibrationCapture) => {
             switch_mode(d, modes::capture(&current_opts(d)), "capture")
         }
@@ -2158,6 +2256,14 @@ fn main() {
         .set_nonblocking(true)
         .expect("nonblocking listener");
 
+    let mut inputs = InputRuntime::default();
+    match input_calibration::load(&input_calibration::default_path()) {
+        Ok(calibration) => inputs.calibration = calibration,
+        Err(error) => {
+            log(format!("{error}; using factory input defaults"));
+            inputs.error = Some(error);
+        }
+    }
     let d = Arc::new(Daemon {
         shm,
         rec,
@@ -2185,6 +2291,7 @@ fn main() {
         radio_wake: eventfd().expect("eventfd"),
         radio_on: AtomicBool::new(false),
         inject: Injection::default(),
+        inputs: Mutex::new(inputs),
     });
     let engine_thread = {
         let d = Arc::clone(&d);
@@ -2229,6 +2336,129 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_config() -> input_calibration::CalibrationFile {
+        use input_calibration::{CalibrationFile, Endpoint, HandCalibration, StickAxis};
+        let hand = |identity: String| HandCalibration {
+            identity,
+            trigger: Endpoint {
+                released: -0.1,
+                pressed: 0.9,
+            },
+            grip: Endpoint {
+                released: -0.2,
+                pressed: 0.8,
+            },
+            stick: [StickAxis {
+                min: -1.0,
+                center: 0.0,
+                max: 1.0,
+            }; 2],
+        };
+        CalibrationFile::new([hand("a".repeat(32)), hand("b".repeat(32))]).unwrap()
+    }
+
+    #[test]
+    fn publication_clamps_defaults_and_keeps_raw_values_for_calibration() {
+        let mut runtime = InputRuntime::default();
+        let mut state = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            received_host_ns: 42,
+            trigger: f32::INFINITY,
+            grip: -0.2,
+            stick: [1.2, f32::NAN],
+            ..Default::default()
+        };
+        runtime.apply(0, &mut state);
+        assert_eq!(
+            (state.trigger, state.grip, state.stick),
+            (0.0, 0.0, [1.0, 0.0])
+        );
+        assert!(runtime.latest[0].trigger.is_infinite());
+        assert_eq!(runtime.latest[0].grip, -0.2);
+        assert_eq!(runtime.latest[0].received_host_ns, 42);
+        let raw = serde_json::to_value(&runtime.latest).unwrap();
+        assert!(raw[0]["trigger"].is_null());
+    }
+
+    #[test]
+    fn correction_preserves_measurement_and_dropout_releases_after_offset() {
+        let mut runtime = InputRuntime {
+            calibration: Some(input_config()),
+            ..Default::default()
+        };
+        runtime.set_identity(0, "a".repeat(32));
+        let mut state = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            trigger: 0.9,
+            grip: 0.8,
+            received_host_ns: 42,
+            ..Default::default()
+        };
+        runtime.apply(0, &mut state);
+        assert_eq!((state.trigger, state.grip), (1.0, 1.0));
+        assert_eq!(
+            (runtime.latest[0].trigger, runtime.latest[0].grip),
+            (0.9, 0.8)
+        );
+        state.flags = 0;
+        state.trigger = 0.0;
+        state.grip = 0.0;
+        runtime.apply(0, &mut state);
+        assert_eq!(
+            (state.trigger, state.grip, state.stick),
+            (0.0, 0.0, [0.0; 2])
+        );
+        assert!(!runtime.latest[0].connected);
+    }
+
+    #[test]
+    fn device_change_invalidates_old_sample_and_uses_factory_fallback() {
+        let mut runtime = InputRuntime {
+            calibration: Some(input_config()),
+            ..Default::default()
+        };
+        runtime.set_identity(0, "a".repeat(32));
+        runtime.latest[0].connected = true;
+        runtime.latest[0].received_host_ns = 42;
+        runtime.set_identity(0, "c".repeat(32));
+        assert!(!runtime.latest[0].connected);
+        assert_eq!(runtime.latest[0].received_host_ns, 0);
+        assert!(!runtime.calibration_applies(0));
+        let mut state = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            grip: 0.8,
+            ..Default::default()
+        };
+        runtime.apply(0, &mut state);
+        assert_eq!(state.grip, 0.8);
+    }
+
+    #[test]
+    fn invalid_live_reload_retains_active_config_and_missing_file_resets_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "cv1touch-input-reload-{}-{}",
+            std::process::id(),
+            shm::now_ns()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let path = dir.join("input.json");
+        let original = input_config();
+        let runtime = Mutex::new(InputRuntime {
+            calibration: Some(original.clone()),
+            ..Default::default()
+        });
+        fs::write(&path, b"{broken}").unwrap();
+        assert!(reload_inputs(&runtime, &path).is_err());
+        assert_eq!(
+            runtime.lock().unwrap().calibration.as_ref(),
+            Some(&original)
+        );
+        fs::remove_file(&path).unwrap();
+        reload_inputs(&runtime, &path).unwrap();
+        assert!(runtime.lock().unwrap().calibration.is_none());
+        fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn an_armed_inject_presses_for_its_duration_only() {

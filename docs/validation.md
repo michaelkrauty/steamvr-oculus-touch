@@ -6,6 +6,8 @@ The original development setup used a Linux x86-64 desktop, one CV1 Touch pair, 
 
 The release work adds clean-build and relocated-install checks, regression tests for runtime failure paths, and a documented first-time setup. CI checks the deterministic software paths without USB devices or a running SteamVR server. Hardware behavior cannot be inferred from CI alone.
 
+Input calibration regressions cover endpoint and stick normalization, controller identity changes, stale or incomplete captures, disconnect release, malformed configuration, and save/reload rollback. The input test checks the corresponding SteamVR axis or button instead of accepting unrelated movement. Validate measured endpoints and in-app delivery on your own controllers after calibration.
+
 ## Measurement interpretation
 
 Development captures compared tracked controller poses to a rigidly attached SteamVR reference and checked cross-camera/Touch-to-Touch consistency. A reference's own errors, non-rigid attachment, changed room setup, clock alignment, and fit/test overlap can dominate the residual. Tracking is not established as more accurate than another controller merely because a fitted residual is small.

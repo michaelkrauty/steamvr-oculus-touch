@@ -33,6 +33,8 @@ Host/device clock mapping and exposure-time compensation place measurements on a
 
 Shared-memory slots use single-writer seqlocks. Alignment writers are serialized; hand ownership transfers between radio and fallback publishing. Driver readers reject incompatible mappings and stale heartbeats. Stale or disconnected controller samples release application inputs. Haptic/control sends use bounded local IPC and cannot deliver SIGPIPE to SteamVR. A separate daemon keeps device reconnects and tracking computation out of the SteamVR server.
 
+Optional [input calibration](input-calibration.md) maps measured trigger/grip endpoints and stick travel before publication. The wizard samples factory-normalized inputs before user correction, so repeated calibration does not compound corrections. A stable factory-calibration identity binds each hand's settings to its controller; mismatches use finite, bounded factory values. Live reload validates the complete configuration before replacing it under the publication lock. Disconnect release bypasses the transform, since a raw zero can represent a partial press after endpoint correction.
+
 The daemon attempts bounded real-time priority through rtkit for selected transport threads and falls back with a diagnostic if policy denies it. By default it inherits the process's allowed CPUs. `CV1TOUCH_CPUS` is an optional explicit CPU-list override; invalid or unavailable CPUs are rejected rather than applying a development-machine topology. Avoid changing scheduling policy without measuring it under your real workload.
 
 ## Expert use

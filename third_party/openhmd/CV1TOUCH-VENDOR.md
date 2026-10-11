@@ -9,3 +9,5 @@ Local changes expose a bounded CV1 acquisition API, controller/radio decoding, f
 Compare this snapshot against the pinned upstream commit to inspect the complete modification set. Subsequent release changes are tracked in this repository. Preserve upstream notices when modifying or extracting code.
 
 The UVC stream stop flag is atomic and is cleared before changing the USB alternate setting or taking libusb's event-waiter lock. This allows a retrying completion callback to retire its transfer and prevents a shutdown lock cycle; `test_uvc_shutdown` exercises that path without devices.
+
+The CV1 extension exposes a controller's cached factory-calibration identity for binding optional user input calibration to that controller. The identity is copied when factory calibration completes; controller sample and shared-memory layouts are unchanged. Factory-normalized analog values remain unbounded at acquisition so the input-calibration guide can measure shifted endpoints; the Rust daemon applies user correction and bounds values before SteamVR publication.

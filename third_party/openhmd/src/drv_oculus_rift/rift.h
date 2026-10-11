@@ -261,6 +261,8 @@ struct rift_touch_controller_s {
 	rift_tracked_device *tracked_dev;
 
 	bool have_calibration;
+	/* Snapshot of the factory calibration identity, owned by this controller. */
+	uint8_t cv1touch_calibration_hash[16];
 	rift_touch_calibration calibration;
 
 	bool time_valid;
