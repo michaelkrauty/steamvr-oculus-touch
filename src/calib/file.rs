@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::iso_to_xyzw;
 use super::solve::Solution;
@@ -235,6 +236,15 @@ pub fn load(path: &Path) -> Result<CalibrationFile, String> {
 /// Writes atomically (temp file + rename). An existing file is first renamed to
 /// `<name>.bak-<unix nanoseconds>`, which is returned.
 pub fn save(path: &Path, f: &CalibrationFile) -> Result<Option<PathBuf>, String> {
+    save_with_fingerprint(path, f).map(|(backup, _)| backup)
+}
+
+/// Also returns the SHA-256 of the exact serialized bytes installed by this save,
+/// without rereading a path another writer may subsequently replace.
+pub fn save_with_fingerprint(
+    path: &Path,
+    f: &CalibrationFile,
+) -> Result<(Option<PathBuf>, String), String> {
     f.validate()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -246,6 +256,7 @@ pub fn save(path: &Path, f: &CalibrationFile) -> Result<Option<PathBuf>, String>
             path.display()
         ));
     }
+    let fingerprint = format!("{:x}", Sha256::digest(text.as_bytes()));
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let backup = if path.exists() {
@@ -261,7 +272,7 @@ pub fn save(path: &Path, f: &CalibrationFile) -> Result<Option<PathBuf>, String>
         None
     };
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(backup)
+    Ok((backup, fingerprint))
 }
 
 #[cfg(test)]
@@ -275,6 +286,23 @@ mod tests {
         d.join("calibration.json")
     }
 
+    #[test]
+    fn saved_fingerprint_matches_exact_bytes_and_survives_external_replacement() {
+        let path = tmp("saved-fingerprint");
+        let a = CalibrationFile::example();
+        let (backup, accepted) = save_with_fingerprint(&path, &a).unwrap();
+        assert!(backup.is_none());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(accepted, crate::setup::fingerprint(&path).unwrap());
+        assert_eq!(accepted, format!("{:x}", Sha256::digest(&bytes)));
+        let mut b = a.clone();
+        b.source = "another writer's valid calibration".into();
+        save(&path, &b).unwrap();
+        assert_ne!(accepted, crate::setup::fingerprint(&path).unwrap());
+        assert_eq!(accepted, format!("{:x}", Sha256::digest(bytes)));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
     #[test]
     fn save_and_load_round_trip_with_backup() {
         let path = tmp("roundtrip");

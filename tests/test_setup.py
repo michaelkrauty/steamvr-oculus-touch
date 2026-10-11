@@ -69,7 +69,7 @@ class SetupTests(unittest.TestCase):
                         sensors.append({"serial": "CAMNEW", "placed": 0, "frames": self.counter,
                                         "fixes": [0, 0]})
                     reply = {"generation": 1, "engine_ready": self.engine_ready, "mode": "calibrated" if self.configured else "provisional",
-                             "recording": False, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
+                             "recording_scoped_stop": True, "recording": False, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
                              "alignment": {"registration": self.configured and self.loaded_configuration,
                                            "render": [self.configured and self.loaded_configuration] * 2},
                              "input_calibration": {"calibrated": [self.configured and self.loaded_configuration] * 2}}
@@ -153,7 +153,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual([stage["stage"] for stage in report["stages"]],
-                         ["camera", "gravity", "render", "registration", "inputs"])
+                         ["camera", "gravity", "render", "inputs", "registration"])
         self.assertFalse(report["ready"])
         self.assertTrue(self.commands)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
@@ -185,7 +185,7 @@ class SetupTests(unittest.TestCase):
         result = self.cli("--check", "--json")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         stages = json.loads(result.stdout)["stages"]
-        self.assertEqual([r["state"] for r in stages], ["unknown"] * 4 + ["ready"])
+        self.assertEqual([r["state"] for r in stages], ["unknown"] * 3 + ["ready", "unknown"])
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertFalse((self.root / "state").exists())
         self.terminal_guide("keep\n" * 4)
@@ -208,12 +208,12 @@ class SetupTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         report = json.loads(self.cli("--check", "--json").stdout)
         self.assertEqual([r["state"] for r in report["stages"]],
-                         ["stale", "stale", "ready", "stale", "ready"])
+                         ["stale", "stale", "ready", "ready", "stale"])
         self.extra_sensor = True
         report = json.loads(self.cli("--check", "--json").stdout)
         self.assertFalse(report["ready"])
         self.assertIn("need placement", report["stages"][0]["reason"])
-        self.assertEqual(report["stages"][3]["state"], "blocked")
+        self.assertEqual(next(r for r in report["stages"] if r["stage"] == "registration")["state"], "blocked")
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
     def test_sleeping_hands_reuse_valid_files_without_capture_or_erasure(self):
@@ -249,7 +249,7 @@ class SetupTests(unittest.TestCase):
         persisted = journal.read_bytes()
         report = json.loads(self.cli("--check", "--json").stdout)
         self.assertEqual([r["state"] for r in report["stages"]],
-                         ["stale", "stale", "ready", "stale", "ready"])
+                         ["stale", "stale", "ready", "ready", "stale"])
         self.assertEqual(journal.read_bytes(), persisted)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
 
@@ -324,6 +324,21 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_human_actions_are_bold_when_forced_but_json_and_no_color_stay_plain(self):
+        self.fixtures()
+        self.env.pop("NO_COLOR", None)
+        self.env.update(TERM="xterm-256color", CLICOLOR_FORCE="1")
+        checked = self.cli("--check", "--json")
+        self.assertNotIn("\x1b", checked.stdout)
+        output = self.terminal_guide("keep\n" * 4)
+        self.assertIn("\x1b[1mNext action:", output)
+        self.assertIn("\nCamera: Unknown", output)
+        self.env["NO_COLOR"] = "1"
+        self.assertNotIn("\x1b", self.terminal_guide())
+        self.env.pop("NO_COLOR")
+        self.env["TERM"] = "dumb"
+        self.assertNotIn("\x1b", self.terminal_guide())
 
     def test_malformed_journal_is_read_only_and_never_contacts_daemon(self):
         journal = self.root / "state/cv1touch/setup.json"

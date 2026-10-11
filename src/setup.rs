@@ -141,13 +141,16 @@ fn assessment(s: &Snapshot, c: &Checkpoint, stage: Stage) -> (State, String) {
             "requires valid controller geometry and source meshes".into(),
         );
     }
-    if c.pending.contains(&stage) {
-        return (Stale, "previous stage attempt did not complete".into());
-    }
     match artifact(s, stage) {
         Artifact::Missing => return (Missing, "artifact is missing".into()),
         Artifact::Invalid(reason) => return (Invalid, reason.clone()),
         Artifact::Valid(_) => {}
+    }
+    if c.pending.contains(&stage) {
+        return (
+            Stale,
+            "stage needs completion or verification after an interrupted operation or dependency change".into(),
+        );
     }
     if stage == Stage::Inputs {
         return (
@@ -182,8 +185,8 @@ pub fn plan(snapshot: &Snapshot, checkpoint: &Checkpoint) -> Vec<StageReport> {
         Stage::Camera,
         Stage::Gravity,
         Stage::Render,
-        Stage::Registration,
         Stage::Inputs,
+        Stage::Registration,
     ]
     .into_iter()
     .map(|stage| {
@@ -259,6 +262,27 @@ pub fn record_success(
     checkpoint.recordings.insert(stage, next.recordings.clone());
     checkpoint.completed.insert(stage, next);
     checkpoint.pending.remove(&stage);
+    Ok(())
+}
+/// Complete Camera and Gravity together only after a fresh, unforced full camera
+/// solve has accepted world gravity, saved the file, resumed tracking and passed
+/// final dependency verification. Never use this for adoption or sensor placement.
+pub fn record_full_camera_success(
+    snapshot: &Snapshot,
+    checkpoint: &mut Checkpoint,
+    accepted_camera_sha256: &str,
+    recordings: Vec<PathBuf>,
+) -> Result<(), String> {
+    if recordings.is_empty() {
+        return Err("accepted full camera capture provenance is required".into());
+    }
+    if valid(&snapshot.camera) != Some(accepted_camera_sha256) {
+        return Err("camera calibration changed after the accepted solve; Camera and Gravity remain incomplete, capture retained".into());
+    }
+    let mut next = checkpoint.clone();
+    record_success(Stage::Camera, snapshot, &mut next, recordings.clone())?;
+    record_success(Stage::Gravity, snapshot, &mut next, recordings)?;
+    *checkpoint = next;
     Ok(())
 }
 /// Carry bindings only for an intentional frame-preserving update, or a gravity
@@ -481,6 +505,28 @@ mod tests {
     fn states(s: &Snapshot, c: &Checkpoint) -> Vec<(Stage, State)> {
         plan(s, c).into_iter().map(|r| (r.stage, r.state)).collect()
     }
+    fn stage_report(s: &Snapshot, c: &Checkpoint, stage: Stage) -> StageReport {
+        plan(s, c)
+            .into_iter()
+            .find(|report| report.stage == stage)
+            .unwrap()
+    }
+    #[test]
+    fn guided_order_leaves_headset_registration_until_after_inputs() {
+        assert_eq!(
+            plan(&snapshot(), &Checkpoint::default())
+                .into_iter()
+                .map(|report| report.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                Stage::Camera,
+                Stage::Gravity,
+                Stage::Render,
+                Stage::Inputs,
+                Stage::Registration
+            ]
+        );
+    }
     #[test]
     fn fresh_and_legacy_states_are_explicit() {
         use Stage::*;
@@ -492,8 +538,8 @@ mod tests {
                 (Camera, Missing),
                 (Gravity, Blocked),
                 (Render, Missing),
-                (Registration, Blocked),
-                (Inputs, Missing)
+                (Inputs, Missing),
+                (Registration, Blocked)
             ]
         );
         s.camera = Artifact::Valid(hash('a'));
@@ -506,8 +552,8 @@ mod tests {
                 (Camera, Unknown),
                 (Gravity, Unknown),
                 (Render, Unknown),
-                (Registration, Unknown),
-                (Inputs, Ready)
+                (Inputs, Ready),
+                (Registration, Unknown)
             ]
         );
     }
@@ -529,6 +575,51 @@ mod tests {
         (s, c)
     }
     #[test]
+    fn pending_missing_registration_remains_missing_after_camera_completion() {
+        let (mut s, mut c) = complete();
+        s.registration = Artifact::Missing;
+        begin_stage(Stage::Camera, &mut c);
+        record_success(Stage::Camera, &s, &mut c, vec![]).unwrap();
+        let journal = serde_json::to_vec(&c).unwrap();
+        let reports = plan(&s, &c);
+        assert_eq!(
+            reports
+                .iter()
+                .find(|r| r.stage == Stage::Registration)
+                .unwrap()
+                .state,
+            State::Missing
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .find(|r| r.stage == Stage::Registration)
+                .unwrap()
+                .reason,
+            "artifact is missing"
+        );
+        assert_eq!(reports[1].state, State::Stale);
+        assert!(c.pending.contains(&Stage::Registration));
+        assert_eq!(serde_json::to_vec(&c).unwrap(), journal);
+        assert!(adopt(Stage::Registration, &s, &mut c).is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), journal);
+    }
+    #[test]
+    fn pending_invalid_registration_retains_artifact_error() {
+        let (mut s, mut c) = complete();
+        s.registration = Artifact::Invalid("malformed registration".into());
+        begin_stage(Stage::Camera, &mut c);
+        record_success(Stage::Camera, &s, &mut c, vec![]).unwrap();
+        let journal = serde_json::to_vec(&c).unwrap();
+        let report = stage_report(&s, &c, Stage::Registration);
+        assert_eq!(report.state, State::Invalid);
+        assert_eq!(report.reason, "malformed registration");
+        assert!(c.pending.contains(&Stage::Registration));
+        assert_eq!(serde_json::to_vec(&c).unwrap(), journal);
+        assert!(adopt(Stage::Registration, &s, &mut c).is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), journal);
+    }
+    #[test]
     fn unchanged_and_sleeping_require_no_captures() {
         let (mut s, c) = complete();
         for stage in [
@@ -542,7 +633,7 @@ mod tests {
         }
         assert!(plan(&s, &c).iter().all(|r| r.state == State::Ready));
         s.inputs = Artifact::Missing;
-        assert_eq!(plan(&s, &c)[4].state, State::Blocked);
+        assert_eq!(stage_report(&s, &c, Stage::Inputs).state, State::Blocked);
     }
     #[test]
     fn external_camera_and_geometry_changes_invalidate_only_dependencies() {
@@ -554,12 +645,12 @@ mod tests {
                 (Stage::Camera, State::Stale),
                 (Stage::Gravity, State::Stale),
                 (Stage::Render, State::Ready),
-                (Stage::Registration, State::Stale),
-                (Stage::Inputs, State::Ready)
+                (Stage::Inputs, State::Ready),
+                (Stage::Registration, State::Stale)
             ]
         );
         s.render_sources = Artifact::Valid(hash('f'));
-        assert_eq!(plan(&s, &c)[2].state, State::Stale);
+        assert_eq!(stage_report(&s, &c, Stage::Render).state, State::Stale);
     }
     #[test]
     fn full_world_begin_and_failed_finish_cannot_claim_success() {
@@ -571,8 +662,8 @@ mod tests {
                 (Stage::Camera, State::Stale),
                 (Stage::Gravity, State::Stale),
                 (Stage::Render, State::Ready),
-                (Stage::Registration, State::Stale),
-                (Stage::Inputs, State::Ready)
+                (Stage::Inputs, State::Ready),
+                (Stage::Registration, State::Stale)
             ]
         );
         let before = serde_json::to_vec(&c).unwrap();
@@ -585,8 +676,11 @@ mod tests {
         .is_err());
         assert_eq!(serde_json::to_vec(&c).unwrap(), before);
         record_success(Stage::Camera, &s, &mut c, vec![]).unwrap();
-        assert_eq!(plan(&s, &c)[0].state, State::Ready);
-        assert_eq!(plan(&s, &c)[3].state, State::Stale);
+        assert_eq!(stage_report(&s, &c, Stage::Camera).state, State::Ready);
+        assert_eq!(
+            stage_report(&s, &c, Stage::Registration).state,
+            State::Stale
+        );
     }
     #[test]
     fn preserved_world_and_compensation_require_both_previous_hashes() {
@@ -601,15 +695,24 @@ mod tests {
         new.registration = Artifact::Valid(hash('e'));
         let mut uncompensated = c.clone();
         preserve_camera_update(&old, &new, &mut uncompensated, false).unwrap();
-        assert_eq!(plan(&new, &uncompensated)[3].state, State::Stale);
+        assert_eq!(
+            stage_report(&new, &uncompensated, Stage::Registration).state,
+            State::Stale
+        );
         let mut compensated = c.clone();
         preserve_camera_update(&old, &new, &mut compensated, true).unwrap();
-        assert_eq!(plan(&new, &compensated)[3].state, State::Ready);
+        assert_eq!(
+            stage_report(&new, &compensated, Stage::Registration).state,
+            State::Ready
+        );
         for stage in [Stage::Camera, Stage::Registration] {
             let mut unproven = c.clone();
             unproven.completed.get_mut(&stage).unwrap().artifact_sha256 = hash('0');
             preserve_camera_update(&old, &new, &mut unproven, true).unwrap();
-            assert_eq!(plan(&new, &unproven)[3].state, State::Stale);
+            assert_eq!(
+                stage_report(&new, &unproven, Stage::Registration).state,
+                State::Stale
+            );
         }
     }
     struct Temp(PathBuf);
@@ -632,6 +735,96 @@ mod tests {
         }
     }
     #[test]
+    fn accepted_full_camera_solve_completes_gravity_with_the_same_capture() {
+        let temp = Temp::new();
+        let capture = temp.0.join("accepted-camera.jsonl");
+        let (mut s, mut c) = complete();
+        s.camera = Artifact::Valid(hash('f'));
+        s.recordings.insert(capture.clone());
+        begin_stage(Stage::Camera, &mut c);
+        record_full_camera_success(&s, &mut c, &hash('f'), vec![capture.clone()]).unwrap();
+        let reports = plan(&s, &c);
+        assert_eq!(reports[0].state, State::Ready);
+        assert_eq!(reports[1].state, State::Ready);
+        assert_eq!(
+            reports
+                .iter()
+                .find(|r| r.stage == Stage::Registration)
+                .unwrap()
+                .state,
+            State::Stale
+        );
+        let camera = &c.completed[&Stage::Camera];
+        let gravity = &c.completed[&Stage::Gravity];
+        assert_eq!(gravity.artifact_sha256, camera.artifact_sha256);
+        assert_eq!(
+            gravity.camera_sha256.as_ref(),
+            Some(&camera.artifact_sha256)
+        );
+        assert_eq!(gravity.recordings, vec![capture.clone()]);
+        assert_eq!(camera.recordings, gravity.recordings);
+        assert_eq!(c.recordings[&Stage::Gravity], vec![capture]);
+        assert!(!c.pending.contains(&Stage::Gravity));
+        assert!(c.pending.contains(&Stage::Registration));
+    }
+    #[test]
+    fn replacement_during_reload_cannot_claim_accepted_camera_capture() {
+        let temp = Temp::new();
+        let capture = temp.0.join("accepted-A.jsonl");
+        let (mut s, mut c) = complete();
+        let accepted_hash = hash('a');
+        s.recordings.insert(capture.clone());
+        begin_stage(Stage::Camera, &mut c);
+        record_capture(Stage::Camera, &s, &mut c, capture.clone()).unwrap();
+        // The solver accepted A, but final inspection after reload sees valid B.
+        s.camera = Artifact::Valid(hash('b'));
+        let before = serde_json::to_vec(&c).unwrap();
+        assert!(
+            record_full_camera_success(&s, &mut c, &accepted_hash, vec![capture.clone()]).is_err(),
+            "accepted {accepted_hash} must not grant completion to replacement B"
+        );
+        assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        assert_eq!(c.recordings[&Stage::Camera], vec![capture]);
+        assert!(c.pending.contains(&Stage::Camera));
+        assert!(c.pending.contains(&Stage::Gravity));
+    }
+    #[test]
+    fn full_camera_completion_failure_never_partially_completes_stages() {
+        let temp = Temp::new();
+        let capture = temp.0.join("accepted-camera.jsonl");
+        let (mut s, mut c) = complete();
+        begin_stage(Stage::Camera, &mut c);
+        s.recordings.insert(capture.clone());
+        let before = serde_json::to_vec(&c).unwrap();
+        assert!(record_full_camera_success(&s, &mut c, &hash('a'), vec![]).is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        assert!(record_full_camera_success(
+            &s,
+            &mut c,
+            &hash('a'),
+            vec![temp.0.join("missing.jsonl")]
+        )
+        .is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        s.camera = Artifact::Valid("bad fingerprint".into());
+        assert!(record_full_camera_success(&s, &mut c, &hash('a'), vec![capture]).is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        for stage in [Stage::Camera, Stage::Gravity, Stage::Registration] {
+            assert!(c.pending.contains(&stage));
+            assert!(!c.completed.contains_key(&stage));
+        }
+    }
+    #[test]
+    fn ordinary_camera_completion_does_not_infer_gravity_from_saved_artifact() {
+        let (s, mut c) = complete();
+        begin_stage(Stage::Camera, &mut c);
+        record_success(Stage::Camera, &s, &mut c, vec![]).unwrap();
+        assert_eq!(stage_report(&s, &c, Stage::Camera).state, State::Ready);
+        assert_eq!(stage_report(&s, &c, Stage::Gravity).state, State::Stale);
+        assert!(c.pending.contains(&Stage::Gravity));
+        assert!(!c.completed.contains_key(&Stage::Gravity));
+    }
+    #[test]
     fn exact_recordings_required_at_completion_but_not_for_completed_fit() {
         let temp = Temp::new();
         let recording = temp.0.join("capture.jsonl");
@@ -641,7 +834,7 @@ mod tests {
         record_success(Stage::Camera, &s, &mut c, vec![recording.clone()]).unwrap();
         std::fs::remove_file(&recording).unwrap();
         s.recordings.clear();
-        assert_eq!(plan(&s, &c)[0].state, State::Ready);
+        assert_eq!(stage_report(&s, &c, Stage::Camera).state, State::Ready);
         assert_eq!(
             c.completed[&Stage::Camera].recordings,
             vec![recording.clone()]
@@ -720,6 +913,9 @@ mod tests {
         save(&journal, &c).unwrap();
         let recovered = load(&journal).unwrap().unwrap();
         assert_eq!(recovered.recordings[&Stage::Camera], vec![path]);
-        assert_eq!(plan(&s, &recovered)[0].state, State::Stale);
+        assert_eq!(
+            stage_report(&s, &recovered, Stage::Camera).state,
+            State::Stale
+        );
     }
 }

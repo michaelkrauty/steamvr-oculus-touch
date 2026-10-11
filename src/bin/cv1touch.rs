@@ -5,7 +5,7 @@
 //! calibrate, consistency.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{self, Command as Process};
@@ -23,6 +23,28 @@ use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 
 #[path = "cv1touch/setup.rs"]
 mod guided_setup;
+
+fn human_color_enabled(no_color: bool, term_dumb: bool, terminal: bool, forced: bool) -> bool {
+    !no_color && !term_dumb && (terminal || forced)
+}
+
+fn human_text(message: &str) -> String {
+    let color = human_color_enabled(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("TERM").is_ok_and(|value| value == "dumb"),
+        io::stdout().is_terminal(),
+        std::env::var("CLICOLOR_FORCE").is_ok_and(|value| value == "1"),
+    );
+    if color {
+        format!("\x1b[1m{message}\x1b[0m")
+    } else {
+        message.to_owned()
+    }
+}
+
+fn human_action(message: &str) {
+    println!("{}", human_text(message));
+}
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
@@ -442,9 +464,12 @@ fn pace_windows(phases: &[String]) -> Result<Vec<(String, u64, u64)>, i32> {
     let mut windows = Vec::new();
     for (i, (name, secs)) in parsed.iter().enumerate() {
         print!(
-            "Phase {}/{}: {name} ({secs} s). Press Enter to start...",
-            i + 1,
-            parsed.len()
+            "{}",
+            human_text(&format!(
+                "Phase {}/{}: {name} ({secs} s). Press Enter to start...",
+                i + 1,
+                parsed.len()
+            ))
         );
         let _ = io::stdout().flush();
         if !wait_enter() {
@@ -554,18 +579,24 @@ fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
 }
 
 fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
+    calibrate_solve_saved(rec, out, force).map_or_else(|code| code, |_| 0)
+}
+
+/// Return the accepted saved output hash for guided completion; preserve expert
+/// diagnostics and exit codes through the ordinary wrapper.
+fn calibrate_solve_saved(rec: &Path, out: &Path, force: bool) -> Result<String, i32> {
     let cap = match capture::load(rec) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cv1touch: {e}");
-            return 1;
+            return Err(1);
         }
     };
     let sol = match solve::solve_capture(&cap, &solve::SolveOptions::default()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cv1touch: calibration failed: {e}");
-            return 1;
+            return Err(1);
         }
     };
     print!("{}", solve::format_report(&sol));
@@ -578,7 +609,7 @@ fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
                  Re-run with every sensor streaming, or add --force to drop them",
                 missing.join(", ")
             );
-            return 1;
+            return Err(1);
         }
     }
     if let Err(e) = solve::check(&sol, &solve::Acceptance::default()) {
@@ -587,30 +618,30 @@ fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
                 "cv1touch: not installing: {e} (re-run, or `calibrate solve {} --force`)",
                 rec.display()
             );
-            return 1;
+            return Err(1);
         }
         eprintln!("cv1touch: warning: {e}");
     }
     if interrupted() {
         eprintln!("cv1touch: interrupted: not installing");
-        return 130;
+        return Err(130);
     }
     let f = file::CalibrationFile::from_solution(
         &sol,
         &absolute(rec).display().to_string(),
         unix_now(),
     );
-    match file::save(out, &f) {
-        Ok(backup) => {
+    match file::save_with_fingerprint(out, &f) {
+        Ok((backup, fingerprint)) => {
             if let Some(b) = backup {
                 println!("previous calibration kept as {}", b.display());
             }
             println!("installed {}", out.display());
-            0
+            Ok(fingerprint)
         }
         Err(e) => {
             eprintln!("cv1touch: {e}");
-            1
+            Err(1)
         }
     }
 }
@@ -1317,6 +1348,8 @@ fn eval_capture() -> i32 {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct RawInput {
+    #[serde(default)]
+    buttons: Option<u32>,
     identity: String,
     connected: bool,
     received_host_ns: u64,
@@ -1545,7 +1578,7 @@ fn measured_inputs(
 }
 
 fn input_enter(prompt: &str) -> Result<(), String> {
-    println!("{prompt}\nPress Enter when ready.");
+    human_action(&format!("{prompt}\nPress Enter when ready."));
     io::stdout().flush().map_err(|e| e.to_string())?;
     loop {
         if interrupted() {
@@ -2248,11 +2281,147 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
     capture_free_named(max_s, instructions, frames, None)
 }
 
+fn guided_record_start_with(
+    cancelled: impl FnOnce() -> bool,
+    request: impl FnOnce() -> Result<String, String>,
+    reconcile: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if cancelled() {
+        return Err(
+            "capture interrupted before record-start dispatch; no recording started".into(),
+        );
+    }
+    let response = request();
+    if response.as_ref().is_ok_and(|reply| reply.trim() == "ok") {
+        return Ok(());
+    }
+    if let Ok(reply) = &response {
+        if reply.starts_with("err ") {
+            return Err(reply.clone()); // An explicit rejection did not start our recorder.
+        }
+    }
+    let error = response
+        .err()
+        .unwrap_or_else(|| "missing or malformed record-start acknowledgement".into());
+    reconcile().map_err(|cleanup| format!("{error}; scoped recorder cleanup failed: {cleanup}"))?;
+    Err(format!(
+        "{error}; own recording safely stopped if it started"
+    ))
+}
+
+struct ScopedRecordingGuard {
+    command: String,
+    armed: bool,
+}
+impl Drop for ScopedRecordingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = control::request(
+                &control::socket_path(),
+                &self.command,
+                Duration::from_millis(750),
+            );
+        }
+    }
+}
+
+fn scoped_cleanup_reply(reply: &str) -> bool {
+    reply.trim() == "ok not-matching" || reply.starts_with("ok stopped ")
+}
+
+fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGuard, String> {
+    let capability = control::request(
+        &control::socket_path(),
+        "status",
+        Duration::from_millis(750),
+    )
+    .ok()
+    .and_then(|reply| {
+        reply
+            .strip_prefix("ok ")
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    });
+    if capability.as_ref().is_none_or(|status| {
+        status["recording_scoped_stop"] != true || status["recording"] != false
+    }) {
+        return Err("guided capture requires an idle matching daemon with scoped recording cleanup; no recording started".into());
+    }
+    let command = control::record_stop_if_line(rec)?;
+    let start_command = control::record_start_line(rec, frames)?;
+    let mut scoped = ScopedRecordingGuard {
+        command,
+        armed: true,
+    };
+    let command = start_command;
+    let rejected = std::cell::Cell::new(false);
+    let cleaned = std::cell::Cell::new(false);
+    let result = guided_record_start_with(
+        || {
+            let cancelled = interrupted();
+            if cancelled {
+                rejected.set(true);
+            }
+            cancelled
+        },
+        || {
+            let reply = control::request(
+                &control::socket_path(),
+                &command,
+                Duration::from_millis(750),
+            )
+            .map_err(|error| error.to_string());
+            rejected.set(reply.as_ref().is_ok_and(|reply| reply.starts_with("err ")));
+            reply
+        },
+        || {
+            let reply = control::request(
+                &control::socket_path(),
+                &scoped.command,
+                Duration::from_millis(750),
+            )
+            .map_err(|error| error.to_string())?;
+            if !scoped_cleanup_reply(&reply) {
+                return Err(reply);
+            }
+            cleaned.set(true);
+            Ok(())
+        },
+    );
+    if let Err(error) = result {
+        // Explicit rejections must never stop a pre-existing recording. Other failures
+        // already attempted path-scoped cleanup; Drop retries only our path if necessary.
+        if rejected.get() || cleaned.get() {
+            scoped.armed = false;
+        }
+        return Err(error);
+    }
+    Ok(scoped)
+}
+
+trait CaptureFeedback {
+    fn before_start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn started(&mut self) -> Result<(), String>;
+    fn poll(&mut self) -> Result<bool, String>;
+    fn stopped(&mut self) -> Result<(), String>;
+}
+
 fn capture_free_named(
     max_s: u64,
     instructions: &str,
     frames: bool,
     base: Option<&Path>,
+) -> Result<PathBuf, i32> {
+    capture_free_named_with_feedback(max_s, instructions, frames, base, None)
+}
+
+fn capture_free_named_with_feedback(
+    max_s: u64,
+    instructions: &str,
+    frames: bool,
+    base: Option<&Path>,
+    mut feedback: Option<&mut dyn CaptureFeedback>,
 ) -> Result<PathBuf, i32> {
     catch_interrupts();
     if status_json()
@@ -2287,10 +2456,27 @@ fn capture_free_named(
         eprintln!("cv1touch: {e}");
         return Err(1);
     }
-    if send_path(control::record_start_line(&rec, frames)) != 0 {
-        return Err(1);
+    if let Some(hook) = feedback.as_mut() {
+        if let Err(error) = hook.before_start() {
+            eprintln!("cv1touch: {error}; no recording started");
+            return Err(1);
+        }
+        if interrupted() {
+            return Err(130);
+        }
     }
-    let mut guard = StopRecordingGuard(true);
+    let mut scoped_guard = if feedback.is_some() {
+        Some(guided_start_recording(&rec, frames).map_err(|error| {
+            eprintln!("cv1touch: {error}; no registration fit installed");
+            1
+        })?)
+    } else {
+        if send_path(control::record_start_line(&rec, frames)) != 0 {
+            return Err(1);
+        }
+        None
+    };
+    let mut guard = StopRecordingGuard(scoped_guard.is_none());
     let start = shm::now_ns();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -2343,12 +2529,23 @@ fn capture_free_named(
         "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
         rec.display()
     );
-    println!("{instructions}");
+    human_action(instructions);
+    let mut feedback_error = feedback.as_mut().and_then(|hook| hook.started().err());
     let deadline = start + max_s * 1_000_000_000;
     let mut last_print = 0u64;
     loop {
-        if interrupted() {
+        if interrupted() || feedback_error.is_some() {
             break;
+        }
+        if let Some(hook) = feedback.as_mut() {
+            match hook.poll() {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    feedback_error = Some(error);
+                    break;
+                }
+            }
         }
         let mut fds = libc::pollfd {
             fd: 0,
@@ -2356,7 +2553,7 @@ fn capture_free_named(
             revents: 0,
         };
         // SAFETY: one valid pollfd.
-        if unsafe { libc::poll(&mut fds, 1, 200) } > 0 {
+        if unsafe { libc::poll(&mut fds, 1, if feedback.is_some() { 20 } else { 200 }) } > 0 {
             let mut line = String::new();
             let _ = io::stdin().lock().read_line(&mut line);
             break;
@@ -2376,14 +2573,31 @@ fn capture_free_named(
     let (tracks, kinds) = sampler.join().unwrap_or_default();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
+    let stop_command = scoped_guard
+        .as_ref()
+        .map_or("record stop", |guard| guard.command.as_str());
     let stopped = control::request(
         &control::socket_path(),
-        "record stop",
+        stop_command,
         Duration::from_secs(5),
     );
-    let stopped_ok = stopped.as_ref().is_ok_and(|reply| reply.starts_with("ok"));
+    let stopped_ok = stopped.as_ref().is_ok_and(|reply| {
+        if scoped_guard.is_some() {
+            reply.starts_with("ok stopped ")
+        } else {
+            reply.starts_with("ok")
+        }
+    });
     if stopped_ok {
         guard.0 = false;
+        if let Some(scoped) = scoped_guard.as_mut() {
+            scoped.armed = false;
+        }
+        if let Some(hook) = feedback.as_mut() {
+            if let Err(error) = hook.stopped() {
+                feedback_error.get_or_insert(error);
+            }
+        }
     }
     let kind = |serial: &str| kinds.get(serial).cloned().unwrap_or_default();
     let mut out = io::stdout();
@@ -2441,6 +2655,13 @@ fn capture_free_named(
         rec.display(),
         truth_path.display()
     );
+    if let Some(error) = feedback_error {
+        let _ = writeln!(
+            io::stderr(),
+            "cv1touch: {error}; capture retained, no registration fit installed"
+        );
+        return Err(1);
+    }
     if !stopped_ok {
         return Err(1);
     }
@@ -5017,6 +5238,79 @@ mod tests {
     use super::*;
     use cv1touch::shm::ControllerState;
 
+    #[test]
+    fn guided_start_requires_ack_and_reconciles_ambiguous_failures() {
+        for response in [
+            Err("timeout".to_owned()),
+            Ok(String::new()),
+            Ok("unexpected".into()),
+        ] {
+            let stops = std::cell::Cell::new(0);
+            assert!(guided_record_start_with(
+                || false,
+                || response,
+                || {
+                    stops.set(stops.get() + 1);
+                    Ok(())
+                }
+            )
+            .is_err());
+            assert_eq!(stops.get(), 1);
+        }
+        let stops = std::cell::Cell::new(0);
+        assert!(guided_record_start_with(
+            || false,
+            || Ok("err already recording".into()),
+            || {
+                stops.set(1);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(stops.get(), 0);
+        assert!(guided_record_start_with(
+            || false,
+            || Ok("ok".into()),
+            || panic!("acknowledged start needs no reconciliation")
+        )
+        .is_ok());
+        assert!(guided_record_start_with(
+            || false,
+            || Ok(String::new()),
+            || Err("stop failed".into())
+        )
+        .unwrap_err()
+        .contains("stop failed"));
+    }
+    #[test]
+    fn cancelled_guided_dispatch_never_starts_or_stops_recording() {
+        let requests = std::cell::Cell::new(0);
+        let cleanup = std::cell::Cell::new(0);
+        let result = guided_record_start_with(
+            || true,
+            || {
+                requests.set(1);
+                Ok("ok".into())
+            },
+            || {
+                cleanup.set(1);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(requests.get(), 0);
+        assert_eq!(cleanup.get(), 0);
+    }
+    #[test]
+    fn scoped_cleanup_accepts_stopped_or_absent_but_not_empty_or_rejection() {
+        assert!(scoped_cleanup_reply(
+            "ok stopped records=1 dropped=0 write_errors=0 bytes=48"
+        ));
+        assert!(scoped_cleanup_reply("ok not-matching"));
+        for reply in ["", "ok", "err failed", "ok stopping", "unexpected"] {
+            assert!(!scoped_cleanup_reply(reply));
+        }
+    }
     /// Review fix 1: samples from before Enter (reading the briefing, picking things up) or after the
     /// final beep do not enter the solve.
     #[test]
@@ -5080,9 +5374,18 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn human_color_policy_respects_no_color_dumb_and_pipes() {
+        assert!(human_color_enabled(false, false, true, false));
+        assert!(human_color_enabled(false, false, false, true));
+        assert!(!human_color_enabled(false, false, false, false));
+        assert!(!human_color_enabled(true, false, true, true));
+        assert!(!human_color_enabled(false, true, true, true));
+    }
     fn raw_input_snapshot(timestamp: u64) -> RawInputs {
         RawInputs {
             hands: std::array::from_fn(|hand| RawInput {
+                buttons: None,
                 identity: format!("{:032x}", hand + 1),
                 connected: true,
                 received_host_ns: timestamp,

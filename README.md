@@ -41,7 +41,7 @@ The initial doctor check reports missing calibration/alignment until setup is co
 
 ## Development setup guide
 
-On development `main`, `cv1touch setup` guides camera calibration, gravity levelling, render fitting, headset registration, and input calibration, retaining completed stages across runs. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. These commands are unreleased and are not included in v0.1.0; see [guided setup](docs/setup.md#guided-setup-development-main) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
+On development `main`, `cv1touch setup` guides camera calibration, gravity alignment, render fitting, input calibration, and finally headset registration, retaining completed stages across runs. A fresh accepted camera solve also completes gravity alignment from the same capture. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. These commands are unreleased and are not included in v0.1.0; see [guided setup](docs/setup.md#guided-setup-development-main) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
 
 ## Documentation
 

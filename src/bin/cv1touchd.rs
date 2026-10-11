@@ -64,6 +64,7 @@ struct RawInputs {
     identity: String,
     connected: bool,
     received_host_ns: u64,
+    buttons: u32,
     trigger: f32,
     grip: f32,
     stick: [f32; 2],
@@ -98,6 +99,7 @@ impl InputRuntime {
         let raw = &mut self.latest[hand];
         raw.connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
         raw.received_host_ns = state.received_host_ns;
+        raw.buttons = state.buttons;
         raw.trigger = state.trigger;
         raw.grip = state.grip;
         raw.stick = state.stick;
@@ -1556,7 +1558,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         d.tracker,
         d.mode.lock().unwrap(),
@@ -1614,6 +1616,16 @@ fn handle(d: &Daemon, line: &str) -> String {
                 s.records, s.dropped, s.write_errors, s.bytes
             )
         }
+        Ok(Command::RecordStopIf(path)) => match d.rec.stop_if(&path) {
+            Some(s) => {
+                d.record_frames.store(false, Ordering::Release);
+                format!(
+                    "ok stopped records={} dropped={} write_errors={} bytes={}",
+                    s.records, s.dropped, s.write_errors, s.bytes
+                )
+            }
+            None => "ok not-matching".into(),
+        },
         Ok(Command::Status) => status_json(d),
         Ok(Command::Inputs) => {
             let inputs = d.inputs.lock().unwrap();
@@ -2392,6 +2404,33 @@ mod tests {
     }
 
     #[test]
+    fn scoped_record_stop_reports_outcome_and_preserves_unrelated_session() {
+        let d = status_daemon();
+        let path = std::env::temp_dir().join(format!("cv1touch-scoped-stop-{}.rec", shm::now_ns()));
+        let other = path.with_extension("other.rec");
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(status["recording_scoped_stop"], true);
+        let stop = control::record_stop_if_line(&path).unwrap();
+        assert_eq!(handle(&d, &stop), "ok not-matching");
+        assert_eq!(
+            handle(&d, &control::record_start_line(&path, true).unwrap()),
+            "ok"
+        );
+        assert_eq!(
+            handle(&d, &control::record_stop_if_line(&other).unwrap()),
+            "ok not-matching"
+        );
+        assert!(d.rec.active());
+        assert!(d.record_frames.load(Ordering::Acquire));
+        assert!(handle(&d, &stop).starts_with("ok stopped records="));
+        assert!(!d.rec.has_session());
+        assert!(!d.record_frames.load(Ordering::Acquire));
+        assert_eq!(handle(&d, &stop), "ok not-matching");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn status_does_not_report_the_engine_ready_before_initialization() {
         let d = status_daemon();
         let reply = status_json(&d);
@@ -2473,6 +2512,68 @@ mod tests {
             }; 2],
         };
         CalibrationFile::new([hand("a".repeat(32)), hand("b".repeat(32))]).unwrap()
+    }
+
+    #[test]
+    fn raw_buttons_preserve_physical_bits_before_injection() {
+        let mut runtime = InputRuntime::default();
+        runtime.set_identity(0, "a".repeat(32));
+        let physical = cv1touch::hand::BTN_X | cv1touch::hand::BTN_STICK | (1 << 31);
+        let mut state = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            buttons: physical,
+            received_host_ns: 42,
+            ..Default::default()
+        };
+        runtime.apply(0, &mut state);
+        let injection = Injection::default();
+        injection.arm(42);
+        injection
+            .press(
+                0,
+                control::Injected {
+                    buttons: cv1touch::hand::BTN_Y,
+                    ..Default::default()
+                },
+                100,
+                42,
+            )
+            .unwrap();
+        injection.apply(0, 42, &mut state);
+        assert_ne!(state.buttons, physical);
+        let snapshot = runtime.latest.clone();
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json[0]["buttons"], physical);
+        assert_eq!(json[0]["received_host_ns"], 42);
+        assert_eq!(json[1]["buttons"], 0);
+    }
+
+    #[test]
+    fn raw_buttons_reset_on_identity_change_and_disconnect() {
+        let d = status_daemon();
+        {
+            let mut runtime = d.inputs.lock().unwrap();
+            runtime.set_identity(0, "a".repeat(32));
+            let mut state = ControllerState {
+                flags: ffi::CV1T_FLAG_CONNECTED,
+                buttons: cv1touch::hand::BTN_X,
+                received_host_ns: 42,
+                ..Default::default()
+            };
+            runtime.apply(0, &mut state);
+            runtime.set_identity(0, "b".repeat(32));
+            let json = serde_json::to_value(&runtime.latest).unwrap();
+            assert_eq!(json[0]["buttons"], 0);
+            assert_eq!(json[0]["received_host_ns"], 0);
+            runtime.apply(0, &mut state);
+        }
+        publish_disconnected(&d);
+        let runtime = d.inputs.lock().unwrap();
+        let json = serde_json::to_value(&runtime.latest).unwrap();
+        assert_eq!(json[0]["buttons"], 0);
+        assert_eq!(json[0]["connected"], false);
+        assert_eq!(json[0]["received_host_ns"], 0);
+        assert_eq!(json[0]["identity"], "");
     }
 
     #[test]

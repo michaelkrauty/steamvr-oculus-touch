@@ -33,6 +33,7 @@ pub enum Command {
     /// Path, and whether to record the sensors' pixels too.
     RecordStart(PathBuf, bool),
     RecordStop,
+    RecordStopIf(PathBuf),
     Status,
     /// Factory-normalized inputs, before optional user calibration and output clamping.
     Inputs,
@@ -182,10 +183,20 @@ pub fn calibration_load_line(path: &Path) -> Result<String, String> {
     Ok(format!("calibration load {}", quoted_path(path)?))
 }
 
+/// Stop only the recording started with this exact path, even after a lost start reply.
+pub fn record_stop_if_line(path: &Path) -> Result<String, String> {
+    Ok(format!("record stop-if {}", quoted_path(path)?))
+}
+
 pub fn parse(line: &str) -> Result<Command, String> {
     if let Some((verb, rest)) = word(line) {
         if let Some((subcommand, args)) = word(rest) {
             match (verb, subcommand) {
+                ("record", "stop-if") => {
+                    return path_arguments(args, false)
+                        .map(|(path, _)| Command::RecordStopIf(path))
+                        .map_err(|e| format!("record stop-if: {e}"))
+                }
                 ("record", "start") => {
                     return path_arguments(args, true)
                         .map(|(path, frames)| Command::RecordStart(path, frames))
@@ -333,6 +344,24 @@ mod tests {
     use std::thread;
 
     /// Review Focus 5: values the engine would silently mangle must be rejected.
+    #[test]
+    fn scoped_stop_quotes_paths_and_rejects_malformed_arguments() {
+        let path = Path::new("/tmp/a \"quoted\" \\name\nframes.rec");
+        let line = record_stop_if_line(path).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(parse(&line), Ok(Command::RecordStopIf(path.to_path_buf())));
+        for line in [
+            "record stop-if",
+            "record stop-if relative.rec",
+            "record stop-if \"/tmp/unterminated",
+            "record stop-if \"/tmp/a\"frames",
+            "record stop-if \"/tmp/a\" frames",
+            "record stop-if \"/tmp/a\\u0000b\"",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
     #[test]
     fn quoted_paths_round_trip_spaces_quotes_newlines_and_frames() {
         let path = Path::new("/tmp/state with spaces/a \"quoted\" \\name\nframes.rec");

@@ -310,7 +310,7 @@ fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) ->
 }
 
 fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
-    println!("{prompt}");
+    human_action(prompt);
     io::stdout().flush().map_err(|e| e.to_string())?;
     loop {
         if interrupted() {
@@ -340,7 +340,7 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
             if allowed.contains(&answer.as_str()) {
                 return Ok(answer);
             }
-            println!("Enter {}.", allowed.join(" / "));
+            human_action(&format!("Enter {}.", allowed.join(" / ")));
         }
     }
 }
@@ -376,12 +376,9 @@ fn timed_capture(
     gravity: bool,
 ) -> Result<PathBuf, String> {
     let rec = capture_path(stage, checkpoint)?;
-    if send_path(control::record_start_line(&rec, false)) != 0 {
-        return Err("cannot start recording".into());
-    }
-    let mut guard = StopRecordingGuard(true);
+    let mut guard = guided_start_recording(&rec, false)?;
     let result = if gravity {
-        println!("Gravity: rest both controllers completely still in 12 varied orientations. Change pitch AND roll between holds, covering faces and edges; keep the rings visible. Each hold lasts 3 seconds.");
+        human_action("Next action: rest both controllers completely still in 12 varied orientations. Change pitch AND roll between holds, covering faces and edges; keep the rings visible. Each hold lasts 3 seconds.");
         (1..=12).try_for_each(|hold| -> Result<(), String> {
             choice(&format!("Hold {hold}/12: place both controllers in a NEW orientation. Enter 'ready' when stationary, or 'quit'."), &["ready", "quit"])
                 .and_then(|answer| if answer == "quit" { Err("setup stopped; recording retained".into()) } else { Ok(()) })?;
@@ -390,9 +387,13 @@ fn timed_capture(
     } else {
         let seconds = if stage == Stage::Render { 5 } else { 60 };
         if stage == Stage::Render {
-            println!("Keep both controllers awake while recording their factory geometry.");
+            human_action(
+                "Next action: keep both controllers awake while recording their factory geometry.",
+            );
         } else {
-            println!("{CALIBRATION_BRIEFING}");
+            human_action(&format!(
+                "Next action: prepare for camera calibration.\n{CALIBRATION_BRIEFING}"
+            ));
         }
         let name = if stage == Stage::Render {
             "geometry"
@@ -405,13 +406,24 @@ fn timed_capture(
             Err("capture interrupted".into())
         }
     };
-    let stopped = send("record stop");
-    if stopped == 0 {
-        guard.0 = false;
+    let stopped = control::request(
+        &control::socket_path(),
+        &guard.command,
+        Duration::from_millis(750),
+    )
+    .map_err(|error| error.to_string());
+    let stopped_ok = stopped
+        .as_ref()
+        .is_ok_and(|reply| reply.starts_with("ok stopped "));
+    if stopped_ok {
+        guard.armed = false;
     }
     result?;
-    if stopped != 0 {
-        return Err("recording did not stop successfully".into());
+    if !stopped_ok {
+        return Err(format!(
+            "recording did not stop successfully; own-path cleanup will retry: {}",
+            stopped.unwrap_or_else(|error| error)
+        ));
     }
     Ok(rec)
 }
@@ -580,8 +592,8 @@ fn wait_reload_with(
 }
 
 fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
-    println!(
-        "Waiting for tracking to resume. Keep both Touch controllers awake with a face button."
+    human_action(
+        "Next action: keep both Touch controllers awake with a face button while tracking resumes.",
     );
     let start = std::time::Instant::now();
     wait_reload_with(
@@ -604,6 +616,302 @@ fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
     )
 }
 
+struct ButtonEdges {
+    last_ns: [u64; 2],
+    released: [u32; 2],
+    armed_after_ns: u64,
+}
+impl ButtonEdges {
+    fn new(armed_after_ns: u64) -> Self {
+        Self {
+            last_ns: [0; 2],
+            released: [0; 2],
+            armed_after_ns,
+        }
+    }
+    fn observe(
+        &mut self,
+        raw: &RawInputs,
+        ids: &[String; 2],
+        now_ns: u64,
+    ) -> Result<[u32; 2], String> {
+        input_identities_match(raw, ids)?;
+        let mut edges = [0; 2];
+        for (hand, sample) in raw.hands.iter().enumerate() {
+            let buttons = sample.buttons.ok_or("controller-guided registration requires a matching cv1touchd with raw button support; update the daemon")?;
+            if !sample.connected
+                || sample.received_host_ns == 0
+                || now_ns
+                    .checked_sub(sample.received_host_ns)
+                    .is_none_or(|age| age > 500_000_000)
+            {
+                return Err("controller input is disconnected, stale or has an invalid timestamp; registration not started or fitted".into());
+            }
+            if sample.received_host_ns < self.last_ns[hand] {
+                return Err(
+                    "controller input timestamp moved backward; registration cancelled".into(),
+                );
+            }
+            if sample.received_host_ns == self.last_ns[hand] {
+                continue;
+            }
+            self.last_ns[hand] = sample.received_host_ns;
+            if sample.received_host_ns <= self.armed_after_ns {
+                continue;
+            }
+            edges[hand] = buttons & self.released[hand];
+            self.released[hand] = !buttons;
+        }
+        Ok(edges)
+    }
+}
+
+const REGISTRATION_PREPARATION: &str = "Headset registration preparation: bring the tracked headset within easy reach. Keep SteamVR running and confirm the headset is tracking. Wake both Touch controllers. Before putting on the headset, test left X and right A: release then press the requested button to receive a gentle buzz; release then press it again ONLY if you felt that buzz. Right B cancels, and Ctrl+C remains available.
+After confirming both hands, put on the headset. Release then press right A when ready for the 10-second positioning countdown. Both controllers give one gentle pulse each second. Hold both Touch controllers firmly against the headset without covering its tracking sensors or the Touch rings. Keep their relative positions rigid, with no slipping. A distinct DOUBLE stronger buzz means recording has actually started. Make two slow turns each way, then nod and tilt repeatedly. Release then press right A to finish (or press Enter); right B cancels without installing a fit. Recording also stops after 150 seconds. A longer gentle buzz means recording has stopped. If a requested test buzz is not felt, cancel and fix haptics before continuing.";
+
+fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
+    if interrupted() {
+        return Err("registration interrupted; no fit installed".into());
+    }
+    let reply = control::request(
+        &control::socket_path(),
+        "inputs",
+        Duration::from_millis(500),
+    )
+    .map_err(|e| e.to_string())?;
+    let raw = parse_raw_inputs(&reply)?;
+    let reply = control::request(
+        &control::socket_path(),
+        "status",
+        Duration::from_millis(500),
+    )
+    .map_err(|e| e.to_string())?;
+    let status: serde_json::Value = serde_json::from_str(
+        reply
+            .strip_prefix("ok ")
+            .ok_or("cannot read daemon status during registration")?,
+    )
+    .map_err(|e| e.to_string())?;
+    if before.generation.is_none() || status["generation"].as_u64() != before.generation {
+        return Err(
+            "daemon restarted during registration preparation or capture; no fit installed".into(),
+        );
+    }
+    let sensors = status::sensors_from_status(&status)?;
+    if status["mode"] != "calibrated"
+        || status["engine_ready"] == false
+        || sensors.len() != before.sensors.len()
+        || sensors.iter().any(|sensor| sensor.placed == 0)
+        || sensors.iter().map(shm::serial_str).collect::<BTreeSet<_>>() != before.sensors
+    {
+        return Err(
+            "camera engine or sensor placement changed during registration; no fit installed"
+                .into(),
+        );
+    }
+    if before.snapshot.camera
+        != Artifact::Valid(setup::fingerprint(&file::default_path()).map_err(|e| e.to_string())?)
+    {
+        return Err("camera world changed during registration; no fit installed".into());
+    }
+    let identities = before
+        .identities
+        .as_ref()
+        .ok_or("controller identities unavailable")?;
+    PairedInputPhase::new([0, 0]).observe(&raw, identities, shm::now_ns())?;
+    if raw.hands.iter().any(|hand| hand.buttons.is_none()) {
+        return Err("guided controller controls require a matching cv1touchd with raw button support; update the daemon and retry".into());
+    }
+    if raw.hands[HAND_RIGHT]
+        .buttons
+        .is_some_and(|buttons| buttons & cv1touch::hand::BTN_B != 0)
+    {
+        return Err(
+            "registration cancelled with right B; capture retained if started, no fit installed"
+                .into(),
+        );
+    }
+    Ok(raw)
+}
+
+fn registration_haptic(
+    hand: usize,
+    duration: f32,
+    frequency: f32,
+    amplitude: f32,
+) -> Result<(), String> {
+    let command = format!(
+        "haptic {} {duration} {frequency} {amplitude}",
+        ["left", "right"][hand]
+    );
+    let reply = control::request(
+        &control::socket_path(),
+        &command,
+        Duration::from_millis(500),
+    )
+    .map_err(|e| format!("haptic command failed: {e}; cancel and verify controller feedback"))?;
+    if reply.trim() != "ok" {
+        return Err(format!(
+            "haptic command rejected: {reply}; cancel and verify controller feedback"
+        ));
+    }
+    Ok(())
+}
+
+fn wait_registration_press(before: &Inspection, hand: usize, button: u32) -> Result<(), String> {
+    let start = Instant::now();
+    let mut edges = ButtonEdges::new(shm::now_ns());
+    let ids = before
+        .identities
+        .as_ref()
+        .ok_or("controller identities unavailable")?;
+    while start.elapsed() < Duration::from_secs(300) {
+        let raw = registration_inputs(before)?;
+        if edges.observe(&raw, ids, shm::now_ns())?[hand] & button != 0 {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err("timed out waiting for a fresh controller release and press; rerun setup when ready".into())
+}
+
+fn confirm_registration_controls_with(
+    mut press: impl FnMut(usize, u32) -> Result<(), String>,
+    mut buzz: impl FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    for (hand, button, name) in [
+        (HAND_LEFT, cv1touch::hand::BTN_X, "left X"),
+        (HAND_RIGHT, cv1touch::hand::BTN_A, "right A"),
+    ] {
+        human_action(&format!(
+            "Next action: release then press {name} for a gentle test buzz."
+        ));
+        press(hand, button)?;
+        buzz(hand)?;
+        human_action(&format!("Next action: release then press {name} again ONLY if you felt that buzz; right B cancels."));
+        press(hand, button)?;
+    }
+    Ok(())
+}
+
+fn registration_countdown_with(
+    mut tick: impl FnMut(usize) -> Result<(), String>,
+    mut second: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    for remaining in (1..=10).rev() {
+        println!("Registration positioning countdown: {remaining} seconds...");
+        tick(HAND_LEFT)?;
+        tick(HAND_RIGHT)?;
+        second()?;
+    }
+    Ok(())
+}
+
+fn registration_countdown(before: &Inspection) -> Result<(), String> {
+    let ids = before
+        .identities
+        .as_ref()
+        .ok_or("controller identities unavailable")?;
+    let mut edges = ButtonEdges::new(shm::now_ns());
+    registration_countdown_with(
+        |hand| registration_haptic(hand, 0.08, 80., 0.35),
+        || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(1) {
+                let raw = registration_inputs(before)?;
+                edges.observe(&raw, ids, shm::now_ns())?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        },
+    )
+}
+
+struct RegistrationFeedback<'a> {
+    before: &'a Inspection,
+    edges: ButtonEdges,
+}
+impl RegistrationFeedback<'_> {
+    fn rearm_finish(&mut self, now_ns: u64) {
+        self.edges = ButtonEdges::new(now_ns);
+    }
+}
+
+impl CaptureFeedback for RegistrationFeedback<'_> {
+    fn before_start(&mut self) -> Result<(), String> {
+        let raw = registration_inputs(self.before)?;
+        let ids = self
+            .before
+            .identities
+            .as_ref()
+            .ok_or("controller identities unavailable")?;
+        self.edges.observe(&raw, ids, shm::now_ns())?;
+        Ok(())
+    }
+    fn started(&mut self) -> Result<(), String> {
+        for pulse in 0..2 {
+            for hand in [HAND_LEFT, HAND_RIGHT] {
+                registration_haptic(hand, 0.15, 160., 0.65)?;
+            }
+            if pulse == 0 {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        // Start ACK and both start-cue pulses must precede any finish-button edge.
+        self.rearm_finish(shm::now_ns());
+        Ok(())
+    }
+    fn poll(&mut self) -> Result<bool, String> {
+        let raw = registration_inputs(self.before)?;
+        let ids = self
+            .before
+            .identities
+            .as_ref()
+            .ok_or("controller identities unavailable")?;
+        Ok(self.edges.observe(&raw, ids, shm::now_ns())?[HAND_RIGHT] & cv1touch::hand::BTN_A != 0)
+    }
+    fn stopped(&mut self) -> Result<(), String> {
+        for hand in [HAND_LEFT, HAND_RIGHT] {
+            registration_haptic(hand, 0.3, 80., 0.45)?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_registration_preparation(before: &Inspection, after: &Inspection) -> Result<(), String> {
+    if before.generation.is_none() || before.identities.is_none() {
+        return Err(
+            "registration preparation requires known daemon and controller identities".into(),
+        );
+    }
+    verify_fitted_dependencies(Stage::Registration, before, after)?;
+    if let Some(reason) = after.snapshot.blocked.get(&Stage::Registration) {
+        return Err(format!(
+            "registration preparation is not ready: {reason}; no recording started"
+        ));
+    }
+    if !matches!(after.snapshot.camera, Artifact::Valid(_))
+        || !after.unplaced.is_empty()
+        || after.sensors != before.sensors
+    {
+        return Err("camera placement or connected sensors changed during preparation; no recording started".into());
+    }
+    Ok(())
+}
+
+fn registration_capture_after_preparation<T>(
+    checkpoint: &mut Checkpoint,
+    prepare: impl FnOnce() -> Result<(), String>,
+    countdown: impl FnOnce() -> Result<(), String>,
+    verify: impl FnOnce(&Checkpoint) -> Result<(), String>,
+    capture: impl FnOnce(&mut Checkpoint) -> Result<T, String>,
+) -> Result<T, String> {
+    prepare()?;
+    countdown()?;
+    verify(checkpoint)?;
+    capture(checkpoint)
+}
+
 fn run_stage(
     stage: Stage,
     inspection: &Inspection,
@@ -619,9 +927,10 @@ fn run_stage(
     setup::begin_stage(stage, checkpoint);
     persist(checkpoint)?;
     let mut recordings = Vec::new();
+    let mut accepted_camera_sha256 = None;
     let code = match stage {
         Stage::Camera if preserve => {
-            println!("Place new sensors in the existing world. Keep all previously calibrated sensors fixed.");
+            human_action("Next action: place new sensors in the existing world. Keep all previously calibrated sensors fixed.");
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
@@ -641,7 +950,13 @@ fn run_stage(
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
-            let solved = calibrate_solve(&rec, &file::default_path(), false);
+            let solved = match calibrate_solve_saved(&rec, &file::default_path(), false) {
+                Ok(fingerprint) => {
+                    accepted_camera_sha256 = Some(fingerprint);
+                    0
+                }
+                Err(code) => code,
+            };
             let restored = restore_mode(&file::default_path());
             if restored == 0 {
                 restore.0 = false;
@@ -673,15 +988,55 @@ fn run_stage(
             fit_render(Some(&rec))
         }
         Stage::Registration => {
-            let rec = capture_path(stage, checkpoint)?;
-            let base = rec.with_extension("");
-            checkpoint
-                .recordings
-                .entry(stage)
-                .or_default()
-                .push(base.with_extension("truth.json"));
-            persist(checkpoint)?;
-            capture_free_named(150, "Press both Touch controllers firmly to the headset, away from its tracking surface. Keep the attachment rigid while making two slow turns each way, then nodding and tilting repeatedly. Press Enter after releasing the controllers.", false, Some(&base)).map_err(|code| format!("headset capture failed ({code})"))?;
+            let (rec, base) = registration_capture_after_preparation(
+                checkpoint,
+                || {
+                    human_action(&format!("Next action: verify button and haptic feedback before putting on the headset.\n{REGISTRATION_PREPARATION}"));
+                    confirm_registration_controls_with(
+                        |hand, button| wait_registration_press(inspection, hand, button),
+                        |hand| registration_haptic(hand, 0.12, 80., 0.35),
+                    )?;
+                    human_action("Next action: put on the headset. Release then press right A to begin the haptic positioning countdown; right B cancels.");
+                    wait_registration_press(inspection, HAND_RIGHT, cv1touch::hand::BTN_A)
+                },
+                || registration_countdown(inspection),
+                |checkpoint| {
+                    let current = inspect(checkpoint);
+                    if interrupted() {
+                        return Err(
+                            "setup interrupted during preparation; no recording started".into()
+                        );
+                    }
+                    verify_registration_preparation(inspection, &current)
+                },
+                |checkpoint| {
+                    if interrupted() {
+                        return Err(
+                            "setup interrupted during preparation; no recording started".into()
+                        );
+                    }
+                    let rec = capture_path(stage, checkpoint)?;
+                    let base = rec.with_extension("");
+                    checkpoint
+                        .recordings
+                        .entry(stage)
+                        .or_default()
+                        .push(base.with_extension("truth.json"));
+                    persist(checkpoint)?;
+                    if interrupted() {
+                        return Err(
+                            "setup interrupted during preparation; no recording started".into()
+                        );
+                    }
+                    println!("Starting headset registration recording now.");
+                    let mut feedback = RegistrationFeedback {
+                        before: inspection,
+                        edges: ButtonEdges::new(shm::now_ns()),
+                    };
+                    capture_free_named_with_feedback(150, "Keep both Touch controllers firmly against the headset without slipping or covering its tracking sensors. Make two slow turns each way, then nod and tilt repeatedly. Release then press right A to finish, or press Enter. Right B cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
+                    Ok((rec, base))
+                },
+            )?;
             recordings.push(rec);
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
@@ -718,7 +1073,17 @@ fn run_stage(
         carried.recordings = checkpoint.recordings.clone();
         *checkpoint = carried;
     }
-    setup::record_success(stage, &next.snapshot, checkpoint, recordings)?;
+    if interrupted() {
+        return Err("setup interrupted; stage remains incomplete and captures retained".into());
+    }
+    if stage == Stage::Camera && !preserve {
+        let accepted = accepted_camera_sha256
+            .as_deref()
+            .ok_or("accepted camera output fingerprint unavailable; stage remains incomplete")?;
+        setup::record_full_camera_success(&next.snapshot, checkpoint, accepted, recordings)?;
+    } else {
+        setup::record_success(stage, &next.snapshot, checkpoint, recordings)?;
+    }
     persist(checkpoint)
 }
 
@@ -755,7 +1120,7 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
             print_report(&inspection, &checkpoint, false);
             let stage_reports = reports(&inspection, &checkpoint);
             let Some(report) = stage_reports.iter().find(|r| r.state != State::Ready) else {
-                println!("Saved setup is complete. Check physical alignment, movement and input-test in a focused VR app. Wake controllers if asleep.");
+                human_action("Next action: check physical alignment, movement and input-test in a focused VR app. Wake controllers if asleep. Saved setup is complete.");
                 return Ok(());
             };
             if report.state == State::Blocked {
@@ -767,6 +1132,10 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     report.stage,
                     Stage::Camera | Stage::Gravity | Stage::Render | Stage::Registration
                 );
+            human_action(&format!(
+                "Next action: complete or verify {:?}.",
+                report.stage
+            ));
             let answer = if can_adopt {
                 choice(&format!("{:?}: type keep ONLY if you have verified the current camera placement, level, render alignment and SteamVR registration are correct together. This adopts saved files without changing them. Type new to capture this stage, or quit.", report.stage), &["keep", "new", "quit"])?
             } else {
@@ -820,6 +1189,283 @@ mod tests {
             engine_ready: Some(true),
         }
     }
+    #[test]
+    fn controls_need_a_press_buzz_and_another_confirmation_press_for_each_hand() {
+        let events = std::cell::RefCell::new(Vec::new());
+        confirm_registration_controls_with(
+            |hand, _| {
+                events.borrow_mut().push(("press", hand));
+                Ok(())
+            },
+            |hand| {
+                events.borrow_mut().push(("buzz", hand));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            [
+                ("press", HAND_LEFT),
+                ("buzz", HAND_LEFT),
+                ("press", HAND_LEFT),
+                ("press", HAND_RIGHT),
+                ("buzz", HAND_RIGHT),
+                ("press", HAND_RIGHT)
+            ]
+        );
+    }
+    #[test]
+    fn countdown_ticks_both_hands_ten_times_before_capture() {
+        let events = std::cell::RefCell::new(Vec::new());
+        registration_capture_after_preparation(
+            &mut Checkpoint::default(),
+            || Ok(()),
+            || {
+                registration_countdown_with(
+                    |hand| {
+                        events.borrow_mut().push(hand);
+                        Ok(())
+                    },
+                    || {
+                        events.borrow_mut().push(2);
+                        Ok(())
+                    },
+                )
+            },
+            |_| Ok(()),
+            |_| {
+                events.borrow_mut().push(3);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(events.borrow().len(), 31);
+        for second in events.borrow()[..30].chunks(3) {
+            assert_eq!(second, [HAND_LEFT, HAND_RIGHT, 2]);
+        }
+        assert_eq!(events.borrow()[30], 3);
+    }
+    #[test]
+    fn haptic_rejection_or_countdown_cancel_prevents_recording() {
+        for haptic_failure in [true, false] {
+            let starts = std::cell::Cell::new(0);
+            let result = registration_capture_after_preparation(
+                &mut Checkpoint::default(),
+                || Ok(()),
+                || {
+                    registration_countdown_with(
+                        |_| {
+                            if haptic_failure {
+                                Err("haptic rejected".into())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        || Err("right B or interrupt cancelled countdown".into()),
+                    )
+                },
+                |_| Ok(()),
+                |_| {
+                    starts.set(starts.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(starts.get(), 0);
+        }
+        let presses = std::cell::Cell::new(0);
+        assert!(confirm_registration_controls_with(
+            |_, _| {
+                presses.set(presses.get() + 1);
+                Ok(())
+            },
+            |_| Err("haptic rejected".into())
+        )
+        .is_err());
+        assert_eq!(
+            presses.get(),
+            1,
+            "queue failure must not solicit or claim receipt confirmation"
+        );
+    }
+    #[test]
+    fn controller_start_requires_a_new_release_press_and_ignores_duplicate_reports() {
+        let mut raw = reload_inputs();
+        let ids = saved().identities.unwrap();
+        let mut edges = ButtonEdges::new(999_999_999);
+        raw.hands[1].buttons = Some(cv1touch::hand::BTN_A);
+        assert_eq!(
+            edges.observe(&raw, &ids, 1_000_000_010).unwrap()[1],
+            0,
+            "already held must not start"
+        );
+        raw.hands[1].buttons = Some(0);
+        raw.hands[1].received_host_ns += 1;
+        edges.observe(&raw, &ids, 1_000_000_010).unwrap();
+        raw.hands[1].buttons = Some(cv1touch::hand::BTN_A);
+        assert_eq!(
+            edges.observe(&raw, &ids, 1_000_000_010).unwrap()[1],
+            0,
+            "same timestamp is not a new press"
+        );
+        raw.hands[1].received_host_ns += 1;
+        assert_eq!(
+            edges.observe(&raw, &ids, 1_000_000_010).unwrap()[1],
+            cv1touch::hand::BTN_A
+        );
+        assert_eq!(edges.observe(&raw, &ids, 1_000_000_010).unwrap()[1], 0);
+    }
+    #[test]
+    fn controller_start_rejects_missing_stale_disconnected_or_replaced_samples() {
+        let ids = saved().identities.unwrap();
+        let mut raw = reload_inputs();
+        raw.hands[1].buttons = None;
+        assert!(ButtonEdges::new(0)
+            .observe(&raw, &ids, 1_000_000_010)
+            .is_err());
+        raw = reload_inputs();
+        raw.hands[0].connected = false;
+        assert!(ButtonEdges::new(0)
+            .observe(&raw, &ids, 1_000_000_010)
+            .is_err());
+        raw = reload_inputs();
+        raw.hands[0].identity = "3".repeat(32);
+        assert!(ButtonEdges::new(0)
+            .observe(&raw, &ids, 1_000_000_010)
+            .is_err());
+        raw = reload_inputs();
+        assert!(ButtonEdges::new(0)
+            .observe(&raw, &ids, 2_000_000_000)
+            .is_err());
+        raw = reload_inputs();
+        let mut edges = ButtonEdges::new(0);
+        edges.observe(&raw, &ids, 1_000_000_010).unwrap();
+        raw.hands[0].received_host_ns -= 1;
+        assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
+    }
+    #[test]
+    fn registration_starts_only_after_ready_countdown_and_verification() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = registration_capture_after_preparation(
+            &mut Checkpoint::default(),
+            || {
+                events.borrow_mut().push("ready");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("ten-second countdown complete");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("prerequisites verified");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("record-start");
+                Ok("capture")
+            },
+        )
+        .unwrap();
+        assert_eq!(result, "capture");
+        assert_eq!(
+            *events.borrow(),
+            [
+                "ready",
+                "ten-second countdown complete",
+                "prerequisites verified",
+                "record-start"
+            ]
+        );
+    }
+    #[test]
+    fn registration_quit_interrupt_or_failed_readiness_never_starts_recording() {
+        for rejected_phase in 0..3 {
+            let starts = std::cell::Cell::new(0);
+            let gate = |phase| {
+                if phase == rejected_phase {
+                    Err("preparation cancelled or unavailable".into())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = registration_capture_after_preparation(
+                &mut Checkpoint::default(),
+                || gate(0),
+                || gate(1),
+                |_| gate(2),
+                |_| {
+                    starts.set(starts.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(
+                result.is_err(),
+                "rejected preparation phase {rejected_phase}"
+            );
+            assert_eq!(
+                starts.get(),
+                0,
+                "rejected preparation phase {rejected_phase}"
+            );
+        }
+    }
+    #[test]
+    fn registration_preparation_rejects_changed_or_unready_prerequisites() {
+        let before = saved();
+        assert!(verify_registration_preparation(&before, &before).is_ok());
+        let mut after = saved();
+        after.generation = Some(2);
+        assert!(verify_registration_preparation(&before, &after).is_err());
+        after = saved();
+        after.identities.as_mut().unwrap()[0] = "3".repeat(32);
+        assert!(verify_registration_preparation(&before, &after).is_err());
+        after = saved();
+        after.snapshot.camera = Artifact::Valid("b".repeat(64));
+        assert!(verify_registration_preparation(&before, &after).is_err());
+        after = saved();
+        after
+            .snapshot
+            .blocked
+            .insert(Stage::Registration, "controllers asleep".into());
+        assert!(verify_registration_preparation(&before, &after).is_err());
+        after = saved();
+        after.sensors.insert("NEWCAM".into());
+        assert!(verify_registration_preparation(&before, &after).is_err());
+    }
+    #[test]
+    fn recording_finish_requires_release_press_after_start_cue() {
+        let before = saved();
+        let ids = before.identities.as_ref().unwrap();
+        let mut feedback = RegistrationFeedback {
+            before: &before,
+            edges: ButtonEdges::new(0),
+        };
+        let mut raw = reload_inputs();
+        feedback.edges.observe(&raw, ids, 1_000_000_010).unwrap();
+        feedback.rearm_finish(1_000_000_100);
+        // A pressed before the recorder acknowledgement/start cue is queued, not a finish.
+        raw.hands[HAND_RIGHT].buttons = Some(cv1touch::hand::BTN_A);
+        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_050;
+        assert_eq!(
+            feedback.edges.observe(&raw, ids, 1_000_000_110).unwrap()[HAND_RIGHT],
+            0
+        );
+        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_120;
+        assert_eq!(
+            feedback.edges.observe(&raw, ids, 1_000_000_130).unwrap()[HAND_RIGHT],
+            0
+        );
+        raw.hands[HAND_RIGHT].buttons = Some(0);
+        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_140;
+        feedback.edges.observe(&raw, ids, 1_000_000_150).unwrap();
+        raw.hands[HAND_RIGHT].buttons = Some(cv1touch::hand::BTN_A);
+        raw.hands[HAND_RIGHT].received_host_ns = 1_000_000_160;
+        assert_eq!(
+            feedback.edges.observe(&raw, ids, 1_000_000_170).unwrap()[HAND_RIGHT],
+            cv1touch::hand::BTN_A
+        );
+    }
     fn reload_sample(generation: u64, frames: u32) -> serde_json::Value {
         serde_json::json!({"generation": generation, "mode": "calibrated", "recording": false, "engine_ready": true,
             "sensors": [{"serial": "CAMTEST", "placed": 1, "frames": frames, "fixes": [0,0]}]})
@@ -827,6 +1473,7 @@ mod tests {
     fn reload_inputs() -> RawInputs {
         RawInputs {
             hands: std::array::from_fn(|hand| RawInput {
+                buttons: Some(0),
                 identity: (hand + 1).to_string().repeat(32),
                 connected: true,
                 received_host_ns: 1_000_000_000,
