@@ -4,6 +4,21 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- Development `cv1touch setup` guide for camera, gravity, render, headset-registration, and input stages, with a private resumable journal and dependency-aware reuse.
+- Read-only `setup --check` and `setup --check --json` reports; explicit visual-verification/adoption of legacy calibration without discarding its files.
+
+### Changed
+
+- Guided input calibration captures both hands in four shared phases, reducing timed capture to 16 seconds while retaining freshness, identity, travel, and save/reload checks.
+
+### Fixed
+
+- Failed camera captures recover provisional tracking when the previous calibration is malformed; rejected reloads attempt recovery and report failure.
+- Cancelled render, registration, gravity, placement, and refinement fits do not install their computed settings.
+- Guided registration bootstraps a fresh fit after camera-world changes instead of depending on an obsolete saved transform.
+
 ## [0.1.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) - 2026-10-10
 
 ### Added

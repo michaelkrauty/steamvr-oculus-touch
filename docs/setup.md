@@ -46,6 +46,30 @@ The installer refuses to overwrite unmanaged or modified installed files, includ
 
 SteamVR is discovered from its OpenVR path registry and common native Steam paths. Set `CV1TOUCH_STEAMVR` to the SteamVR runtime directory if needed, and `CV1TOUCH_STEAM_ROOT` to the Steam directory containing `config/steamvr.vrsettings` if discovery is ambiguous. Export these for installation and CLI commands; add them to a systemd user-service override when the daemon needs custom paths.
 
+## Guided setup (development `main`)
+
+The following commands are unreleased and available on development `main`, not in the v0.1.0 quick start:
+
+```sh
+cv1touch setup --check
+cv1touch setup --check --json
+cv1touch setup
+```
+
+The check commands are read-only: they report camera, gravity, render, registration, and input stages as ready, missing, invalid, unknown, stale, or blocked. They do not start recordings or change configuration. A ready stage means its saved dependencies are reusable; it does not certify current physical tracking accuracy. Use the status dashboard and the final SteamVR checks below to verify operation.
+
+Complete installation and device access first, start the daemon, wake both already-paired controllers, and check that every expected sensor receives frames. Captures require an interactive terminal. SteamVR and its independently tracked headset must be available for headset registration. Setup does not pair controllers, reset hardware, change firmware, grant permissions, or start/restart services for you.
+
+The guide runs only the stages that need work and keeps a private completion journal at `$XDG_STATE_HOME/cv1touch/setup.json` (default `~/.local/state/cv1touch/setup.json`). It keeps exact recording paths and checks configuration dependencies. Rerunning with the same completed configuration reuses it without another capture. Changes to a full camera-world calibration require gravity and registration review; render and input settings have their own dependencies. Input reuse is bound to the physical controllers' factory identities. Interrupted or rejected work does not count as completed; fix the reported prerequisite and rerun the guide.
+
+Existing camera, gravity, render, and registration files without journal evidence are **unknown**, rather than silently trusted or discarded. The guide lets you deliberately adopt them after visual verification or perform a new capture. Before adopting, check overlapping sensor coverage, level tracking, correct rendered controller offsets, and controller position/orientation relative to the SteamVR headset throughout the play area. Adoption records your verification and retains the existing calibration files; it does not perform a new accuracy measurement. If you cannot verify a stage, recapture it. Identity-bound valid input settings can be reused independently.
+
+Follow each physical prompt fully: move both controllers slowly across overlapping camera views and varied orientations; hold them still in at least 12 substantially different orientations for gravity levelling; keep both controllers rigid against the headset while turning, nodding, and tilting for registration. The guide retains the existing solver acceptance gates. It cannot infer a reliable headset-space transform from unrelated head and hand movement. Input calibration uses four shared phases for both hands: neutral, full trigger, full grip, then full stick circles, totalling 16 seconds of timed capture plus confirmations.
+
+After setup, verify both hands in SteamVR, input delivery, haptics, occlusion recovery, sleeping/waking, and a daemon restart as described below. The guided flow has automated coverage; live hardware validation of this unreleased flow is still pending. Linux remains the supported target; Windows is unsupported.
+
+The manual commands below remain available for explicit recordings, inspection, alternative registration paths, and expert control.
+
 ## Calibrate and align
 
 Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. A previously paired CV1 headset supplies the radio link; your other SteamVR headset supplies the reference pose.
@@ -78,7 +102,7 @@ Camera calibration estimates the sensors' poses in a shared world. Registration 
    ```
 
    Replace `BASE` with the printed path. The fit must have sufficient motion and agreement. If the two controllers move relative to the headset, repeat the capture. No separate tracked controller is required for this path.
-6. Run `cv1touch calibrate inputs`. For each controller, the guide captures released triggers/grips and the centered stick, full trigger and grip presses, then full thumbstick circles. Follow the prompts, press firmly at the normal mechanical stop, and move the stick against its gate through several complete circles. Settings apply immediately and survive restarts; SteamVR can stay open. See [input calibration](input-calibration.md) for reset and expert controls.
+6. Run `cv1touch calibrate inputs`. In v0.1.0, the guide captures each controller separately. On development `main`, both hands share four phases: released triggers/grips and centered sticks, full trigger presses, full grip presses, then full thumbstick circles. Follow the prompts, press firmly at the normal mechanical stop, and move the stick against its gate through several complete circles. Settings apply immediately and survive restarts; SteamVR can stay open. See [input calibration](input-calibration.md) for reset and expert controls.
 7. Verify position and orientation in SteamVR. Run `cv1touch input-test` and follow its button prompts with a focused VR app running. The tool checks the exact supported SteamVR inputs and reports menu/thumb-rest delivery as a manual app check. Test haptics with a game or `cv1touch haptic left 0.1 100 0.5`. Check occlusion recovery, sleeping/waking, both hands, and a daemon restart before relying on the setup.
 
 Sensor movement requires recalibration or `calibrate refine`/`calibrate place` with a new observable capture. A new SteamVR room setup or a substantial non-rigid base-station re-solve can require repeating headset registration. See [troubleshooting](troubleshooting.md).

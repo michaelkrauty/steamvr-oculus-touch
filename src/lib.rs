@@ -16,6 +16,7 @@ pub mod modes;
 pub mod recorder;
 pub mod register;
 pub mod rendermodel;
+pub mod setup;
 pub mod shm;
 pub mod status;
 pub mod steamvr;
