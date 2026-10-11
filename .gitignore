@@ -2,6 +2,9 @@
 /target/
 *.rec
 *.bak-*
+# Personal controller calibration exports.
+input-calibration.json
+cv1touch-input-calibration.json
 /.cache/
 /.claude/
 /.superpowers/

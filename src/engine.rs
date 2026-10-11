@@ -262,6 +262,16 @@ impl Engine {
         (!dec.is_null()).then_some(RadioDecoder(dec))
     }
 
+    /// Stable factory-calibration identity for this physical controller. Available after
+    /// calibration is loaded; query on the engine thread and keep out of public logs.
+    pub fn controller_identity(&self, hand: usize) -> Option<String> {
+        let device = *self.hands.get(hand)?;
+        let mut buf = [0 as c_char; 33];
+        // SAFETY: buffer has the advertised size and this Engine owns the device.
+        (unsafe { ffi::ohmd_cv1touch_get_controller_identity(device, buf.as_mut_ptr(), 33) } == 0)
+            .then(|| cstr_field(&buf))
+    }
+
     pub fn controller(&self, hand: usize) -> Option<Controller> {
         let mut c = Controller::default();
         // SAFETY: valid device and out-pointer.

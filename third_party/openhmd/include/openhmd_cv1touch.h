@@ -144,6 +144,9 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_free(ohmd_cv1tou
  * IMU samples and inputs of its calibrated, non-empty Touch messages and returns n. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radio_decoder *dec, const unsigned char *buf, int size,
 		uint64_t received_ns, ohmd_cv1touch_controller *out);
+/* Stable factory-calibration identity, 32 lowercase hex bytes + NUL. Returns -1 until
+ * calibrated or on invalid arguments. Engine thread only. Does not change sample ABI. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller_identity(ohmd_device *device, char *out, int size);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *device, ohmd_cv1touch_controller *out);
 /* The controller's factory LED model: number of LEDs written (0 until read over the radio), -1 on error. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *device, ohmd_cv1touch_led *out, int max);

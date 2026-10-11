@@ -27,7 +27,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
-         cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  \
+         cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
          cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
          cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
          cv1touch fit-render [REC]\n  cv1touch steamvr install|uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
@@ -1255,10 +1255,590 @@ fn eval_capture() -> i32 {
     eval_cmd(&base)
 }
 
-/// One step of the input test: what to do, and when the daemon's state shows it.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct RawInput {
+    identity: String,
+    connected: bool,
+    received_host_ns: u64,
+    trigger: f32,
+    grip: f32,
+    stick: [f32; 2],
+}
+
+#[derive(serde::Deserialize)]
+struct RawInputs {
+    hands: [RawInput; 2],
+}
+
+fn parse_raw_inputs(reply: &str) -> Result<RawInputs, String> {
+    let json = reply
+        .strip_prefix("ok ")
+        .ok_or_else(|| format!("cannot read raw inputs: {reply}"))?;
+    let inputs: RawInputs = serde_json::from_str(json)
+        .map_err(|e| format!("invalid raw input reply (axes must be finite numbers): {e}"))?;
+    if inputs.hands.iter().any(|hand| {
+        [hand.trigger, hand.grip, hand.stick[0], hand.stick[1]]
+            .iter()
+            .any(|v| !v.is_finite())
+    }) {
+        return Err("raw inputs contain nonfinite axes".into());
+    }
+    Ok(inputs)
+}
+
+fn raw_inputs() -> Result<RawInputs, String> {
+    control::request(&control::socket_path(), "inputs", Duration::from_secs(1))
+        .map_err(|e| format!("cannot read raw inputs from cv1touchd: {e}"))
+        .and_then(|reply| parse_raw_inputs(&reply))
+}
+
+fn raw_inputs_json() -> i32 {
+    let result = (|| -> Result<String, String> {
+        let reply = control::request(&control::socket_path(), "inputs", Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        parse_raw_inputs(&reply)?;
+        let value: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").ok_or("invalid raw input reply")?)
+                .map_err(|e| e.to_string())?;
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            1
+        }
+    }
+}
+
+fn input_identities_match(inputs: &RawInputs, identities: &[String; 2]) -> Result<(), String> {
+    for (hand, expected) in inputs.hands.iter().zip(identities) {
+        if hand.identity.len() != 32
+            || !hand
+                .identity
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(
+                "controller identity is unavailable; wake both controllers and retry".into(),
+            );
+        }
+        if &hand.identity != expected {
+            return Err(
+                "a physical controller changed during calibration; no calibration was saved".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct InputPhase {
+    last_ns: u64,
+    samples: Vec<RawInput>,
+}
+
+impl InputPhase {
+    fn observe(
+        &mut self,
+        inputs: &RawInputs,
+        identities: &[String; 2],
+        hand: usize,
+        now_ns: u64,
+    ) -> Result<bool, String> {
+        input_identities_match(inputs, identities)?;
+        let sample = &inputs.hands[hand];
+        if !sample.connected {
+            return Err(format!(
+                "{} controller disconnected; wake it and retry",
+                ["left", "right"][hand]
+            ));
+        }
+        if sample.received_host_ns == 0
+            || now_ns
+                .checked_sub(sample.received_host_ns)
+                .is_none_or(|age| age > 500_000_000)
+        {
+            return Err(format!(
+                "{} input sample is stale or has an invalid timestamp",
+                ["left", "right"][hand]
+            ));
+        }
+        if sample.received_host_ns < self.last_ns {
+            return Err("input timestamps moved backward; retry calibration".into());
+        }
+        if sample.received_host_ns == self.last_ns {
+            return Ok(false);
+        }
+        if [
+            sample.trigger,
+            sample.grip,
+            sample.stick[0],
+            sample.stick[1],
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || v.abs() > 4.0)
+        {
+            return Err(
+                "raw input sample is outside the supported factory-coordinate range".into(),
+            );
+        }
+        self.last_ns = sample.received_host_ns;
+        self.samples.push(sample.clone());
+        Ok(true)
+    }
+
+    fn finish(self, minimum: usize) -> Result<Vec<RawInput>, String> {
+        if self.samples.len() < minimum {
+            return Err(format!("only {} fresh input samples; need at least {minimum}. Wake the controller and retry", self.samples.len()));
+        }
+        Ok(self.samples)
+    }
+}
+
+fn input_quantile(
+    samples: &[RawInput],
+    axis: impl Fn(&RawInput) -> f32,
+    q: f32,
+) -> Result<f32, String> {
+    let mut values: Vec<f32> = samples.iter().map(axis).collect();
+    if values.is_empty() || values.iter().any(|v| !v.is_finite() || v.abs() > 4.0) {
+        return Err("missing or invalid input samples".into());
+    }
+    values.sort_by(f32::total_cmp);
+    let at = q * (values.len() - 1) as f32;
+    let lo = at.floor() as usize;
+    let hi = at.ceil() as usize;
+    Ok(values[lo] + (values[hi] - values[lo]) * (at - lo as f32))
+}
+
+fn measured_inputs(
+    identity: &str,
+    phases: &[Vec<RawInput>; 4],
+) -> Result<cv1touch::input_calibration::HandCalibration, String> {
+    use cv1touch::input_calibration::{Endpoint, HandCalibration, StickAxis};
+    Ok(HandCalibration {
+        identity: identity.into(),
+        trigger: Endpoint {
+            released: input_quantile(&phases[0], |s| s.trigger, 0.5)?,
+            pressed: input_quantile(&phases[1], |s| s.trigger, 0.5)?,
+        },
+        grip: Endpoint {
+            released: input_quantile(&phases[0], |s| s.grip, 0.5)?,
+            pressed: input_quantile(&phases[2], |s| s.grip, 0.5)?,
+        },
+        stick: [
+            StickAxis {
+                min: input_quantile(&phases[3], |s| s.stick[0], 0.02)?,
+                center: input_quantile(&phases[0], |s| s.stick[0], 0.5)?,
+                max: input_quantile(&phases[3], |s| s.stick[0], 0.98)?,
+            },
+            StickAxis {
+                min: input_quantile(&phases[3], |s| s.stick[1], 0.02)?,
+                center: input_quantile(&phases[0], |s| s.stick[1], 0.5)?,
+                max: input_quantile(&phases[3], |s| s.stick[1], 0.98)?,
+            },
+        ],
+    })
+}
+
+fn input_enter(prompt: &str) -> Result<(), String> {
+    println!("{prompt}\nPress Enter when ready.");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    loop {
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd.
+        let ready = unsafe { libc::poll(&mut fd, 1, 100) };
+        if ready > 0 {
+            let mut line = String::new();
+            if io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err(
+                    "input calibration requires Enter confirmation; standard input is closed"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+}
+
+fn collect_inputs(
+    hand: usize,
+    identities: &[String; 2],
+    last_ns: &mut u64,
+    seconds: u64,
+    minimum: usize,
+) -> Result<Vec<RawInput>, String> {
+    println!("Sampling for {seconds} seconds...");
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut phase = InputPhase {
+        last_ns: *last_ns,
+        ..Default::default()
+    };
+    while Instant::now() < deadline {
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        let tick = Instant::now();
+        phase.observe(&raw_inputs()?, identities, hand, shm::now_ns())?;
+        thread::sleep(Duration::from_millis(50).saturating_sub(tick.elapsed()));
+    }
+    *last_ns = phase.last_ns;
+    let samples = phase.finish(minimum)?;
+    println!("Done: {} fresh samples.", samples.len());
+    Ok(samples)
+}
+
+fn private_input_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staged = parent.join(format!(
+        ".input-calibration-{}-{}",
+        process::id(),
+        shm::now_ns()
+    ));
+    let mut created = false;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .map_err(|e| e.to_string())?;
+        created = true;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&staged, path).map_err(|e| e.to_string())?;
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())
+    })();
+    if created {
+        let _ = std::fs::remove_file(staged);
+    }
+    result
+}
+
+fn remove_input_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn previous_input_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    const MAX_BACKUP: u64 = 1_048_576;
+    if !metadata.is_file() || metadata.len() > MAX_BACKUP {
+        return Err(format!(
+            "refusing nonregular or oversized input calibration: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BACKUP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_BACKUP {
+        return Err("input calibration grew beyond the backup limit".into());
+    }
+    Ok(Some(bytes))
+}
+
+fn write_input_calibration(
+    path: &Path,
+    candidate: Option<&cv1touch::input_calibration::CalibrationFile>,
+    reload: Option<&mut dyn FnMut() -> Result<(), String>>,
+) -> Result<(), String> {
+    write_input_calibration_with(path, candidate, reload, cv1touch::input_calibration::save)
+}
+
+fn write_input_calibration_with(
+    path: &Path,
+    candidate: Option<&cv1touch::input_calibration::CalibrationFile>,
+    mut reload: Option<&mut dyn FnMut() -> Result<(), String>>,
+    save: impl FnOnce(&Path, &cv1touch::input_calibration::CalibrationFile) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(file) = candidate {
+        file.validate()?;
+    }
+    let previous = previous_input_bytes(path)?;
+    if let Some(bytes) = &previous {
+        let mut name = path
+            .file_name()
+            .ok_or("input calibration path needs a filename")?
+            .to_os_string();
+        name.push(format!(".bak-{}-{}", unix_now(), shm::now_ns()));
+        let backup = path.with_file_name(name);
+        private_input_bytes(&backup, bytes)?;
+        println!("Backup: {}", backup.display());
+    }
+    let saved = if let Some(file) = candidate {
+        save(path, file)
+    } else {
+        remove_input_file(path)
+    };
+    let outcome = saved.and_then(|_| match &mut reload {
+        Some(reload) => reload(),
+        None => Ok(()),
+    });
+    if let Err(error) = outcome {
+        let restored = if let Some(bytes) = &previous {
+            private_input_bytes(path, bytes)
+        } else {
+            remove_input_file(path)
+        };
+        restored.map_err(|rollback| {
+            format!("input calibration update failed: {error}; file rollback failed: {rollback}")
+        })?;
+        let recovery = reload
+            .as_mut()
+            .and_then(|reload| reload().err())
+            .map(|e| format!("; restored file could not reload: {e}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "input calibration update failed: {error}; previous input file restored{recovery}"
+        ));
+    }
+    Ok(())
+}
+
+fn reload_inputs() -> Result<(), String> {
+    let reply = control::request(
+        &control::socket_path(),
+        "inputs reload",
+        Duration::from_secs(5),
+    )
+    .map_err(|e| e.to_string())?;
+    if reply == "ok" || reply.starts_with("ok ") {
+        Ok(())
+    } else {
+        Err(reply)
+    }
+}
+
+fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
+    catch_interrupts();
+    let path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(cv1touch::input_calibration::default_path);
+    let result = (|| -> Result<(), String> {
+        if reset {
+            write_input_calibration(&path, None, Some(&mut reload_inputs))?;
+            println!("Input calibration reset; factory input mapping reloaded.");
+            return Ok(());
+        }
+        input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
+        let first = raw_inputs()?;
+        let identities = std::array::from_fn(|hand| first.hands[hand].identity.clone());
+        for hand in 0..2 {
+            InputPhase::default().observe(&first, &identities, hand, shm::now_ns())?;
+        }
+        let mut measured = Vec::new();
+        for (hand, identity) in identities.iter().enumerate() {
+            let name = ["left", "right"][hand];
+            let mut last_ns = 0;
+            input_enter(&format!("{name} Touch: release trigger and grip, let the thumbstick center.\nKeep all three neutral for 2 seconds after Enter."))?;
+            let neutral = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
+            input_enter(&format!(
+                "{name} Touch: pull the trigger fully and hold it for 2 seconds after Enter."
+            ))?;
+            let trigger = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
+            input_enter(&format!("{name} Touch: release the trigger, squeeze the grip fully and hold for 2 seconds after Enter."))?;
+            let grip = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
+            input_enter(&format!("{name} Touch: release the grip. After Enter, roll the thumbstick around its FULL outer edge\ncontinuously for 10 seconds, covering forward, back, left and right. Keep it at the edge."))?;
+            let circles = collect_inputs(hand, &identities, &mut last_ns, 10, 150)?;
+            let calibration = measured_inputs(identity, &[neutral, trigger, grip, circles])?;
+            calibration.validate().map_err(|e| format!("{name} input measurements rejected: {e}; retry with released controls and full travel"))?;
+            println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
+            measured.push(calibration);
+        }
+        let candidate = cv1touch::input_calibration::CalibrationFile::new(
+            measured
+                .try_into()
+                .map_err(|_| "both hands must be calibrated")?,
+        )?;
+        input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+        let final_inputs = raw_inputs()?;
+        for hand in 0..2 {
+            InputPhase::default().observe(&final_inputs, &identities, hand, shm::now_ns())?;
+        }
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        if out.is_some() {
+            write_input_calibration(&path, Some(&candidate), None)?;
+            println!(
+                "Saved {}. The daemon was not reloaded (--out).",
+                path.display()
+            );
+        } else {
+            write_input_calibration(&path, Some(&candidate), Some(&mut reload_inputs))?;
+            println!(
+                "Saved {} and reloaded inputs. Run `cv1touch input-test` to verify full travel.",
+                path.display()
+            );
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            if interrupted() {
+                130
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// The Oculus Touch profile's legacy input mapping (axis 0 joystick, 1 trigger, 2 grip;
+/// button bits 7 A/X, 1 B/Y, 32 joystick, 33 trigger). Unsupported inputs need a manual check.
+#[derive(Clone, Copy)]
+enum LegacyInput {
+    Axis {
+        axis: usize,
+        component: usize,
+        threshold: f32,
+    },
+    Press(u64),
+    Touch {
+        mask: u64,
+        released: u64,
+        trigger_released: bool,
+    },
+}
+
 struct InputStep {
     prompt: String,
     done: Box<dyn Fn(&shm::ControllerState) -> bool>,
+    steam: Option<LegacyInput>,
+}
+
+#[derive(Default)]
+struct InputProgress {
+    daemon_seen: bool,
+    steam_seen: bool,
+    daemon_trigger: Option<(f32, f32)>,
+    steam_trigger: Option<(f32, f32)>,
+    daemon_grip: Option<(f32, f32)>,
+    steam_grip: Option<(f32, f32)>,
+}
+
+impl InputProgress {
+    fn observe(
+        &mut self,
+        step: &InputStep,
+        daemon: Option<&shm::ControllerState>,
+        steam: Option<&vr::ControllerState>,
+    ) -> bool {
+        let range = |range: &mut Option<(f32, f32)>, value: f32| {
+            if value.is_finite() {
+                *range = Some(range.map_or((value, value), |(min, max)| {
+                    (min.min(value), max.max(value))
+                }));
+            }
+        };
+        if let Some(state) = daemon {
+            range(&mut self.daemon_trigger, state.trigger);
+            range(&mut self.daemon_grip, state.grip);
+        }
+        if let Some(state) = steam {
+            range(&mut self.steam_trigger, state.2[1].0);
+            range(&mut self.steam_grip, state.2[2].0);
+        }
+        let daemon_now = daemon.is_some_and(|state| (step.done)(state));
+        self.daemon_seen |= daemon_now;
+        let steam_now = step.steam.is_some_and(|expected| {
+            steam.is_some_and(|state| match expected {
+                LegacyInput::Axis {
+                    axis,
+                    component,
+                    threshold,
+                } => {
+                    let value = if component == 0 {
+                        state.2[axis].0
+                    } else {
+                        state.2[axis].1
+                    };
+                    value.is_finite()
+                        && if threshold > 0.0 {
+                            value > threshold
+                        } else {
+                            value < threshold
+                        }
+                }
+                LegacyInput::Press(mask) => state.0 & mask != 0,
+                LegacyInput::Touch {
+                    mask,
+                    released,
+                    trigger_released,
+                } => {
+                    state.1 & mask != 0
+                        && state.0 & released == 0
+                        && (!trigger_released || state.2[1].0 < 0.2)
+                }
+            })
+        });
+        self.steam_seen |= daemon_now && steam_now;
+        input_delivery_ok(daemon_now, step.steam.is_none() || steam_now)
+    }
+
+    fn analog_report(&self, axis: usize) -> String {
+        let range = |r: Option<(f32, f32)>| {
+            r.map_or_else(
+                || "unavailable".into(),
+                |(min, max)| format!("{min:.3}..{max:.3}"),
+            )
+        };
+        let (name, daemon, steam) = if axis == 1 {
+            ("trigger", self.daemon_trigger, self.steam_trigger)
+        } else {
+            ("grip", self.daemon_grip, self.steam_grip)
+        };
+        format!(
+            "{name} range: daemon {}, SteamVR {}; full travel requires > 0.9",
+            range(daemon),
+            range(steam)
+        )
+    }
 }
 
 fn input_steps(hand: usize) -> Vec<InputStep> {
@@ -1274,73 +1854,111 @@ fn input_steps(hand: usize) -> Vec<InputStep> {
     } else {
         (h::BTN_X, h::BTN_Y)
     };
-    let step = |prompt: String, done: Box<dyn Fn(&shm::ControllerState) -> bool>| InputStep {
-        prompt,
-        done,
+    let step =
+        |prompt: String, done: Box<dyn Fn(&shm::ControllerState) -> bool>, steam| InputStep {
+            prompt,
+            done,
+            steam,
+        };
+    let axis = |axis, component, threshold| {
+        Some(LegacyInput::Axis {
+            axis,
+            component,
+            threshold,
+        })
+    };
+    let press = |bit| Some(LegacyInput::Press(1_u64 << bit));
+    let touch = |bit, released, trigger_released| {
+        Some(LegacyInput::Touch {
+            mask: 1_u64 << bit,
+            released,
+            trigger_released,
+        })
     };
     let mut v = vec![
         step(
             "pull the trigger all the way".into(),
             Box::new(|s| s.trigger > 0.9),
+            axis(1, 0, 0.9),
         ),
         step(
             "squeeze the grip all the way".into(),
             Box::new(|s| s.grip > 0.9),
+            axis(2, 0, 0.9),
         ),
         step(
             "push the stick forward".into(),
             Box::new(|s| s.stick[1] > 0.8),
+            axis(0, 1, 0.8),
         ),
         step(
             "pull the stick back".into(),
             Box::new(|s| s.stick[1] < -0.8),
+            axis(0, 1, -0.8),
         ),
         step(
             "push the stick left".into(),
             Box::new(|s| s.stick[0] < -0.8),
+            axis(0, 0, -0.8),
         ),
         step(
             "push the stick right".into(),
             Box::new(|s| s.stick[0] > 0.8),
+            axis(0, 0, 0.8),
         ),
         step(
             "click the stick down".into(),
             Box::new(|s| s.buttons & h::BTN_STICK != 0),
+            press(32),
         ),
-        step(format!("press {a}"), Box::new(move |s| s.buttons & ba != 0)),
-        step(format!("press {b}"), Box::new(move |s| s.buttons & bb != 0)),
+        step(
+            format!("press {a}"),
+            Box::new(move |s| s.buttons & ba != 0),
+            press(7),
+        ),
+        step(
+            format!("press {b}"),
+            Box::new(move |s| s.buttons & bb != 0),
+            press(1),
+        ),
         step(
             format!("rest a finger on {a} without pressing"),
             Box::new(move |s| s.touches & ta != 0 && s.buttons & ba == 0),
+            touch(7, 1 << 7, false),
         ),
         step(
             format!("rest a finger on {b} without pressing"),
             Box::new(move |s| s.touches & tb != 0 && s.buttons & bb == 0),
+            touch(1, 1 << 1, false),
         ),
         step(
             "rest a finger on the trigger without pulling".into(),
             Box::new(|s| s.touches & h::TOUCH_TRIGGER != 0 && s.trigger < 0.2),
+            touch(33, 1 << 33, true),
         ),
         step(
             "rest the thumb on the stick without moving it".into(),
             Box::new(|s| s.touches & h::TOUCH_STICK != 0),
+            touch(32, 0, false),
         ),
         step(
             "rest the thumb on the thumb rest".into(),
             Box::new(|s| s.touches & h::TOUCH_THUMBREST != 0),
+            None,
         ),
     ];
     if !right {
         v.push(step(
             "press the menu button (the one below Y)".into(),
             Box::new(|s| s.buttons & h::BTN_SYSTEM != 0),
+            None,
         ));
     }
     v
 }
 
 /// Walks through every input of both Touches and checks each in the daemon's published state and
-/// in SteamVR's view of the device (legacy controller state: which bit or axis moved), then a
+/// in SteamVR's exact supported legacy input. Menu/thumb-rest need a manual check, then a
 /// haptic pulse per hand.
 fn input_test() -> i32 {
     catch_interrupts();
@@ -1359,6 +1977,9 @@ fn input_test() -> i32 {
         return 1;
     }
     let mut results: Vec<(String, bool, String)> = Vec::new();
+    let (mut daemon_seen, mut daemon_total, mut steam_seen, mut steam_total) = (0, 0, 0, 0);
+    let mut manual = Vec::new();
+    println!("Keep SteamVR input focus available; unsupported menu/thumb-rest delivery needs a manual check.");
     for hand in [HAND_LEFT, HAND_RIGHT] {
         let name = ["left", "right"][hand];
         let vr_index = index_of(if hand == HAND_LEFT {
@@ -1370,35 +1991,20 @@ fn input_test() -> i32 {
         for st in input_steps(hand) {
             print!("  {name}: {} ... ", st.prompt);
             let _ = io::stdout().flush();
-            let baseline = vr_index.and_then(|i| client.as_ref()?.controller_state(i));
+            let mut progress = InputProgress::default();
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut ok = false;
             let mut seen = String::from("-");
             while Instant::now() < deadline && !interrupted() {
-                if reader.hand(hand).is_some_and(|s| (st.done)(&s)) {
-                    if let (Some((p0, t0, a0)), Some((p1, t1, a1))) = (
-                        baseline,
-                        vr_index.and_then(|i| client.as_ref()?.controller_state(i)),
-                    ) {
-                        let mut parts = Vec::new();
-                        if p1 & !p0 != 0 {
-                            parts.push(format!("pressed bits {:#x}", p1 & !p0));
-                        }
-                        if t1 & !t0 != 0 {
-                            parts.push(format!("touched bits {:#x}", t1 & !t0));
-                        }
-                        for k in 0..5 {
-                            if (a1[k].0 - a0[k].0).abs() > 0.5 || (a1[k].1 - a0[k].1).abs() > 0.5 {
-                                parts.push(format!("axis{k} ({:+.2}, {:+.2})", a1[k].0, a1[k].1));
-                            }
-                        }
-                        ok = input_delivery_ok(true, !parts.is_empty());
-                        seen = if parts.is_empty() {
-                            "nothing in SteamVR".into()
-                        } else {
-                            parts.join(", ")
-                        };
-                    }
+                let daemon = reader.hand(hand);
+                let steam = vr_index.and_then(|i| client.as_ref()?.controller_state(i));
+                if progress.observe(&st, daemon.as_ref(), steam.as_ref()) {
+                    ok = true;
+                    seen = if st.steam.is_some() {
+                        "required input observed".into()
+                    } else {
+                        "unverified by legacy interface; check manually in SteamVR".into()
+                    };
                     break;
                 }
                 let mut fds = libc::pollfd {
@@ -1413,7 +2019,36 @@ fn input_test() -> i32 {
                     break;
                 }
             }
-            println!("{}  [SteamVR: {seen}]", if ok { "ok" } else { "NOT SEEN" });
+            daemon_total += 1;
+            daemon_seen += usize::from(progress.daemon_seen);
+            if st.steam.is_some() {
+                steam_total += 1;
+                steam_seen += usize::from(progress.steam_seen);
+                if !ok {
+                    seen = "required input not observed; check SteamVR input focus".into();
+                }
+            } else {
+                seen = "unverified by legacy interface; check manually in SteamVR".into();
+                manual.push(format!("{name}: {}", st.prompt));
+            }
+            if !ok {
+                if let Some(LegacyInput::Axis {
+                    axis: axis @ (1 | 2),
+                    ..
+                }) = st.steam
+                {
+                    seen.push_str(&format!("; {}", progress.analog_report(axis)));
+                }
+            }
+            println!(
+                "{}  [daemon: {}; SteamVR: {seen}]",
+                if ok { "ok" } else { "NOT SEEN" },
+                if progress.daemon_seen {
+                    "seen"
+                } else {
+                    "not seen"
+                }
+            );
             results.push((format!("{name}: {}", st.prompt), ok, seen));
             // wait for the release before the next step
             let release = Instant::now() + Duration::from_secs(5);
@@ -1442,10 +2077,19 @@ fn input_test() -> i32 {
         }
     }
     let failed: Vec<&(String, bool, String)> = results.iter().filter(|r| !r.1).collect();
+    println!("\nDaemon inputs: {daemon_seen} of {daemon_total} seen; supported SteamVR inputs: {steam_seen} of {steam_total} seen");
+    let haptics: Vec<_> = results
+        .iter()
+        .filter(|r| r.0.ends_with(": haptic"))
+        .collect();
     println!(
-        "\n{} of {} inputs seen",
-        results.len() - failed.len(),
-        results.len()
+        "Haptics: {} of {} confirmed",
+        haptics.iter().filter(|r| r.1).count(),
+        haptics.len()
+    );
+    println!(
+        "Manual SteamVR checks (legacy interface cannot verify): {}",
+        manual.join("; ")
     );
     for f in &failed {
         println!("  NOT SEEN: {}", f.0);
@@ -4047,6 +4691,8 @@ fn main() {
         ["status"] => status_board(shm::DEFAULT_NAME),
         ["status", "--shm", name] => status_board(name),
         ["status", "--json"] => json_status(),
+        ["inputs", "--json"] => raw_inputs_json(),
+        ["inputs", "reload"] => send("inputs reload"),
         ["--help"] | ["-h"] | ["help"] => usage_code(0),
         ["--version"] | ["-V"] => { println!("cv1touch {} (shm ABI {})", env!("CARGO_PKG_VERSION"), cv1touch::ffi::CV1T_SHM_VERSION); 0 },
         ["doctor"] => doctor(false),
@@ -4089,6 +4735,9 @@ fn main() {
             }
             rec_summary(Path::new(path), &windows)
         }
+        ["calibrate", "inputs"] => calibrate_inputs(None, false),
+        ["calibrate", "inputs", "--out", out] => calibrate_inputs(Some(Path::new(out)), false),
+        ["calibrate", "inputs", "--reset"] => calibrate_inputs(None, true),
         ["calibrate"] => calibrate(&file::default_path()),
         ["calibrate", "--out", out] => calibrate(Path::new(out)),
         ["calibrate", "solve", rec, rest @ ..] => {
@@ -4261,6 +4910,387 @@ mod tests {
                 && backups.contains(&b"old registration".to_vec())
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn raw_input_snapshot(timestamp: u64) -> RawInputs {
+        RawInputs {
+            hands: std::array::from_fn(|hand| RawInput {
+                identity: format!("{:032x}", hand + 1),
+                connected: true,
+                received_host_ns: timestamp,
+                trigger: 0.0,
+                grip: 0.0,
+                stick: [0.0; 2],
+            }),
+        }
+    }
+
+    #[test]
+    fn input_wizard_rejects_stale_duplicate_and_swapped_controller_samples() {
+        let mut readings = raw_input_snapshot(1_000_000_000);
+        let identities = std::array::from_fn(|hand| readings.hands[hand].identity.clone());
+        let mut phase = InputPhase::default();
+        assert!(phase
+            .observe(&readings, &identities, 0, 1_000_000_001)
+            .unwrap());
+        assert!(!phase
+            .observe(&readings, &identities, 0, 1_000_000_002)
+            .unwrap());
+        assert_eq!(phase.samples.len(), 1);
+        assert!(phase
+            .observe(&readings, &identities, 0, 1_600_000_000)
+            .is_err());
+        readings.hands[1].identity = "f".repeat(32);
+        assert!(phase
+            .observe(&readings, &identities, 0, 1_000_000_003)
+            .is_err());
+        readings.hands[1].identity = identities[1].clone();
+        readings.hands[0].received_host_ns -= 1;
+        assert!(phase
+            .observe(&readings, &identities, 0, 1_000_000_003)
+            .is_err());
+        readings.hands[0].connected = false;
+        assert!(phase
+            .observe(&readings, &identities, 0, 1_000_000_003)
+            .is_err());
+        assert!(phase.finish(30).is_err());
+    }
+
+    #[test]
+    fn input_wizard_rejects_null_axes_and_future_or_empty_identity() {
+        let readings = raw_input_snapshot(100);
+        let identities = std::array::from_fn(|hand| readings.hands[hand].identity.clone());
+        let mut json = serde_json::json!({"hands": readings.hands});
+        json["hands"][0]["grip"] = serde_json::Value::Null;
+        assert!(parse_raw_inputs(&format!("ok {json}")).is_err());
+        assert!(InputPhase::default()
+            .observe(&readings, &identities, 0, 99)
+            .is_err());
+        let mut bad = readings;
+        bad.hands[0].identity.clear();
+        assert!(InputPhase::default()
+            .observe(&bad, &identities, 0, 101)
+            .is_err());
+    }
+
+    fn input_wizard_phases(hand: usize) -> [Vec<RawInput>; 4] {
+        std::array::from_fn(|phase| {
+            (0..if phase == 3 { 200 } else { 40 })
+                .map(|i| {
+                    let mut sample = raw_input_snapshot(100 + i as u64).hands[hand].clone();
+                    match phase {
+                        1 => sample.trigger = 1.0,
+                        2 => sample.grip = 1.0,
+                        3 => {
+                            let angle = i as f32 * std::f32::consts::TAU / 200.0;
+                            sample.stick = [angle.cos(), angle.sin()];
+                        }
+                        _ => {}
+                    }
+                    sample
+                })
+                .collect()
+        })
+    }
+
+    fn input_wizard_candidate() -> cv1touch::input_calibration::CalibrationFile {
+        cv1touch::input_calibration::CalibrationFile::new(std::array::from_fn(|hand| {
+            measured_inputs(&format!("{:032x}", hand + 1), &input_wizard_phases(hand)).unwrap()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn input_wizard_uses_hold_medians_and_circle_quantiles_not_single_spikes() {
+        let mut phases = input_wizard_phases(0);
+        phases[1][0].trigger = -4.0;
+        phases[2][0].grip = 4.0;
+        phases[3][0].stick = [-4.0, -4.0];
+        phases[3][1].stick = [4.0, 4.0];
+        let hand = measured_inputs(&"1".repeat(32), &phases).unwrap();
+        assert_eq!(hand.trigger.pressed, 1.0);
+        assert_eq!(hand.grip.pressed, 1.0);
+        for axis in hand.stick {
+            assert!(axis.min >= -1.0 && axis.min < -0.9);
+            assert!(axis.max <= 1.0 && axis.max > 0.9);
+            assert_eq!(axis.center, 0.0);
+        }
+        let mut incomplete = phases;
+        for sample in &mut incomplete[3] {
+            sample.stick = [0.3, 0.3];
+        }
+        let hand = measured_inputs(&"1".repeat(32), &incomplete).unwrap();
+        assert!(cv1touch::input_calibration::CalibrationFile::new([
+            hand,
+            input_wizard_candidate().hands[1].clone()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn input_wizard_save_and_reset_restore_only_input_file_on_reload_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cv1t-input-transaction-{}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input-calibration.json");
+        let unrelated = dir.join("calibration.json");
+        std::fs::write(&unrelated, b"camera configuration").unwrap();
+        let original = b"original input bytes";
+        std::fs::write(&path, original).unwrap();
+        let candidate = input_wizard_candidate();
+        let mut reject_reload = || Err("mock reload rejected".into());
+        assert!(
+            write_input_calibration(&path, Some(&candidate), Some(&mut reject_reload)).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"camera configuration");
+        assert!(write_input_calibration(&path, None, Some(&mut reject_reload)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_name().to_string_lossy().contains(".bak-")
+                    && std::fs::read(entry.path()).unwrap() == original
+            }));
+        write_input_calibration(&path, Some(&candidate), None).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            cv1touch::input_calibration::load(&path).unwrap(),
+            Some(candidate)
+        );
+        write_input_calibration(&path, None, None).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"camera configuration");
+        assert!(write_input_calibration(
+            &path,
+            Some(&input_wizard_candidate()),
+            Some(&mut reject_reload)
+        )
+        .is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn input_wizard_restores_malformed_previous_bytes_after_post_write_save_error() {
+        let dir = std::env::temp_dir().join(format!("cv1t-input-post-write-{}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input-calibration.json");
+        let old = b"{ malformed old configuration";
+        std::fs::write(&path, old).unwrap();
+        let error = write_input_calibration_with(
+            &path,
+            Some(&input_wizard_candidate()),
+            None,
+            |path, _| {
+                std::fs::write(path, b"new bytes after rename").unwrap();
+                Err("injected directory fsync failure after rename".into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("directory fsync failure"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_file(&path).unwrap();
+        assert!(write_input_calibration_with(
+            &path,
+            Some(&input_wizard_candidate()),
+            None,
+            |path, _| {
+                std::fs::write(path, b"new file after rename").unwrap();
+                Err("injected post-write failure".into())
+            }
+        )
+        .is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn input_wizard_never_follows_a_config_symlink_for_backup_or_reset() {
+        let dir = std::env::temp_dir().join(format!("cv1t-input-symlink-{}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input-calibration.json");
+        let target = dir.join("unrelated.json");
+        std::fs::write(&target, b"unrelated configuration").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(write_input_calibration(&path, None, None).is_err());
+        assert!(write_input_calibration(&path, Some(&input_wizard_candidate()), None).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated configuration");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn steam_input(axis: usize, x: f32, y: f32) -> vr::ControllerState {
+        let mut state = (0, 0, [(0.0, 0.0); 5]);
+        state.2[axis] = (x, y);
+        state
+    }
+
+    #[test]
+    fn input_delivery_rejects_unrelated_axis_and_wrong_direction() {
+        let steps = input_steps(HAND_LEFT);
+        let trigger = ControllerState {
+            trigger: 1.0,
+            ..Default::default()
+        };
+        assert!(!InputProgress::default().observe(
+            &steps[0],
+            Some(&trigger),
+            Some(&steam_input(2, 1.0, 0.0))
+        ));
+        assert!(InputProgress::default().observe(
+            &steps[0],
+            Some(&trigger),
+            Some(&steam_input(1, 1.0, 0.0))
+        ));
+        let grip = ControllerState {
+            grip: 1.0,
+            ..Default::default()
+        };
+        assert!(!InputProgress::default().observe(
+            &steps[1],
+            Some(&grip),
+            Some(&steam_input(1, 1.0, 0.0))
+        ));
+        let forward = ControllerState {
+            stick: [0.0, 1.0],
+            ..Default::default()
+        };
+        assert!(!InputProgress::default().observe(
+            &steps[2],
+            Some(&forward),
+            Some(&steam_input(0, 0.0, -1.0))
+        ));
+        assert!(!InputProgress::default().observe(
+            &steps[2],
+            Some(&forward),
+            Some(&steam_input(0, 1.0, 0.0))
+        ));
+        assert!(InputProgress::default().observe(
+            &steps[2],
+            Some(&forward),
+            Some(&steam_input(0, 0.0, 1.0))
+        ));
+    }
+
+    #[test]
+    fn input_delivery_accepts_held_full_grip_and_retries_driver_lag() {
+        let steps = input_steps(HAND_LEFT);
+        let grip = ControllerState {
+            grip: 1.0,
+            ..Default::default()
+        };
+        let mut progress = InputProgress::default();
+        assert!(!progress.observe(&steps[1], Some(&grip), None));
+        assert!(!progress.observe(&steps[1], Some(&grip), Some(&steam_input(2, 0.2, 0.0))));
+        assert!(!progress.observe(&steps[1], Some(&grip), Some(&steam_input(2, 0.8, 0.0))));
+        assert!(progress.observe(&steps[1], Some(&grip), Some(&steam_input(2, 1.0, 0.0))));
+        assert!(InputProgress::default().observe(
+            &steps[1],
+            Some(&grip),
+            Some(&steam_input(2, 1.0, 0.0))
+        ));
+        assert!(!InputProgress::default().observe(
+            &steps[1],
+            None,
+            Some(&steam_input(2, 1.0, 0.0))
+        ));
+    }
+
+    #[test]
+    fn input_delivery_reports_partial_grip_without_relaxing_full_squeeze() {
+        let steps = input_steps(HAND_LEFT);
+        let mut progress = InputProgress::default();
+        for value in [0.0, 0.25, 0.5, 0.9] {
+            let grip = ControllerState {
+                grip: value,
+                ..Default::default()
+            };
+            assert!(!progress.observe(&steps[1], Some(&grip), Some(&steam_input(2, value, 0.0))));
+        }
+        let diagnostic = progress.analog_report(2);
+        assert!(diagnostic.contains("daemon 0.000..0.900"), "{diagnostic}");
+        assert!(diagnostic.contains("SteamVR 0.000..0.900"), "{diagnostic}");
+        assert!(diagnostic.contains("> 0.9"), "{diagnostic}");
+        assert!(!progress.daemon_seen);
+    }
+
+    #[test]
+    fn input_delivery_reports_trigger_delivery_failure_separately_from_grip() {
+        let steps = input_steps(HAND_LEFT);
+        let mut progress = InputProgress::default();
+        for value in [0.0, 0.5, 1.0] {
+            let state = ControllerState {
+                trigger: value,
+                grip: 0.25,
+                ..Default::default()
+            };
+            let mut steam = steam_input(1, 0.0, 0.0);
+            steam.2[2].0 = 0.75;
+            assert!(!progress.observe(&steps[0], Some(&state), Some(&steam)));
+        }
+        let diagnostic = progress.analog_report(1);
+        assert!(
+            diagnostic.contains("trigger range: daemon 0.000..1.000"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("SteamVR 0.000..0.000"), "{diagnostic}");
+        assert!(progress.daemon_seen);
+        assert!(!progress.steam_seen);
+    }
+
+    #[test]
+    fn input_delivery_requires_exact_button_and_unpressed_touch() {
+        let steps = input_steps(HAND_RIGHT);
+        let a = ControllerState {
+            buttons: cv1touch::hand::BTN_A,
+            ..Default::default()
+        };
+        assert!(!InputProgress::default().observe(
+            &steps[7],
+            Some(&a),
+            Some(&(1 << 1, 0, [(0.0, 0.0); 5]))
+        ));
+        assert!(InputProgress::default().observe(
+            &steps[7],
+            Some(&a),
+            Some(&(1 << 7, 0, [(0.0, 0.0); 5]))
+        ));
+        let touch = ControllerState {
+            touches: cv1touch::hand::TOUCH_A,
+            ..Default::default()
+        };
+        assert!(!InputProgress::default().observe(
+            &steps[9],
+            Some(&touch),
+            Some(&(1 << 7, 1 << 7, [(0.0, 0.0); 5]))
+        ));
+        assert!(InputProgress::default().observe(
+            &steps[9],
+            Some(&touch),
+            Some(&(0, 1 << 7, [(0.0, 0.0); 5]))
+        ));
+    }
+
+    #[test]
+    fn input_delivery_marks_legacy_unavailable_steps_as_manual() {
+        let steps = input_steps(HAND_LEFT);
+        let thumb = ControllerState {
+            touches: cv1touch::hand::TOUCH_THUMBREST,
+            ..Default::default()
+        };
+        assert!(steps[13].steam.is_none());
+        assert!(InputProgress::default().observe(&steps[13], Some(&thumb), None));
+        assert!(!InputProgress::default().observe(&steps[13], None, None));
+        assert!(steps[14].steam.is_none());
     }
 
     #[test]

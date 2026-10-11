@@ -35,11 +35,12 @@ cv1touch doctor
 cv1touch status --json
 ```
 
-The initial doctor check reports missing calibration/alignment until setup is complete. Follow [setup and calibration](docs/setup.md#calibrate-and-align). Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, and registration to your SteamVR headset. Once complete, the daemon starts automatically and reconnects to devices.
+The initial doctor check reports missing calibration/alignment until setup is complete. Follow [setup and calibration](docs/setup.md#calibrate-and-align). Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, registration to your SteamVR headset, and guided trigger/grip/thumbstick calibration. Once complete, the daemon starts automatically and reconnects to devices.
 
 ## Documentation
 
 - [Setup, calibration, upgrades, and removal](docs/setup.md)
+- [Trigger, grip, and thumbstick calibration](docs/input-calibration.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Architecture, coordinates, and expert controls](docs/architecture.md)
 - [Validation and measurement limits](docs/validation.md)

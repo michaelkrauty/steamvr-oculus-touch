@@ -357,6 +357,7 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 		}
 
 		touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
+		memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
 		/* release: the radio thread's decoder copies the calibration once it sees the flag */
 		__atomic_store_n(&touch->have_calibration, true, __ATOMIC_RELEASE);
 		dump_controller_calibration(touch);
@@ -1611,6 +1612,30 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radi
 			n++;
 	}
 	return n;
+}
+
+/* Factory calibration hash is stable across reconnects; no personal serial is exposed.
+ * Call on the engine thread, like get_controller. Never read the shared radio scratch hash. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller_identity(ohmd_device *device, char *out, int size)
+{
+	if (out == NULL || size < 33)
+		return -1;
+	out[0] = '\0';
+	if (device == NULL || device->getf != getf)
+		return -1;
+	rift_device_priv *priv = rift_device_priv_get(device);
+	if (priv->id != 1 && priv->id != 2)
+		return -1;
+	rift_touch_controller_t *touch = (rift_touch_controller_t *)priv;
+	if (!__atomic_load_n(&touch->have_calibration, __ATOMIC_ACQUIRE))
+		return -1;
+	static const char hex[] = "0123456789abcdef";
+	for (int i = 0; i < 16; i++) {
+		out[2*i] = hex[touch->cv1touch_calibration_hash[i] >> 4];
+		out[2*i+1] = hex[touch->cv1touch_calibration_hash[i] & 15];
+	}
+	out[32] = '\0';
+	return 0;
 }
 
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *device, ohmd_cv1touch_controller *out)

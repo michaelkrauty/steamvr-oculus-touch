@@ -34,6 +34,9 @@ pub enum Command {
     RecordStart(PathBuf, bool),
     RecordStop,
     Status,
+    /// Factory-normalized inputs, before optional user calibration and output clamping.
+    Inputs,
+    InputsReload,
     CalibrationCapture,
     CalibrationProvisional,
     CalibrationLoad(PathBuf),
@@ -201,6 +204,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
     match words.as_slice() {
         [] => Err("empty command".into()),
         ["status"] => Ok(Command::Status),
+        ["inputs"] => Ok(Command::Inputs),
+        ["inputs", "reload"] => Ok(Command::InputsReload),
+        ["inputs", ..] => Err("usage: inputs [reload]".into()),
         ["stations", rest @ ..] => {
             if rest.len() % 8 != 0 {
                 return Err("stations: a serial and 7 numbers (x y z qx qy qz qw) per station".into());
@@ -602,5 +608,14 @@ mod tests {
             .unwrap_err()
             .contains("absolute"));
         assert!(parse("calibration").unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn input_sampling_and_reload_have_no_implicit_write_command() {
+        assert_eq!(parse("inputs"), Ok(Command::Inputs));
+        assert_eq!(parse("inputs reload"), Ok(Command::InputsReload));
+        for command in ["inputs reset", "inputs reload extra", "inputs write"] {
+            assert!(parse(command).is_err());
+        }
     }
 }
