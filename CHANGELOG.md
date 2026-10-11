@@ -16,7 +16,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - Source documentation and recording diagnostics describe current behavior without unpublished development notes or phase labels.
 - Original-code copyright notices and software citation identify the maintainer by GitHub username.
-- Linux CI uses a dedicated runner for trusted private-repository changes and GitHub-hosted runners for public repositories and fork pull requests.
+- Upstream Linux CI runs maintainer changes automatically and requires explicit workflow approval for external fork revisions on the dedicated runner; manual branch checks and independent GitHub-hosted checks in forks are available.
 - Project and repository renamed to SteamVR Oculus Touch (`steamvr-oculus-touch`); command names and configuration paths remain compatible.
 
 ### Fixed
