@@ -26,6 +26,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Guided headset registration explains preparation before recording and waits for a deliberate button press and haptic countdown, so users can get into position without watching the terminal.
 - Guided capture validates recording acknowledgements and scopes cleanup to its own recording when a start reply is lost.
 - Guided calibration prompts identify buttons by controller, state when input sampling begins, and separate the control checks from headset instructions.
+- A controller falling asleep before the registration countdown (during the button checks or while reading the headset instructions) no longer aborts setup: the guide names the controller to wake, waits up to five minutes, and then needs a fresh release and press. A dropout during the countdown or recording still cancels without installing a fit.
 
 ## [0.1.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) - 2026-10-10
 

@@ -616,10 +616,17 @@ fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
     )
 }
 
+/// Input older than this is stale: the controller stopped sending (asleep, or out of range).
+const FRESH_INPUT_NS: u64 = 500_000_000;
+
 struct ButtonEdges {
     last_ns: [u64; 2],
     released: [u32; 2],
     armed_after_ns: u64,
+    /// Preparation: per hand, whether its newest sample was asleep or stale.
+    waiting: [bool; 2],
+    /// Preparation: a controller dropped out since the last press check; both hands re-arm.
+    rearm: bool,
 }
 impl ButtonEdges {
     fn new(armed_after_ns: u64) -> Self {
@@ -627,7 +634,55 @@ impl ButtonEdges {
             last_ns: [0; 2],
             released: [0; 2],
             armed_after_ns,
+            waiting: [false; 2],
+            rearm: false,
         }
+    }
+    /// Before the countdown, a controller that falls asleep (or goes stale) is waited for: None
+    /// until both are fresh again, and then both hands need a fresh release and press, so a wake,
+    /// held or queued press starts nothing. A changed controller, missing button support and a
+    /// zero, future or backward timestamp still fail at once, and a fresh B on the right
+    /// controller cancels even while the left one sleeps.
+    fn observe_preparation(
+        &mut self,
+        raw: &RawInputs,
+        ids: &[String; 2],
+        now_ns: u64,
+    ) -> Result<Option<[u32; 2]>, String> {
+        input_identities_match(raw, ids)?;
+        for (hand, sample) in raw.hands.iter().enumerate() {
+            let buttons = sample.buttons.ok_or("controller-guided registration requires a matching cv1touchd with raw button support; update the daemon")?;
+            if sample.received_host_ns == 0 || sample.received_host_ns > now_ns {
+                return Err(
+                    "controller input has an invalid timestamp; registration not started or fitted"
+                        .into(),
+                );
+            }
+            if sample.received_host_ns < self.last_ns[hand] {
+                return Err(
+                    "controller input timestamp moved backward; registration cancelled".into(),
+                );
+            }
+            self.waiting[hand] =
+                !sample.connected || now_ns - sample.received_host_ns > FRESH_INPUT_NS;
+            if hand == HAND_RIGHT && !self.waiting[hand] && buttons & cv1touch::hand::BTN_B != 0 {
+                return Err(
+                    "registration cancelled with B on the right controller; no recording started"
+                        .into(),
+                );
+            }
+        }
+        if self.waiting.contains(&true) {
+            for (last, sample) in self.last_ns.iter_mut().zip(&raw.hands) {
+                *last = (*last).max(sample.received_host_ns);
+            }
+            self.rearm = true;
+            return Ok(None);
+        }
+        if std::mem::take(&mut self.rearm) {
+            self.released = [0; 2];
+        }
+        self.observe(raw, ids, now_ns).map(Some)
     }
     fn observe(
         &mut self,
@@ -643,7 +698,7 @@ impl ButtonEdges {
                 || sample.received_host_ns == 0
                 || now_ns
                     .checked_sub(sample.received_host_ns)
-                    .is_none_or(|age| age > 500_000_000)
+                    .is_none_or(|age| age > FRESH_INPUT_NS)
             {
                 return Err("controller input is disconnected, stale or has an invalid timestamp; registration not started or fitted".into());
             }
@@ -668,11 +723,11 @@ impl ButtonEdges {
 
 const REGISTRATION_PREPARATION: &str = "Step: headset registration
 Keep SteamVR running and confirm the headset is tracking.
-Bring the headset and both controllers within reach.
 
-Position: hold both Touch controllers firmly against the headset.
+Position: try to keep both controllers solidly pressed against the HMD; don't let them slip.
 Keep the headset's tracking sensors and the Touch rings uncovered.
-Keep the controllers rigid against the headset, with no slipping.
+This step measures the controllers' position and orientation relative to the HMD,
+so the headset and controllers need to move as one rigid unit.
 
 Start: put on the headset, then release and press A on the right controller.
 Both controllers pulse once per second during the 10-second positioning countdown.
@@ -684,7 +739,9 @@ Finish: release and press A on the right controller, or press Enter.
 B on the right controller cancels without installing a fit; Ctrl+C also interrupts.
 Recording stops after 150 seconds at most. A longer gentle buzz signals it has stopped.";
 
-fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
+/// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
+/// unchanged since `before`; the samples themselves are not judged here.
+fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
     if interrupted() {
         return Err("registration interrupted; no fit installed".into());
     }
@@ -729,6 +786,13 @@ fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
     {
         return Err("camera world changed during registration; no fit installed".into());
     }
+    Ok(raw)
+}
+
+/// `registration_context` with both controllers required awake and fresh, as the countdown and
+/// the recording need them.
+fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
+    let raw = registration_context(before)?;
     let identities = before
         .identities
         .as_ref()
@@ -773,16 +837,30 @@ fn registration_haptic(
     Ok(())
 }
 
-fn wait_registration_press(before: &Inspection, hand: usize, button: u32) -> Result<(), String> {
+/// Waits up to 300 s, before the countdown, for a fresh release and press of `button` on `hand`
+/// (`name` in prompts). A controller that falls asleep meanwhile is waited for, with one line when
+/// it drops out and one when it is back; anything else wrong fails at once.
+fn wait_preparation_press(
+    before: &Inspection,
+    hand: usize,
+    button: u32,
+    name: &str,
+) -> Result<(), String> {
     let start = Instant::now();
     let mut edges = ButtonEdges::new(shm::now_ns());
     let ids = before
         .identities
         .as_ref()
         .ok_or("controller identities unavailable")?;
+    let mut shown = [false; 2];
     while start.elapsed() < Duration::from_secs(300) {
-        let raw = registration_inputs(before)?;
-        if edges.observe(&raw, ids, shm::now_ns())?[hand] & button != 0 {
+        let raw = registration_context(before)?;
+        let edge = edges.observe_preparation(&raw, ids, shm::now_ns())?;
+        if let Some(line) = readiness_change(shown, edges.waiting, name) {
+            human_action(&line);
+        }
+        shown = edges.waiting;
+        if edge.is_some_and(|edges| edges[hand] & button != 0) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
@@ -790,8 +868,22 @@ fn wait_registration_press(before: &Inspection, hand: usize, button: u32) -> Res
     Err("timed out waiting for a fresh controller release and press; rerun setup when ready".into())
 }
 
+/// The line to show when the controllers' readiness changes: which one fell asleep, or, once
+/// both are back, the press still awaited. None while nothing changed.
+fn readiness_change(shown: [bool; 2], waiting: [bool; 2], name: &str) -> Option<String> {
+    let names = ["left", "right"];
+    if let Some(hand) = (0..2).find(|&h| waiting[h] && !shown[h]) {
+        return Some(format!(
+            "The {} controller is asleep: press any button on it to wake it.",
+            names[hand]
+        ));
+    }
+    (shown.contains(&true) && !waiting.contains(&true))
+        .then(|| format!("Both controllers are awake. Release and press {name}."))
+}
+
 fn confirm_registration_controls_with(
-    mut press: impl FnMut(usize, u32) -> Result<(), String>,
+    mut press: impl FnMut(usize, u32, &str) -> Result<(), String>,
     mut buzz: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {
     for (hand, button, name) in [
@@ -805,10 +897,10 @@ fn confirm_registration_controls_with(
         human_action(&format!(
             "Next action: release then press {name} for a gentle test buzz."
         ));
-        press(hand, button)?;
+        press(hand, button, name)?;
         buzz(hand)?;
         human_action(&format!("Next action: release then press {name} again ONLY if you felt that buzz; B on the right controller cancels."));
-        press(hand, button)?;
+        press(hand, button, name)?;
     }
     Ok(())
 }
@@ -1010,13 +1102,18 @@ fn run_stage(
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
-                    human_action("Step: controls and haptic check\nKeep the headset off and wake both controllers.\nConfirm each test buzz only if you feel it.\nIf a buzz is missing, cancel and fix haptics before continuing.\nB on the right controller cancels; Ctrl+C also interrupts.");
+                    human_action("Button and haptic check\nB on the right controller cancels; Ctrl+C also interrupts.");
                     confirm_registration_controls_with(
-                        |hand, button| wait_registration_press(inspection, hand, button),
+                        |hand, button, name| wait_preparation_press(inspection, hand, button, name),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
                     )?;
                     human_action(REGISTRATION_PREPARATION);
-                    wait_registration_press(inspection, HAND_RIGHT, cv1touch::hand::BTN_A)
+                    wait_preparation_press(
+                        inspection,
+                        HAND_RIGHT,
+                        cv1touch::hand::BTN_A,
+                        "A on the right controller",
+                    )
                 },
                 || registration_countdown(inspection),
                 |checkpoint| {
@@ -1052,7 +1149,7 @@ fn run_stage(
                         before: inspection,
                         edges: ButtonEdges::new(shm::now_ns()),
                     };
-                    capture_free_named_with_feedback(150, "Position: keep both controllers rigid against the headset, with its tracking sensors and the Touch rings uncovered.\nMotion: make two slow turns each way, then nod and tilt repeatedly.\nFinish: release and press A on the right controller, or press Enter. B on the right controller cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
+                    capture_free_named_with_feedback(150, "Position: keep both controllers solidly pressed against the HMD so they move as one rigid unit; don't let them slip. Keep its tracking sensors and the Touch rings uncovered.\nMotion: make two slow turns each way, then nod and tilt repeatedly.\nFinish: release and press A on the right controller, or press Enter. B on the right controller cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
                     Ok((rec, base))
                 },
             )?;
@@ -1212,7 +1309,7 @@ mod tests {
     fn controls_need_a_press_buzz_and_another_confirmation_press_for_each_hand() {
         let events = std::cell::RefCell::new(Vec::new());
         confirm_registration_controls_with(
-            |hand, _| {
+            |hand, _, _| {
                 events.borrow_mut().push(("press", hand));
                 Ok(())
             },
@@ -1295,7 +1392,7 @@ mod tests {
         }
         let presses = std::cell::Cell::new(0);
         assert!(confirm_registration_controls_with(
-            |_, _| {
+            |_, _, _| {
                 presses.set(presses.get() + 1);
                 Ok(())
             },
@@ -1362,6 +1459,137 @@ mod tests {
         edges.observe(&raw, &ids, 1_000_000_010).unwrap();
         raw.hands[0].received_host_ns -= 1;
         assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
+    }
+    #[test]
+    fn readiness_lines_only_on_a_dropout_and_the_recovery() {
+        let name = "A on the right controller";
+        assert_eq!(readiness_change([false; 2], [false; 2], name), None);
+        assert!(readiness_change([false; 2], [true, false], name)
+            .unwrap()
+            .contains("left controller is asleep"));
+        assert_eq!(
+            readiness_change([true, false], [true, false], name),
+            None,
+            "no repeats while it sleeps"
+        );
+        assert!(readiness_change([true, false], [true, true], name)
+            .unwrap()
+            .contains("right controller is asleep"));
+        assert_eq!(
+            readiness_change([true, true], [false, true], name),
+            None,
+            "the right one is still asleep"
+        );
+        assert_eq!(
+            readiness_change([false, true], [false, false], name).as_deref(),
+            Some("Both controllers are awake. Release and press A on the right controller.")
+        );
+    }
+    #[test]
+    fn preparation_resumes_after_sleep_or_stale_only_with_a_fresh_release_press() {
+        let ids = saved().identities.unwrap();
+        for asleep in [true, false] {
+            let mut edges = ButtonEdges::new(999_999_999);
+            let mut raw = reload_inputs();
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_000_000_010)
+                    .unwrap(),
+                Some([0, 0])
+            );
+            if asleep {
+                raw.hands[0].connected = false;
+            }
+            raw.hands[1].received_host_ns = 1_600_000_000;
+            raw.hands[1].buttons = Some(cv1touch::hand::BTN_A);
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_600_000_010)
+                    .unwrap(),
+                None
+            );
+            raw.hands[0].connected = true;
+            raw.hands[0].received_host_ns = 1_600_000_020;
+            raw.hands[1].received_host_ns = 1_600_000_020;
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_600_000_030)
+                    .unwrap(),
+                Some([0, 0]),
+                "wake/held press must not start"
+            );
+            raw.hands[1].buttons = Some(0);
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_600_000_040)
+                    .unwrap(),
+                Some([0, 0]),
+                "duplicate/queued release must not arm"
+            );
+            raw.hands[1].buttons = Some(cv1touch::hand::BTN_A);
+            raw.hands[1].received_host_ns = 1_600_000_050;
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_600_000_060)
+                    .unwrap(),
+                Some([0, 0])
+            );
+            raw.hands[1].buttons = Some(0);
+            raw.hands[1].received_host_ns = 1_600_000_070;
+            edges
+                .observe_preparation(&raw, &ids, 1_600_000_080)
+                .unwrap();
+            raw.hands[1].buttons = Some(cv1touch::hand::BTN_A);
+            raw.hands[1].received_host_ns = 1_600_000_090;
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_600_000_100)
+                    .unwrap(),
+                Some([0, cv1touch::hand::BTN_A])
+            );
+        }
+    }
+    #[test]
+    fn preparation_cancels_on_fresh_right_b_even_when_left_is_sleeping() {
+        let ids = saved().identities.unwrap();
+        let mut raw = reload_inputs();
+        raw.hands[0].connected = false;
+        raw.hands[1].buttons = Some(cv1touch::hand::BTN_B);
+        let error = ButtonEdges::new(0)
+            .observe_preparation(&raw, &ids, 1_000_000_010)
+            .unwrap_err();
+        assert!(error.contains("cancelled with B"), "{error}");
+    }
+    #[test]
+    fn preparation_keeps_identity_support_and_timestamp_errors_strict_while_waiting() {
+        let ids = saved().identities.unwrap();
+        for fault in 0..5 {
+            let mut edges = ButtonEdges::new(0);
+            let mut raw = reload_inputs();
+            edges
+                .observe_preparation(&raw, &ids, 1_000_000_010)
+                .unwrap();
+            raw.hands[0].connected = false;
+            assert_eq!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_000_000_020)
+                    .unwrap(),
+                None
+            );
+            match fault {
+                0 => raw.hands[0].identity = "3".repeat(32),
+                1 => raw.hands[0].buttons = None,
+                2 => raw.hands[0].received_host_ns = 0,
+                3 => raw.hands[0].received_host_ns = 2_000_000_000,
+                _ => raw.hands[0].received_host_ns -= 1,
+            }
+            assert!(
+                edges
+                    .observe_preparation(&raw, &ids, 1_000_000_030)
+                    .is_err(),
+                "fault {fault}"
+            );
+        }
     }
     #[test]
     fn registration_starts_only_after_ready_countdown_and_verification() {
