@@ -375,7 +375,12 @@ fn beeps(count: usize) {
     }
     let path = std::env::temp_dir().join(format!("cv1touch-beep-{}-{count}.wav", process::id()));
     if std::fs::write(&path, &wav).is_ok() {
-        let _ = Process::new("paplay").arg(&path).status();
+        // a missing sound server only loses the beep; its complaints would bury the prompts
+        let _ = Process::new("paplay")
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -1577,6 +1582,140 @@ fn measured_inputs(
     })
 }
 
+/// The four input calibration steps, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalStep {
+    Rest,
+    Triggers,
+    Grips,
+    Sticks,
+}
+
+impl CalStep {
+    const ALL: [CalStep; 4] = [
+        CalStep::Rest,
+        CalStep::Triggers,
+        CalStep::Grips,
+        CalStep::Sticks,
+    ];
+
+    /// Seconds recorded and the fewest fresh samples each hand must give.
+    fn length(self) -> (u64, usize) {
+        match self {
+            CalStep::Sticks => (10, 150),
+            _ => (2, 30),
+        }
+    }
+
+    /// Whether one awake hand is in this step's position, on raw factory values. Loose on
+    /// purpose: it only decides when to start recording; the recording sets the endpoints.
+    fn in_position(self, h: &RawInput) -> bool {
+        let stick = (h.stick[0] * h.stick[0] + h.stick[1] * h.stick[1]).sqrt();
+        h.connected
+            && match self {
+                CalStep::Rest => h.trigger < 0.15 && h.grip < 0.15 && stick < 0.25,
+                CalStep::Triggers => h.trigger > 0.75 && h.grip < 0.5,
+                CalStep::Grips => h.grip > 0.75 && h.trigger < 0.5,
+                CalStep::Sticks => stick > 0.6,
+            }
+    }
+
+    /// The standalone command's prompt (Enter starts the recording).
+    fn prompt(self) -> &'static str {
+        match self {
+            CalStep::Rest => "Input calibration 1/4: neutral controls.\nRelease both triggers and grips; let both thumbsticks center.\nPress Enter, then leave all controls untouched until 'Done' appears (2 seconds).",
+            CalStep::Triggers => "Input calibration 2/4: triggers.\nKeep both grips released and both thumbsticks centered.\nPress Enter first. Immediately pull both triggers fully and keep them held until 'Done' appears (2 seconds).",
+            CalStep::Grips => "Input calibration 3/4: grips.\nKeep both triggers released and both thumbsticks centered.\nPress Enter first. Immediately squeeze both grips fully and keep them held until 'Done' appears (2 seconds).",
+            CalStep::Sticks => "Input calibration 4/4: thumbsticks.\nRelease both triggers and grips.\nPress Enter first. Immediately move BOTH thumbsticks in full circles along their outer edges until 'Done' appears (10 seconds).\nCover forward, back, left and right; keep the sticks against their outer edges.",
+        }
+    }
+
+    /// What the guide asks for (numbered by the caller).
+    fn guided(self) -> &'static str {
+        match self {
+            CalStep::Rest => "Let go of both triggers, grips and sticks.",
+            CalStep::Triggers => "Pull both triggers all the way and hold them.",
+            CalStep::Grips => "Let go of the triggers and squeeze both grips fully.",
+            CalStep::Sticks => "Let go of the grips and circle both sticks around their outer edges until the double buzz.",
+        }
+    }
+}
+
+/// Both hands held in a step's position for `HOLD_NS` without a break.
+#[derive(Default)]
+struct InPosition {
+    since: Option<u64>,
+}
+
+impl InPosition {
+    const HOLD_NS: u64 = 300_000_000;
+
+    fn update(&mut self, step: CalStep, raw: &RawInputs, now_ns: u64) -> bool {
+        if !raw.hands.iter().all(|h| step.in_position(h)) {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now_ns);
+        now_ns.saturating_sub(since) >= Self::HOLD_NS
+    }
+}
+
+/// Waits until both hands hold `step`'s position (or Enter, offered after a while for controls
+/// that never reach the expected travel).
+fn input_gate(step: CalStep) -> Result<(), String> {
+    let start = Instant::now();
+    let mut gate = InPosition::default();
+    let mut hinted = false;
+    loop {
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd.
+        if unsafe { libc::poll(&mut fd, 1, 30) } > 0 {
+            let mut line = String::new();
+            if io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("input calibration needs an interactive terminal; input closed".into());
+            }
+            return Ok(());
+        }
+        if gate.update(step, &raw_inputs()?, shm::now_ns()) {
+            return Ok(());
+        }
+        if !hinted && start.elapsed() > Duration::from_secs(8) {
+            hinted = true;
+            println!("      (not detected yet: press Enter to record anyway)");
+        }
+    }
+}
+
+/// `pulses` short buzzes on both controllers, with as many beeps: one starts a timed step, two
+/// end it. Best effort: a missed cue does not stop anything.
+fn cue(pulses: usize) {
+    for pulse in 0..pulses {
+        for hand in ["left", "right"] {
+            let _ = control::request(
+                &control::socket_path(),
+                &format!("haptic {hand} 0.12 160 0.6"),
+                Duration::from_millis(300),
+            );
+        }
+        if pulse + 1 < pulses {
+            thread::sleep(Duration::from_millis(180));
+        }
+    }
+    beeps(pulses);
+}
+
 fn input_enter(prompt: &str) -> Result<(), String> {
     human_action(&format!("{prompt}\nPress Enter when ready."));
     io::stdout().flush().map_err(|e| e.to_string())?;
@@ -1617,8 +1756,11 @@ fn collect_inputs(
     last_ns: &mut [u64; 2],
     seconds: u64,
     minimum: usize,
+    quiet: bool,
 ) -> Result<[Vec<RawInput>; 2], String> {
-    println!("Sampling both hands for {seconds} seconds...");
+    if !quiet {
+        println!("Sampling both hands for {seconds} seconds...");
+    }
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut phase = PairedInputPhase::new(*last_ns);
     while Instant::now() < deadline {
@@ -1631,11 +1773,13 @@ fn collect_inputs(
     }
     *last_ns = phase.last_ns();
     let samples = phase.finish(minimum)?;
-    println!(
-        "Done: left {} / right {} fresh samples.",
-        samples[0].len(),
-        samples[1].len()
-    );
+    if !quiet {
+        println!(
+            "Done: left {} / right {} fresh samples.",
+            samples[0].len(),
+            samples[1].len()
+        );
+    }
     Ok(samples)
 }
 
@@ -1785,6 +1929,12 @@ fn reload_inputs() -> Result<(), String> {
 }
 
 fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
+    calibrate_inputs_with(out, reset, false)
+}
+
+/// `guided`: the setup guide's version: each step records as soon as both hands are in position,
+/// with buzzes instead of Enter, and nothing printed but the steps.
+fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
     catch_interrupts();
     let path = out
         .map(Path::to_path_buf)
@@ -1795,7 +1945,13 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
             println!("Input calibration reset; factory input mapping reloaded.");
             return Ok(());
         }
-        input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
+        if guided {
+            human_action(
+                "Do each step; it records as soon as you are in position (Enter also starts it).",
+            );
+        } else {
+            input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
+        }
         let first = raw_inputs()?;
         let identities = std::array::from_fn(|hand| first.hands[hand].identity.clone());
         for hand in 0..2 {
@@ -1804,14 +1960,19 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
         let mut last_ns = std::array::from_fn(|hand| first.hands[hand].received_host_ns);
         let mut phases: [[Vec<RawInput>; 4]; 2] =
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
-        for (phase, (prompt, seconds, minimum)) in [
-            ("Input calibration 1/4: neutral controls.\nRelease both triggers and grips; let both thumbsticks center.\nPress Enter, then leave all controls untouched until 'Done' appears (2 seconds).", 2, 30),
-            ("Input calibration 2/4: triggers.\nKeep both grips released and both thumbsticks centered.\nPress Enter first. Immediately pull both triggers fully and keep them held until 'Done' appears (2 seconds).", 2, 30),
-            ("Input calibration 3/4: grips.\nKeep both triggers released and both thumbsticks centered.\nPress Enter first. Immediately squeeze both grips fully and keep them held until 'Done' appears (2 seconds).", 2, 30),
-            ("Input calibration 4/4: thumbsticks.\nRelease both triggers and grips.\nPress Enter first. Immediately move BOTH thumbsticks in full circles along their outer edges until 'Done' appears (10 seconds).\nCover forward, back, left and right; keep the sticks against their outer edges.", 10, 150),
-        ].into_iter().enumerate() {
-            input_enter(prompt)?;
-            let samples = collect_inputs(&identities, &mut last_ns, seconds, minimum)?;
+        for (phase, step) in CalStep::ALL.into_iter().enumerate() {
+            let (seconds, minimum) = step.length();
+            if guided {
+                human_action(&format!("  {}/4 {}", phase + 1, step.guided()));
+                input_gate(step)?;
+                cue(1);
+            } else {
+                input_enter(step.prompt())?;
+            }
+            let samples = collect_inputs(&identities, &mut last_ns, seconds, minimum, guided)?;
+            if guided {
+                cue(2);
+            }
             for (hand, samples) in samples.into_iter().enumerate() {
                 phases[hand][phase] = samples;
             }
@@ -1821,7 +1982,9 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
             let name = ["left", "right"][hand];
             let calibration = measured_inputs(identity, &phases[hand])?;
             calibration.validate().map_err(|e| format!("{name} input measurements rejected: {e}; retry with released controls and full travel"))?;
-            println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
+            if !guided {
+                println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
+            }
             measured.push(calibration);
         }
         let candidate = cv1touch::input_calibration::CalibrationFile::new(
@@ -1829,7 +1992,9 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
                 .try_into()
                 .map_err(|_| "both hands must be calibrated")?,
         )?;
-        input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+        if !guided {
+            input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+        }
         let final_inputs = raw_inputs()?;
         for hand in 0..2 {
             InputPhase::default().observe(&final_inputs, &identities, hand, shm::now_ns())?;
@@ -1845,10 +2010,12 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
             );
         } else {
             write_input_calibration(&path, Some(&candidate), Some(&mut reload_inputs))?;
-            println!(
-                "Saved {} and reloaded inputs. Run `cv1touch input-test` to verify full travel.",
-                path.display()
-            );
+            if !guided {
+                println!(
+                    "Saved {} and reloaded inputs. Run `cv1touch input-test` to verify full travel.",
+                    path.display()
+                );
+            }
         }
         Ok(())
     })();
@@ -2525,10 +2692,14 @@ fn capture_free_named_with_feedback(
             (tracks, kinds)
         })
     };
-    println!(
-        "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
-        rec.display()
-    );
+    // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
+    let chatty = feedback.is_none();
+    if chatty {
+        println!(
+            "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
+            rec.display()
+        );
+    }
     human_action(instructions);
     let mut feedback_error = feedback.as_mut().and_then(|hook| hook.started().err());
     let deadline = start + max_s * 1_000_000_000;
@@ -2601,11 +2772,17 @@ fn capture_free_named_with_feedback(
     }
     let kind = |serial: &str| kinds.get(serial).cloned().unwrap_or_default();
     let mut out = io::stdout();
-    let _ = writeln!(
-        out,
-        "\n{}",
-        stopped.unwrap_or_else(|e| format!("record stop failed: {e}"))
-    );
+    match &stopped {
+        Ok(reply) if chatty => {
+            let _ = writeln!(out, "\n{reply}");
+        }
+        Ok(_) => {
+            let _ = writeln!(out);
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "\ncv1touch: record stop failed: {e}");
+        }
+    }
     let Some(((reference, samples), rest)) = reference_first(tracks.into_iter().collect(), kind)
     else {
         let _ = writeln!(
@@ -2615,14 +2792,16 @@ fn capture_free_named_with_feedback(
         );
         return Err(1);
     };
-    let _ = writeln!(
-        out,
-        "  {reference} ({}, the reference): {} poses",
-        kind(&reference),
-        samples.len()
-    );
-    for (serial, rows) in &rest {
-        let _ = writeln!(out, "  {serial} ({}): {} poses", kind(serial), rows.len());
+    if chatty {
+        let _ = writeln!(
+            out,
+            "  {reference} ({}, the reference): {} poses",
+            kind(&reference),
+            samples.len()
+        );
+        for (serial, rows) in &rest {
+            let _ = writeln!(out, "  {serial} ({}): {} poses", kind(serial), rows.len());
+        }
     }
     let others = rest
         .iter()
@@ -2649,12 +2828,14 @@ fn capture_free_named_with_feedback(
         let _ = writeln!(io::stderr(), "cv1touch: {}: {e}", truth_path.display());
         return Err(1);
     }
-    let _ = writeln!(
-        out,
-        "recording {}\ntruth {}",
-        rec.display(),
-        truth_path.display()
-    );
+    if chatty {
+        let _ = writeln!(
+            out,
+            "recording {}\ntruth {}",
+            rec.display(),
+            truth_path.display()
+        );
+    }
     if let Some(error) = feedback_error {
         let _ = writeln!(
             io::stderr(),
@@ -5236,6 +5417,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_hand(trigger: f32, grip: f32, stick: [f32; 2]) -> RawInput {
+        RawInput {
+            buttons: Some(0),
+            identity: "1".repeat(32),
+            connected: true,
+            received_host_ns: 1,
+            trigger,
+            grip,
+            stick,
+        }
+    }
+
+    #[test]
+    fn each_input_step_knows_when_a_hand_is_in_position() {
+        let rest = raw_hand(0.02, 0.05, [0.03, -0.04]);
+        let triggers = raw_hand(0.93, 0.1, [0.0, 0.0]);
+        let grips = raw_hand(0.1, 0.9, [0.0, 0.0]);
+        let edge = raw_hand(0.0, 0.0, [0.55, 0.6]);
+        assert!(CalStep::Rest.in_position(&rest) && !CalStep::Rest.in_position(&triggers));
+        assert!(CalStep::Triggers.in_position(&triggers) && !CalStep::Triggers.in_position(&grips));
+        assert!(CalStep::Grips.in_position(&grips) && !CalStep::Grips.in_position(&triggers));
+        assert!(CalStep::Sticks.in_position(&edge) && !CalStep::Sticks.in_position(&rest));
+        let mut asleep = triggers.clone();
+        asleep.connected = false;
+        assert!(
+            !CalStep::Triggers.in_position(&asleep),
+            "a sleeping controller is not in position"
+        );
+    }
+
+    #[test]
+    fn a_step_starts_once_both_hands_hold_position_long_enough() {
+        let mut gate = InPosition::default();
+        let both = |t, g| RawInputs {
+            hands: [raw_hand(t, g, [0.; 2]), raw_hand(t, g, [0.; 2])],
+        };
+        let one = RawInputs {
+            hands: [raw_hand(0.95, 0., [0.; 2]), raw_hand(0.1, 0., [0.; 2])],
+        };
+        assert!(!gate.update(CalStep::Triggers, &one, 0));
+        assert!(!gate.update(CalStep::Triggers, &both(0.95, 0.), 100_000_000));
+        assert!(
+            !gate.update(CalStep::Triggers, &both(0.95, 0.), 300_000_000),
+            "held only 200 ms"
+        );
+        assert!(
+            !gate.update(CalStep::Triggers, &one, 350_000_000),
+            "a dropout restarts the hold"
+        );
+        assert!(!gate.update(CalStep::Triggers, &both(0.9, 0.), 400_000_000));
+        assert!(gate.update(CalStep::Triggers, &both(0.9, 0.), 700_000_000));
+    }
     use cv1touch::shm::ControllerState;
 
     #[test]

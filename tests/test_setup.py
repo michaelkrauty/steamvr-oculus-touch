@@ -236,7 +236,7 @@ class SetupTests(unittest.TestCase):
         value["sensors"][0]["pos"] = [0.1, 0, 0]
         path.write_text(json.dumps(value))
         before = {p: p.read_bytes() for p in directory.iterdir()}
-        output = self.terminal_guide("new\n", expected_code=1)
+        output = self.terminal_guide("new\nq\n", expected_code=1)
         self.assertIn("cannot enter camera capture mode", output)
         mutations = [command for command in self.commands if command not in {"status", "inputs"}]
         self.assertEqual(mutations, ["calibration capture",
@@ -258,7 +258,7 @@ class SetupTests(unittest.TestCase):
         self.terminal_guide("keep\n" * 4)
         (directory / "calibration.json").write_text("{malformed camera")
         before = {p: p.read_bytes() for p in directory.iterdir()}
-        output = self.terminal_guide("new\n", expected_code=1)
+        output = self.terminal_guide("new\nq\n", expected_code=1)
         self.assertIn("cannot enter camera capture mode", output)
         mutations = [command for command in self.commands if command not in {"status", "inputs"}]
         self.assertEqual(mutations, ["calibration capture", "calibration provisional"])
@@ -299,7 +299,7 @@ class SetupTests(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["stages"][0]["state"], "blocked")
         self.assertIn("initializing or reloading", report["stages"][0]["reason"])
-        output = self.terminal_guide(expected_code=1)
+        output = self.terminal_guide("q\n", expected_code=1)
         self.assertIn("initializing or reloading", output)
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
@@ -318,7 +318,7 @@ class SetupTests(unittest.TestCase):
         before = {p: p.read_bytes() for p in directory.iterdir()}
         journal = self.root / "state/cv1touch/setup.json"
         checkpoint = journal.read_bytes()
-        output = self.terminal_guide("new\n", expected_code=1)
+        output = self.terminal_guide("new\nq\n", expected_code=1)
         self.assertIn("matching cv1touchd", output)
         self.assertIn("no capture was started", output)
         self.assertEqual(journal.read_bytes(), checkpoint)
@@ -332,8 +332,8 @@ class SetupTests(unittest.TestCase):
         checked = self.cli("--check", "--json")
         self.assertNotIn("\x1b", checked.stdout)
         output = self.terminal_guide("keep\n" * 4)
-        self.assertIn("\x1b[1mNext action:", output)
-        self.assertIn("\nCamera: Unknown", output)
+        self.assertIn("\x1b[1mSensor positions (~2 min)", output)
+        self.assertIn("Sensor positions    saved earlier, not verified", output)
         self.env["NO_COLOR"] = "1"
         self.assertNotIn("\x1b", self.terminal_guide())
         self.env.pop("NO_COLOR")

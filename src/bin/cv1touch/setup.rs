@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 
+#[path = "setup_ui.rs"]
+mod ui;
+
 #[derive(Serialize)]
 struct Check {
     name: &'static str,
@@ -294,17 +297,12 @@ fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) ->
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({"ready": ready, "checks": inspection.checks, "stages": stages, "note": "Saved dependency reuse does not verify physical alignment. Setup never pairs or resets controllers."})).unwrap());
     } else {
-        for check in &inspection.checks {
-            println!(
-                "{} {}: {}",
-                if check.ok { "ok" } else { "ATTENTION" },
-                check.name,
-                check.detail
-            );
-        }
-        for report in stages {
-            println!("{:?}: {:?} — {}", report.stage, report.state, report.reason);
-        }
+        let g = glyphs();
+        println!(
+            "{}\n\n{}",
+            ui::checks(&check_views(inspection), inspection.sensors.len(), &g),
+            ui::checklist(&stages, &g)
+        );
     }
     ready
 }
@@ -340,9 +338,136 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
             if allowed.contains(&answer.as_str()) {
                 return Ok(answer);
             }
-            human_action(&format!("Enter {}.", allowed.join(" / ")));
+            human_action(&if allowed.contains(&"") {
+                format!(
+                    "Press Enter{}, or q to quit.",
+                    if allowed.contains(&"k") { ", k" } else { "" }
+                )
+            } else {
+                format!("Enter {}.", allowed.join(" / "))
+            });
         }
     }
+}
+
+/// A stage's log: solver and fit output goes here instead of the terminal, and a failure points
+/// at it.
+struct StageLog {
+    path: PathBuf,
+}
+
+impl StageLog {
+    fn new(stage: Stage) -> StageLog {
+        StageLog {
+            path: absolute(&state_dir().join(format!("setup-{stage:?}-{}.log", shm::now_ns()))),
+        }
+    }
+
+    /// Runs `f` (which must not prompt) with stdout and stderr appended to the log; both are
+    /// restored afterwards, also if the log cannot be opened (then `f` prints as usual).
+    fn quiet<T>(&self, f: impl FnOnce() -> T) -> T {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let _ = io::stdout().flush();
+        let Ok(log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)
+        else {
+            return f();
+        };
+        // SAFETY: plain descriptor duplication; the saved copies are restored and closed below.
+        let saved = unsafe { [libc::dup(1), libc::dup(2)] };
+        if saved.contains(&-1) {
+            return f();
+        }
+        unsafe {
+            libc::dup2(log.as_raw_fd(), 1);
+            libc::dup2(log.as_raw_fd(), 2);
+        }
+        let out = f();
+        let _ = io::stdout().flush();
+        unsafe {
+            libc::dup2(saved[0], 1);
+            libc::dup2(saved[1], 2);
+            libc::close(saved[0]);
+            libc::close(saved[1]);
+        }
+        out
+    }
+
+    /// The last error the stage reported, for the one-line failure.
+    fn last_error(&self) -> Option<String> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        text.lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("cv1touch: "))
+            .map(str::to_owned)
+    }
+
+    fn failure(&self, fallback: &str) -> String {
+        format!(
+            "{} (details: {})",
+            self.last_error().unwrap_or_else(|| fallback.to_owned()),
+            self.path.display()
+        )
+    }
+}
+
+/// `send` without echoing the daemon's reply; 0 on "ok".
+fn send_quiet(line: &str) -> i32 {
+    match control::request(&control::socket_path(), line, Duration::from_secs(5)) {
+        Ok(reply) if !reply.starts_with("err") => 0,
+        Ok(reply) => {
+            eprintln!("cv1touch: {line}: {reply}");
+            1
+        }
+        Err(e) => {
+            eprintln!("cv1touch: cannot reach cv1touchd: {e}");
+            1
+        }
+    }
+}
+
+fn glyphs() -> ui::Glyphs {
+    ui::Glyphs::for_terminal(std::env::var("TERM").is_ok_and(|t| t == "dumb"))
+}
+
+fn check_views(inspection: &Inspection) -> Vec<ui::CheckView<'_>> {
+    inspection
+        .checks
+        .iter()
+        .map(|c| ui::CheckView {
+            name: c.name,
+            ok: c.ok,
+            detail: &c.detail,
+        })
+        .collect()
+}
+
+/// The file a stage installs, parsed, for its result line.
+fn installed(stage: Stage) -> Option<serde_json::Value> {
+    let path = match stage {
+        Stage::Camera | Stage::Gravity => file::default_path(),
+        Stage::Render => cv1touch::align::render_path(),
+        Stage::Registration => cv1touch::align::registration_path(),
+        Stage::Inputs => input_calibration::default_path(),
+    };
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Asks at a stage prompt: Enter starts, q quits, k keeps (where offered).
+fn ask(prompt: &str, can_keep: bool) -> Result<ui::Answer, String> {
+    let keys: &[&str] = if can_keep {
+        &[
+            "", "new", "start", "s", "y", "yes", "k", "keep", "q", "quit", "exit",
+        ]
+    } else {
+        &["", "new", "start", "s", "y", "yes", "q", "quit", "exit"]
+    };
+    let line = choice(prompt, keys)?;
+    ui::answer(&line, can_keep).ok_or_else(|| "unrecognised answer".to_string())
 }
 
 fn persist(checkpoint: &Checkpoint) -> Result<(), String> {
@@ -357,18 +482,105 @@ fn capture_path(stage: Stage, checkpoint: &mut Checkpoint) -> Result<PathBuf, St
     Ok(rec)
 }
 
-fn static_hold() -> Result<(), String> {
-    beeps(1);
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
-        if interrupted() {
-            return Err("gravity capture interrupted".into());
+/// A fresh press of A on the right controller: released in one fresh sample, pressed in a newer
+/// one. While the controller is asleep or stale it is not known to be released, so the press
+/// that wakes it, or one held from before, starts nothing.
+struct PressA {
+    last_ns: u64,
+    released: bool,
+}
+
+impl PressA {
+    fn new() -> PressA {
+        PressA {
+            last_ns: 0,
+            released: false,
         }
-        thread::sleep(Duration::from_millis(100));
     }
-    beeps(2);
+
+    fn pressed(&mut self, raw: &RawInputs, now_ns: u64) -> bool {
+        let s = &raw.hands[HAND_RIGHT];
+        let fresh = s.connected
+            && s.received_host_ns != 0
+            && now_ns
+                .checked_sub(s.received_host_ns)
+                .is_some_and(|age| age <= FRESH_INPUT_NS);
+        if !fresh {
+            self.released = false;
+            return false;
+        }
+        if s.received_host_ns <= self.last_ns {
+            return false;
+        }
+        self.last_ns = s.received_host_ns;
+        let down = s.buttons.is_some_and(|b| b & cv1touch::hand::BTN_A != 0);
+        let edge = down && self.released;
+        self.released = !down;
+        edge
+    }
+}
+
+/// Shows `prompt` and waits for A on the right controller or Enter; q at the terminal stops.
+fn go_signal(prompt: &str) -> Result<(), String> {
+    human_action(prompt);
+    let mut a = PressA::new();
+    loop {
+        if interrupted() {
+            return Err("interrupted; nothing was recorded".into());
+        }
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: one initialized poll descriptor.
+        if unsafe { libc::poll(&mut fd, 1, 20) } > 0 {
+            let mut line = String::new();
+            if io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("setup requires an interactive terminal; input closed".into());
+            }
+            if matches!(line.trim(), "q" | "quit") {
+                return Err("stopped; nothing was recorded".into());
+            }
+            return Ok(());
+        }
+        if raw_inputs().is_ok_and(|raw| a.pressed(&raw, shm::now_ns())) {
+            return Ok(());
+        }
+    }
+}
+
+/// A timed step: a cue, a countdown on one line, two cues at the end.
+fn timed_window(seconds: u64) -> Result<(), String> {
+    cue(1);
+    let end = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if interrupted() {
+            println!();
+            return Err("interrupted; the capture is kept".into());
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        print!("\r  {:>3} s ", left.as_secs() + 1);
+        let _ = io::stdout().flush();
+        thread::sleep(Duration::from_millis(200));
+    }
+    print!("\r        \r");
+    let _ = io::stdout().flush();
+    cue(2);
     Ok(())
 }
+
+const START: &str = "Press A on the right controller (or Enter) to start.";
+
+const CAMERA_MOTION: &str = "For 60 seconds, wave both controllers slowly through the whole play space:\nhigh and low, near and far, twisting your wrists. Every sensor should see them, often two at once.";
 
 fn timed_capture(
     stage: Stage,
@@ -378,33 +590,20 @@ fn timed_capture(
     let rec = capture_path(stage, checkpoint)?;
     let mut guard = guided_start_recording(&rec, false)?;
     let result = if gravity {
-        human_action("Next action: rest both controllers completely still in 12 varied orientations. Change pitch AND roll between holds, covering faces and edges; keep the rings visible. Each hold lasts 3 seconds.");
+        human_action("Hold both controllers still in 12 different orientations: tilt AND roll them between holds, rings visible.\nFor each one: hold still, press A (or Enter), and keep still until the double buzz (3 s).");
         (1..=12).try_for_each(|hold| -> Result<(), String> {
-            choice(&format!("Hold {hold}/12: place both controllers in a NEW orientation. Enter 'ready' when stationary, or 'quit'."), &["ready", "quit"])
-                .and_then(|answer| if answer == "quit" { Err("setup stopped; recording retained".into()) } else { Ok(()) })?;
-            static_hold()
+            go_signal(&format!(
+                "  Hold {hold}/12: still, in a new orientation, then A."
+            ))?;
+            timed_window(3)
         })
+    } else if stage == Stage::Render {
+        go_signal(&format!(
+            "Wake both controllers and keep them awake for 5 seconds.\n{START}"
+        ))
+        .and_then(|()| timed_window(5))
     } else {
-        let seconds = if stage == Stage::Render { 5 } else { 60 };
-        if stage == Stage::Render {
-            human_action(
-                "Next action: keep both controllers awake while recording their factory geometry.",
-            );
-        } else {
-            human_action(&format!(
-                "Next action: prepare for camera calibration.\n{CALIBRATION_BRIEFING}"
-            ));
-        }
-        let name = if stage == Stage::Render {
-            "geometry"
-        } else {
-            "wave"
-        };
-        if pace(&[format!("{name}:{seconds}")]) == 0 {
-            Ok(())
-        } else {
-            Err("capture interrupted".into())
-        }
+        go_signal(&format!("{CAMERA_MOTION}\n{START}")).and_then(|()| timed_window(60))
     };
     let stopped = control::request(
         &control::socket_path(),
@@ -592,9 +791,7 @@ fn wait_reload_with(
 }
 
 fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
-    human_action(
-        "Next action: keep both Touch controllers awake with a face button while tracking resumes.",
-    );
+    println!("Tracking restarts; keep the controllers awake.");
     let start = std::time::Instant::now();
     wait_reload_with(
         before,
@@ -721,23 +918,10 @@ impl ButtonEdges {
     }
 }
 
-const REGISTRATION_PREPARATION: &str = "Step: headset registration
-Keep SteamVR running and confirm the headset is tracking.
-
-Position: try to keep both controllers solidly pressed against the HMD; don't let them slip.
-Keep the headset's tracking sensors and the Touch rings uncovered.
-This step measures the controllers' position and orientation relative to the HMD,
-so the headset and controllers need to move as one rigid unit.
-
-Start: put on the headset, then release and press A on the right controller.
-Both controllers pulse once per second during the 10-second positioning countdown.
-A distinct DOUBLE stronger buzz signals that recording has started.
-
-Motion: after the double buzz, make two slow turns each way, then nod and tilt repeatedly.
-
-Finish: release and press A on the right controller, or press Enter.
-B on the right controller cancels without installing a fit; Ctrl+C also interrupts.
-Recording stops after 150 seconds at most. A longer gentle buzz signals it has stopped.";
+const REGISTRATION_PREPARATION: &str = "Put on the headset (SteamVR running, headset tracking).
+Press both controllers firmly against it, rings and the headset's sensors uncovered.
+The fit measures where they sit on the headset, so don't let them slip.
+Press A to start: 10 pulses to get in position, then a double buzz starts the recording.";
 
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
@@ -874,32 +1058,36 @@ fn readiness_change(shown: [bool; 2], waiting: [bool; 2], name: &str) -> Option<
     let names = ["left", "right"];
     if let Some(hand) = (0..2).find(|&h| waiting[h] && !shown[h]) {
         return Some(format!(
-            "The {} controller is asleep: press any button on it to wake it.",
+            "  The {} controller is asleep: press any button on it.",
             names[hand]
         ));
     }
     (shown.contains(&true) && !waiting.contains(&true))
-        .then(|| format!("Both controllers are awake. Release and press {name}."))
+        .then(|| format!("  Both awake. Press {name}."))
 }
 
 fn confirm_registration_controls_with(
     mut press: impl FnMut(usize, u32, &str) -> Result<(), String>,
     mut buzz: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    for (hand, button, name) in [
-        (HAND_LEFT, cv1touch::hand::BTN_X, "X on the left controller"),
+    for (hand, button, name, key) in [
+        (
+            HAND_LEFT,
+            cv1touch::hand::BTN_X,
+            "X on the left controller",
+            "X",
+        ),
         (
             HAND_RIGHT,
             cv1touch::hand::BTN_A,
             "A on the right controller",
+            "A",
         ),
     ] {
-        human_action(&format!(
-            "Next action: release then press {name} for a gentle test buzz."
-        ));
+        human_action(&format!("  Press {name}."));
         press(hand, button, name)?;
         buzz(hand)?;
-        human_action(&format!("Next action: release then press {name} again ONLY if you felt that buzz; B on the right controller cancels."));
+        human_action(&format!("  Felt a buzz? Press {key} again."));
         press(hand, button, name)?;
     }
     Ok(())
@@ -910,7 +1098,8 @@ fn registration_countdown_with(
     mut second: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     for remaining in (1..=10).rev() {
-        println!("Registration positioning countdown: {remaining} seconds...");
+        print!("\r  getting in position: {remaining:>2} s ");
+        let _ = io::stdout().flush();
         tick(HAND_LEFT)?;
         tick(HAND_RIGHT)?;
         second()?;
@@ -1039,36 +1228,38 @@ fn run_stage(
     persist(checkpoint)?;
     let mut recordings = Vec::new();
     let mut accepted_camera_sha256 = None;
+    let log = StageLog::new(stage);
     let code = match stage {
         Stage::Camera if preserve => {
-            human_action("Next action: place new sensors in the existing world. Keep all previously calibrated sensors fixed.");
+            println!("New sensors join the existing ones; keep those where they are.");
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
             for serial in &inspection.unplaced {
-                if calibrate_place(serial, &rec, &file::default_path(), true) != 0 {
-                    return Err("sensor placement rejected; earlier backups retained".into());
+                if log.quiet(|| calibrate_place(serial, &rec, &file::default_path(), true)) != 0 {
+                    return Err(log.failure("sensor placement rejected; earlier backups retained"));
                 }
             }
-            restore_mode(&file::default_path())
+            log.quiet(|| restore_mode(&file::default_path()))
         }
         Stage::Camera => {
             let mut restore = RestoreCamera(true);
-            if send("calibration capture") != 0 {
+            if log.quiet(|| send_quiet("calibration capture")) != 0 {
                 return Err("cannot enter camera capture mode".into());
             }
             wait_reload(inspection, "capture")?;
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
-            let solved = match calibrate_solve_saved(&rec, &file::default_path(), false) {
-                Ok(fingerprint) => {
-                    accepted_camera_sha256 = Some(fingerprint);
-                    0
-                }
-                Err(code) => code,
-            };
-            let restored = restore_mode(&file::default_path());
+            let solved =
+                match log.quiet(|| calibrate_solve_saved(&rec, &file::default_path(), false)) {
+                    Ok(fingerprint) => {
+                        accepted_camera_sha256 = Some(fingerprint);
+                        0
+                    }
+                    Err(code) => code,
+                };
+            let restored = log.quiet(|| restore_mode(&file::default_path()));
             if restored == 0 {
                 restore.0 = false;
             }
@@ -1085,24 +1276,26 @@ fn run_stage(
             let compensate = setup::plan(&inspection.snapshot, &old)
                 .iter()
                 .any(|r| r.stage == Stage::Registration && r.state == State::Ready);
-            let code = calibrate_gravity_with(&rec, &file::default_path(), true, compensate);
-            if code == 0 && restore_mode(&file::default_path()) == 0 {
-                send("alignment reload")
-            } else {
-                1
-            }
+            log.quiet(|| {
+                let code = calibrate_gravity_with(&rec, &file::default_path(), true, compensate);
+                if code == 0 && restore_mode(&file::default_path()) == 0 {
+                    send_quiet("alignment reload")
+                } else {
+                    1
+                }
+            })
         }
         Stage::Render => {
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
-            fit_render(Some(&rec))
+            log.quiet(|| fit_render(Some(&rec)))
         }
         Stage::Registration => {
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
-                    human_action("Button and haptic check\nB on the right controller cancels; Ctrl+C also interrupts.");
+                    human_action("Button check (B on the right controller cancels at any point):");
                     confirm_registration_controls_with(
                         |hand, button, name| wait_preparation_press(inspection, hand, button, name),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
@@ -1144,29 +1337,34 @@ fn run_stage(
                             "setup interrupted during preparation; no recording started".into()
                         );
                     }
-                    println!("Starting headset registration recording now.");
+                    print!("\r                            \r");
                     let mut feedback = RegistrationFeedback {
                         before: inspection,
                         edges: ButtonEdges::new(shm::now_ns()),
                     };
-                    capture_free_named_with_feedback(150, "Position: keep both controllers solidly pressed against the HMD so they move as one rigid unit; don't let them slip. Keep its tracking sensors and the Touch rings uncovered.\nMotion: make two slow turns each way, then nod and tilt repeatedly.\nFinish: release and press A on the right controller, or press Enter. B on the right controller cancels without installing a fit.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
+                    capture_free_named_with_feedback(150, "Recording: turn slowly twice each way, then nod and tilt. Keep the controllers from slipping.\nA to finish (or Enter), B to cancel.", false, Some(&base), Some(&mut feedback)).map_err(|code| format!("headset capture failed ({code}); capture retained, no fit installed"))?;
                     Ok((rec, base))
                 },
             )?;
             recordings.push(rec);
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
-            let code = register_from_capture_with(&base, true, Some("hmd"), true, false);
-            if code == 0 {
-                send("alignment reload")
-            } else {
-                code
-            }
+            log.quiet(|| {
+                let code = register_from_capture_with(&base, true, Some("hmd"), true, false);
+                if code == 0 {
+                    send_quiet("alignment reload")
+                } else {
+                    code
+                }
+            })
         }
-        Stage::Inputs => calibrate_inputs(None, false),
+        Stage::Inputs => calibrate_inputs_with(None, false, true),
     };
-    if code != 0 || interrupted() {
-        return Err("stage did not complete; previous backups and capture paths retained. Rerun setup when ready.".into());
+    if interrupted() {
+        return Err("interrupted; earlier settings and the capture are kept".into());
+    }
+    if code != 0 {
+        return Err(log.failure("the fit was rejected; earlier settings and the capture are kept"));
     }
     if matches!(stage, Stage::Camera | Stage::Gravity) {
         wait_reload(inspection, "calibrated")?;
@@ -1230,17 +1428,45 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
         checkpoint = setup::load(&journal_path())
             .map_err(|e| format!("setup journal: {e}"))?
             .unwrap_or_default();
-        println!("Setup reuses verified saved work. It never pairs/resets controllers, restarts services or changes USB permissions. Type quit at a prompt to stop.");
+        let g = glyphs();
+        let mut shown_checks = String::new();
+        // the stage list shows at the start and again after a failure; a finished stage is one
+        // result line, then the next prompt
+        let mut show_list = true;
         loop {
             let inspection = inspect(&checkpoint);
-            print_report(&inspection, &checkpoint, false);
+            let views = check_views(&inspection);
+            let check_text = ui::checks(&views, inspection.sensors.len(), &g);
+            if check_text != shown_checks {
+                println!("{check_text}");
+                shown_checks = check_text;
+            }
             let stage_reports = reports(&inspection, &checkpoint);
+            if std::mem::take(&mut show_list) {
+                println!("\n{}\n", ui::checklist(&stage_reports, &g));
+            }
             let Some(report) = stage_reports.iter().find(|r| r.state != State::Ready) else {
-                human_action("Next action: check physical alignment, movement and input-test in a focused VR app. Wake controllers if asleep. Saved setup is complete.");
+                human_action("Saved setup is complete. Check both hands in SteamVR: position, buttons and haptics.");
                 return Ok(());
             };
-            if report.state == State::Blocked {
-                return Err(format!("{:?} is blocked: {}. Resolve this prerequisite, then rerun setup; no recapture was started.", report.stage, report.reason));
+            if !ui::checks_pass(&views) || report.state == State::Blocked {
+                if report.state == State::Blocked {
+                    println!(
+                        "{} {}: {}",
+                        g.fail,
+                        ui::stage_name(report.stage),
+                        report.reason
+                    );
+                }
+                show_list = true;
+                if ask(
+                    "Fix that, then press Enter to check again (q: quit).",
+                    false,
+                )? == ui::Answer::Quit
+                {
+                    return Err("setup stopped before finishing; completed stages are kept".into());
+                }
+                continue;
             }
             let can_adopt = matches!(report.state, State::Unknown | State::Stale)
                 && inspection.unplaced.is_empty()
@@ -1248,28 +1474,42 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
                     report.stage,
                     Stage::Camera | Stage::Gravity | Stage::Render | Stage::Registration
                 );
-            human_action(&format!(
-                "Next action: complete or verify {:?}.",
-                report.stage
-            ));
-            let answer = if can_adopt {
-                choice(&format!("{:?}: type keep ONLY if you have verified the current camera placement, level, render alignment and SteamVR registration are correct together. This adopts saved files without changing them. Type new to capture this stage, or quit.", report.stage), &["keep", "new", "quit"])?
-            } else {
-                choice(&format!("{:?}: type new to run this stage, or quit. Existing settings have backups; captures must pass the existing solver checks.", report.stage), &["new", "quit"])?
-            };
-            if answer == "quit" {
-                return Ok(());
-            }
-            if answer == "keep" {
-                setup::adopt(report.stage, &inspection.snapshot, &mut checkpoint)?;
-                persist(&checkpoint)?;
-            } else {
-                // Recheck live prerequisites after the user has prepared the hardware.
-                let current = inspect(&checkpoint);
-                if let Some(reason) = current.snapshot.blocked.get(&report.stage) {
-                    return Err(reason.clone());
+            match ask(&ui::stage_prompt(report.stage, can_adopt), can_adopt)? {
+                ui::Answer::Quit => return Ok(()),
+                ui::Answer::Keep => {
+                    setup::adopt(report.stage, &inspection.snapshot, &mut checkpoint)?;
+                    persist(&checkpoint)?;
+                    println!("{} {}: kept", g.done, ui::stage_name(report.stage));
                 }
-                run_stage(report.stage, &current, &mut checkpoint)?;
+                ui::Answer::Start => {
+                    // Recheck live prerequisites after the user has prepared the hardware.
+                    let current = inspect(&checkpoint);
+                    if let Some(reason) = current.snapshot.blocked.get(&report.stage) {
+                        println!("{} {}: {reason}", g.fail, ui::stage_name(report.stage));
+                        show_list = true;
+                        continue;
+                    }
+                    let name = ui::stage_name(report.stage);
+                    match run_stage(report.stage, &current, &mut checkpoint) {
+                        Ok(()) => println!(
+                            "{} {name}: {}",
+                            g.done,
+                            ui::result_summary(report.stage, installed(report.stage).as_ref())
+                        ),
+                        Err(error) => {
+                            println!("{} {name}: {error}", g.fail);
+                            show_list = true;
+                            if interrupted() {
+                                return Err("setup interrupted; completed stages are kept".into());
+                            }
+                            if ask("Enter: try again   q: quit", false)? == ui::Answer::Quit {
+                                return Err(format!(
+                                    "{name} not finished; completed stages are kept"
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     };
@@ -1482,7 +1722,7 @@ mod tests {
         );
         assert_eq!(
             readiness_change([false, true], [false, false], name).as_deref(),
-            Some("Both controllers are awake. Release and press A on the right controller.")
+            Some("  Both awake. Press A on the right controller.")
         );
     }
     #[test]
