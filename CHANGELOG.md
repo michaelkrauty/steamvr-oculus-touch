@@ -19,3 +19,4 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - USB camera shutdown deadlock that could stall daemon restarts.
 - Out-of-range analog inputs after factory calibration drift; SteamVR output now stays within its normalized ranges.
 - Input diagnostics accepting unrelated axes or missing updates during driver delivery lag.
+- Linux OpenVR controller-state packing that could prevent input diagnostics from reading SteamVR buttons and axes correctly.

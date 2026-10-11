@@ -62,6 +62,19 @@ type ShutdownFn = unsafe extern "C" fn();
 
 /// Pressed bits, touched bits and the five legacy controller axes.
 pub type ControllerState = (u64, u64, [(f32, f32); 5]);
+
+// The C API header omits the SDK's Linux/macOS pack(4) for VRControllerState001_t.
+// Use the driver SDK's platform layout at this boundary instead of the generated C struct.
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), repr(C, packed(4)))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), repr(C))]
+#[derive(Default)]
+struct LegacyControllerState {
+    packet_num: u32,
+    button_pressed: u64,
+    button_touched: u64,
+    axes: [sys::VRControllerAxis_t; 5],
+}
+
 /// Raw-universe pose, linear velocity and angular velocity.
 pub type PoseWithVelocity = (Isometry3<f64>, [f64; 3], [f64; 3]);
 
@@ -218,20 +231,22 @@ impl Client {
 
     /// SteamVR's legacy view of a controller's inputs: (pressed bits, touched bits, five axes).
     pub fn controller_state(&self, index: u32) -> Option<ControllerState> {
-        let mut st = sys::VRControllerState_t::default();
-        // SAFETY: as above; the struct size is passed.
+        let mut st = LegacyControllerState::default();
+        // SAFETY: st has the SDK's platform layout and its exact size is passed. The cast only
+        // crosses the FFI boundary; no reference to the generated, differently aligned type is
+        // formed. Packed fields below are copied by value, without unaligned references.
         let ok = unsafe {
             self.sys.GetControllerState.expect("GetControllerState")(
                 index,
-                &mut st,
-                std::mem::size_of::<sys::VRControllerState_t>() as u32,
+                std::ptr::addr_of_mut!(st).cast(),
+                std::mem::size_of::<LegacyControllerState>() as u32,
             )
         };
         ok.then(|| {
             (
-                st.ulButtonPressed,
-                st.ulButtonTouched,
-                st.rAxis.map(|a| (a.x, a.y)),
+                st.button_pressed,
+                st.button_touched,
+                st.axes.map(|a| (a.x, a.y)),
             )
         })
     }
@@ -320,6 +335,99 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use nalgebra::Vector3;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const PRESSED: u64 = 0x1234_5678_9abc_def0;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const TOUCHED: u64 = 0xfedc_ba98_7654_3210;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const AXES: [(f32, f32); 5] = [
+        (-0.75, 0.25),
+        (0.95, 0.0),
+        (0.99, 0.0),
+        (0.125, -0.375),
+        (-0.625, 0.875),
+    ];
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unsafe extern "C" fn packed_controller_state(
+        index: u32,
+        state: *mut sys::VRControllerState_t,
+        size: u32,
+    ) -> bool {
+        // Device 9 models a runtime that requires the exact SDK size. Device 10 also accepts
+        // larger buffers, exposing shifted field reads independently of size rejection.
+        if !(index == 9 && size == 60 || index == 10 && size >= 60) || state.is_null() {
+            return false;
+        }
+        let mut bytes = [0u8; 60];
+        bytes[..4].copy_from_slice(&0x1020_3040u32.to_ne_bytes());
+        bytes[4..12].copy_from_slice(&PRESSED.to_ne_bytes());
+        bytes[12..20].copy_from_slice(&TOUCHED.to_ne_bytes());
+        for (axis, (x, y)) in AXES.into_iter().enumerate() {
+            let offset = 20 + axis * 8;
+            bytes[offset..offset + 4].copy_from_slice(&x.to_ne_bytes());
+            bytes[offset + 4..offset + 8].copy_from_slice(&y.to_ne_bytes());
+        }
+        // SAFETY: the caller provides at least 60 writable bytes. Copy bytes without assuming
+        // the generated C header's incorrect eight-byte alignment for this Linux/macOS ABI.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), state.cast::<u8>(), bytes.len()) };
+        true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mock_controller_client() -> std::mem::ManuallyDrop<Client> {
+        unsafe extern "C" fn unused_shutdown() {}
+        let table = sys::VR_IVRSystem_FnTable {
+            GetControllerState: Some(packed_controller_state),
+            ..Default::default()
+        };
+        // No library was opened. ManuallyDrop avoids the real client's shutdown/dlclose path.
+        std::mem::ManuallyDrop::new(Client {
+            lib: std::ptr::null_mut(),
+            sys: Box::leak(Box::new(table)),
+            shutdown: unused_shutdown,
+        })
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn controller_state_passes_the_platform_legacy_abi_size() {
+        let client = mock_controller_client();
+        assert_eq!(client.controller_state(9), Some((PRESSED, TOUCHED, AXES)));
+        assert_eq!(client.controller_state(11), None);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn controller_state_decodes_real_packed_buttons_and_all_axes() {
+        assert_eq!(
+            mock_controller_client().controller_state(10),
+            Some((PRESSED, TOUCHED, AXES))
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn controller_state_layout_preserves_packet_and_sdk_offsets() {
+        assert_eq!(std::mem::size_of::<LegacyControllerState>(), 60);
+        assert_eq!(std::mem::align_of::<LegacyControllerState>(), 4);
+        assert_eq!(std::mem::offset_of!(LegacyControllerState, packet_num), 0);
+        assert_eq!(
+            std::mem::offset_of!(LegacyControllerState, button_pressed),
+            4
+        );
+        assert_eq!(
+            std::mem::offset_of!(LegacyControllerState, button_touched),
+            12
+        );
+        assert_eq!(std::mem::offset_of!(LegacyControllerState, axes), 20);
+        let mut state = LegacyControllerState::default();
+        // SAFETY: the mock writes exactly the SDK's 60-byte layout into this matching buffer.
+        assert!(unsafe { packed_controller_state(9, std::ptr::addr_of_mut!(state).cast(), 60) });
+        let packet = state.packet_num;
+        assert_eq!(packet, 0x1020_3040);
+    }
 
     #[test]
     fn matrix34_to_isometry() {

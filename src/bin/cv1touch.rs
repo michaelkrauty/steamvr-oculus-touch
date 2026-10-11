@@ -1756,6 +1756,8 @@ struct InputStep {
 struct InputProgress {
     daemon_seen: bool,
     steam_seen: bool,
+    daemon_trigger: Option<(f32, f32)>,
+    steam_trigger: Option<(f32, f32)>,
     daemon_grip: Option<(f32, f32)>,
     steam_grip: Option<(f32, f32)>,
 }
@@ -1775,9 +1777,11 @@ impl InputProgress {
             }
         };
         if let Some(state) = daemon {
+            range(&mut self.daemon_trigger, state.trigger);
             range(&mut self.daemon_grip, state.grip);
         }
         if let Some(state) = steam {
+            range(&mut self.steam_trigger, state.2[1].0);
             range(&mut self.steam_grip, state.2[2].0);
         }
         let daemon_now = daemon.is_some_and(|state| (step.done)(state));
@@ -1817,17 +1821,22 @@ impl InputProgress {
         input_delivery_ok(daemon_now, step.steam.is_none() || steam_now)
     }
 
-    fn grip_report(&self) -> String {
+    fn analog_report(&self, axis: usize) -> String {
         let range = |r: Option<(f32, f32)>| {
             r.map_or_else(
                 || "unavailable".into(),
                 |(min, max)| format!("{min:.3}..{max:.3}"),
             )
         };
+        let (name, daemon, steam) = if axis == 1 {
+            ("trigger", self.daemon_trigger, self.steam_trigger)
+        } else {
+            ("grip", self.daemon_grip, self.steam_grip)
+        };
         format!(
-            "grip range: daemon {}, SteamVR {}; full squeeze requires > 0.9",
-            range(self.daemon_grip),
-            range(self.steam_grip)
+            "{name} range: daemon {}, SteamVR {}; full travel requires > 0.9",
+            range(daemon),
+            range(steam)
         )
     }
 }
@@ -2022,8 +2031,14 @@ fn input_test() -> i32 {
                 seen = "unverified by legacy interface; check manually in SteamVR".into();
                 manual.push(format!("{name}: {}", st.prompt));
             }
-            if !ok && matches!(st.steam, Some(LegacyInput::Axis { axis: 2, .. })) {
-                seen.push_str(&format!("; {}", progress.grip_report()));
+            if !ok {
+                if let Some(LegacyInput::Axis {
+                    axis: axis @ (1 | 2),
+                    ..
+                }) = st.steam
+                {
+                    seen.push_str(&format!("; {}", progress.analog_report(axis)));
+                }
             }
             println!(
                 "{}  [daemon: {}; SteamVR: {seen}]",
@@ -5201,11 +5216,35 @@ mod tests {
             };
             assert!(!progress.observe(&steps[1], Some(&grip), Some(&steam_input(2, value, 0.0))));
         }
-        let diagnostic = progress.grip_report();
+        let diagnostic = progress.analog_report(2);
         assert!(diagnostic.contains("daemon 0.000..0.900"), "{diagnostic}");
         assert!(diagnostic.contains("SteamVR 0.000..0.900"), "{diagnostic}");
         assert!(diagnostic.contains("> 0.9"), "{diagnostic}");
         assert!(!progress.daemon_seen);
+    }
+
+    #[test]
+    fn input_delivery_reports_trigger_delivery_failure_separately_from_grip() {
+        let steps = input_steps(HAND_LEFT);
+        let mut progress = InputProgress::default();
+        for value in [0.0, 0.5, 1.0] {
+            let state = ControllerState {
+                trigger: value,
+                grip: 0.25,
+                ..Default::default()
+            };
+            let mut steam = steam_input(1, 0.0, 0.0);
+            steam.2[2].0 = 0.75;
+            assert!(!progress.observe(&steps[0], Some(&state), Some(&steam)));
+        }
+        let diagnostic = progress.analog_report(1);
+        assert!(
+            diagnostic.contains("trigger range: daemon 0.000..1.000"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("SteamVR 0.000..0.000"), "{diagnostic}");
+        assert!(progress.daemon_seen);
+        assert!(!progress.steam_seen);
     }
 
     #[test]
