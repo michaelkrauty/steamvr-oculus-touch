@@ -33,7 +33,7 @@ Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or r
 
 ## Install
 
-Quit SteamVR, then run `python3 scripts/install.py` from the clone. It installs:
+Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.1.0` tag or an extracted [v0.1.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
 
 | Location | Purpose |
 | --- | --- |
@@ -102,11 +102,16 @@ The live status board lists every sensor. `camera_queue.dropped_frames` counts e
 
 ## Upgrade
 
-Quit SteamVR, update the clone, run `python3 scripts/install.py`, then restart the service:
+Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.1.0` with the desired published tag:
 
 ```sh
+git fetch origin --tags
+git checkout --detach v0.1.0
+python3 scripts/install.py
 systemctl --user restart cv1touchd
 ```
+
+For a source-archive installation, extract the desired release into a new directory and run `python3 scripts/install.py` there, then restart the service.
 
 The installer replaces managed binaries and keeps calibration/state. A running process can continue using its previous mapped code until restarted. SteamVR loads a new driver on its next start. Keep a known-good release available if you need rollback; newer configuration schemas may need corresponding backups.
 

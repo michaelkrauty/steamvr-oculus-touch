@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.1.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0) - 2026-10-10
+
 ### Added
 
 - Complete Linux CV1 Touch stack: Rust daemon/tracker, camera calibration, SteamVR-space registration, native SteamVR driver, haptics, recording and replay.
@@ -22,7 +24,6 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 ### Fixed
 
 - Registered SteamVR driver upgrades and removal now preserve modified or unmanaged files; verified ownership metadata and atomic package replacement protect installation changes.
-
 - Installation and runtime dependencies on a developer's checkout and CPU topology.
 - First-time headset registration without an existing alignment file.
 - Concurrent alignment writes, stale controller inputs, and SIGPIPE on driver control sends.
