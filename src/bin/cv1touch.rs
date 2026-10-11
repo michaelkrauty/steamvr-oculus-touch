@@ -1652,7 +1652,7 @@ impl CalStep {
             CalStep::Rest => "Let go of both triggers, grips and sticks.",
             CalStep::Triggers => "Pull both triggers all the way and hold them.",
             CalStep::Grips => "Let go of the triggers and squeeze both grips fully.",
-            CalStep::Sticks => "Let go of the grips and circle both sticks around their outer edges until the double buzz.",
+            CalStep::Sticks => "Let go of the grips and circle both sticks around their outer edges until the double beep.",
         }
     }
 }
@@ -1719,7 +1719,7 @@ fn input_gate(step: CalStep) -> Result<(), String> {
     }
 }
 
-/// `pulses` short buzzes on both controllers, with as many beeps: one starts a timed step, two
+/// `pulses` short buzzes from both controllers and as many beeps from the speakers: one starts a timed step, two
 /// end it. Best effort: a missed cue does not stop anything.
 fn cue(pulses: usize) {
     for pulse in 0..pulses {
@@ -1954,7 +1954,7 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
 }
 
 /// `guided`: the setup guide's version: each step records as soon as both hands are in position,
-/// with buzzes instead of Enter, and nothing printed but the steps.
+/// with buzzes and beeps instead of Enter, and nothing printed but the steps.
 fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
     match calibrate_inputs_result(out, reset, guided) {
         Ok(()) => 0,

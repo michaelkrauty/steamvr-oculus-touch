@@ -607,7 +607,7 @@ fn timed_capture(
     let rec = capture_path(stage, checkpoint)?;
     let mut guard = guided_start_recording(&rec, false)?;
     let result = if gravity {
-        human_action("Hold both controllers still in 12 different orientations: tilt AND roll them between holds, rings visible.\nFor each one: hold still, press A (or Enter), and keep still until the double buzz (3 s).");
+        human_action("Hold both controllers still in 12 different orientations: tilt AND roll them between holds, rings visible.\nFor each one: hold still, press A (or Enter), and keep still until the double beep (3 s).");
         (1..=12).try_for_each(|hold| -> Result<(), String> {
             go_signal(&format!(
                 "  Hold {hold}/12: still, in a new orientation, then A."
@@ -935,10 +935,16 @@ impl ButtonEdges {
     }
 }
 
-const REGISTRATION_PREPARATION: &str = "Put on the headset (SteamVR running, headset tracking).
-Press both controllers firmly against it, rings and the headset's sensors uncovered.
-The fit measures where they sit on the headset, so don't let them slip.
-Press A to start: 10 pulses to get in position, then a double buzz starts the recording.";
+const REGISTRATION_PREPARATION: &str =
+    "Headset alignment: wearing the headset, you hold the controllers against it and move your
+head for about a minute. Read all of this now; you won't see the screen with the headset on.
+  1. Put on the headset (SteamVR running).
+  2. Hold one controller firmly against each side of the headset, rings and the headset's
+     sensors uncovered. Don't let them slip: the fit measures where they sit on the headset.
+  3. Press A, then keep still through 10 buzzes.
+  4. After the double buzz, turn around slowly in place, two full turns each way,
+     then nod and tilt your head a few times.
+  5. Press A to finish (B cancels). It also stops by itself after 150 s, with a long buzz.";
 
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
@@ -1106,7 +1112,7 @@ fn confirm_registration_controls_with(
         human_action(&format!("  Press {name}."));
         press(hand, button, name)?;
         buzz(hand)?;
-        human_action(&format!("  Felt a buzz? Press {key} again."));
+        human_action(&format!("  Felt the buzz? Press {key} again."));
         press(hand, button, name)?;
     }
     Ok(())
@@ -1118,7 +1124,7 @@ fn registration_countdown_with(
 ) -> Result<(), String> {
     let result = (|| {
         for remaining in (1..=10).rev() {
-            print!("\r  getting in position: {remaining:>2} s ");
+            print!("\r  hold still: {remaining:>2} s ");
             let _ = io::stdout().flush();
             tick(HAND_LEFT)?;
             tick(HAND_RIGHT)?;
@@ -1747,6 +1753,27 @@ mod tests {
         raw.hands[0].received_host_ns -= 1;
         assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
     }
+    #[test]
+    fn headset_instructions_say_everything_before_the_headset_goes_on() {
+        // once the headset is on the screen is out of sight: what to hold, when, how to move,
+        // how long and how to finish must all be read beforehand
+        for needed in [
+            "won't see the screen",
+            "against each side",
+            "keep still through 10 buzzes",
+            "After the double buzz",
+            "two full turns each way",
+            "nod and tilt",
+            "Press A to finish",
+            "B cancels",
+            "150 s",
+        ] {
+            assert!(REGISTRATION_PREPARATION.contains(needed), "{needed}");
+        }
+        // its cues are the controllers' haptics: buzzes; beeps are the speakers
+        assert!(!REGISTRATION_PREPARATION.contains("beep"));
+    }
+
     #[test]
     fn readiness_lines_only_on_a_dropout_and_the_recovery() {
         let name = "A on the right controller";
