@@ -234,6 +234,24 @@ def install(args):
                 expected = previous["files"].get(relative)
                 if not expected or destination.is_symlink() or digest(destination) != expected:
                     raise RuntimeError(f"refusing to replace an unmanaged or modified file: {destination}")
+        # Validate the registered copy before committing any prefix/service changes. Legacy
+        # adoption must compare against the trusted OLD source assets, not the upgrade payload.
+        legacy_args = []
+        if not args.no_steamvr:
+            old_assets = ("lib/cv1touch/driver_cv1touch.so", "lib/cv1touch/driver.vrdrivermanifest")
+            if all(relative in previous["files"] for relative in old_assets):
+                snapshots = []
+                for index, relative in enumerate(old_assets):
+                    old = owned_destination(prefix, relative)
+                    if not old.is_file() or old.is_symlink() or digest(old) != previous["files"][relative]:
+                        raise RuntimeError(f"untrusted previous driver asset: {old}")
+                    snapshot = Path(temporary) / f"previous-driver-{index}"
+                    shutil.copy2(old, snapshot)
+                    snapshots.append(str(snapshot))
+                legacy_args = ["--legacy-assets", *snapshots]
+            check_env = dict(os.environ)
+            check_env["LD_LIBRARY_PATH"] = str(bundle) + (":" + check_env["LD_LIBRARY_PATH"] if check_env.get("LD_LIBRARY_PATH") else "")
+            run([bundle / "cv1touch", "steamvr", "check", *legacy_args], env=check_env)
         managed = {relative: digest(source) for relative, source in sources.items()}
         replacements = {owned_destination(prefix, relative): source for relative, source in sources.items()}
         if not args.no_service:
@@ -250,10 +268,10 @@ def install(args):
         replacements[manifest_path(prefix)] = manifest
         prefix.mkdir(parents=True, exist_ok=True)
         replace_transaction(prefix, replacements)
-    if not args.no_steamvr:
-        run([prefix / "bin/cv1touch", "steamvr", "install"])
-        record["steamvr"] = True
-        write_manifest(prefix, record)
+        if not args.no_steamvr:
+            run([prefix / "bin/cv1touch", "steamvr", "install", *legacy_args])
+            record["steamvr"] = True
+            write_manifest(prefix, record)
     if not args.no_service:
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", "--now", "cv1touchd.service"])

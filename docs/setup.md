@@ -2,7 +2,7 @@
 
 ## Build dependencies
 
-The supported build target is Linux x86-64. Rust 1.85 or newer and Cargo are required; install a stable toolchain using [the official Rust instructions](https://www.rust-lang.org/tools/install) if your distribution packages are older. The OpenVR headers and modified OpenHMD sources are vendored; the build does not need a system OpenVR SDK. Native dependencies are dynamically linked, so build on the distribution where you will run it.
+The supported build target is Linux x86-64. Rust 1.85 or newer, Cargo, Meson 1.3 or newer, and Python 3.9 or newer are required; install a stable toolchain using [the official Rust instructions](https://www.rust-lang.org/tools/install) if your distribution packages are older. The OpenVR headers and modified OpenHMD sources are vendored; the build does not need a system OpenVR SDK. Native dependencies are dynamically linked, so build on the distribution where you will run it.
 
 On Debian/Ubuntu with a suitable Rust toolchain:
 
@@ -16,7 +16,7 @@ On Arch Linux:
 sudo pacman -S --needed base-devel rust meson ninja clang hidapi libusb opencv libjpeg-turbo pipewire glib2 gstreamer gst-plugins-base python procps-ng
 ```
 
-Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.
+Hosted CI builds on Ubuntu 24.04; this identifies the build environment, not a SteamVR runtime compatibility guarantee. Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.
 
 ## Device access
 
@@ -42,7 +42,7 @@ Quit SteamVR, then run `python3 scripts/install.py` from the clone. It installs:
 | `$XDG_DATA_HOME/cv1touch/steamvr/cv1touch` | Driver registered with SteamVR; defaults to `~/.local/share` |
 | `$XDG_CONFIG_HOME/systemd/user/cv1touchd.service` | User service; defaults to `~/.config` |
 
-The installer refuses to overwrite unmanaged or modified installed files. For a manual deployment, use `--no-service` and/or `--no-steamvr`; `--prefix PATH` changes the binary/library installation prefix. `--no-build` reuses a release build, `--target-dir PATH` selects its Cargo output, and `--artifacts DIR` installs a prepared bundle. Run `python3 scripts/install.py --help` for all options.
+The installer refuses to overwrite unmanaged or modified installed files, including the registered SteamVR driver package. Driver ownership is recorded with SHA-256 hashes; a legacy package without ownership metadata is adopted only when both files exactly match the trusted previous installation. Existing driver conflicts are checked before the installer replaces prefix files; back up local changes and remove the conflicting package manually before retrying. For a manual deployment, use `--no-service` and/or `--no-steamvr`; `--prefix PATH` changes the binary/library installation prefix. `--no-build` reuses a release build, `--target-dir PATH` selects its Cargo output, and `--artifacts DIR` installs a prepared bundle. Run `python3 scripts/install.py --help` for all options. `cv1touch steamvr check` checks registered-driver ownership without changing files or registration.
 
 SteamVR is discovered from its OpenVR path registry and common native Steam paths. Set `CV1TOUCH_STEAMVR` to the SteamVR runtime directory if needed, and `CV1TOUCH_STEAM_ROOT` to the Steam directory containing `config/steamvr.vrsettings` if discovery is ambiguous. Export these for installation and CLI commands; add them to a systemd user-service override when the daemon needs custom paths.
 

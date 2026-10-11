@@ -162,6 +162,31 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.prefix / "bin/cv1touch").read_bytes(), b"upgraded-cli")
         self.assertEqual((self.prefix / "bin/cv1touchd").read_bytes(), b"upgraded-daemon")
 
+    def test_driver_preflight_failure_precedes_prefix_changes(self):
+        args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=False)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(INSTALLER, "run", side_effect=RuntimeError("modified registered driver")) as run:
+            with self.assertRaisesRegex(RuntimeError, "modified registered driver"):
+                INSTALLER.install(args)
+        self.assertEqual(run.call_args.args[0][1:3], ["steamvr", "check"])
+        self.assertFalse((self.prefix / "bin/cv1touch").exists())
+        self.assertFalse((self.prefix / "lib/cv1touch/install-manifest.json").exists())
+
+    def test_driver_upgrade_uses_trusted_old_assets_for_preflight_and_install(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        old_driver = (self.prefix / "lib/cv1touch/driver_cv1touch.so").read_bytes()
+        (self.bundle / "driver_cv1touch.so").write_bytes(b"new driver")
+        args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=False)
+        observed = []
+        def capture(command, **kwargs):
+            observed.append(command)
+            self.assertEqual(command[2], "check" if len(observed) == 1 else "install")
+            self.assertEqual(command[3], "--legacy-assets")
+            self.assertEqual(Path(command[4]).read_bytes(), old_driver)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(INSTALLER, "run", side_effect=capture):
+            INSTALLER.install(args)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual((self.prefix / "lib/cv1touch/driver_cv1touch.so").read_bytes(), b"new driver")
+
     def test_prepared_bundle_requires_notices_without_source_fallback(self):
         args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=True)
         with mock.patch.object(INSTALLER, "ROOT", self.root / "missing-source"):

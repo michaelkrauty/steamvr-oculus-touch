@@ -30,7 +30,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
          cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
          cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
-         cv1touch fit-render [REC]\n  cv1touch steamvr install|uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
+         cv1touch fit-render [REC]\n  cv1touch steamvr install|check [--legacy-assets SO MANIFEST] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
          cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
          cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
          cv1touch register --follow BASE --reference SERIAL|hmd [--write] | register --stations REC [--write | --out PATH]\n  \
@@ -1043,7 +1043,23 @@ fn vrserver_running() -> Result<bool, String> {
     }
 }
 
-fn steamvr_install() -> i32 {
+fn steamvr_check(legacy: Option<(&Path, &Path)>) -> i32 {
+    let assets = steamvr::driver_assets().ok();
+    let legacy = legacy.or_else(|| {
+        assets
+            .as_ref()
+            .map(|(so, manifest)| (so.as_path(), manifest.as_path()))
+    });
+    match steamvr::check_driver(&steamvr::driver_dir(), legacy) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("cv1touch: {e}");
+            1
+        }
+    }
+}
+
+fn steamvr_install(legacy: Option<(&Path, &Path)>) -> i32 {
     match vrserver_running() {
         Ok(false) => {}
         Ok(true) => {
@@ -1083,8 +1099,10 @@ fn steamvr_install() -> i32 {
             return 1;
         }
     };
-    if let Err(e) = steamvr::assemble(&so, &manifest, &dir) {
-        eprintln!("cv1touch: {e} (build first: cargo build --release)");
+    if let Err(e) =
+        steamvr::assemble_with_legacy(&so, &manifest, &dir, legacy.or(Some((&so, &manifest))))
+    {
+        eprintln!("cv1touch: {e}");
         return 1;
     }
     println!("driver files in {}", dir.display());
@@ -1125,6 +1143,9 @@ fn steamvr_install() -> i32 {
 }
 
 fn steamvr_uninstall() -> i32 {
+    if steamvr_check(None) != 0 {
+        return 1;
+    }
     match Command::new(steamvr::vrpathreg())
         .arg("removedriver")
         .arg(steamvr::driver_dir())
@@ -4832,7 +4853,10 @@ fn main() {
         ["register", "--stations", rec, "--out", out] => register_stations(Path::new(rec), true, Some(Path::new(out))),
         ["register", "--solve", file] => register_solve_file(Path::new(file), false),
         ["register", "--solve", file, "--force"] => register_solve_file(Path::new(file), true),
-        ["steamvr", "install"] => steamvr_install(),
+        ["steamvr", "install"] => steamvr_install(None),
+        ["steamvr", "install", "--legacy-assets", so, manifest] => steamvr_install(Some((Path::new(so), Path::new(manifest)))),
+        ["steamvr", "check"] => steamvr_check(None),
+        ["steamvr", "check", "--legacy-assets", so, manifest] => steamvr_check(Some((Path::new(so), Path::new(manifest)))),
         ["steamvr", "uninstall"] => steamvr_uninstall(),
         ["eval-capture"] => eval_capture(),
         ["input-test"] => input_test(),

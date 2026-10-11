@@ -21,6 +21,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- Registered SteamVR driver upgrades and removal now preserve modified or unmanaged files; verified ownership metadata and atomic package replacement protect installation changes.
+
 - Installation and runtime dependencies on a developer's checkout and CPU topology.
 - First-time headset registration without an existing alignment file.
 - Concurrent alignment writes, stale controller inputs, and SIGPIPE on driver control sends.
