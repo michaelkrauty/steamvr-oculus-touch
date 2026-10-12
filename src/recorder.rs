@@ -689,10 +689,12 @@ mod tests {
     #[test]
     fn start_errors() {
         let r = Recorder::new(1 << 16);
-        let err = r
-            .start(Path::new("/nonexistent-cv1t-dir/x.rec"), 1)
-            .unwrap_err();
-        assert!(err.contains("No such file"), "{err}");
+        let missing = std::env::temp_dir()
+            .join("nonexistent-cv1t-dir")
+            .join("x.rec");
+        let err = r.start(&missing, 1).unwrap_err();
+        let not_found = std::fs::File::open(&missing).unwrap_err().to_string();
+        assert!(err.contains(&not_found), "{err}");
         assert!(!r.active());
         r.write(RAW_REPORT, 1, &[&0u32.to_le_bytes()]);
         assert_eq!(r.stats().records, 0);

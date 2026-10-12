@@ -336,28 +336,33 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::thread;
 
+    /// An absolute directory on this platform; `C:/` needs no escaping in the JSON-quoted form.
+    const TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
     /// Review Focus 5: values the engine would silently mangle must be rejected.
     #[test]
     fn scoped_stop_quotes_paths_and_rejects_malformed_arguments() {
-        let path = Path::new("/tmp/a \"quoted\" \\name\nframes.rec");
+        let path = &PathBuf::from(format!("{TMP}/a \"quoted\" \\name\nframes.rec"));
         let line = record_stop_if_line(path).unwrap();
         assert!(!line.contains('\n'));
         assert_eq!(parse(&line), Ok(Command::RecordStopIf(path.to_path_buf())));
         for line in [
-            "record stop-if",
-            "record stop-if relative.rec",
-            "record stop-if \"/tmp/unterminated",
-            "record stop-if \"/tmp/a\"frames",
-            "record stop-if \"/tmp/a\" frames",
-            "record stop-if \"/tmp/a\\u0000b\"",
+            "record stop-if".to_string(),
+            "record stop-if relative.rec".to_string(),
+            format!("record stop-if \"{TMP}/unterminated"),
+            format!("record stop-if \"{TMP}/a\"frames"),
+            format!("record stop-if \"{TMP}/a\" frames"),
+            format!("record stop-if \"{TMP}/a\\u0000b\""),
         ] {
-            assert!(parse(line).is_err(), "{line}");
+            assert!(parse(&line).is_err(), "{line}");
         }
     }
 
     #[test]
     fn quoted_paths_round_trip_spaces_quotes_newlines_and_frames() {
-        let path = Path::new("/tmp/state with spaces/a \"quoted\" \\name\nframes.rec");
+        let path = &PathBuf::from(format!(
+            "{TMP}/state with spaces/a \"quoted\" \\name\nframes.rec"
+        ));
         for frames in [false, true] {
             let line = record_start_line(path, frames).unwrap();
             assert!(!line.contains('\n'), "request must stay one wire line");
@@ -372,30 +377,47 @@ mod tests {
             Command::CalibrationLoad(path.to_path_buf())
         );
         assert_eq!(
-            parse("record start \"/tmp/file frames\"").unwrap(),
-            Command::RecordStart(PathBuf::from("/tmp/file frames"), false)
+            parse(&format!("record start \"{TMP}/file frames\"")).unwrap(),
+            Command::RecordStart(PathBuf::from(format!("{TMP}/file frames")), false)
         );
     }
 
     #[test]
     fn quoted_path_syntax_rejects_invalid_or_trailing_input() {
         for line in [
-            "record start \"/tmp/unterminated",
-            "record start \"/tmp/a\"frames",
-            "record start \"/tmp/a\" trailing",
-            "record start \"/tmp/a\" frames trailing",
-            "calibration load \"/tmp/a\" frames",
-            "calibration load \"relative\"",
-            "record start \"/tmp/a\\u0000b\"",
-            "record start",
-            "calibration load",
+            format!("record start \"{TMP}/unterminated"),
+            format!("record start \"{TMP}/a\"frames"),
+            format!("record start \"{TMP}/a\" trailing"),
+            format!("record start \"{TMP}/a\" frames trailing"),
+            format!("calibration load \"{TMP}/a\" frames"),
+            "calibration load \"relative\"".to_string(),
+            format!("record start \"{TMP}/a\\u0000b\""),
+            "record start".to_string(),
+            "calibration load".to_string(),
         ] {
-            assert!(parse(line).is_err(), "{line}");
+            assert!(parse(&line).is_err(), "{line}");
         }
         assert_eq!(
-            parse("  record\tstart\t/tmp/legacy.rec frames  ").unwrap(),
-            Command::RecordStart(PathBuf::from("/tmp/legacy.rec"), true)
+            parse(&format!("  record\tstart\t{TMP}/legacy.rec frames  ")).unwrap(),
+            Command::RecordStart(PathBuf::from(format!("{TMP}/legacy.rec")), true)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_windows_paths_round_trip() {
+        let path = Path::new(r"C:\Users\someone\cv1touch state\a.rec");
+        let line = record_start_line(path, true).unwrap();
+        assert_eq!(
+            parse(&line).unwrap(),
+            Command::RecordStart(path.to_path_buf(), true)
+        );
+        assert_eq!(
+            parse(r"record start C:\Users\someone\a.rec").unwrap(),
+            Command::RecordStart(PathBuf::from(r"C:\Users\someone\a.rec"), false)
+        );
+        // Rooted but driveless: relative to the current drive, so not absolute.
+        assert!(parse(r"record start \Users\a.rec").is_err());
     }
 
     #[test]
@@ -581,12 +603,18 @@ mod tests {
         assert!(parse("status now").is_err());
         assert_eq!(parse("record stop"), Ok(Command::RecordStop));
         assert_eq!(
-            parse("record start /tmp/a.rec"),
-            Ok(Command::RecordStart(PathBuf::from("/tmp/a.rec"), false))
+            parse(&format!("record start {TMP}/a.rec")),
+            Ok(Command::RecordStart(
+                PathBuf::from(format!("{TMP}/a.rec")),
+                false
+            ))
         );
         assert_eq!(
-            parse("record start /tmp/a.rec frames"),
-            Ok(Command::RecordStart(PathBuf::from("/tmp/a.rec"), true))
+            parse(&format!("record start {TMP}/a.rec frames")),
+            Ok(Command::RecordStart(
+                PathBuf::from(format!("{TMP}/a.rec")),
+                true
+            ))
         );
         assert!(parse("record start relative.rec")
             .unwrap_err()
@@ -602,7 +630,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cv1t-lock-test-{}", std::process::id()));
         let first = lock_single_instance(&path).unwrap();
         let err = lock_single_instance(&path).unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EWOULDBLOCK));
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(first);
         let again = lock_single_instance(&path).unwrap();
         drop(again);
@@ -638,10 +666,12 @@ mod tests {
             Ok(Command::CalibrationProvisional)
         );
         assert_eq!(
-            parse("calibration load /tmp/cv1touch-test/.config/cv1touch/calibration.json"),
-            Ok(Command::CalibrationLoad(PathBuf::from(
-                "/tmp/cv1touch-test/.config/cv1touch/calibration.json"
-            )))
+            parse(&format!(
+                "calibration load {TMP}/cv1touch-test/.config/cv1touch/calibration.json"
+            )),
+            Ok(Command::CalibrationLoad(PathBuf::from(format!(
+                "{TMP}/cv1touch-test/.config/cv1touch/calibration.json"
+            ))))
         );
         assert!(parse("calibration load relative.json")
             .unwrap_err()
