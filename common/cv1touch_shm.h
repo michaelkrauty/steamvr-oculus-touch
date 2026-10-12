@@ -9,13 +9,17 @@
 #define CV1TOUCH_SHM_H
 
 #include <limits.h>
-#include <linux/futex.h>
 #include <stddef.h>
 #include <stdint.h>
+/* Rust's bindings need only the types: CV1T_SHM_TYPES_ONLY leaves out the platform headers and the
+ * inline helpers, so they generate for any target. */
+#ifndef CV1T_SHM_TYPES_ONLY
+#include <linux/futex.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 #define CV1T_SHM_NAME "/cv1touch"
 #define CV1T_SHM_MAGIC 0x54315643u /* "CV1T" little-endian */
@@ -157,6 +161,7 @@ CV1T_STATIC_ASSERT(sizeof(cv1t_shm) == 1328, "cv1t_shm ABI");
  * - Gate all controller inputs and pose use on CV1T_FLAG_CONNECTED (and position on CV1T_FLAG_POSITION).
  */
 
+#ifndef CV1T_SHM_TYPES_ONLY
 /* ---- Inline reader helpers for C/C++ consumers (the Rust side implements its own in src/shm.rs) ---- */
 
 static inline uint64_t cv1t_now_ns(void)
@@ -198,5 +203,6 @@ static inline uint32_t cv1t_shm_wait(const cv1t_shm *shm, uint32_t last_seen, in
 	syscall(SYS_futex, (uint32_t *)&shm->update_futex, FUTEX_WAIT, last_seen, &ts, NULL, 0);
 	return __atomic_load_n(&shm->update_futex, __ATOMIC_ACQUIRE);
 }
+#endif /* CV1T_SHM_TYPES_ONLY */
 
 #endif

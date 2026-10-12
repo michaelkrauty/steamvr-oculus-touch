@@ -4,12 +4,17 @@
 //! Safe wrapper over the vendored OpenHMD engine. Not Send: create and use it on one thread
 //! (OpenHMD does no locking with its auto-update thread disabled).
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int};
+#[cfg(feature = "engine")]
+use std::ffi::{c_void, CStr};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "engine")]
 use std::ptr;
+#[cfg(feature = "engine")]
 use std::sync::Arc;
 
 use crate::ffi;
+#[cfg(feature = "engine")]
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
 
 pub use ffi::ohmd_cv1touch_blob as Blob;
@@ -128,6 +133,7 @@ pub trait EngineSink: Send + Sync {
     }
 }
 
+#[cfg(feature = "engine")]
 pub struct Engine {
     ctx: *mut ffi::ohmd_context,
     hands: [*mut ffi::ohmd_device; 2],
@@ -135,6 +141,7 @@ pub struct Engine {
     sink: *mut Arc<dyn EngineSink>,
 }
 
+#[cfg(feature = "engine")]
 unsafe extern "C" fn frame_cb(
     user: *mut c_void,
     info: *const FrameInfo,
@@ -153,6 +160,7 @@ unsafe extern "C" fn frame_cb(
     sink.frame(&*info, blobs);
 }
 
+#[cfg(feature = "engine")]
 unsafe extern "C" fn image_cb(
     user: *mut c_void,
     info: *const FrameInfo,
@@ -169,6 +177,7 @@ unsafe extern "C" fn image_cb(
     sink.image(&*info, width as usize, height as usize, stride as usize, px);
 }
 
+#[cfg(feature = "engine")]
 unsafe extern "C" fn report_cb(
     user: *mut c_void,
     source: c_int,
@@ -199,6 +208,7 @@ pub fn sensor_serial(s: &Sensor) -> String {
     cstr_field(&s.serial)
 }
 
+#[cfg(feature = "engine")]
 impl Engine {
     /// Probes and opens both Touch controllers with OpenHMD's auto-update thread disabled.
     pub fn open(opts: &EngineOptions, sink: Arc<dyn EngineSink>) -> Result<Engine, String> {
@@ -356,6 +366,7 @@ impl Engine {
     }
 }
 
+#[cfg(feature = "engine")]
 impl Drop for Engine {
     fn drop(&mut self) {
         // SAFETY: we own the context; destroying it stops all engine threads before the sink is freed.
@@ -371,6 +382,7 @@ impl Drop for Engine {
     }
 }
 
+#[cfg(feature = "engine")]
 /// Decodes radio reports the radio thread reads through a hidraw handle of its own, on its own copy
 /// of each controller's state (`ohmd_cv1touch_radio_decode`): it never waits on the engine. Its
 /// samples' device times run on its own clocks. It points into the engine's headset, so it must be
@@ -379,8 +391,10 @@ pub struct RadioDecoder(*mut ffi::ohmd_cv1touch_radio_decoder);
 
 // SAFETY: the decoder's state is its own; of the engine's it reads only each controller's
 // calibration, after a flag the engine sets once with release ordering.
+#[cfg(feature = "engine")]
 unsafe impl Send for RadioDecoder {}
 
+#[cfg(feature = "engine")]
 impl RadioDecoder {
     /// The calibrated controllers' samples (IMU, inputs, times) in one radio report received at
     /// `received_ns`: `out[..n]`.
@@ -409,17 +423,19 @@ impl RadioDecoder {
 }
 
 /// The engine's device mask for hands (bit 1 << OpenHMD device id; the headset, 0, never).
+#[cfg_attr(not(feature = "engine"), allow(dead_code))]
 fn search_skip_mask(hands: [bool; 2]) -> u32 {
     let mut mask = 0u32;
-    if hands[HAND_LEFT] {
+    if hands[crate::shm::HAND_LEFT] {
         mask |= 1 << crate::calib::DEVICE_LEFT;
     }
-    if hands[HAND_RIGHT] {
+    if hands[crate::shm::HAND_RIGHT] {
         mask |= 1 << crate::calib::DEVICE_RIGHT;
     }
     mask
 }
 
+#[cfg(feature = "engine")]
 impl Drop for RadioDecoder {
     fn drop(&mut self) {
         // SAFETY: made by ohmd_cv1touch_radio_decoder_new, freed once.

@@ -104,7 +104,10 @@ pub fn driver_assets() -> Result<(PathBuf, PathBuf), String> {
             dir.display()
         ));
     }
-    let native = PathBuf::from(env!("CV1TOUCH_NATIVE_DIR"));
+    let native = PathBuf::from(
+        option_env!("CV1TOUCH_NATIVE_DIR")
+            .ok_or("this build has no native driver; build with the engine feature")?,
+    );
     let so = native.join("driver/driver_cv1touch.so");
     let manifest =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("driver/cv1touch/driver.vrdrivermanifest");

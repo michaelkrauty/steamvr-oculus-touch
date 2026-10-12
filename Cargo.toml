@@ -9,6 +9,22 @@ repository = "https://github.com/michaelkrauty/steamvr-oculus-touch"
 readme = "README.md"
 description = "SteamVR Oculus Touch: Rift CV1 controller tracking daemon and tools"
 
+[features]
+default = ["engine"]
+# The native acquisition engine (OpenHMD, OpenCV): built and linked by build.rs. Without it the
+# library's tracking, calibration and protocol code still builds and tests on any platform.
+engine = []
+
+[[bin]]
+name = "cv1touch"
+path = "src/bin/cv1touch.rs"
+required-features = ["engine"]
+
+[[bin]]
+name = "cv1touchd"
+path = "src/bin/cv1touchd.rs"
+required-features = ["engine"]
+
 [dependencies]
 libc = "0.2"
 nalgebra = "0.33"
