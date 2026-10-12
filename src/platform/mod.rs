@@ -256,6 +256,71 @@ pub mod dirs {
     }
 }
 
+pub mod hid {
+    //! The headset's HID interfaces (Rift CV1 2833:0031): input reports, one per read with the
+    //! report ID first. hidraw on Linux, the HID class driver on Windows; both let the engine and
+    //! this process each read every report.
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::os;
+
+    /// Interrupts a `Device::wait` from another thread.
+    pub struct Waker(pub(super) os::Waker);
+
+    impl Waker {
+        pub fn new() -> io::Result<Waker> {
+            os::Waker::new().map(Waker)
+        }
+
+        pub fn wake(&self) {
+            self.0.wake()
+        }
+    }
+
+    /// What ended a wait (both may be false: the timeout).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Woke {
+        pub report: bool,
+        pub waker: bool,
+    }
+
+    pub struct Device(pub(super) os::HidDevice);
+
+    impl Device {
+        /// Opens an interface for reading. Reads never block.
+        pub fn open(path: &Path) -> io::Result<Device> {
+            os::HidDevice::open(path).map(Device)
+        }
+
+        /// Waits until a report is ready, `waker` fires, or `timeout` (None: no limit) passes.
+        pub fn wait(&mut self, waker: &Waker, timeout: Option<Duration>) -> io::Result<Woke> {
+            self.0.wait(&waker.0, timeout)
+        }
+
+        /// The next report already received into `buf` (its length), or None when none is
+        /// waiting. An error means the device is gone.
+        pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+            self.0.try_read(buf)
+        }
+    }
+
+    /// The headset's HID interface `interface`, if connected: 0 carries the headset's own
+    /// reports and the radio commands, 1 the radio's messages.
+    pub fn headset_interface(interface: u8) -> Option<PathBuf> {
+        os::headset_interface(interface)
+    }
+
+    /// Whether a Windows HID device path is the headset's interface `interface`
+    /// (\\?\hid#vid_2833&pid_0031&mi_01#...).
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(crate) fn is_headset_path(path: &str, interface: u8) -> bool {
+        let path = path.to_ascii_lowercase();
+        path.contains("vid_2833&pid_0031") && path.contains(&format!("&mi_{interface:02}"))
+    }
+}
+
 pub mod ipc {
     //! The control channel: one stream per request, private to this user (a Unix-domain socket on
     //! Linux, a named pipe on Windows), and the lock that keeps one daemon per user.
@@ -589,6 +654,76 @@ mod tests {
         for odd in [env(&[]), env(&[("LOCALAPPDATA", r"AppData\Local")])] {
             assert_eq!(resolve(&odd).config_home, std::env::temp_dir());
         }
+    }
+
+    #[test]
+    fn a_hid_wait_ends_on_a_report_a_waker_or_the_timeout() {
+        use super::hid::{Waker, Woke};
+        use std::time::{Duration, Instant};
+        // reports arrive one per read, as from the HID interfaces: a SOCK_SEQPACKET pair on Linux,
+        // a message-mode named pipe on Windows; dropping the sender is the device going away
+        let (device, sender) = super::os::fake_hid();
+        let (mut device, mut sender) = (super::hid::Device(device), Some(sender));
+        let waker = std::sync::Arc::new(Waker::new().unwrap());
+        let mut buf = [0u8; 64];
+
+        let before = Instant::now();
+        assert_eq!(
+            device
+                .wait(&waker, Some(Duration::from_millis(30)))
+                .unwrap(),
+            Woke::default()
+        );
+        assert!(before.elapsed() >= Duration::from_millis(20));
+        assert_eq!(device.try_read(&mut buf).unwrap(), None);
+
+        let remote = waker.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            remote.wake();
+        });
+        let before = Instant::now();
+        let woke = device.wait(&waker, Some(Duration::from_secs(5))).unwrap();
+        t.join().unwrap();
+        assert!(woke.waker && !woke.report, "{woke:?}");
+        assert!(before.elapsed() < Duration::from_secs(2));
+
+        super::os::fake_hid_send(sender.as_mut().unwrap(), &[0x0c, 1, 2, 3]);
+        super::os::fake_hid_send(sender.as_mut().unwrap(), &[0x0c, 4, 5]);
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while got.len() < 2 && Instant::now() < deadline {
+            device
+                .wait(&waker, Some(Duration::from_millis(100)))
+                .unwrap();
+            while let Some(n) = device.try_read(&mut buf).unwrap() {
+                got.push(buf[..n].to_vec());
+            }
+        }
+        assert_eq!(got, [vec![0x0c, 1, 2, 3], vec![0x0c, 4, 5]]);
+
+        sender = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let gone = loop {
+            device
+                .wait(&waker, Some(Duration::from_millis(100)))
+                .unwrap();
+            match device.try_read(&mut buf) {
+                Err(e) => break e,
+                Ok(_) => assert!(Instant::now() < deadline, "the unplug went unnoticed"),
+            }
+        };
+        let _ = (gone, sender);
+    }
+
+    #[test]
+    fn the_headset_interfaces_are_found_by_path() {
+        use super::hid::is_headset_path;
+        let radio = r"\\?\hid#vid_2833&pid_0031&mi_01#8&2b1a3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert!(is_headset_path(radio, 1));
+        assert!(!is_headset_path(radio, 0));
+        assert!(is_headset_path(&radio.to_ascii_uppercase(), 1));
+        assert!(!is_headset_path(r"\\?\hid#vid_2833&pid_0211&mi_01#...", 1));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::mem;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{Hand, HandConfig};
+use cv1touch::platform::hid;
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
@@ -176,9 +177,9 @@ struct Daemon {
     extra_latency_ns: std::sync::atomic::AtomicI64,
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
-    /// Wakes the radio thread (an eventfd): new camera frames or bodies, or time to stop. It lives as
-    /// long as the daemon, so a sensor thread never writes to a closed (or reused) descriptor.
-    radio_wake: std::os::fd::OwnedFd,
+    /// Wakes the radio thread: new camera frames or bodies, or time to stop. It lives as long as
+    /// the daemon, so a sensor thread never signals a closed (or reused) handle.
+    radio_wake: hid::Waker,
     /// The radio thread runs: it records the radio's reports (stamped as they land), not the engine.
     radio_on: AtomicBool,
     /// Input injection for automated tests.
@@ -188,15 +189,7 @@ struct Daemon {
 
 impl Daemon {
     fn wake_radio(&self) {
-        let one = 1u64;
-        // SAFETY: an eventfd takes one u64; a full counter (never, in practice) just drops the wake.
-        unsafe {
-            libc::write(
-                self.radio_wake.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            )
-        };
+        self.radio_wake.wake();
     }
 }
 
@@ -751,11 +744,11 @@ fn engine_main(d: Arc<Daemon>) {
         // the radio thread holds a decoder pointing into the engine: the scope joins it first
         thread::scope(|scope| {
             let radio = new_pipeline(&d, &opts, &e).and_then(|pipe| {
-                let Some(path) = engine::radio_hidraw(std::path::Path::new("/sys/class/hidraw")) else {
-                    log("no hidraw node for the headset's radio: publishing OpenHMD poses");
+                let Some(path) = hid::headset_interface(1) else {
+                    log("no HID interface for the headset's radio: publishing OpenHMD poses");
                     return None;
                 };
-                let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path) {
+                let file = match hid::Device::open(&path) {
                     Ok(f) => f,
                     Err(err) => {
                         log(format!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display()));
@@ -1091,10 +1084,10 @@ impl BodyFinder {
 
 /// How long the radio thread sleeps with nothing to do, ms: it keeps the hands' published state
 /// current (a controller set down stops sending) about this often.
-const RADIO_IDLE_WAKE_MS: i32 = 20;
+const RADIO_IDLE_WAKE_MS: u64 = 20;
 const RADIO_REFRESH_NS: u64 = 20_000_000;
 
-/// The radio thread: reads the radio through its own hidraw handle and publishes each controller
+/// The radio thread: reads the radio through its own HID handle and publishes each controller
 /// sample as it lands (the tracker's pose at it), and between reports feeds the tracker the camera
 /// frames one at a time, so a report waits for at most one frame. Runs SCHED_RR (`make_realtime`)
 /// with inherited affinity or the explicit `CV1TOUCH_CPUS` selection.
@@ -1102,7 +1095,7 @@ fn radio_main(
     d: &Daemon,
     link: &RadioLink,
     mut dec: engine::RadioDecoder,
-    radio: fs::File,
+    mut radio: hid::Device,
     mut pipe: Pipeline,
     mut watch: Option<LandmarkWatch>,
 ) {
@@ -1133,64 +1126,33 @@ fn radio_main(
     let mut search_skip = SearchSkip::default();
     let mut next_stats = 0u64;
     let mut buf = [0u8; 64];
-    let (radio_fd, wake_fd) = (radio.as_raw_fd(), d.radio_wake.as_raw_fd());
     let mut radio_failed = false;
     let mut rest = Rest::new();
     while !link.stop.load(Ordering::Acquire) && !radio_failed {
-        let mut fds = [
-            libc::pollfd {
-                fd: radio_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: wake_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: valid pollfd array.
-        unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                2,
-                if d.track_in.lock().unwrap().is_empty() {
-                    RADIO_IDLE_WAKE_MS
-                } else {
-                    0
-                },
-            )
+        let idle_ms = if d.track_in.lock().unwrap().is_empty() {
+            RADIO_IDLE_WAKE_MS
+        } else {
+            0
         };
+        // an interrupted wait just reads what is in
+        let _ = radio.wait(&d.radio_wake, Some(Duration::from_millis(idle_ms)));
         // every report that is in
         let mut arrived = [None; 2];
         let mut published = false;
         while !radio_failed {
-            // SAFETY: valid fd and buffer.
-            let n =
-                unsafe { libc::read(radio_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                let err = std::io::Error::last_os_error();
-                if n < 0
-                    && err.kind() == ErrorKind::WouldBlock
-                    && fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
-                {
+            let n = match radio.try_read(&mut buf) {
+                Ok(Some(n)) => n,
+                Ok(None) => break,
+                Err(err) => {
+                    // the headset gone (waiting on a dead device returns at once, which would
+                    // spin this thread): the engine reopens, with a new radio thread
+                    log(format!("radio read failed ({err}); reopening the engine"));
+                    radio_failed = true;
                     break;
                 }
-                // the headset gone (polling a dead node returns at once, which would spin this
-                // thread): the engine reopens, with a new radio thread
-                log(format!(
-                    "radio read failed ({}); reopening the engine",
-                    if n < 0 {
-                        err.to_string()
-                    } else {
-                        "end of file".into()
-                    }
-                ));
-                radio_failed = true;
-                break;
-            }
+            };
             let at = shm::now_ns();
-            let report = &buf[..n as usize];
+            let report = &buf[..n];
             if d.rec.active() {
                 d.rec
                     .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
@@ -1230,11 +1192,6 @@ fn radio_main(
         if published {
             d.shm.signal();
             holds.note(arrived, shm::now_ns());
-        }
-        if fds[1].revents & libc::POLLIN != 0 {
-            let mut v = 0u64;
-            // SAFETY: an eventfd reads as one u64.
-            unsafe { libc::read(wake_fd, &mut v as *mut u64 as *mut libc::c_void, 8) };
         }
         for b in link.bodies.lock().unwrap().drain(..) {
             pipe.body(b.device_id, b.leds.clone(), b.imu);
@@ -2140,17 +2097,6 @@ fn make_usb_thread_realtime() {
     }
 }
 
-fn eventfd() -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: plain syscall; the descriptor is owned from here on.
-    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a fresh descriptor nobody else owns.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-}
-
 /// Blocks SIGINT/SIGTERM (inherited by threads spawned afterwards) and returns a signalfd for them.
 fn block_signals() -> i32 {
     // SAFETY: plain signal-mask setup.
@@ -2481,7 +2427,7 @@ fn main() {
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
         ],
-        radio_wake: eventfd().expect("eventfd"),
+        radio_wake: hid::Waker::new().expect("radio waker"),
         radio_on: AtomicBool::new(false),
         inject: Injection::default(),
         inputs: Mutex::new(inputs),
@@ -2572,7 +2518,7 @@ mod tests {
                 std::sync::atomic::AtomicI32::new(-1),
                 std::sync::atomic::AtomicI32::new(-1),
             ],
-            radio_wake: eventfd().unwrap(),
+            radio_wake: hid::Waker::new().unwrap(),
             radio_on: AtomicBool::new(false),
             inject: Injection::default(),
             inputs: Mutex::new(Default::default()),

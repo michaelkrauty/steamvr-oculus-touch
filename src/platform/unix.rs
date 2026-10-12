@@ -419,9 +419,216 @@ impl Listener {
     }
 }
 
+pub struct Waker(std::os::fd::OwnedFd);
+
+impl Waker {
+    pub fn new() -> io::Result<Waker> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: no pointers; the descriptor is owned below.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        Ok(Waker(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    pub fn wake(&self) {
+        use std::os::fd::AsRawFd;
+        let one = 1u64;
+        // SAFETY: an eventfd takes one u64.
+        unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            )
+        };
+    }
+
+    fn drain(&self) {
+        use std::os::fd::AsRawFd;
+        let mut v = 0u64;
+        // SAFETY: an eventfd reads as one u64.
+        unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                &mut v as *mut u64 as *mut libc::c_void,
+                8,
+            )
+        };
+    }
+}
+
+/// A hidraw node, read without blocking.
+pub struct HidDevice {
+    file: File,
+    /// The last wait saw the node fail or hang up: a read with nothing left is the device gone.
+    hung_up: bool,
+}
+
+impl HidDevice {
+    pub fn open(path: &Path) -> io::Result<HidDevice> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(HidDevice {
+            file,
+            hung_up: false,
+        })
+    }
+
+    pub fn wait(
+        &mut self,
+        waker: &Waker,
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<crate::platform::hid::Woke> {
+        use std::os::fd::AsRawFd;
+        let mut fds = [
+            libc::pollfd {
+                fd: self.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: waker.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as libc::c_int);
+        // SAFETY: a valid pollfd array.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) } < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(Default::default())
+            } else {
+                Err(e)
+            };
+        }
+        self.hung_up = fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
+        let waker_fired = fds[1].revents & libc::POLLIN != 0;
+        if waker_fired {
+            waker.drain();
+        }
+        Ok(crate::platform::hid::Woke {
+            report: fds[0].revents & libc::POLLIN != 0,
+            waker: waker_fired,
+        })
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        use std::io::Read;
+        match self.file.read(buf) {
+            Ok(0) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "end of file")),
+            Ok(n) => Ok(Some(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && !self.hung_up => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the device hung up",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+pub fn headset_interface(interface: u8) -> Option<std::path::PathBuf> {
+    headset_hidraw(Path::new("/sys/class/hidraw"), interface)
+}
+
+/// The hidraw node of the headset's (Rift CV1 2833:0031) HID interface `interface` among the
+/// nodes under `sys_class_hidraw` (normally /sys/class/hidraw).
+fn headset_hidraw(sys_class_hidraw: &Path, interface: u8) -> Option<std::path::PathBuf> {
+    let mut names: Vec<String> = std::fs::read_dir(sys_class_hidraw)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let suffix = format!("/input{interface}");
+    names
+        .into_iter()
+        .find(|n| {
+            let Ok(uevent) =
+                std::fs::read_to_string(sys_class_hidraw.join(n).join("device/uevent"))
+            else {
+                return false;
+            };
+            uevent.lines().any(|l| l == "HID_ID=0003:00002833:00000031")
+                && uevent
+                    .lines()
+                    .any(|l| l.starts_with("HID_PHYS=") && l.ends_with(&suffix))
+        })
+        .map(|n| Path::new("/dev").join(n))
+}
+
+/// A device fed through a SOCK_SEQPACKET pair, which delivers one message per read as hidraw
+/// delivers one report.
+#[cfg(test)]
+pub fn fake_hid() -> (HidDevice, std::os::unix::net::UnixDatagram) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: a valid two-element array.
+    let ret = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    // SAFETY: fresh descriptors owned below.
+    let (device, sender) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    (
+        HidDevice {
+            file: File::from(device),
+            hung_up: false,
+        },
+        std::os::unix::net::UnixDatagram::from(sender),
+    )
+}
+
+#[cfg(test)]
+pub fn fake_hid_send(sender: &mut std::os::unix::net::UnixDatagram, report: &[u8]) {
+    assert_eq!(sender.send(report).unwrap(), report.len());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_headset_interfaces_among_the_hidraw_nodes() {
+        let sys = std::env::temp_dir().join(format!("cv1t-hidraw-{}", std::process::id()));
+        let node = |name: &str, uevent: &str| {
+            let dir = sys.join(name).join("device");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("uevent"), uevent).unwrap();
+        };
+        node(
+            "hidraw3",
+            "HID_ID=0003:0000046D:0000C262\nHID_PHYS=usb-0000:00:14.0-5/input1\n",
+        );
+        node("hidraw27", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input0\n");
+        node("hidraw26", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input1\n");
+        assert_eq!(
+            headset_hidraw(&sys, 1),
+            Some(std::path::PathBuf::from("/dev/hidraw26"))
+        );
+        assert_eq!(
+            headset_hidraw(&sys, 0),
+            Some(std::path::PathBuf::from("/dev/hidraw27"))
+        );
+        std::fs::remove_dir_all(sys.join("hidraw26")).unwrap();
+        assert_eq!(
+            headset_hidraw(&sys, 1),
+            None,
+            "the headset's other interface is not the radio"
+        );
+        std::fs::remove_dir_all(&sys).unwrap();
+    }
 
     #[test]
     fn ownership_directory_rejects_symlinks_and_shared_permissions() {

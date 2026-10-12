@@ -7,7 +7,6 @@
 use std::ffi::{c_char, c_int};
 #[cfg(feature = "engine")]
 use std::ffi::{c_void, CStr};
-use std::path::{Path, PathBuf};
 #[cfg(feature = "engine")]
 use std::ptr;
 #[cfg(feature = "engine")]
@@ -449,31 +448,6 @@ impl Drop for RadioDecoder {
     }
 }
 
-/// The hidraw node of the headset's radio interface (Rift CV1 2833:0031, interface 1) among the
-/// nodes under `sys_class_hidraw` (normally /sys/class/hidraw).
-pub fn radio_hidraw(sys_class_hidraw: &Path) -> Option<PathBuf> {
-    let mut names: Vec<String> = std::fs::read_dir(sys_class_hidraw)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-        .into_iter()
-        .find(|n| {
-            let Ok(uevent) =
-                std::fs::read_to_string(sys_class_hidraw.join(n).join("device/uevent"))
-            else {
-                return false;
-            };
-            uevent.lines().any(|l| l == "HID_ID=0003:00002833:00000031")
-                && uevent
-                    .lines()
-                    .any(|l| l.starts_with("HID_PHYS=") && l.ends_with("/input1"))
-        })
-        .map(|n| Path::new("/dev").join(n))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,33 +458,6 @@ mod tests {
         assert_eq!(search_skip_mask([true, false]), 1 << 2, "left is device 2");
         assert_eq!(search_skip_mask([false, true]), 1 << 1, "right is device 1");
         assert_eq!(search_skip_mask([true, true]), 0b110, "never the headset");
-    }
-
-    #[test]
-    fn finds_the_radio_interface_among_the_hidraw_nodes() {
-        let sys = std::env::temp_dir().join(format!("cv1t-hidraw-{}", std::process::id()));
-        let node = |name: &str, uevent: &str| {
-            let dir = sys.join(name).join("device");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("uevent"), uevent).unwrap();
-        };
-        node(
-            "hidraw3",
-            "HID_ID=0003:0000046D:0000C262\nHID_PHYS=usb-0000:00:14.0-5/input1\n",
-        );
-        node("hidraw27", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input0\n");
-        node("hidraw26", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input1\n");
-        assert_eq!(
-            radio_hidraw(&sys),
-            Some(std::path::PathBuf::from("/dev/hidraw26"))
-        );
-        std::fs::remove_dir_all(sys.join("hidraw26")).unwrap();
-        assert_eq!(
-            radio_hidraw(&sys),
-            None,
-            "the headset's other interface is not the radio"
-        );
-        std::fs::remove_dir_all(&sys).unwrap();
     }
 
     #[test]

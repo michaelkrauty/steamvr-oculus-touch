@@ -845,3 +845,372 @@ impl Drop for Listener {
         }
     }
 }
+
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+};
+use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+    HidD_FreePreparsedData, HidD_GetHidGuid, HidD_GetPreparsedData, HidD_SetNumInputBuffers,
+    HidP_GetCaps, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+};
+use windows_sys::Win32::Foundation::{ERROR_IO_INCOMPLETE, WAIT_OBJECT_0};
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
+
+pub struct Waker(Handle);
+
+// SAFETY: event handles may be signalled from any thread.
+unsafe impl Send for Waker {}
+unsafe impl Sync for Waker {}
+
+impl Waker {
+    pub fn new() -> io::Result<Waker> {
+        // SAFETY: an unnamed auto-reset event.
+        let event = Handle(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
+        if event.0.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Waker(event))
+    }
+
+    pub fn wake(&self) {
+        // SAFETY: our event handle.
+        unsafe { SetEvent(self.0 .0) };
+    }
+}
+
+/// Reports the HID class driver queues for this handle, beyond the default 32, so a busy moment
+/// in the reader drops none.
+const HID_INPUT_BUFFERS: u32 = 512;
+
+/// A HID interface opened through the HID class driver, with one read always in flight: a report
+/// lands in `buf` as it arrives, and `try_read` takes it and starts the next read.
+pub struct HidDevice {
+    handle: Handle,
+    event: Handle,
+    // boxed: the system writes to it until the read completes
+    ov: Box<OVERLAPPED>,
+    buf: Vec<u8>,
+    in_flight: bool,
+    ready: Option<usize>,
+    /// The error that ended reading (the device unplugged): every later read reports it.
+    failed: Option<i32>,
+}
+
+// SAFETY: the handles may be used from any thread; the in-flight read's buffers move with it.
+unsafe impl Send for HidDevice {}
+
+impl HidDevice {
+    pub fn open(path: &Path) -> io::Result<HidDevice> {
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path; the handle is owned below. Sharing as hidapi does lets
+        // the engine keep its own handle on the same interface.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = Handle(handle);
+        let mut caps: HIDP_CAPS = unsafe { std::mem::zeroed() };
+        // SAFETY: our device handle; the preparsed data is freed once.
+        unsafe {
+            let mut data = 0;
+            if HidD_GetPreparsedData(handle.0, &mut data) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let status = HidP_GetCaps(data, &mut caps);
+            HidD_FreePreparsedData(data);
+            if status != HIDP_STATUS_SUCCESS {
+                return Err(io::Error::other("the HID interface has no capabilities"));
+            }
+            HidD_SetNumInputBuffers(handle.0, HID_INPUT_BUFFERS);
+        }
+        HidDevice::from_handle(handle, caps.InputReportByteLength as usize)
+    }
+
+    fn from_handle(handle: Handle, input_len: usize) -> io::Result<HidDevice> {
+        let mut device = HidDevice {
+            handle,
+            event: manual_event()?,
+            // SAFETY: zeroed is a valid OVERLAPPED.
+            ov: Box::new(unsafe { std::mem::zeroed() }),
+            buf: vec![0; input_len.max(1)],
+            in_flight: false,
+            ready: None,
+            failed: None,
+        };
+        device.start_read();
+        Ok(device)
+    }
+
+    /// Puts the read for the next report in flight, unless one is, or a report is waiting.
+    fn start_read(&mut self) {
+        if self.in_flight || self.ready.is_some() || self.failed.is_some() {
+            return;
+        }
+        // SAFETY: the boxed OVERLAPPED and `buf` stay put until the read completes or is
+        // cancelled (Drop).
+        unsafe {
+            *self.ov = std::mem::zeroed();
+            self.ov.hEvent = self.event.0;
+            if ReadFile(
+                self.handle.0,
+                self.buf.as_mut_ptr(),
+                self.buf.len() as u32,
+                std::ptr::null_mut(),
+                &mut *self.ov,
+            ) == 0
+            {
+                let e = GetLastError();
+                if e != ERROR_IO_PENDING {
+                    self.failed = Some(e as i32);
+                    return;
+                }
+            }
+        }
+        self.in_flight = true;
+    }
+
+    /// Takes in the read in flight if it has finished.
+    fn collect(&mut self) {
+        if !self.in_flight {
+            return;
+        }
+        let mut moved = 0u32;
+        // SAFETY: the OVERLAPPED of our read on our handle.
+        unsafe {
+            if GetOverlappedResult(self.handle.0, &*self.ov, &mut moved, 0) == 0 {
+                let e = GetLastError();
+                if e == ERROR_IO_INCOMPLETE {
+                    return;
+                }
+                self.failed = Some(e as i32);
+            } else {
+                self.ready = Some(moved as usize);
+            }
+        }
+        self.in_flight = false;
+    }
+
+    pub fn wait(
+        &mut self,
+        waker: &Waker,
+        timeout: Option<Duration>,
+    ) -> io::Result<crate::platform::hid::Woke> {
+        use crate::platform::hid::Woke;
+        self.start_read();
+        self.collect();
+        if self.ready.is_some() || self.failed.is_some() {
+            return Ok(Woke {
+                report: true,
+                waker: false,
+            });
+        }
+        let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(INFINITE as u128 - 1) as u32);
+        let handles = [self.event.0, waker.0 .0];
+        // SAFETY: two valid handles.
+        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) } {
+            WAIT_OBJECT_0 => {
+                self.collect();
+                Ok(Woke {
+                    report: self.ready.is_some() || self.failed.is_some(),
+                    waker: false,
+                })
+            }
+            r if r == WAIT_OBJECT_0 + 1 => Ok(Woke {
+                report: false,
+                waker: true,
+            }),
+            WAIT_TIMEOUT => Ok(Woke::default()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        self.collect();
+        if let Some(n) = self.ready.take() {
+            let n = n.min(buf.len());
+            buf[..n].copy_from_slice(&self.buf[..n]);
+            self.start_read();
+            return Ok(Some(n));
+        }
+        if let Some(e) = self.failed {
+            return Err(io::Error::from_raw_os_error(e));
+        }
+        self.start_read();
+        Ok(None)
+    }
+}
+
+impl Drop for HidDevice {
+    fn drop(&mut self) {
+        if self.in_flight {
+            let mut moved = 0;
+            // SAFETY: cancel our read and wait it out before its buffers are freed.
+            unsafe {
+                CancelIoEx(self.handle.0, &*self.ov);
+                GetOverlappedResult(self.handle.0, &*self.ov, &mut moved, 1);
+            }
+        }
+    }
+}
+
+/// The HID class's device interfaces present, by path.
+pub fn headset_interface(interface: u8) -> Option<std::path::PathBuf> {
+    // SAFETY: SetupAPI calls with valid out-pointers; the detail buffer is 8-byte aligned and as
+    // large as SetupAPI asked for; the device information set is destroyed once.
+    unsafe {
+        let mut guid = std::mem::zeroed();
+        HidD_GetHidGuid(&mut guid);
+        let set = SetupDiGetClassDevsW(
+            &guid,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        );
+        if set == INVALID_HANDLE_VALUE as isize {
+            return None;
+        }
+        let mut found = None;
+        for index in 0.. {
+            let mut data: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
+            data.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+            if SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &guid, index, &mut data) == 0 {
+                break;
+            }
+            let mut size = 0u32;
+            SetupDiGetDeviceInterfaceDetailW(
+                set,
+                &data,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+                std::ptr::null_mut(),
+            );
+            if size == 0 {
+                continue;
+            }
+            let mut storage = vec![0u64; (size as usize).div_ceil(8)];
+            let detail = storage.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            if SetupDiGetDeviceInterfaceDetailW(
+                set,
+                &data,
+                detail,
+                size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+            let path = std::ptr::addr_of!((*detail).DevicePath) as *const u16;
+            let mut len = 0;
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+            let path = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+            if super::hid::is_headset_path(&path, interface) {
+                found = Some(std::path::PathBuf::from(path));
+                break;
+            }
+        }
+        SetupDiDestroyDeviceInfoList(set);
+        found
+    }
+}
+
+/// The far end of a fake HID device: a message-mode pipe delivers one message per read, as the
+/// HID class driver delivers one report.
+#[cfg(test)]
+pub struct FakeHidSender(Handle);
+
+#[cfg(test)]
+pub fn fake_hid() -> (HidDevice, FakeHidSender) {
+    use std::sync::atomic::AtomicUsize;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_ATTRIBUTES, PIPE_ACCESS_OUTBOUND};
+    use windows_sys::Win32::System::Pipes::{
+        SetNamedPipeHandleState, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let name = wide(&format!(
+        r"\\.\pipe\cv1t-fake-hid-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    // SAFETY: Win32 calls with a NUL-terminated name; the handles are owned below.
+    unsafe {
+        let server = CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_OUTBOUND,
+            PIPE_TYPE_MESSAGE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            std::ptr::null(),
+        );
+        assert!(
+            server != INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let server = Handle(server);
+        let client = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | FILE_WRITE_ATTRIBUTES,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            std::ptr::null_mut(),
+        );
+        assert!(
+            client != INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let client = Handle(client);
+        let mode = PIPE_READMODE_MESSAGE;
+        assert!(
+            SetNamedPipeHandleState(client.0, &mode, std::ptr::null(), std::ptr::null()) != 0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        if ConnectNamedPipe(server.0, std::ptr::null_mut()) == 0 {
+            assert_eq!(GetLastError(), ERROR_PIPE_CONNECTED);
+        }
+        (
+            HidDevice::from_handle(client, 64).unwrap(),
+            FakeHidSender(server),
+        )
+    }
+}
+
+#[cfg(test)]
+pub fn fake_hid_send(sender: &mut FakeHidSender, report: &[u8]) {
+    let mut wrote = 0;
+    // SAFETY: our pipe handle and a buffer of the stated length.
+    let ok = unsafe {
+        WriteFile(
+            sender.0 .0,
+            report.as_ptr(),
+            report.len() as u32,
+            &mut wrote,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(ok != 0 && wrote as usize == report.len());
+}
