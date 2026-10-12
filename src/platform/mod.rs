@@ -104,9 +104,171 @@ pub mod dylib {
     }
 }
 
+/// The monotonic clock every cv1touch timestamp uses, in nanoseconds, shared by all processes:
+/// CLOCK_MONOTONIC on Linux, the performance counter on Windows.
+pub fn now_ns() -> u64 {
+    os::now_ns()
+}
+
+/// `ticks` of a counter running at `frequency` per second, in nanoseconds, without overflow.
+pub fn ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
+    (ticks as u128 * 1_000_000_000 / frequency.max(1) as u128) as u64
+}
+
+pub mod shm {
+    //! Named shared memory between the daemon (one writer, owning the name) and its readers, with
+    //! a wake-up for readers waiting on a counter inside it.
+    use std::io;
+
+    use super::os;
+
+    /// A segment this process created and owns; gone when dropped.
+    pub struct OwnedSegment(os::OwnedSegment);
+
+    impl OwnedSegment {
+        /// Takes `name` for this process (one owner per name at a time), replaces anything left
+        /// from an earlier owner, and maps `len` zeroed bytes for reading and writing. `name` is
+        /// "/" and one more component, as for POSIX shared memory.
+        pub fn create(name: &str, len: usize) -> io::Result<OwnedSegment> {
+            os::OwnedSegment::create(name, len).map(OwnedSegment)
+        }
+
+        pub fn ptr(&self) -> *mut u8 {
+            self.0.ptr()
+        }
+
+        /// Wakes the readers waiting on the counter at `word` (inside the segment); call after
+        /// changing it.
+        pub fn wake(&self, word: *mut u32) {
+            self.0.wake(word)
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum OpenError {
+        /// Nobody owns the name (the daemon is not running).
+        NotFound,
+        /// The segment is smaller than expected (being created, or another layout).
+        TooSmall,
+        Io(io::Error),
+    }
+
+    /// Another process's segment, mapped read-only.
+    pub struct OpenedSegment(os::OpenedSegment);
+
+    impl OpenedSegment {
+        pub fn open(name: &str, len: usize) -> Result<OpenedSegment, OpenError> {
+            os::OpenedSegment::open(name, len).map(OpenedSegment)
+        }
+
+        /// The mapping; only read through it.
+        pub fn ptr(&self) -> *mut u8 {
+            self.0.ptr()
+        }
+
+        /// Waits until the counter at `word` (inside the segment) differs from `last_seen`, a
+        /// wake-up arrives, or `timeout_ns` passes.
+        pub fn wait(&self, word: *mut u32, last_seen: u32, timeout_ns: u64) {
+            self.0.wait(word, last_seen, timeout_ns)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fs;
+    use super::shm::{OpenError, OpenedSegment, OwnedSegment};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn segment_name(tag: &str) -> String {
+        format!("/cv1t-platform-{tag}-{}", std::process::id())
+    }
+
+    #[test]
+    fn the_clock_converts_counter_ticks_exactly_and_moves_forward() {
+        assert_eq!(super::ticks_to_ns(10_000_000, 10_000_000), 1_000_000_000);
+        // a month of uptime at 10 MHz, which overflows a naive ticks * 1e9 in u64
+        let month = 30 * 24 * 3600 * 10_000_000u64;
+        assert_eq!(
+            super::ticks_to_ns(month, 10_000_000),
+            30 * 24 * 3600 * 1_000_000_000
+        );
+        assert_eq!(super::ticks_to_ns(3, 3_000_000_000), 1);
+        let (a, b) = (super::now_ns(), super::now_ns());
+        assert!(a > 0 && b >= a);
+    }
+
+    #[test]
+    fn a_segment_written_by_its_owner_reads_the_same_elsewhere() {
+        let name = segment_name("rw");
+        assert!(matches!(
+            OpenedSegment::open(&name, 64),
+            Err(OpenError::NotFound)
+        ));
+        let owner = OwnedSegment::create(&name, 64).unwrap();
+        // SAFETY: 64 bytes mapped
+        unsafe {
+            assert!(std::slice::from_raw_parts(owner.ptr(), 64)
+                .iter()
+                .all(|&b| b == 0));
+            owner.ptr().add(8).write(42);
+        }
+        let reader = OpenedSegment::open(&name, 64).unwrap();
+        // SAFETY: as above
+        assert_eq!(unsafe { reader.ptr().add(8).read() }, 42);
+        assert!(
+            OwnedSegment::create(&name, 64).is_err(),
+            "one owner at a time"
+        );
+        drop(reader);
+        drop(owner);
+        assert!(matches!(
+            OpenedSegment::open(&name, 64),
+            Err(OpenError::NotFound)
+        ));
+        // the name is free again; a process another test is starting may hold a forked copy of
+        // the ownership lock until it executes (the descriptor closes on exec), so allow a moment
+        let free = (0..200).any(|_| {
+            OwnedSegment::create(&name, 64).is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(free, "the name stays taken");
+    }
+
+    #[test]
+    fn a_reader_waiting_on_the_counter_is_woken_by_the_owner() {
+        let name = segment_name("wake");
+        let owner = OwnedSegment::create(&name, 64).unwrap();
+        let reader = OpenedSegment::open(&name, 64).unwrap();
+        let word = owner.ptr() as *mut u32;
+        // the wait itself, on this thread, released by a bump from another
+        let bumper_word = word as usize;
+        let owner_ptr = &owner as *const OwnedSegment as usize;
+        let bumper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: the counter is inside the live segment; the owner outlives the thread
+            unsafe {
+                AtomicU32::from_ptr(bumper_word as *mut u32).fetch_add(1, Ordering::Release);
+                (*(owner_ptr as *const OwnedSegment)).wake(bumper_word as *mut u32);
+            }
+        });
+        let before = std::time::Instant::now();
+        reader.wait(reader.ptr() as *mut u32, 0, 5_000_000_000);
+        let waited = before.elapsed();
+        bumper.join().unwrap();
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+        // SAFETY: as above
+        assert_eq!(
+            unsafe { AtomicU32::from_ptr(reader.ptr() as *mut u32).load(Ordering::Acquire) },
+            1
+        );
+        // with nothing changing, the wait ends at the timeout
+        let before = std::time::Instant::now();
+        reader.wait(reader.ptr() as *mut u32, 1, 30_000_000);
+        assert!(before.elapsed() >= std::time::Duration::from_millis(20));
+    }
 
     #[test]
     fn a_system_library_loads_and_resolves_a_symbol() {

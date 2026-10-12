@@ -5,19 +5,15 @@
 //! Layout: common/cv1touch_shm.h via bindgen. Hand slots and the sensor block are seqlock-protected;
 //! `update_futex` is bumped and woken once per publish batch.
 
-use std::ffi::CString;
 use std::fmt;
-use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
 use std::ptr::{self, addr_of_mut};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::ffi;
+use crate::platform::shm::{OpenError, OpenedSegment, OwnedSegment};
 
 pub use ffi::cv1t_alignment as Alignment;
 pub use ffi::cv1t_controller_state as ControllerState;
@@ -30,15 +26,10 @@ pub const HAND_RIGHT: usize = ffi::CV1T_HAND_RIGHT as usize;
 pub const MAX_SENSORS: usize = ffi::CV1T_MAX_SENSORS as usize;
 const READ_TRIES: usize = 1000;
 
-/// CLOCK_MONOTONIC in nanoseconds: the clock every cv1touch timestamp uses.
+/// The monotonic clock every cv1touch timestamp uses, in nanoseconds (CLOCK_MONOTONIC on Linux,
+/// the performance counter on Windows), shared by every process.
 pub fn now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: valid out-pointer.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    crate::platform::now_ns()
 }
 
 pub fn set_serial(s: &mut SensorStatus, value: &str) {
@@ -56,11 +47,6 @@ pub fn serial_str(s: &SensorStatus) -> String {
         .map(|&c| c as u8)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn cname(name: &str) -> io::Result<CString> {
-    CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "shm name contains NUL"))
 }
 
 /// SAFETY: `p` must point to an aligned u32 inside a mapping that outlives the returned reference.
@@ -179,117 +165,22 @@ impl Segment {
     }
 }
 
-// Use the same mount namespace as POSIX shared memory: runtime-dir and XDG overrides
-// must not let two writers own one segment. Never unlink a lock file (that splits locks).
-fn private_lock_directory(path: &Path) -> io::Result<File> {
-    match DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let meta = dir.metadata()?;
-    // SAFETY: geteuid has no arguments and cannot fail.
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o777 != 0o700 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "shared-memory lock directory must be owned by this user with mode 0700",
-        ));
-    }
-    Ok(dir)
-}
-
-fn lock_shm_name(name: &str) -> io::Result<File> {
-    let component = name
-        .strip_prefix('/')
-        .filter(|s| !s.is_empty() && !s.contains('/') && *s != "." && *s != "..")
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "shared-memory name must be / followed by a single name",
-            )
-        })?;
-    let component = cname(component)?;
-    // SAFETY: geteuid has no arguments and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    let dir = private_lock_directory(Path::new(&format!("/dev/shm/cv1touch-locks-{uid}")))?;
-    // SAFETY: live directory fd and NUL-terminated single component; no symlinks followed.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            component.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh owned descriptor, closed on every error/return through File.
-    let file = unsafe { File::from_raw_fd(fd) };
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o777 != 0o600 || meta.nlink() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "invalid shared-memory ownership lock",
-        ));
-    }
-    // SAFETY: valid fd, held for the complete ShmWriter lifetime including unlink on Drop.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(file)
-}
-
 pub struct ShmWriter {
     seg: Segment,
-    name: CString,
-    _ownership: File,
+    name: String,
+    mapping: OwnedSegment,
     // Alignment reloads and the universe watcher can publish concurrently.
     alignment_writer: Mutex<()>,
 }
 
 impl ShmWriter {
-    /// Locks this SHM name across processes, replaces any stale segment, and creates a fresh one.
+    /// Takes this SHM name across processes, replaces any stale segment, and creates a fresh one.
     pub fn create(name: &str, generation: u64) -> io::Result<Self> {
-        let ownership = lock_shm_name(name)?;
-        let name = cname(name)?;
         let len = size_of::<ffi::cv1t_shm>();
-        // SAFETY: plain POSIX calls; the new mapping is exclusively ours until magic is published.
+        let mapping = OwnedSegment::create(name, len)?;
+        let s = mapping.ptr() as *mut ffi::cv1t_shm;
+        // SAFETY: a fresh zeroed mapping, exclusively ours until magic is published.
         unsafe {
-            libc::shm_unlink(name.as_ptr());
-            let fd = libc::shm_open(
-                name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            );
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ftruncate(fd, len as libc::off_t) < 0 {
-                let e = io::Error::last_os_error();
-                libc::close(fd);
-                libc::shm_unlink(name.as_ptr());
-                return Err(e);
-            }
-            let p = libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            libc::close(fd);
-            if p == libc::MAP_FAILED {
-                let e = io::Error::last_os_error();
-                libc::shm_unlink(name.as_ptr());
-                return Err(e);
-            }
-            let s = p as *mut ffi::cv1t_shm;
             (*s).version = ffi::CV1T_SHM_VERSION;
             (*s).size = len as u32;
             (*s).generation = generation;
@@ -297,13 +188,13 @@ impl ShmWriter {
             (*s).heartbeat_host_ns = now_ns();
             // Publish the magic last: readers trust nothing else until they see it.
             atomic_u32(addr_of_mut!((*s).magic)).store(ffi::CV1T_SHM_MAGIC, Ordering::Release);
-            Ok(Self {
-                seg: Segment(s),
-                name,
-                _ownership: ownership,
-                alignment_writer: Mutex::new(()),
-            })
         }
+        Ok(Self {
+            seg: Segment(s),
+            name: name.to_string(),
+            mapping,
+            alignment_writer: Mutex::new(()),
+        })
     }
 
     pub fn publish_hand(&self, hand: usize, state: &ControllerState) {
@@ -317,21 +208,13 @@ impl ShmWriter {
         }
     }
 
-    /// Bumps the futex word and wakes waiting readers; call once per publish batch.
+    /// Bumps the update counter and wakes waiting readers; call once per publish batch.
     pub fn signal(&self) {
-        // SAFETY: mapping is live; FUTEX_WAKE on a shared mapping.
+        // SAFETY: mapping is live.
         unsafe {
             let word = addr_of_mut!((*self.seg.0).update_futex);
             atomic_u32(word).fetch_add(1, Ordering::Release);
-            libc::syscall(
-                libc::SYS_futex,
-                word,
-                libc::FUTEX_WAKE,
-                i32::MAX,
-                ptr::null::<libc::timespec>(),
-                ptr::null::<u32>(),
-                0,
-            );
+            self.mapping.wake(word);
         }
     }
 
@@ -377,7 +260,7 @@ impl ShmWriter {
 
     /// The name readers open this segment by.
     pub fn name(&self) -> &str {
-        self.name.to_str().unwrap_or_default()
+        &self.name
     }
 
     pub fn hand(&self, hand: usize) -> Option<ControllerState> {
@@ -390,14 +273,10 @@ impl ShmWriter {
 }
 
 impl Drop for ShmWriter {
-    /// Zeroes magic (readers holding the mapping see the daemon is gone), unmaps and unlinks.
+    /// Zeroes magic (readers holding the mapping see the daemon is gone); the mapping goes after.
     fn drop(&mut self) {
         // SAFETY: we own the mapping.
-        unsafe {
-            atomic_u32(addr_of_mut!((*self.seg.0).magic)).store(0, Ordering::Release);
-            libc::munmap(self.seg.0 as *mut libc::c_void, size_of::<ffi::cv1t_shm>());
-            libc::shm_unlink(self.name.as_ptr());
-        }
+        unsafe { atomic_u32(addr_of_mut!((*self.seg.0).magic)).store(0, Ordering::Release) };
     }
 }
 
@@ -428,57 +307,37 @@ impl std::error::Error for ShmError {}
 pub struct ShmReader {
     seg: Segment,
     generation: u64,
+    mapping: OpenedSegment,
 }
 
 impl ShmReader {
     pub fn open(name: &str) -> Result<Self, ShmError> {
-        let cname = cname(name).map_err(ShmError::Io)?;
         let len = size_of::<ffi::cv1t_shm>();
-        // SAFETY: read-only mapping of the daemon's segment; validated before use.
-        unsafe {
-            let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0);
-            if fd < 0 {
-                let e = io::Error::last_os_error();
-                return Err(if e.kind() == io::ErrorKind::NotFound {
-                    ShmError::NotRunning
-                } else {
-                    ShmError::Io(e)
-                });
-            }
-            // A segment that is not (yet) fully sized would SIGBUS on first access: the daemon
-            // creates it, then sizes it, then publishes the magic.
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(fd, &mut st) < 0 || (st.st_size as usize) < len {
-                libc::close(fd);
-                return Err(ShmError::NotRunning);
-            }
-            let p = libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            libc::close(fd);
-            if p == libc::MAP_FAILED {
-                return Err(ShmError::Io(io::Error::last_os_error()));
-            }
-            let mut reader = Self {
-                seg: Segment(p as *mut ffi::cv1t_shm),
-                generation: 0,
-            };
-            if reader.seg.magic() != ffi::CV1T_SHM_MAGIC {
-                return Err(ShmError::NotRunning);
-            }
-            let version = ptr::read_volatile(addr_of_mut!((*reader.seg.0).version));
-            let size = ptr::read_volatile(addr_of_mut!((*reader.seg.0).size));
-            if version != ffi::CV1T_SHM_VERSION || size as usize != len {
-                return Err(ShmError::Abi { version, size });
-            }
-            reader.generation = reader.seg.generation();
-            Ok(reader)
+        let mapping = OpenedSegment::open(name, len).map_err(|e| match e {
+            // not there, or not sized yet: the daemon creates it, sizes it, then publishes magic
+            OpenError::NotFound | OpenError::TooSmall => ShmError::NotRunning,
+            OpenError::Io(e) => ShmError::Io(e),
+        })?;
+        let mut reader = Self {
+            seg: Segment(mapping.ptr() as *mut ffi::cv1t_shm),
+            generation: 0,
+            mapping,
+        };
+        if reader.seg.magic() != ffi::CV1T_SHM_MAGIC {
+            return Err(ShmError::NotRunning);
         }
+        // SAFETY: a validated, live read-only mapping.
+        let (version, size) = unsafe {
+            (
+                ptr::read_volatile(addr_of_mut!((*reader.seg.0).version)),
+                ptr::read_volatile(addr_of_mut!((*reader.seg.0).size)),
+            )
+        };
+        if version != ffi::CV1T_SHM_VERSION || size as usize != len {
+            return Err(ShmError::Abi { version, size });
+        }
+        reader.generation = reader.seg.generation();
+        Ok(reader)
     }
 
     pub fn generation(&self) -> u64 {
@@ -515,29 +374,10 @@ impl ShmReader {
 
     /// Blocks until the update counter differs from `last_seen` or the timeout passes.
     pub fn wait(&self, last_seen: u32, timeout_ns: u64) -> u32 {
-        let ts = libc::timespec {
-            tv_sec: (timeout_ns / 1_000_000_000) as libc::time_t,
-            tv_nsec: (timeout_ns % 1_000_000_000) as libc::c_long,
-        };
-        // SAFETY: FUTEX_WAIT on the mapped futex word.
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                addr_of_mut!((*self.seg.0).update_futex),
-                libc::FUTEX_WAIT,
-                last_seen,
-                &ts as *const libc::timespec,
-                ptr::null::<u32>(),
-                0,
-            );
-        }
+        // SAFETY: the counter is inside the live mapping.
+        let word = unsafe { addr_of_mut!((*self.seg.0).update_futex) };
+        self.mapping.wait(word, last_seen, timeout_ns);
         self.seg.update_counter()
-    }
-}
-
-impl Drop for ShmReader {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.seg.0 as *mut libc::c_void, size_of::<ffi::cv1t_shm>()) };
     }
 }
 
@@ -646,27 +486,6 @@ mod tests {
         }
         assert_eq!(torn, 0, "readers accepted mixed alignment snapshots");
         assert!(r.alignment().is_some(), "writers left the seqlock busy");
-    }
-
-    #[test]
-    fn ownership_directory_rejects_symlinks_and_shared_permissions() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("cv1t-lockdir-{}", std::process::id()));
-        DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        let target = dir.join("target");
-        let link = dir.join("link");
-        DirBuilder::new().mode(0o700).create(&target).unwrap();
-        symlink(&target, &link).unwrap();
-        assert!(
-            private_lock_directory(&link).is_err(),
-            "followed a lock-directory symlink"
-        );
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            private_lock_directory(&target).is_err(),
-            "accepted a shared lock directory"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -794,9 +613,10 @@ mod tests {
     /// A reader racing segment creation (created but not yet sized) must not die with SIGBUS:
     /// this reader is the reference for the SteamVR driver inside vrserver.
     #[test]
+    #[cfg(unix)]
     fn open_of_unsized_segment_is_not_running() {
         let name = test_name("unsized");
-        let cname = cname(&name).unwrap();
+        let cname = std::ffi::CString::new(name.clone()).unwrap();
         // SAFETY: plain POSIX calls on a test-only segment.
         unsafe {
             libc::shm_unlink(cname.as_ptr());
