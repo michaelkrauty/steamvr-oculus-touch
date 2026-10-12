@@ -5,9 +5,8 @@
 //! to the calibration wizard. Stored identities bind each hand to its physical controller.
 
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -207,11 +206,7 @@ pub fn default_path() -> PathBuf {
         .join("cv1touch/input-calibration.json")
 }
 pub fn load(path: &Path) -> Result<Option<CalibrationFile>, String> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match crate::platform::fs::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
@@ -238,28 +233,19 @@ pub fn save(path: &Path, value: &CalibrationFile) -> Result<(), String> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .map_err(|e| e.to_string())?;
+    crate::platform::fs::create_private_dir_all(parent).map_err(|e| e.to_string())?;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let temp = parent.join(format!(
         ".input-calibration-{}-{}.tmp",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .map_err(|e| e.to_string())?;
+    let mut file = crate::platform::fs::create_private(&temp).map_err(|e| e.to_string())?;
     let result = (|| {
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
-        std::fs::File::open(parent)?.sync_all()
+        crate::platform::fs::rename_replacing(&temp, path)?;
+        crate::platform::fs::sync_dir(parent)
     })()
     .map_err(|e: std::io::Error| e.to_string());
     if result.is_err() {

@@ -396,11 +396,7 @@ pub fn fingerprint(path: &std::path::Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 fn open_regular(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = crate::platform::fs::open_read_nofollow(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -440,7 +436,6 @@ pub fn load(path: &std::path::Path) -> std::io::Result<Option<Checkpoint>> {
 /// A failed save must stop setup rather than continuing with unrecorded success.
 pub fn save(path: &std::path::Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     validate(checkpoint)?;
@@ -470,17 +465,12 @@ pub fn save(path: &std::path::Path, checkpoint: &Checkpoint) -> std::io::Result<
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)?;
+    let mut file = crate::platform::fs::create_private(&temp)?;
     let result = (|| {
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temp, path)?;
-        std::fs::File::open(parent)?.sync_all()
+        crate::platform::fs::rename_replacing(&temp, path)?;
+        crate::platform::fs::sync_dir(parent)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);

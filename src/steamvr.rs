@@ -243,9 +243,7 @@ fn staging_dir(dir: &Path) -> Result<PathBuf, String> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("{}: {e}", path.display()))
+    crate::platform::fs::sync_dir(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Linux-only atomic directory publication keeps ownership metadata and both payloads together.
@@ -256,31 +254,13 @@ fn publish_directory(
     exists: bool,
     legacy: Option<(&Path, &Path)>,
 ) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-    let from = std::ffi::CString::new(stage.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let to = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let flags = if exists {
-        libc::RENAME_EXCHANGE
-    } else {
-        libc::RENAME_NOREPLACE
-    };
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            flags,
-        )
-    };
-    if result != 0 {
-        return Err(format!(
-            "could not atomically publish {}: {}; existing package retained, staged files at {}",
+    crate::platform::fs::swap_dir(stage, dir, exists).map_err(|e| {
+        format!(
+            "could not atomically publish {}: {e}; existing package retained, staged files at {}",
             dir.display(),
-            std::io::Error::last_os_error(),
             stage.display()
-        ));
-    }
+        )
+    })?;
     sync_directory(dir.parent().ok_or("driver directory has no parent")?)?;
     if exists {
         // If an external writer raced the final check, retain its changes as recovery evidence.
@@ -315,9 +295,7 @@ pub fn assemble_with_legacy(
             let destination = stage.join(name);
             std::fs::copy(source, &destination)
                 .map_err(|e| format!("{}: {e}", source.display()))?;
-            std::fs::File::open(&destination)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
+            crate::platform::fs::sync_file(&destination).map_err(|e| e.to_string())?;
         }
         let metadata = stage.join(OWNERSHIP_FILE);
         std::fs::write(
@@ -325,9 +303,7 @@ pub fn assemble_with_legacy(
             serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        std::fs::File::open(&metadata)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
+        crate::platform::fs::sync_file(&metadata).map_err(|e| e.to_string())?;
         sync_directory(&stage.join("bin/linux64"))?;
         sync_directory(&stage.join("bin"))?;
         sync_directory(&stage)?;

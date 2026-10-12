@@ -59,19 +59,22 @@ pub fn load(path: &Path) -> Result<Settings, String> {
 /// Writes `s` to `path` through a temporary file, synced before and after the rename, so that
 /// neither a crash nor a power cut leaves half a file.
 pub fn save(path: &Path, s: &Settings) -> Result<(), String> {
+    use crate::platform::fs;
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    fs::create_private_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
+    // a temporary file left by an interrupted save
+    let _ = std::fs::remove_file(&tmp);
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = fs::create_private(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(dir)?.sync_all()
+        fs::rename_replacing(&tmp, path)?;
+        fs::sync_dir(dir)
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -195,10 +194,7 @@ pub fn default_path() -> PathBuf {
 
 pub fn load(path: &Path) -> Result<CalibrationFile, String> {
     // O_NONBLOCK makes a FIFO fail the regular-file check instead of blocking daemon reload.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+    let file = crate::platform::fs::open_read_nonblocking(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let metadata = file
         .metadata()
@@ -428,6 +424,7 @@ mod tests {
         if result.is_err() {
             // Release a regressed blocking reader so the test can fail without hanging CI.
             use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
             if let Ok(mut writer) = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)

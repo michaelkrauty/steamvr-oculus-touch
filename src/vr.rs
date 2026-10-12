@@ -5,8 +5,10 @@
 //! libopenvr_api.so: device list, raw-universe poses and properties. Used by `cv1touch register`
 //! and `cv1touch vr-devices`; SteamVR must be running.
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::{c_char, c_void, CStr};
+use std::path::Path;
+
+use crate::platform::dylib::Library;
 
 use nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion};
 
@@ -21,17 +23,22 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/openvr.rs"));
 }
 
-pub const CLASS_CONTROLLER: u32 = sys::ETrackedDeviceClass_TrackedDeviceClass_Controller;
-pub const CLASS_HMD: u32 = sys::ETrackedDeviceClass_TrackedDeviceClass_HMD;
-pub const CLASS_TRACKING_REFERENCE: u32 =
+/// OpenVR's C enums: unsigned on Linux, `int` with MSVC, so named rather than spelled.
+pub type DeviceClass = sys::ETrackedDeviceClass;
+pub type DeviceProperty = sys::ETrackedDeviceProperty;
+
+pub const CLASS_CONTROLLER: DeviceClass = sys::ETrackedDeviceClass_TrackedDeviceClass_Controller;
+pub const CLASS_HMD: DeviceClass = sys::ETrackedDeviceClass_TrackedDeviceClass_HMD;
+pub const CLASS_TRACKING_REFERENCE: DeviceClass =
     sys::ETrackedDeviceClass_TrackedDeviceClass_TrackingReference;
-pub const PROP_CURRENT_UNIVERSE_ID: u32 = sys::ETrackedDeviceProperty_Prop_CurrentUniverseId_Uint64;
+pub const PROP_CURRENT_UNIVERSE_ID: DeviceProperty =
+    sys::ETrackedDeviceProperty_Prop_CurrentUniverseId_Uint64;
 const MAX_DEVICES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub index: u32,
-    pub class: u32,
+    pub class: DeviceClass,
     pub serial: String,
     pub model: String,
     pub tracking_system: String,
@@ -56,8 +63,9 @@ pub fn find_reference(devices: &[Device]) -> Option<&Device> {
     })
 }
 
-type InitFn = unsafe extern "C" fn(*mut u32, u32, *const c_char) -> u32;
-type GetInterfaceFn = unsafe extern "C" fn(*const c_char, *mut u32) -> isize;
+type InitFn =
+    unsafe extern "C" fn(*mut sys::EVRInitError, sys::EVRApplicationType, *const c_char) -> u32;
+type GetInterfaceFn = unsafe extern "C" fn(*const c_char, *mut sys::EVRInitError) -> isize;
 type ShutdownFn = unsafe extern "C" fn();
 
 /// Pressed bits, touched bits and the five legacy controller axes.
@@ -78,8 +86,15 @@ struct LegacyControllerState {
 /// Raw-universe pose, linear velocity and angular velocity.
 pub type PoseWithVelocity = (Isometry3<f64>, [f64; 3], [f64; 3]);
 
+/// The OpenVR client library inside the SteamVR runtime, and its bare name for the system search.
+#[cfg(unix)]
+const OPENVR_LIBRARY: (&str, &str) = ("bin/linux64/libopenvr_api.so", "libopenvr_api.so");
+#[cfg(windows)]
+const OPENVR_LIBRARY: (&str, &str) = ("bin/win64/openvr_api.dll", "openvr_api.dll");
+
 pub struct Client {
-    lib: *mut c_void,
+    // dropped after `shutdown` runs in Drop
+    _lib: Library,
     sys: &'static sys::VR_IVRSystem_FnTable,
     shutdown: ShutdownFn,
 }
@@ -90,32 +105,24 @@ unsafe impl Send for Client {}
 
 impl Client {
     pub fn connect() -> Result<Client, String> {
-        // SAFETY: dlopen/dlsym with NUL-terminated names; symbols have the declared C signatures.
+        // SAFETY: symbols looked up by NUL-terminated names have the declared C signatures.
         unsafe {
-            let bundled = crate::steamvr::runtime_root().join("bin/linux64/libopenvr_api.so");
-            let mut lib = CString::new(bundled.as_os_str().as_bytes())
-                .ok()
-                .map_or(std::ptr::null_mut(), |p| {
-                    libc::dlopen(p.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
-                });
-            if lib.is_null() {
-                lib = libc::dlopen(
-                    c"libopenvr_api.so".as_ptr(),
-                    libc::RTLD_NOW | libc::RTLD_LOCAL,
-                );
-            }
-            if lib.is_null() {
-                return Err(format!("cannot load OpenVR client library at {} or libopenvr_api.so; set CV1TOUCH_STEAMVR to the SteamVR runtime directory", bundled.display()));
-            }
-            let sym = |name: &CStr| libc::dlsym(lib, name.as_ptr());
+            let bundled = crate::steamvr::runtime_root().join(OPENVR_LIBRARY.0);
+            let Some(lib) =
+                Library::open(&bundled).or_else(|| Library::open(Path::new(OPENVR_LIBRARY.1)))
+            else {
+                return Err(format!("cannot load OpenVR client library at {} or {}; set CV1TOUCH_STEAMVR to the SteamVR runtime directory", bundled.display(), OPENVR_LIBRARY.1));
+            };
             let (init, get, shutdown) = (
-                sym(c"VR_InitInternal2"),
-                sym(c"VR_GetGenericInterface"),
-                sym(c"VR_ShutdownInternal"),
+                lib.symbol(c"VR_InitInternal2"),
+                lib.symbol(c"VR_GetGenericInterface"),
+                lib.symbol(c"VR_ShutdownInternal"),
             );
             if init.is_null() || get.is_null() || shutdown.is_null() {
-                libc::dlclose(lib);
-                return Err("libopenvr_api.so lacks VR_InitInternal2/VR_GetGenericInterface/VR_ShutdownInternal".into());
+                return Err(format!(
+                    "{} lacks VR_InitInternal2/VR_GetGenericInterface/VR_ShutdownInternal",
+                    OPENVR_LIBRARY.1
+                ));
             }
             // SAFETY: the non-null dlsym results name OpenVR functions with these C ABIs;
             // the library remains loaded until Client is dropped.
@@ -124,14 +131,13 @@ impl Client {
                 std::mem::transmute::<*mut c_void, GetInterfaceFn>(get),
                 std::mem::transmute::<*mut c_void, ShutdownFn>(shutdown),
             );
-            let mut err = 0u32;
+            let mut err: sys::EVRInitError = 0;
             init(
                 &mut err,
                 sys::EVRApplicationType_VRApplication_Background,
                 std::ptr::null(),
             );
             if err != 0 {
-                libc::dlclose(lib);
                 return Err(format!(
                     "OpenVR init failed (error {err}): is SteamVR running?"
                 ));
@@ -140,18 +146,17 @@ impl Client {
                 as *const sys::VR_IVRSystem_FnTable;
             if err != 0 || table.is_null() {
                 shutdown();
-                libc::dlclose(lib);
                 return Err(format!("OpenVR has no FnTable:IVRSystem_026 (error {err})"));
             }
             Ok(Client {
-                lib,
+                _lib: lib,
                 sys: &*table,
                 shutdown,
             })
         }
     }
 
-    fn string_property(&self, index: u32, prop: u32) -> String {
+    fn string_property(&self, index: u32, prop: DeviceProperty) -> String {
         let mut buf = [0 as c_char; 256];
         let mut err = 0;
         // SAFETY: the function table comes from the runtime; buf outlives the call.
@@ -171,7 +176,7 @@ impl Client {
         }
     }
 
-    pub fn uint64_property(&self, index: u32, prop: u32) -> Option<u64> {
+    pub fn uint64_property(&self, index: u32, prop: DeviceProperty) -> Option<u64> {
         let mut err = 0;
         // SAFETY: as above.
         let v = unsafe {
@@ -182,7 +187,7 @@ impl Client {
         (err == 0).then_some(v)
     }
 
-    pub fn float_property(&self, index: u32, prop: u32) -> Option<f32> {
+    pub fn float_property(&self, index: u32, prop: DeviceProperty) -> Option<f32> {
         let mut err = 0;
         // SAFETY: as above.
         let v = unsafe {
@@ -326,7 +331,6 @@ impl Drop for Client {
         // SAFETY: initialised in connect; shut down once.
         unsafe {
             (self.shutdown)();
-            libc::dlclose(self.lib);
         }
     }
 }
@@ -384,7 +388,7 @@ mod tests {
         };
         // No library was opened. ManuallyDrop avoids the real client's shutdown/dlclose path.
         std::mem::ManuallyDrop::new(Client {
-            lib: std::ptr::null_mut(),
+            _lib: Library::null(),
             sys: Box::leak(Box::new(table)),
             shutdown: unused_shutdown,
         })

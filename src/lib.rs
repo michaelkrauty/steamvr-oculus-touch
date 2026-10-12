@@ -14,6 +14,7 @@ pub mod hand;
 pub mod headset_watch;
 pub mod input_calibration;
 pub mod modes;
+pub mod platform;
 pub mod recorder;
 pub mod register;
 pub mod rendermodel;
