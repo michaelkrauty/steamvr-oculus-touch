@@ -276,7 +276,7 @@ def install(args):
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", "--now", "cv1touchd.service"])
     print(f"Installed in {prefix}. Add {prefix / 'bin'} to PATH if needed.")
-    print("Next: cv1touch doctor, then follow docs/setup.md for calibration and alignment.")
+    print("Next: cv1touch doctor, then cv1touch setup to calibrate (docs/setup.md has the details).")
 
 
 def uninstall(args):

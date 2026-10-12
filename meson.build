@@ -1,5 +1,5 @@
 project('cv1touch', 'c', 'cpp',
-  version: '0.1.0',
+  version: '0.2.0',
   meson_version: '>= 1.3',
   subproject_dir: 'third_party',
   default_options: ['c_std=gnu11', 'cpp_std=c++20', 'warning_level=2', 'buildtype=debugoptimized'])

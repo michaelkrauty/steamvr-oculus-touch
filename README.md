@@ -4,7 +4,7 @@ Use first-generation Oculus Rift CV1 Touch controllers in SteamVR on Linux, with
 
 SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
 
-**Status:** v0.1.0 is an early release, tested on one Linux installation with one left/right controller pair and up to five CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. This project is independent of Meta, Oculus, and Valve.
+**Status:** v0.2.0 is an early release, tested on one Linux installation with one left/right controller pair and up to five CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. This project is independent of Meta, Oculus, and Valve.
 
 ## Hardware and software
 
@@ -21,12 +21,12 @@ This repository supplies controllers, not a CV1 display/headset driver. Sandboxe
 Quit SteamVR before installing. Install the build dependencies from [setup](docs/setup.md#build-dependencies), then:
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
+git clone --branch v0.2.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
 cd steamvr-oculus-touch
 python3 scripts/install.py
 ```
 
-v0.1.0 is distributed as source, including [tagged source archives](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.1.0). Native dependencies are dynamically linked; build locally on the distribution where you will run it. For development on `main`, see [Contributing](CONTRIBUTING.md).
+v0.2.0 is distributed as source, including [tagged source archives](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.2.0). Native dependencies are dynamically linked; build locally on the distribution where you will run it. For development on `main`, see [Contributing](CONTRIBUTING.md).
 
 The installer builds with the locked dependency graph, installs into `~/.local`, registers the SteamVR driver, backs up SteamVR settings before enabling multiple drivers, and starts a user service. It never runs sudo. Put `~/.local/bin` on your PATH.
 
@@ -37,11 +37,11 @@ cv1touch doctor
 cv1touch status --json
 ```
 
-The initial doctor check reports missing calibration/alignment until setup is complete. Follow [setup and calibration](docs/setup.md#calibrate-and-align). Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, registration to your SteamVR headset, and guided trigger/grip/thumbstick calibration. Once complete, the daemon starts automatically and reconnects to devices.
+The initial doctor check reports missing calibration/alignment until setup is complete. Then run `cv1touch setup`, which walks you through every calibration step ([guided setup](docs/setup.md#guided-setup)); the manual steps in [setup and calibration](docs/setup.md#calibrate-and-align) remain available. Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, registration to your SteamVR headset, and guided trigger/grip/thumbstick calibration. Once complete, the daemon starts automatically and reconnects to devices.
 
-## Development setup guide
+## Guided setup
 
-On development `main`, `cv1touch setup` guides camera calibration, gravity alignment, render fitting, input calibration, and finally headset registration, retaining completed stages across runs. A fresh accepted camera solve also completes gravity alignment from the same capture. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. These commands are unreleased and are not included in v0.1.0; see [guided setup](docs/setup.md#guided-setup-development-main) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
+`cv1touch setup` guides camera calibration, gravity alignment, render fitting, input calibration, and finally headset registration, retaining completed stages across runs. A fresh accepted camera solve also completes gravity alignment from the same capture. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. See [guided setup](docs/setup.md#guided-setup) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
 
 ## Documentation
 
