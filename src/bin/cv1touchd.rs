@@ -5,11 +5,9 @@
 //! publishes both Touch controllers' state to shared memory.
 
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::mem;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -21,7 +19,7 @@ use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{Hand, HandConfig};
-use cv1touch::platform::hid;
+use cv1touch::platform::{hid, ipc, shutdown};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
@@ -2097,105 +2095,109 @@ fn make_usb_thread_realtime() {
     }
 }
 
-/// Blocks SIGINT/SIGTERM (inherited by threads spawned afterwards) and returns a signalfd for them.
-fn block_signals() -> i32 {
-    // SAFETY: plain signal-mask setup.
-    unsafe {
-        let mut mask: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGINT);
-        libc::sigaddset(&mut mask, libc::SIGTERM);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-        libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
+/// The control endpoint's server; requests stop being handled at `stop`.
+struct ControlServer {
+    one_at_a_time: Arc<Mutex<()>>,
+}
+
+impl ControlServer {
+    /// Waits for the request in progress, if any, and handles no other while the guard lives.
+    fn stop(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-struct Client {
-    stream: UnixStream,
-    buf: Vec<u8>,
+/// One of the MAX_CLIENTS client slots, free again when dropped (also when its thread never
+/// started).
+struct ClientSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ClientSlot {
+    fn take(clients: &Arc<std::sync::atomic::AtomicUsize>) -> Option<ClientSlot> {
+        if clients.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
+            clients.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(ClientSlot(Arc::clone(clients)))
+    }
 }
 
-fn control_loop(d: &Daemon, listener: &UnixListener, sfd: i32) {
-    let mut clients: Vec<Client> = Vec::new();
-    loop {
-        // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
-        // engine thread for seconds, which must not read as a dead daemon; stale poses are the
-        // driver's own concern (sample age)
-        d.shm.heartbeat(shm::now_ns());
-        let mut fds = vec![
-            libc::pollfd {
-                fd: sfd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        fds.extend(clients.iter().map(|c| libc::pollfd {
-            fd: c.stream.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }));
-        // SAFETY: valid pollfd array.
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) } < 0 {
-            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            log("poll failed");
-            return;
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            // SAFETY: reading one siginfo from our signalfd.
-            let mut info: libc::signalfd_siginfo = unsafe { mem::zeroed() };
-            unsafe {
-                libc::read(
-                    sfd,
-                    &mut info as *mut _ as *mut libc::c_void,
-                    mem::size_of::<libc::signalfd_siginfo>(),
-                )
-            };
-            log(format!("signal {}: shutting down", info.ssi_signo));
-            return;
-        }
-        let mut keep = vec![true; clients.len()];
-        for (i, c) in clients.iter_mut().enumerate() {
-            if fds[2 + i].revents == 0 {
-                continue;
-            }
-            let mut chunk = [0u8; 1024];
-            match c.stream.read(&mut chunk) {
-                Ok(0) => keep[i] = false,
-                Ok(n) => c.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(_) => keep[i] = false,
-            }
-            while let Some(pos) = c.buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = c.buf.drain(..=pos).collect();
-                let reply = handle(d, String::from_utf8_lossy(&line).trim());
-                if c.stream.write_all(format!("{reply}\n").as_bytes()).is_err() {
-                    keep[i] = false;
-                    break;
-                }
-            }
-            if c.buf.len() > 4096 {
-                keep[i] = false; // no newline in 4 KiB: not a protocol client
-            }
-        }
-        let mut it = keep.iter();
-        clients.retain(|_| *it.next().unwrap());
-        if fds[1].revents & libc::POLLIN != 0 {
-            while let Ok((stream, _)) = listener.accept() {
-                if clients.len() < MAX_CLIENTS {
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                    clients.push(Client {
-                        stream,
-                        buf: Vec::new(),
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serves the control endpoint: one thread accepts, one thread per client (at most MAX_CLIENTS)
+/// reads its request lines, and one request is handled at a time; each client's requests are
+/// answered in order.
+fn serve_control(d: Arc<Daemon>, mut listener: ipc::Listener) -> ControlServer {
+    let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let one_at_a_time = Arc::new(Mutex::new(()));
+    let server = ControlServer {
+        one_at_a_time: Arc::clone(&one_at_a_time),
+    };
+    thread::Builder::new()
+        .name("cv1t-control".into())
+        .spawn(move || {
+            let mut failing = None;
+            loop {
+                let conn = match listener.accept(true) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // once per failure, not at every retry
+                        let why = e.to_string();
+                        if failing.as_ref() != Some(&why) {
+                            log(format!("control endpoint: {why}"));
+                            failing = Some(why);
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
+                failing = None;
+                let Some(slot) = ClientSlot::take(&clients) else {
+                    continue; // dropped: closed at once
+                };
+                let (d, one_at_a_time) = (Arc::clone(&d), Arc::clone(&one_at_a_time));
+                let spawned = thread::Builder::new()
+                    .name("cv1t-client".into())
+                    .spawn(move || {
+                        let _slot = slot;
+                        serve_client(&d, conn, &one_at_a_time);
                     });
+                if spawned.is_err() {
+                    log("control endpoint: no thread for a client");
                 }
             }
+        })
+        .expect("control thread");
+    server
+}
+
+/// One client's request lines, each answered with one reply line. A client that stops reading
+/// for a second, or sends 4 KiB without a newline, is dropped.
+fn serve_client(d: &Daemon, mut conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match conn.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let reply = {
+                let _turn = one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
+                handle(d, String::from_utf8_lossy(&line).trim())
+            };
+            let _ = conn.set_timeout(Some(Duration::from_secs(1)));
+            if conn.write_all(format!("{reply}\n").as_bytes()).is_err() {
+                return;
+            }
+            let _ = conn.set_timeout(None);
+        }
+        if buf.len() > 4096 {
+            return; // no newline in 4 KiB: not a protocol client
         }
     }
 }
@@ -2246,7 +2248,10 @@ fn main() {
     }
     // First, before any thread exists (the recorder and engine threads inherit this mask):
     // SIGINT/SIGTERM must reach only the signalfd, never a thread whose default action kills us.
-    let sfd = block_signals();
+    let shutdown = shutdown::Requests::take().unwrap_or_else(|e| {
+        log(format!("cannot take SIGINT/SIGTERM: {e}"));
+        process::exit(1);
+    });
     line_buffer_stdout();
     match lock_memory() {
         Ok(()) => log("memory locked: pages stay in RAM once touched"),
@@ -2367,15 +2372,11 @@ fn main() {
         }
     }
     let sock_path = runtime_dir.join("control.sock");
-    let _ = fs::remove_file(&sock_path); // stale socket: the lock guarantees no live owner
-    let listener = UnixListener::bind(&sock_path).unwrap_or_else(|e| {
+    // a stale socket goes (the lock guarantees no live owner); private to this user
+    let listener = ipc::Listener::bind(&sock_path).unwrap_or_else(|e| {
         log(format!("control socket {}: {e}", sock_path.display()));
         process::exit(1);
     });
-    let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
 
     let mut inputs = InputRuntime::default();
     match input_calibration::load(&input_calibration::default_path()) {
@@ -2458,18 +2459,28 @@ fn main() {
         d.opts.lock().unwrap().ignore_sensors
     ));
 
-    control_loop(&d, &listener, sfd);
+    let control = serve_control(Arc::clone(&d), listener);
+    loop {
+        // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
+        // engine thread for seconds, which must not read as a dead daemon; stale poses are the
+        // driver's own concern (sample age)
+        d.shm.heartbeat(shm::now_ns());
+        if let Some(why) = shutdown.wait(Duration::from_millis(200)) {
+            log(format!("{why}: shutting down"));
+            break;
+        }
+    }
 
+    // nothing a client asks for runs while the daemon stops
+    let _no_more_requests = control.stop();
     d.quit.store(true, Ordering::Release);
     let _ = engine_thread.join();
     let _ = universe_thread.join();
     d.rec.stop();
-    drop(listener);
     let _ = fs::remove_file(&sock_path);
-    // SAFETY: closing our signalfd.
-    unsafe { libc::close(sfd) };
+    // the control threads still hold `d`, so retire the segment here rather than on its drop
+    d.shm.retire();
     log("stopped");
-    // `d` drops here: ShmWriter zeroes the magic and unlinks the segment.
 }
 
 #[cfg(test)]
@@ -2803,6 +2814,93 @@ mod tests {
         assert_eq!(skip.changed(), None, "told only on change");
         skip.hands = [true, false];
         assert_eq!(skip.changed(), Some([true, false]));
+    }
+
+    /// The control server answers each request line, whether split across reads or several in
+    /// one, serves at most MAX_CLIENTS clients, drops one that sends 4 KiB without a newline,
+    /// and answers nothing once stopped.
+    #[test]
+    fn the_control_server_answers_each_line_until_it_stops() {
+        use std::io::{ErrorKind, Read, Write};
+        let dir = std::env::temp_dir().join(format!("cv1t-control-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let endpoint = dir.join("control.sock");
+        let control = serve_control(
+            Arc::new(status_daemon()),
+            ipc::Listener::bind(&endpoint).unwrap(),
+        );
+        let connect = || {
+            let mut conn = ipc::Connection::connect(&endpoint).unwrap();
+            conn.set_timeout(Some(Duration::from_secs(5))).unwrap();
+            conn
+        };
+        #[derive(Debug, PartialEq)]
+        enum Reply {
+            Line(String),
+            Closed,
+            Silent,
+        }
+        let reply = |conn: &mut ipc::Connection| {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while byte[0] != b'\n' {
+                match conn.read(&mut byte) {
+                    Ok(1) => line.push(byte[0]),
+                    Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                        return Reply::Silent
+                    }
+                    _ => return Reply::Closed,
+                }
+            }
+            Reply::Line(String::from_utf8(line).unwrap())
+        };
+        let answered =
+            |reply: Reply| matches!(reply, Reply::Line(line) if line.starts_with("ok {"));
+
+        let mut client = connect();
+        client.write_all(b"sta").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(b"tus\nbogus\nstatus\n").unwrap();
+        assert!(answered(reply(&mut client)));
+        assert_eq!(
+            reply(&mut client),
+            Reply::Line("err unknown command 'bogus'\n".into())
+        );
+        assert!(answered(reply(&mut client)));
+
+        let mut idle: Vec<_> = (1..MAX_CLIENTS).map(|_| connect()).collect();
+        let mut refused = connect();
+        let _ = refused.write_all(b"status\n");
+        assert_eq!(
+            reply(&mut refused),
+            Reply::Closed,
+            "one client over the limit"
+        );
+        idle.pop();
+        // the freed slot serves the next client once its thread has seen the hang-up
+        let served = (0..50).any(|_| {
+            let mut next = connect();
+            let ok = next.write_all(b"status\n").is_ok() && answered(reply(&mut next));
+            if !ok {
+                thread::sleep(Duration::from_millis(20));
+            }
+            ok
+        });
+        assert!(served);
+        drop(idle);
+
+        let mut flood = connect();
+        let _ = flood.write_all(&[b'x'; 5000]);
+        assert_eq!(reply(&mut flood), Reply::Closed, "4 KiB without a newline");
+
+        let _stopped = control.stop();
+        client
+            .set_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        client.write_all(b"status\n").unwrap();
+        assert_eq!(reply(&mut client), Reply::Silent, "no answer once stopped");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

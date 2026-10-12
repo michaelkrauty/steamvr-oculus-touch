@@ -7,6 +7,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn dylib_open(path: &Path) -> *mut std::ffi::c_void {
     let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -180,6 +181,7 @@ pub struct OwnedSegment {
     ptr: *mut u8,
     len: usize,
     name: std::ffi::CString,
+    unlinked: AtomicBool,
     _ownership: File,
 }
 
@@ -226,6 +228,7 @@ impl OwnedSegment {
                 ptr: p as *mut u8,
                 len,
                 name: cname,
+                unlinked: AtomicBool::new(false),
                 _ownership: ownership,
             })
         }
@@ -249,15 +252,20 @@ impl OwnedSegment {
             );
         }
     }
+
+    pub fn unlink(&self) {
+        if !self.unlinked.swap(true, Ordering::AcqRel) {
+            // SAFETY: our name, NUL-terminated.
+            unsafe { libc::shm_unlink(self.name.as_ptr()) };
+        }
+    }
 }
 
 impl Drop for OwnedSegment {
     fn drop(&mut self) {
-        // SAFETY: our mapping and name.
-        unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.len);
-            libc::shm_unlink(self.name.as_ptr());
-        }
+        self.unlink();
+        // SAFETY: our mapping.
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
     }
 }
 
@@ -561,6 +569,63 @@ fn headset_hidraw(sys_class_hidraw: &Path, interface: u8) -> Option<std::path::P
                     .any(|l| l.starts_with("HID_PHYS=") && l.ends_with(&suffix))
         })
         .map(|n| Path::new("/dev").join(n))
+}
+
+/// SIGINT and SIGTERM, blocked and read from a signalfd.
+pub struct ShutdownRequests(std::os::fd::OwnedFd);
+
+impl ShutdownRequests {
+    pub fn take() -> io::Result<ShutdownRequests> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain signal-mask setup; the descriptor is owned below.
+        let fd = unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGINT);
+            libc::sigaddset(&mut mask, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+            libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        Ok(ShutdownRequests(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(fd)
+        }))
+    }
+
+    pub fn wait(&self, timeout: std::time::Duration) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        let mut fds = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut fds, 1, ms) } <= 0 || fds.revents & libc::POLLIN == 0 {
+            return None;
+        }
+        // SAFETY: reading one siginfo from our signalfd.
+        let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                &mut info as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<libc::signalfd_siginfo>(),
+            )
+        };
+        (n == std::mem::size_of::<libc::signalfd_siginfo>() as isize)
+            .then(|| format!("signal {}", info.ssi_signo))
+    }
+}
+
+/// SIGTERM to this thread, as `kill` would send the daemon.
+#[cfg(test)]
+pub fn request_shutdown() {
+    // SAFETY: a signal to the calling thread, which blocks it (ShutdownRequests::take).
+    unsafe { libc::raise(libc::SIGTERM) };
 }
 
 /// A device fed through a SOCK_SEQPACKET pair, which delivers one message per read as hidraw

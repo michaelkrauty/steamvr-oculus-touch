@@ -254,6 +254,15 @@ impl ShmWriter {
         }
     }
 
+    /// Tells readers the daemon is gone: zeroes the magic (readers holding the mapping see it)
+    /// and removes the name (new readers find nothing). The mapping stays until the writer drops,
+    /// which retires it too.
+    pub fn retire(&self) {
+        // SAFETY: we own the mapping.
+        unsafe { atomic_u32(addr_of_mut!((*self.seg.0).magic)).store(0, Ordering::Release) };
+        self.mapping.unlink();
+    }
+
     pub fn generation(&self) -> u64 {
         self.seg.generation()
     }
@@ -273,10 +282,8 @@ impl ShmWriter {
 }
 
 impl Drop for ShmWriter {
-    /// Zeroes magic (readers holding the mapping see the daemon is gone); the mapping goes after.
     fn drop(&mut self) {
-        // SAFETY: we own the mapping.
-        unsafe { atomic_u32(addr_of_mut!((*self.seg.0).magic)).store(0, Ordering::Release) };
+        self.retire();
     }
 }
 
@@ -630,6 +637,27 @@ mod tests {
         }
         assert!(matches!(ShmReader::open(&name), Err(ShmError::NotRunning)));
         unsafe { libc::shm_unlink(cname.as_ptr()) };
+    }
+
+    /// A clean stop retires the segment while other threads still hold the writer: readers see
+    /// the daemon gone at once and new ones find nothing.
+    #[test]
+    fn a_retired_writer_reads_as_gone_while_still_held() {
+        let name = test_name("retire");
+        let w = ShmWriter::create(&name, 7).unwrap();
+        let r = ShmReader::open(&name).unwrap();
+        w.retire();
+        assert!(r.stale(now_ns(), 500_000_000));
+        assert!(matches!(ShmReader::open(&name), Err(ShmError::NotRunning)));
+        // on Linux the name itself is gone (on Windows it lasts while a reader holds it)
+        #[cfg(unix)]
+        assert!(matches!(
+            OpenedSegment::open(&name, size_of::<ffi::cv1t_shm>()),
+            Err(OpenError::NotFound)
+        ));
+        w.retire();
+        drop(w);
+        assert!(matches!(ShmReader::open(&name), Err(ShmError::NotRunning)));
     }
 
     /// Review Focus 2: a reader holding the old mapping must see the daemon go away and a restart.

@@ -303,6 +303,9 @@ impl OwnedSegment {
             }
         }
     }
+
+    /// Named objects have no unlink: the name goes with the last handle on the segment.
+    pub fn unlink(&self) {}
 }
 
 impl Drop for OwnedSegment {
@@ -1130,6 +1133,93 @@ pub fn headset_interface(interface: u8) -> Option<std::path::PathBuf> {
         SetupDiDestroyDeviceInfoList(set);
         found
     }
+}
+
+/// The console's control events, set into a manual-reset event by the handler.
+pub struct ShutdownRequests;
+
+static SHUTDOWN_EVENT: OnceLock<usize> = OnceLock::new();
+static SHUTDOWN_KIND: AtomicU32 = AtomicU32::new(u32::MAX);
+
+unsafe extern "system" fn console_control(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    let Some(&event) = SHUTDOWN_EVENT.get() else {
+        return 0;
+    };
+    SHUTDOWN_KIND.store(kind, Ordering::Release);
+    // SAFETY: the event lives as long as the process.
+    unsafe { SetEvent(event as HANDLE) };
+    if matches!(
+        kind,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
+        // Windows ends the process when this returns: hold it while the daemon cleans up (the
+        // process exits from main; the system gives up after a few seconds)
+        std::thread::sleep(Duration::from_secs(10));
+    }
+    1
+}
+
+impl ShutdownRequests {
+    pub fn take() -> io::Result<ShutdownRequests> {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        if SHUTDOWN_EVENT.get().is_none() {
+            // SAFETY: an unnamed manual-reset event, kept for the life of the process.
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let _ = SHUTDOWN_EVENT.set(event as usize);
+        }
+        // SAFETY: a handler that only touches statics.
+        if unsafe { SetConsoleCtrlHandler(Some(console_control), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ShutdownRequests)
+    }
+
+    pub fn wait(&self, timeout: Duration) -> Option<String> {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        let event = *SHUTDOWN_EVENT.get()? as HANDLE;
+        let ms = timeout.as_millis().min(INFINITE as u128 - 1) as u32;
+        // SAFETY: the process-lifetime event.
+        if unsafe { WaitForSingleObject(event, ms) } != WAIT_OBJECT_0 {
+            return None;
+        }
+        Some(
+            match SHUTDOWN_KIND.load(Ordering::Acquire) {
+                CTRL_C_EVENT => "Ctrl+C",
+                CTRL_BREAK_EVENT => "Ctrl+Break",
+                CTRL_CLOSE_EVENT => "console closed",
+                CTRL_LOGOFF_EVENT => "logoff",
+                CTRL_SHUTDOWN_EVENT => "system shutdown",
+                _ => "console control event",
+            }
+            .to_string(),
+        )
+    }
+}
+
+impl Drop for ShutdownRequests {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        // SAFETY: removes the handler `take` added.
+        unsafe { SetConsoleCtrlHandler(Some(console_control), 0) };
+    }
+}
+
+/// Ctrl+Break, as the console would deliver it (to the handler directly: a real console event
+/// would reach the test runner too).
+#[cfg(test)]
+pub fn request_shutdown() {
+    use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
+    // SAFETY: the handler only touches statics.
+    unsafe { console_control(CTRL_BREAK_EVENT) };
 }
 
 /// The far end of a fake HID device: a message-mode pipe delivers one message per read, as the

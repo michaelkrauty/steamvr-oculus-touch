@@ -158,6 +158,13 @@ pub mod shm {
         pub fn wake(&self, word: *mut u32) {
             self.0.wake(word)
         }
+
+        /// Removes the name, once, so that new readers find nothing; the mapping stays until
+        /// drop, which removes the name too. On Windows a name lasts while any process holds the
+        /// segment, so there it goes when the readers let go.
+        pub fn unlink(&self) {
+            self.0.unlink()
+        }
     }
 
     #[derive(Debug)]
@@ -318,6 +325,32 @@ pub mod hid {
     pub(crate) fn is_headset_path(path: &str, interface: u8) -> bool {
         let path = path.to_ascii_lowercase();
         path.contains("vid_2833&pid_0031") && path.contains(&format!("&mi_{interface:02}"))
+    }
+}
+
+pub mod shutdown {
+    //! Requests to stop the daemon: SIGINT and SIGTERM on Linux; on Windows the console's
+    //! control events: Ctrl+C, Ctrl+Break, closing the console, and logoff and shutdown, which
+    //! Windows sends only to a console process that has not loaded user32.
+    use std::io;
+    use std::time::Duration;
+
+    use super::os;
+
+    pub struct Requests(os::ShutdownRequests);
+
+    impl Requests {
+        /// Takes the requests over from their default (ending the process at once). On Linux,
+        /// call it before starting threads: they inherit the blocked signals. On Windows the
+        /// default is back once this is dropped.
+        pub fn take() -> io::Result<Requests> {
+            os::ShutdownRequests::take().map(Requests)
+        }
+
+        /// Waits up to `timeout` for a request; what it was ("signal 15", "Ctrl+C").
+        pub fn wait(&self, timeout: Duration) -> Option<String> {
+            self.0.wait(timeout)
+        }
     }
 }
 
@@ -714,6 +747,16 @@ mod tests {
             }
         };
         let _ = (gone, sender);
+    }
+
+    #[test]
+    fn a_shutdown_request_ends_the_wait() {
+        use std::time::Duration;
+        let requests = super::shutdown::Requests::take().unwrap();
+        assert_eq!(requests.wait(Duration::from_millis(20)), None);
+        super::os::request_shutdown();
+        let why = requests.wait(Duration::from_secs(2));
+        assert!(why.is_some_and(|w| w == "signal 15" || w == "Ctrl+Break"));
     }
 
     #[test]
