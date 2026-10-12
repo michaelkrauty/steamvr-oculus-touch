@@ -14,7 +14,7 @@
 
 namespace cv1t {
 
-class TouchDevice : public vr::ITrackedDeviceServerDriver {
+class TouchDevice final : public vr::ITrackedDeviceServerDriver {
 public:
 	explicit TouchDevice(int hand) : hand_(hand) {}
 	const char *serial() const { return hand_ == CV1T_HAND_LEFT ? "CV1T-LEFT" : "CV1T-RIGHT"; }

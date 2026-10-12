@@ -3,14 +3,71 @@
 
 #include "shm_client.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include "log.h"
 
 namespace cv1t {
+
+#ifdef _WIN32
+static std::wstring widen(const std::string &s)
+{
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+	std::wstring w(static_cast<size_t>(n), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+	return w;
+}
+
+/* Local\cv1touch-<kind>-<name>, the daemon's object names (cv1touch_shm.h). */
+static std::wstring object_name(const wchar_t *kind, const std::string &name)
+{
+	return std::wstring(L"Local\\cv1touch-") + kind + L"-" + widen(name.substr(name.rfind('/') + 1));
+}
+
+/* The segment mapped read-only, or nullptr if it is missing or smaller than the ABI. */
+static const void *map_segment(const std::string &name)
+{
+	HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, object_name(L"shm", name).c_str());
+	if (!mapping)
+		return nullptr;
+	void *p = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+	CloseHandle(mapping); // the view keeps the section alive
+	if (!p)
+		return nullptr;
+	MEMORY_BASIC_INFORMATION info{};
+	if (VirtualQuery(p, &info, sizeof info) == 0 || info.RegionSize < sizeof(cv1t_shm)) {
+		UnmapViewOfFile(p);
+		return nullptr;
+	}
+	return p;
+}
+
+static void unmap_segment(const void *p) { UnmapViewOfFile(p); }
+#else
+/* The segment mapped read-only, or nullptr if it is missing or not sized yet (mapping an unsized
+ * object would SIGBUS). */
+static const void *map_segment(const std::string &name)
+{
+	const int fd = shm_open(name.c_str(), O_RDONLY | O_CLOEXEC, 0);
+	if (fd < 0)
+		return nullptr;
+	struct stat st {};
+	if (fstat(fd, &st) < 0 || static_cast<size_t>(st.st_size) < sizeof(cv1t_shm)) {
+		::close(fd);
+		return nullptr;
+	}
+	void *p = mmap(nullptr, sizeof(cv1t_shm), PROT_READ, MAP_SHARED, fd, 0);
+	::close(fd);
+	return p == MAP_FAILED ? nullptr : p;
+}
+
+static void unmap_segment(const void *p) { munmap(const_cast<void *>(p), sizeof(cv1t_shm)); }
+#endif
 
 ShmClient::ShmClient(std::string name, uint64_t stale_ns) : name_(std::move(name)), stale_ns_(stale_ns) {}
 
@@ -19,8 +76,15 @@ ShmClient::~ShmClient() { close(); }
 void ShmClient::close()
 {
 	if (shm_)
-		munmap(const_cast<cv1t_shm *>(shm_), sizeof(cv1t_shm));
+		unmap_segment(shm_);
 	shm_ = nullptr;
+#ifdef _WIN32
+	for (auto &e : events_) {
+		if (e)
+			CloseHandle(e);
+		e = nullptr;
+	}
+#endif
 	have_hand_[0] = have_hand_[1] = have_alignment_ = false; // a new daemon starts afresh
 }
 
@@ -46,21 +110,12 @@ bool ShmClient::ensure_open(uint64_t now_ns)
 		return false;
 	tried_ = true;
 	last_try_ns_ = now_ns;
-	const int fd = shm_open(name_.c_str(), O_RDONLY | O_CLOEXEC, 0);
-	if (fd < 0)
-		return false;
-	struct stat st {};
-	if (fstat(fd, &st) < 0 || static_cast<size_t>(st.st_size) < sizeof(cv1t_shm)) {
-		::close(fd);
-		return false; // not sized yet: mapping it would SIGBUS
-	}
-	void *p = mmap(nullptr, sizeof(cv1t_shm), PROT_READ, MAP_SHARED, fd, 0);
-	::close(fd);
-	if (p == MAP_FAILED)
+	const void *p = map_segment(name_);
+	if (!p)
 		return false;
 	const auto *s = static_cast<const cv1t_shm *>(p);
 	if (__atomic_load_n(&s->magic, __ATOMIC_ACQUIRE) != CV1T_SHM_MAGIC) {
-		munmap(p, sizeof(cv1t_shm));
+		unmap_segment(p);
 		return false;
 	}
 	if (s->version != CV1T_SHM_VERSION || s->size != sizeof(cv1t_shm)) {
@@ -68,10 +123,14 @@ bool ShmClient::ensure_open(uint64_t now_ns)
 			cv1t_log("cv1touch: daemon shared memory is ABI v%u (%u bytes); this driver needs v%u (%zu): restart cv1touchd from the same build",
 				 s->version, s->size, CV1T_SHM_VERSION, sizeof(cv1t_shm));
 		warned_version_ = true;
-		munmap(p, sizeof(cv1t_shm));
+		unmap_segment(p);
 		return false;
 	}
 	shm_ = s;
+#ifdef _WIN32
+	events_[0] = OpenEventW(SYNCHRONIZE, FALSE, object_name(L"update0", name_).c_str());
+	events_[1] = OpenEventW(SYNCHRONIZE, FALSE, object_name(L"update1", name_).c_str());
+#endif
 	generation_ = s->generation;
 	if (!alive(now_ns)) {
 		close(); // a crashed daemon's leftover segment
@@ -113,7 +172,13 @@ bool ShmClient::alignment(cv1t_alignment *out) const
 
 uint32_t ShmClient::wait(uint32_t last_seen, int64_t timeout_ns) const
 {
-	return shm_ ? cv1t_shm_wait(shm_, last_seen, timeout_ns) : last_seen;
+	if (!shm_)
+		return last_seen;
+#ifdef _WIN32
+	return cv1t_shm_wait_events(shm_, events_, last_seen, timeout_ns);
+#else
+	return cv1t_shm_wait(shm_, last_seen, timeout_ns);
+#endif
 }
 
 } // namespace cv1t

@@ -37,6 +37,9 @@ private:
 	uint64_t last_try_ns_ = 0;
 	bool tried_ = false;
 	bool warned_version_ = false;
+#ifdef _WIN32
+	void *events_[2] = {nullptr, nullptr}; /* the daemon's update0/update1 events */
+#endif
 	/* Last consistent reads: a writer caught mid-update for every retry yields these instead. */
 	mutable cv1t_controller_state last_hand_[CV1T_HAND_COUNT]{};
 	mutable bool have_hand_[CV1T_HAND_COUNT] = {false, false};

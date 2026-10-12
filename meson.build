@@ -2,10 +2,23 @@ project('cv1touch', 'c', 'cpp',
   version: '0.2.0',
   meson_version: '>= 1.3',
   subproject_dir: 'third_party',
-  default_options: ['c_std=gnu11', 'cpp_std=c++20', 'warning_level=2', 'buildtype=debugoptimized'])
+  # b_vscrt (Windows): the driver carries its C/C++ runtime, as -static-libstdc++ does on Linux
+  default_options: ['c_std=gnu11,c11', 'cpp_std=c++20', 'warning_level=2', 'buildtype=debugoptimized',
+    'b_vscrt=static_from_buildtype'])
 
-if host_machine.system() != 'linux' or host_machine.cpu_family() != 'x86_64'
-  error('cv1touch supports Linux x86_64 only')
+if host_machine.cpu_family() != 'x86_64' or host_machine.system() not in ['linux', 'windows']
+  error('cv1touch supports Linux and Windows on x86_64')
+endif
+
+if host_machine.system() == 'windows'
+  # The engine is not ported yet: the SteamVR driver and its tests only. Build with clang-cl
+  # (CC=clang-cl CXX=clang-cl): the shared-memory helpers use the GNU __atomic builtins.
+  if meson.get_compiler('cpp').get_id() != 'clang-cl'
+    error('build the Windows driver with clang-cl (CC=clang-cl CXX=clang-cl)')
+  endif
+  threads_dep = dependency('threads')
+  subdir('driver')
+  subdir_done()
 endif
 
 openhmd_proj = subproject('openhmd', default_options: [

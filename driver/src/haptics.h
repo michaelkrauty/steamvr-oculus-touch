@@ -23,6 +23,11 @@ std::string haptic_line(const HapticCommand &c);
 /* One request line to the daemon's control socket, one reply line back ("ok..." is success);
  * 100 ms timeouts, so a stuck daemon cannot hold the caller. */
 bool send_control_line(const std::string &path, const std::string &line);
+#ifdef _WIN32
+/* The daemon's named pipe for a control endpoint path: \\.\pipe\cv1touch- and the path with "\"
+ * as "/" (the daemon's platform::pipe_name); empty past the 256-character limit. */
+std::wstring control_pipe_name(const std::string &path);
+#endif
 
 /* Sends haptic commands to the daemon's control socket from a worker thread. The newest command
  * per hand wins, and submit() never blocks the caller. */

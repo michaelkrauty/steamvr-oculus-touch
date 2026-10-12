@@ -2,7 +2,8 @@
 // Copyright 2026 michaelkrauty
 
 /* cv1touch shared-memory ABI between cv1touchd (single writer) and its readers (SteamVR driver,
- * tools). All host timestamps are CLOCK_MONOTONIC ns. This header is the single definition:
+ * tools). All host timestamps are monotonic ns: CLOCK_MONOTONIC on Linux, QueryPerformanceCounter
+ * on Windows (see cv1t_now_ns). This header is the single definition:
  * Rust gets it through bindgen (src/ffi.rs); C/C++ readers include it and may use the inline
  * helpers below. Bump CV1T_SHM_VERSION on any layout change. */
 #ifndef CV1TOUCH_SHM_H
@@ -14,13 +15,28 @@
 /* Rust's bindings need only the types: CV1T_SHM_TYPES_ONLY leaves out the platform headers and the
  * inline helpers, so they generate for any target. */
 #ifndef CV1T_SHM_TYPES_ONLY
-#include <linux/futex.h>
 #include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #endif
+#endif
 
+/* Linux: the POSIX shared-memory object CV1T_SHM_NAME; readers wait on update_futex.
+ * Windows: the file mapping Local\cv1touch-shm-<name> (<name> = CV1T_SHM_NAME without its "/"),
+ * owned through the mutex Local\cv1touch-owner-<name>. Publish n (the new update_futex value) sets
+ * the manual-reset event Local\cv1touch-update<n % 2>-<name> and resets the other, so a reader that
+ * saw n waits on update<(n + 1) % 2> (cv1t_shm_wait_events). */
 #define CV1T_SHM_NAME "/cv1touch"
 #define CV1T_SHM_MAGIC 0x54315643u /* "CV1T" little-endian */
 #define CV1T_SHM_VERSION 3u
@@ -155,6 +171,7 @@ CV1T_STATIC_ASSERT(sizeof(cv1t_shm) == 1328, "cv1t_shm ABI");
 /* ---- Reader rules ----
  * - fstat() the segment and require st_size >= sizeof(cv1t_shm) before mmap(): the daemon creates the
  *   object, then sizes it, then publishes magic; mapping an unsized object SIGBUSes on first access.
+ *   On Windows the mapping is created at full size; check the view (VirtualQuery) all the same.
  * - Trust nothing until magic == CV1T_SHM_MAGIC (acquire load) and version/size match.
  * - A daemon exit zeroes magic; a crash leaves magic set, so heartbeat_host_ns age is the crash signal.
  *   A restarted daemon creates a fresh segment: re-open by name when the heartbeat goes stale.
@@ -166,9 +183,18 @@ CV1T_STATIC_ASSERT(sizeof(cv1t_shm) == 1328, "cv1t_shm ABI");
 
 static inline uint64_t cv1t_now_ns(void)
 {
+#ifdef _WIN32
+	LARGE_INTEGER f, t;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&t);
+	const uint64_t freq = f.QuadPart > 0 ? (uint64_t)f.QuadPart : 1, ticks = (uint64_t)t.QuadPart;
+	/* exactly ticks * 1e9 / freq, as the daemon computes it in 128 bits (freq < 1.8e10) */
+	return ticks / freq * 1000000000ull + ticks % freq * 1000000000ull / freq;
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 /* Consistent copy of a seqlock-protected block: 0, or -1 if the writer kept it busy for max_tries. */
@@ -196,6 +222,25 @@ static inline int cv1t_shm_read_alignment(const cv1t_shm *shm, cv1t_alignment *o
 	return cv1t_seq_read(&shm->alignment_seq, out, &shm->alignment, sizeof *out, 1000);
 }
 
+#ifdef _WIN32
+/* Block until update_futex differs from last_seen, a publish wakes the reader, or timeout_ns passes;
+ * returns the current value. events: the opened update0 and update1 (either may be NULL: then it
+ * sleeps out the timeout). */
+static inline uint32_t cv1t_shm_wait_events(const cv1t_shm *shm, HANDLE const events[2], uint32_t last_seen, int64_t timeout_ns)
+{
+	if (__atomic_load_n(&shm->update_futex, __ATOMIC_ACQUIRE) == last_seen) {
+		int64_t ms = timeout_ns > 0 ? (timeout_ns + 999999) / 1000000 : 0;
+		if (ms > 0x7fffffff)
+			ms = 0x7fffffff;
+		HANDLE e = events[(last_seen + 1u) % 2u];
+		if (e)
+			WaitForSingleObject(e, (DWORD)ms);
+		else
+			Sleep((DWORD)ms);
+	}
+	return __atomic_load_n(&shm->update_futex, __ATOMIC_ACQUIRE);
+}
+#else
 /* Block until update_futex differs from last_seen or timeout_ns passes; returns the current value. */
 static inline uint32_t cv1t_shm_wait(const cv1t_shm *shm, uint32_t last_seen, int64_t timeout_ns)
 {
@@ -203,6 +248,7 @@ static inline uint32_t cv1t_shm_wait(const cv1t_shm *shm, uint32_t last_seen, in
 	syscall(SYS_futex, (uint32_t *)&shm->update_futex, FUTEX_WAIT, last_seen, &ts, NULL, 0);
 	return __atomic_load_n(&shm->update_futex, __ATOMIC_ACQUIRE);
 }
+#endif
 #endif /* CV1T_SHM_TYPES_ONLY */
 
 #endif

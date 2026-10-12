@@ -32,3 +32,28 @@ jobs:
         run: cargo clippy --locked --no-default-features --lib --tests -- -D warnings
       - name: Test
         run: cargo test --locked --no-default-features --lib
+  driver:
+    # The SteamVR driver DLL (clang-cl, static runtime) and its tests, then the driver against the
+    # daemon's own shared-memory and control code.
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      CC: clang-cl
+      CXX: clang-cl
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install meson and ninja
+        run: |
+          python -m pip install --disable-pip-version-check "meson==1.8.2" "ninja==1.11.1.4"
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Build
+        run: |
+          meson setup build-driver --vsenv
+          meson compile -C build-driver
+      - name: Test
+        run: meson test -C build-driver --print-errorlogs
+      - name: Contract with the daemon
+        run: cargo run --locked --no-default-features --example driver_contract -- build-driver\driver\test_daemon_contract.exe

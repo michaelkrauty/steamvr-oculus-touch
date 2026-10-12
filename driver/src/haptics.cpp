@@ -7,12 +7,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 #include "cv1touch_shm.h"
+#ifdef _WIN32
+#include <aclapi.h>
+#endif
 #include "log.h"
 
 namespace cv1t {
@@ -46,12 +51,51 @@ std::string haptic_line(const HapticCommand &c)
 	return buf;
 }
 
+#ifdef _WIN32
+static std::wstring widen(const std::string &s)
+{
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+	std::wstring w(static_cast<size_t>(n), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+	return w;
+}
+
+static std::string narrow(const std::wstring &w)
+{
+	const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+	std::string s(static_cast<size_t>(n), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+	return s;
+}
+
+/* cv1touchd's runtime directory: %LOCALAPPDATA%\cv1touch, else the temp directory's cv1touch. */
+std::string HapticSender::default_socket_path()
+{
+	wchar_t buf[MAX_PATH + 1];
+	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH + 1);
+	if (n == 0 || n > MAX_PATH)
+		n = GetTempPathW(MAX_PATH + 1, buf);
+	std::wstring dir(buf, n <= MAX_PATH ? n : 0);
+	if (!dir.empty() && dir.back() != L'\\' && dir.back() != L'/')
+		dir += L'\\';
+	return narrow(dir + L"cv1touch\\control.sock");
+}
+
+std::wstring control_pipe_name(const std::string &path)
+{
+	std::wstring name = L"\\\\.\\pipe\\cv1touch-";
+	for (wchar_t c : widen(path))
+		name += c == L'\\' ? L'/' : c;
+	return name.size() <= 256 ? name : std::wstring();
+}
+#else
 std::string HapticSender::default_socket_path()
 {
 	const char *rt = std::getenv("XDG_RUNTIME_DIR");
 	std::string dir = rt && *rt ? rt : "/run/user/" + std::to_string(getuid());
 	return dir + "/cv1touch/control.sock";
 }
+#endif
 
 HapticSender::HapticSender(std::string socket_path) : path_(std::move(socket_path)) {}
 
@@ -105,6 +149,82 @@ bool HapticSender::take(int hand, HapticCommand *out)
 	return true;
 }
 
+#ifdef _WIN32
+/* One overlapped read or write on the pipe, given up after ms. */
+static bool pipe_io(HANDLE pipe, HANDLE event, bool write, void *buf, DWORD len, DWORD *moved, DWORD ms)
+{
+	OVERLAPPED ov{};
+	ov.hEvent = event;
+	ResetEvent(event);
+	const BOOL done = write ? WriteFile(pipe, buf, len, nullptr, &ov) : ReadFile(pipe, buf, len, nullptr, &ov);
+	if (!done && GetLastError() != ERROR_IO_PENDING)
+		return false;
+	if (WaitForSingleObject(event, ms) != WAIT_OBJECT_0) {
+		CancelIoEx(pipe, &ov);
+		GetOverlappedResult(pipe, &ov, moved, TRUE); // the buffer is in use until the cancel lands
+		return false;
+	}
+	return GetOverlappedResult(pipe, &ov, moved, FALSE) != 0;
+}
+
+/* Pipe names are global, so another account could create the daemon's pipe first. The daemon
+ * makes its user the owner of its pipe (src/platform/windows.rs, served_by): a pipe owned by
+ * anyone else is not the daemon's. */
+static bool owned_by_this_user(HANDLE pipe)
+{
+	HANDLE token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+		return false;
+	alignas(TOKEN_USER) unsigned char user[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+	DWORD size = 0;
+	const bool have_user = GetTokenInformation(token, TokenUser, user, sizeof user, &size) != 0;
+	CloseHandle(token);
+	PSID owner = nullptr;
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	if (!have_user || GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr,
+					  &descriptor) != ERROR_SUCCESS)
+		return false;
+	const bool ours = EqualSid(owner, reinterpret_cast<TOKEN_USER *>(user)->User.Sid) != 0;
+	LocalFree(descriptor);
+	return ours;
+}
+
+/* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
+bool send_control_line(const std::string &path, const std::string &line)
+{
+	const std::wstring name = control_pipe_name(path);
+	if (name.empty())
+		return false;
+	auto open = [&] {
+		// identification only: the server may check who we are, not act as us
+		return CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+				   FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+	};
+	HANDLE pipe = open();
+	// every instance busy for a moment: the daemon offers the next one as it accepts
+	if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeW(name.c_str(), 100))
+		pipe = open();
+	if (pipe == INVALID_HANDLE_VALUE)
+		return false;
+	if (!owned_by_this_user(pipe)) {
+		CloseHandle(pipe);
+		return false;
+	}
+	HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	bool ok = event != nullptr;
+	DWORD moved = 0;
+	ok = ok && pipe_io(pipe, event, true, const_cast<char *>(line.data()), static_cast<DWORD>(line.size()), &moved, 100) &&
+	     moved == line.size();
+	if (ok) {
+		char reply[256];
+		ok = pipe_io(pipe, event, false, reply, sizeof reply - 1, &moved, 100) && moved >= 2 && std::strncmp(reply, "ok", 2) == 0;
+	}
+	if (event)
+		CloseHandle(event);
+	CloseHandle(pipe);
+	return ok;
+}
+#else
 /* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
 bool send_control_line(const std::string &path, const std::string &line)
 {
@@ -127,6 +247,7 @@ bool send_control_line(const std::string &path, const std::string &line)
 	close(fd);
 	return ok;
 }
+#endif
 
 void HapticSender::run()
 {

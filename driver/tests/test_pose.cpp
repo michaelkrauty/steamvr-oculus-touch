@@ -9,7 +9,7 @@
 
 using cv1t::make_pose;
 
-static bool near(double a, double b, double eps = 1e-6) { return std::fabs(a - b) < eps; }
+static bool approx(double a, double b, double eps = 1e-6) { return std::fabs(a - b) < eps; }
 
 static cv1t_controller_state state()
 {
@@ -40,11 +40,11 @@ static void connected_pose_and_timing()
 	const cv1t_controller_state s = state();
 	const auto p = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'002'000'000);
 	assert(p.deviceIsConnected && p.poseIsValid && p.result == vr::TrackingResult_Running_OK);
-	assert(near(p.poseTimeOffset, -0.002));
-	assert(near(p.qRotation.w, std::sqrt(0.5)) && near(p.qRotation.x, std::sqrt(0.5)) && near(p.qRotation.y, 0));
-	assert(near(p.vecPosition[1], 1.2f) && near(p.vecVelocity[0], 0.5f));
+	assert(approx(p.poseTimeOffset, -0.002));
+	assert(approx(p.qRotation.w, std::sqrt(0.5)) && approx(p.qRotation.x, std::sqrt(0.5)) && approx(p.qRotation.y, 0));
+	assert(approx(p.vecPosition[1], 1.2f) && approx(p.vecVelocity[0], 0.5f));
 	// body +Z rotated 90 degrees about +X is world -Y
-	assert(near(p.vecAngularVelocity[0], 0, 1e-6) && near(p.vecAngularVelocity[1], -0.75, 1e-6) && near(p.vecAngularVelocity[2], 0, 1e-6));
+	assert(approx(p.vecAngularVelocity[0], 0, 1e-6) && approx(p.vecAngularVelocity[1], -0.75, 1e-6) && approx(p.vecAngularVelocity[2], 0, 1e-6));
 	assert(p.qWorldFromDriverRotation.w == 1 && p.qDriverFromHeadRotation.w == 1);
 }
 
@@ -72,7 +72,7 @@ static void a_lost_position_is_not_extrapolated()
 	s.flags &= ~CV1T_FLAG_POSITION;
 	const auto p = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'001'000'000);
 	assert(p.poseIsValid && p.vecVelocity[0] == 0 && p.vecVelocity[1] == 0 && p.vecVelocity[2] == 0);
-	assert(near(p.vecAngularVelocity[1], -0.75, 1e-6));
+	assert(approx(p.vecAngularVelocity[1], -0.75, 1e-6));
 }
 
 static void alignment_is_applied_per_hand()
@@ -86,7 +86,7 @@ static void alignment_is_applied_per_hand()
 	al.render_pos[CV1T_HAND_LEFT][2] = 0.04f;
 	const auto left = make_pose(&s, &al, CV1T_HAND_LEFT, 10'001'000'000);
 	assert(left.qWorldFromDriverRotation.w == 0 && left.qWorldFromDriverRotation.y == 1 && left.vecWorldFromDriverTranslation[0] == 2.0);
-	assert(near(left.vecDriverFromHeadTranslation[2], 0.04f));
+	assert(approx(left.vecDriverFromHeadTranslation[2], 0.04f));
 	const auto right = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'001'000'000);
 	assert(right.qDriverFromHeadRotation.w == 1 && right.vecDriverFromHeadTranslation[2] == 0); // no right offset
 }
