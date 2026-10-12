@@ -129,11 +129,17 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, OpenEventW, ResetEvent, SetEvent, WaitForSingleObject,
 };
 
 /// SYNCHRONIZE: waiting on an object is all a reader needs.
 const SYNCHRONIZE: u32 = 0x0010_0000;
+
+/// The update events, one per parity of the counter: publish n sets `update{n % 2}` and resets the
+/// other, so a reader that saw n waits on `update{(n + 1) % 2}` and every waiter wakes (one
+/// auto-reset event would release a single waiter per publish). The SteamVR driver opens the same
+/// names (driver/src/shm_client.cpp).
+const UPDATE_EVENTS: [&str; 2] = ["update0", "update1"];
 
 pub fn now_ns() -> u64 {
     static FREQUENCY: OnceLock<u64> = OnceLock::new();
@@ -201,7 +207,7 @@ impl Drop for Handle {
 pub struct OwnedSegment {
     ptr: *mut u8,
     _mapping: Handle,
-    event: Handle,
+    events: [Handle; 2],
     _owner: Handle,
 }
 
@@ -257,16 +263,23 @@ impl OwnedSegment {
                 }
                 std::ptr::write_bytes(view.Value as *mut u8, 0, len);
             }
-            let event = Handle(CreateEventW(
-                std::ptr::null(),
-                0,
-                0,
-                object_name("update", component).as_ptr(),
-            ));
+            let events = UPDATE_EVENTS.map(|kind| {
+                // a manual-reset event, possibly left signalled by a reader's open handle
+                let event = Handle(CreateEventW(
+                    std::ptr::null(),
+                    1,
+                    0,
+                    object_name(kind, component).as_ptr(),
+                ));
+                if !event.0.is_null() {
+                    ResetEvent(event.0);
+                }
+                event
+            });
             Ok(OwnedSegment {
                 ptr: view.Value as *mut u8,
                 _mapping: mapping,
-                event,
+                events,
                 _owner: owner,
             })
         }
@@ -276,10 +289,18 @@ impl OwnedSegment {
         self.ptr
     }
 
-    pub fn wake(&self, _word: *mut u32) {
-        if !self.event.0.is_null() {
-            // SAFETY: our event handle.
-            unsafe { SetEvent(self.event.0) };
+    pub fn wake(&self, word: *mut u32) {
+        // SAFETY: the counter is inside our live mapping.
+        let n = unsafe { AtomicU32::from_ptr(word) }.load(Ordering::Acquire) as usize;
+        let (now, next) = (&self.events[n % 2], &self.events[(n + 1) % 2]);
+        // SAFETY: our event handles (null ones are skipped).
+        unsafe {
+            if !now.0.is_null() {
+                SetEvent(now.0);
+            }
+            if !next.0.is_null() {
+                ResetEvent(next.0);
+            }
         }
     }
 }
@@ -298,7 +319,7 @@ impl Drop for OwnedSegment {
 pub struct OpenedSegment {
     ptr: *mut u8,
     _mapping: Handle,
-    event: Handle,
+    events: [Handle; 2],
 }
 
 // SAFETY: a read-only shared mapping.
@@ -331,15 +352,17 @@ impl OpenedSegment {
                 UnmapViewOfFile(view);
                 return Err(OpenError::TooSmall);
             }
-            let event = Handle(OpenEventW(
-                SYNCHRONIZE,
-                0,
-                object_name("update", component).as_ptr(),
-            ));
+            let events = UPDATE_EVENTS.map(|kind| {
+                Handle(OpenEventW(
+                    SYNCHRONIZE,
+                    0,
+                    object_name(kind, component).as_ptr(),
+                ))
+            });
             Ok(OpenedSegment {
                 ptr: view.Value as *mut u8,
                 _mapping: mapping,
-                event,
+                events,
             })
         }
     }
@@ -354,11 +377,12 @@ impl OpenedSegment {
             return;
         }
         let ms = timeout_ns.div_ceil(1_000_000).min(u32::MAX as u64 - 1) as u32;
-        if self.event.0.is_null() {
+        let event = &self.events[(last_seen as usize + 1) % 2];
+        if event.0.is_null() {
             std::thread::sleep(Duration::from_millis(ms as u64));
         } else {
             // SAFETY: our event handle.
-            unsafe { WaitForSingleObject(self.event.0, ms) };
+            unsafe { WaitForSingleObject(event.0, ms) };
         }
     }
 }
@@ -420,15 +444,17 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
         })
 }
 
-/// The pipe for an endpoint path: named after the path, which lies in this user's profile.
-fn pipe_name(endpoint: &Path) -> Vec<u16> {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(endpoint.to_string_lossy().as_bytes());
-    let mut id = String::new();
-    for b in &digest[..16] {
-        let _ = std::fmt::Write::write_fmt(&mut id, format_args!("{b:02x}"));
-    }
-    wide(&format!("\\\\.\\pipe\\cv1touch-{id}"))
+fn pipe_name(endpoint: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let path: Vec<u16> = endpoint.as_os_str().encode_wide().collect();
+    let mut name = super::pipe_name(&path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "endpoint path too long for a pipe name",
+        )
+    })?;
+    name.push(0);
+    Ok(name)
 }
 
 fn manual_event() -> io::Result<Handle> {
@@ -472,7 +498,7 @@ unsafe impl Send for Connection {}
 
 impl Connection {
     pub fn connect(endpoint: &Path) -> io::Result<Connection> {
-        let name = pipe_name(endpoint);
+        let name = pipe_name(endpoint)?;
         for _ in 0..3 {
             // SAFETY: a NUL-terminated pipe name; the handle is owned below.
             let pipe = unsafe {
@@ -642,7 +668,7 @@ unsafe impl Send for Listener {}
 impl Listener {
     pub fn bind(endpoint: &Path) -> io::Result<Listener> {
         let mut listener = Listener {
-            name: pipe_name(endpoint),
+            name: pipe_name(endpoint)?,
             security: UserOnly::new()?,
             pending: None,
         };

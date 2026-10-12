@@ -110,6 +110,22 @@ pub fn now_ns() -> u64 {
     os::now_ns()
 }
 
+/// The named pipe for a control endpoint path (UTF-16, no NUL): `\\.\pipe\cv1touch-` and the path
+/// with `\` written as `/`, since a pipe name may hold any character but `\`. None if it would pass
+/// the 256-character limit. The SteamVR driver builds the same name (driver/src/haptics.cpp).
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn pipe_name(path: &[u16]) -> Option<Vec<u16>> {
+    let mut name: Vec<u16> = r"\\.\pipe\cv1touch-".encode_utf16().collect();
+    name.extend(path.iter().map(|&c| {
+        if c == u16::from(b'\\') {
+            u16::from(b'/')
+        } else {
+            c
+        }
+    }));
+    (name.len() <= 256).then_some(name)
+}
+
 /// `ticks` of a counter running at `frequency` per second, in nanoseconds, without overflow.
 pub fn ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
     (ticks as u128 * 1_000_000_000 / frequency.max(1) as u128) as u64
@@ -344,6 +360,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_is_named_after_its_endpoint_path() {
+        let wide = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(
+            super::pipe_name(&wide(r"C:\Users\a b\AppData\Local\cv1touch\control.sock")),
+            Some(wide(
+                r"\\.\pipe\cv1touch-C:/Users/a b/AppData/Local/cv1touch/control.sock"
+            ))
+        );
+        let long = format!(r"C:\{}", "x".repeat(250));
+        assert_eq!(super::pipe_name(&wide(&long)), None);
+    }
+
+    #[test]
     fn a_segment_written_by_its_owner_reads_the_same_elsewhere() {
         let name = segment_name("rw");
         assert!(matches!(
@@ -413,6 +442,43 @@ mod tests {
         let before = std::time::Instant::now();
         reader.wait(reader.ptr() as *mut u32, 1, 30_000_000);
         assert!(before.elapsed() >= std::time::Duration::from_millis(20));
+    }
+
+    /// The driver and a tool can wait at once: every publish must wake all of them, not one.
+    #[test]
+    fn every_waiting_reader_is_woken_by_each_publish() {
+        let name = segment_name("wake-all");
+        let owner = OwnedSegment::create(&name, 64).unwrap();
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let reader = OpenedSegment::open(&name, 64).unwrap();
+                std::thread::spawn(move || {
+                    let word = reader.ptr() as *mut u32;
+                    let mut slowest = std::time::Duration::ZERO;
+                    for seen in 0..3 {
+                        let before = std::time::Instant::now();
+                        reader.wait(word, seen, 5_000_000_000);
+                        slowest = slowest.max(before.elapsed());
+                        // SAFETY: the counter is inside the live segment
+                        while unsafe { AtomicU32::from_ptr(word) }.load(Ordering::Acquire) == seen {
+                            std::thread::yield_now();
+                        }
+                    }
+                    slowest
+                })
+            })
+            .collect();
+        let word = owner.ptr() as *mut u32;
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: as above
+            unsafe { AtomicU32::from_ptr(word) }.fetch_add(1, Ordering::Release);
+            owner.wake(word);
+        }
+        for reader in readers {
+            let slowest = reader.join().unwrap();
+            assert!(slowest < std::time::Duration::from_secs(2), "{slowest:?}");
+        }
     }
 
     #[test]
