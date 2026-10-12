@@ -6,9 +6,9 @@ Run this with the daemon running and both Touch controllers awake:
 cv1touch calibrate inputs
 ```
 
-SteamVR can stay open; no VR application or daemon restart is required for calibration. For each hand, follow the timed prompts to leave the trigger and grip released with the thumbstick centered, hold the trigger fully pulled, hold the grip fully squeezed, and move the thumbstick against its gate through several complete circles. Use normal firm pressure at the mechanical stop. Keep the other inputs released during each press capture.
+SteamVR can stay open; no VR application or daemon restart is required for calibration. Follow four timed prompts with both hands simultaneously: leave both triggers and grips released with both thumbsticks centered for 2 seconds, hold both triggers fully pulled for 2 seconds, hold both grips fully squeezed for 2 seconds, then move both thumbsticks against their gates through several complete circles for 10 seconds. Timed collection totals 16 seconds, plus your time confirming each prompt. Use normal firm pressure at the mechanical stop. Keep the other inputs released during each press capture.
 
-The guide measures the factory-normalized values before any previous user correction. It requires fresh samples, a consistent physical-controller identity, and enough travel in every required direction. Incomplete captures do not replace your current settings. After a successful save, the daemon applies the new settings immediately.
+The guide measures the factory-normalized values before any previous user correction. Each hand independently requires fresh samples, a consistent physical-controller identity, and enough travel in every required direction. A fresh hand cannot compensate for stale or disconnected input from the other hand. Incomplete captures do not replace your current settings. After a successful save, the daemon applies the new settings immediately.
 
 ## What changes
 

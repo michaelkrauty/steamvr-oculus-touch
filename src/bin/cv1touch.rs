@@ -5,7 +5,7 @@
 //! calibrate, consistency.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{self, Command as Process};
@@ -21,9 +21,34 @@ use cv1touch::status;
 use cv1touch::summary::{self, Window};
 use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 
+#[path = "cv1touch/setup.rs"]
+mod guided_setup;
+
+fn human_color_enabled(no_color: bool, term_dumb: bool, terminal: bool, forced: bool) -> bool {
+    !no_color && !term_dumb && (terminal || forced)
+}
+
+fn human_text(message: &str) -> String {
+    let color = human_color_enabled(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("TERM").is_ok_and(|value| value == "dumb"),
+        io::stdout().is_terminal(),
+        std::env::var("CLICOLOR_FORCE").is_ok_and(|value| value == "1"),
+    );
+    if color {
+        format!("\x1b[1m{message}\x1b[0m")
+    } else {
+        message.to_owned()
+    }
+}
+
+fn human_action(message: &str) {
+    println!("{}", human_text(message));
+}
+
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch status [--shm NAME] | status --json\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -350,7 +375,12 @@ fn beeps(count: usize) {
     }
     let path = std::env::temp_dir().join(format!("cv1touch-beep-{}-{count}.wav", process::id()));
     if std::fs::write(&path, &wav).is_ok() {
-        let _ = Process::new("paplay").arg(&path).status();
+        // a missing sound server only loses the beep; its complaints would bury the prompts
+        let _ = Process::new("paplay")
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -379,6 +409,13 @@ fn catch_interrupts() {
 
 fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
+}
+
+fn commit_fit(interrupted: bool, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    if interrupted {
+        return Err("interrupted; fitted configuration was not installed".into());
+    }
+    save()
 }
 
 /// Waits for Enter (or end of input). False when interrupted. Polls stdin because read_line
@@ -432,9 +469,12 @@ fn pace_windows(phases: &[String]) -> Result<Vec<(String, u64, u64)>, i32> {
     let mut windows = Vec::new();
     for (i, (name, secs)) in parsed.iter().enumerate() {
         print!(
-            "Phase {}/{}: {name} ({secs} s). Press Enter to start...",
-            i + 1,
-            parsed.len()
+            "{}",
+            human_text(&format!(
+                "Phase {}/{}: {name} ({secs} s). Press Enter to start...",
+                i + 1,
+                parsed.len()
+            ))
         );
         let _ = io::stdout().flush();
         if !wait_enter() {
@@ -544,18 +584,24 @@ fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
 }
 
 fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
+    calibrate_solve_saved(rec, out, force).map_or_else(|code| code, |_| 0)
+}
+
+/// Return the accepted saved output hash for guided completion; preserve expert
+/// diagnostics and exit codes through the ordinary wrapper.
+fn calibrate_solve_saved(rec: &Path, out: &Path, force: bool) -> Result<String, i32> {
     let cap = match capture::load(rec) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cv1touch: {e}");
-            return 1;
+            return Err(1);
         }
     };
     let sol = match solve::solve_capture(&cap, &solve::SolveOptions::default()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cv1touch: calibration failed: {e}");
-            return 1;
+            return Err(1);
         }
     };
     print!("{}", solve::format_report(&sol));
@@ -568,7 +614,7 @@ fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
                  Re-run with every sensor streaming, or add --force to drop them",
                 missing.join(", ")
             );
-            return 1;
+            return Err(1);
         }
     }
     if let Err(e) = solve::check(&sol, &solve::Acceptance::default()) {
@@ -577,38 +623,43 @@ fn calibrate_solve(rec: &Path, out: &Path, force: bool) -> i32 {
                 "cv1touch: not installing: {e} (re-run, or `calibrate solve {} --force`)",
                 rec.display()
             );
-            return 1;
+            return Err(1);
         }
         eprintln!("cv1touch: warning: {e}");
     }
     if interrupted() {
         eprintln!("cv1touch: interrupted: not installing");
-        return 130;
+        return Err(130);
     }
     let f = file::CalibrationFile::from_solution(
         &sol,
         &absolute(rec).display().to_string(),
         unix_now(),
     );
-    match file::save(out, &f) {
-        Ok(backup) => {
+    match file::save_with_fingerprint(out, &f) {
+        Ok((backup, fingerprint)) => {
             if let Some(b) = backup {
                 println!("previous calibration kept as {}", b.display());
             }
             println!("installed {}", out.display());
-            0
+            Ok(fingerprint)
         }
         Err(e) => {
             eprintln!("cv1touch: {e}");
-            1
+            Err(1)
         }
     }
 }
 
 /// Back to tracking: the calibration at `out` if there is one, else provisional placement.
 fn restore_mode(out: &Path) -> i32 {
-    if out.exists() {
-        send_path(control::calibration_load_line(&absolute(out)))
+    if file::load(out).is_ok() {
+        if send_path(control::calibration_load_line(&absolute(out))) == 0 {
+            return 0;
+        }
+        eprintln!("cv1touch: calibration reload failed; attempting provisional tracking recovery");
+        send("calibration provisional");
+        1
     } else {
         send("calibration provisional")
     }
@@ -744,8 +795,10 @@ fn fit_render(rec: Option<&Path>) -> i32 {
         source: absolute(&rec).display().to_string(),
         hands,
     };
-    match align::save(&align::render_path(), &file) {
-        Ok(_) => println!("installed {}", align::render_path().display()),
+    match commit_fit(interrupted(), || {
+        align::save(&align::render_path(), &file).map(|_| ())
+    }) {
+        Ok(()) => println!("installed {}", align::render_path().display()),
         Err(e) => {
             eprintln!("cv1touch: {e}");
             return 1;
@@ -799,6 +852,17 @@ Quick Lighthouse registration: about 60 s, paced by beeps (press Enter to start)
   both, so they move as one. Move the pair slowly through the play space, and keep turning it:
   roll, pitch and yaw your wrist through as many orientations as you can. Keep both controllers
   where the sensors and the base stations can see them. Slow and steady beats fast.";
+
+/// cv1touchd's shared memory, by the name its status gives (older daemons: the default).
+fn touch_reader() -> Result<ShmReader, String> {
+    let status = status_json().ok_or("cannot read cv1touchd status")?;
+    let name = status["shm"].as_str().unwrap_or(shm::DEFAULT_NAME);
+    let reader = ShmReader::open(name).map_err(|e| format!("cannot read controller poses: {e}"))?;
+    if status["generation"].as_u64() != Some(reader.generation()) {
+        return Err("cv1touchd restarted; no recording started".into());
+    }
+    Ok(reader)
+}
 
 /// A Touch pose worth pairing: awake, with an optical fix in the last 100 ms, carried to `now`.
 fn touch_sample(st: &shm::ControllerState, now: u64) -> Option<nalgebra::Isometry3<f64>> {
@@ -1300,6 +1364,8 @@ fn eval_capture() -> i32 {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct RawInput {
+    #[serde(default)]
+    buttons: Option<u32>,
     identity: String,
     connected: bool,
     received_host_ns: u64,
@@ -1442,6 +1508,45 @@ impl InputPhase {
     }
 }
 
+struct PairedInputPhase {
+    hands: [InputPhase; 2],
+}
+
+impl PairedInputPhase {
+    fn new(last_ns: [u64; 2]) -> Self {
+        Self {
+            hands: last_ns.map(|last_ns| InputPhase {
+                last_ns,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        inputs: &RawInputs,
+        identities: &[String; 2],
+        now_ns: u64,
+    ) -> Result<(), String> {
+        for (hand, phase) in self.hands.iter_mut().enumerate() {
+            phase.observe(inputs, identities, hand, now_ns)?;
+        }
+        Ok(())
+    }
+
+    fn last_ns(&self) -> [u64; 2] {
+        std::array::from_fn(|hand| self.hands[hand].last_ns)
+    }
+
+    fn finish(self, minimum: usize) -> Result<[Vec<RawInput>; 2], String> {
+        let [left, right] = self.hands;
+        Ok([
+            left.finish(minimum).map_err(|e| format!("left: {e}"))?,
+            right.finish(minimum).map_err(|e| format!("right: {e}"))?,
+        ])
+    }
+}
+
 fn input_quantile(
     samples: &[RawInput],
     axis: impl Fn(&RawInput) -> f32,
@@ -1488,8 +1593,170 @@ fn measured_inputs(
     })
 }
 
+/// Drops whatever was typed before a prompt, so an Enter pressed during a capture cannot answer
+/// the next question or start the next step.
+fn discard_typed_ahead() {
+    // SAFETY: plain terminal ioctl on stdin; harmlessly fails when stdin is not a terminal.
+    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+}
+
+/// A line typed at a start prompt: Some(true) Enter starts, Some(false) quit, None ask again.
+fn start_line(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => Some(true),
+        "q" | "quit" | "exit" => Some(false),
+        _ => None,
+    }
+}
+
+/// The setup guide's introduction to input calibration.
+const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
+
+/// The four input calibration steps, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalStep {
+    Rest,
+    Triggers,
+    Grips,
+    Sticks,
+}
+
+impl CalStep {
+    const ALL: [CalStep; 4] = [
+        CalStep::Rest,
+        CalStep::Triggers,
+        CalStep::Grips,
+        CalStep::Sticks,
+    ];
+
+    /// Seconds recorded and the fewest fresh samples each hand must give.
+    fn length(self) -> (u64, usize) {
+        match self {
+            CalStep::Sticks => (10, 150),
+            _ => (2, 30),
+        }
+    }
+
+    /// Whether one awake hand is in this step's position, on raw factory values. Loose on
+    /// purpose: it only decides when to start recording; the recording sets the endpoints.
+    fn in_position(self, h: &RawInput) -> bool {
+        let stick = (h.stick[0] * h.stick[0] + h.stick[1] * h.stick[1]).sqrt();
+        h.connected
+            && match self {
+                CalStep::Rest => h.trigger < 0.15 && h.grip < 0.15 && stick < 0.25,
+                CalStep::Triggers => h.trigger > 0.75 && h.grip < 0.5,
+                CalStep::Grips => h.grip > 0.75 && h.trigger < 0.5,
+                CalStep::Sticks => stick > 0.6 && h.trigger < 0.5 && h.grip < 0.5,
+            }
+    }
+
+    /// The standalone command's prompt (Enter starts the recording).
+    fn prompt(self) -> &'static str {
+        match self {
+            CalStep::Rest => "Input calibration 1/4: neutral controls.\nRelease both triggers and grips; let both thumbsticks center.\nPress Enter, then leave all controls untouched until 'Done' appears (2 seconds).",
+            CalStep::Triggers => "Input calibration 2/4: triggers.\nKeep both grips released and both thumbsticks centered.\nPress Enter first. Immediately pull both triggers fully and keep them held until 'Done' appears (2 seconds).",
+            CalStep::Grips => "Input calibration 3/4: grips.\nKeep both triggers released and both thumbsticks centered.\nPress Enter first. Immediately squeeze both grips fully and keep them held until 'Done' appears (2 seconds).",
+            CalStep::Sticks => "Input calibration 4/4: thumbsticks.\nRelease both triggers and grips.\nPress Enter first. Immediately move BOTH thumbsticks in full circles along their outer edges until 'Done' appears (10 seconds).\nCover forward, back, left and right; keep the sticks against their outer edges.",
+        }
+    }
+
+    /// What the guide asks for (numbered by the caller).
+    fn guided(self) -> &'static str {
+        match self {
+            CalStep::Rest => "Let go of both triggers, grips and sticks, until the double beep.",
+            CalStep::Triggers => {
+                "Pull both triggers all the way and hold them there until the double beep."
+            }
+            CalStep::Grips => {
+                "Let go of the triggers and squeeze both grips fully until the double beep."
+            }
+            CalStep::Sticks => "Let go of the grips and circle both sticks around their outer edges until the double beep.",
+        }
+    }
+}
+
+/// Both hands held in a step's position for `HOLD_NS` without a break.
+#[derive(Default)]
+struct InPosition {
+    since: Option<u64>,
+}
+
+impl InPosition {
+    const HOLD_NS: u64 = 300_000_000;
+
+    fn update(&mut self, step: CalStep, raw: &RawInputs, now_ns: u64) -> bool {
+        if !raw.hands.iter().all(|h| step.in_position(h)) {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now_ns);
+        now_ns.saturating_sub(since) >= Self::HOLD_NS
+    }
+}
+
+/// Waits until both hands hold `step`'s position (or Enter, offered after a while for controls
+/// that never reach the expected travel).
+fn input_gate(step: CalStep) -> Result<(), String> {
+    discard_typed_ahead();
+    let start = Instant::now();
+    let mut gate = InPosition::default();
+    let mut hinted = false;
+    loop {
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd.
+        if unsafe { libc::poll(&mut fd, 1, 30) } > 0 {
+            let mut line = String::new();
+            if io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("input calibration needs an interactive terminal; input closed".into());
+            }
+            match start_line(&line) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err("input calibration stopped; no calibration saved".into()),
+                None => println!("      (Enter records now, q quits)"),
+            }
+        }
+        if gate.update(step, &raw_inputs()?, shm::now_ns()) {
+            return Ok(());
+        }
+        if !hinted && start.elapsed() > Duration::from_secs(8) {
+            hinted = true;
+            println!("      (not detected yet: press Enter to record anyway)");
+        }
+    }
+}
+
+/// `pulses` short buzzes from both controllers and as many beeps from the speakers: one starts a timed step, two
+/// end it. Best effort: a missed cue does not stop anything.
+fn cue(pulses: usize) {
+    for pulse in 0..pulses {
+        for hand in ["left", "right"] {
+            let _ = control::request(
+                &control::socket_path(),
+                &format!("haptic {hand} 0.12 160 0.6"),
+                Duration::from_millis(300),
+            );
+        }
+        if pulse + 1 < pulses {
+            thread::sleep(Duration::from_millis(180));
+        }
+    }
+    beeps(pulses);
+}
+
 fn input_enter(prompt: &str) -> Result<(), String> {
-    println!("{prompt}\nPress Enter when ready.");
+    human_action(&format!("{prompt}\nPress Enter when ready."));
     io::stdout().flush().map_err(|e| e.to_string())?;
     loop {
         if interrupted() {
@@ -1524,29 +1791,34 @@ fn input_enter(prompt: &str) -> Result<(), String> {
 }
 
 fn collect_inputs(
-    hand: usize,
     identities: &[String; 2],
-    last_ns: &mut u64,
+    last_ns: &mut [u64; 2],
     seconds: u64,
     minimum: usize,
-) -> Result<Vec<RawInput>, String> {
-    println!("Sampling for {seconds} seconds...");
+    quiet: bool,
+) -> Result<[Vec<RawInput>; 2], String> {
+    if !quiet {
+        println!("Sampling both hands for {seconds} seconds...");
+    }
     let deadline = Instant::now() + Duration::from_secs(seconds);
-    let mut phase = InputPhase {
-        last_ns: *last_ns,
-        ..Default::default()
-    };
+    let mut phase = PairedInputPhase::new(*last_ns);
     while Instant::now() < deadline {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
         let tick = Instant::now();
-        phase.observe(&raw_inputs()?, identities, hand, shm::now_ns())?;
+        phase.observe(&raw_inputs()?, identities, shm::now_ns())?;
         thread::sleep(Duration::from_millis(50).saturating_sub(tick.elapsed()));
     }
-    *last_ns = phase.last_ns;
+    *last_ns = phase.last_ns();
     let samples = phase.finish(minimum)?;
-    println!("Done: {} fresh samples.", samples.len());
+    if !quiet {
+        println!(
+            "Done: left {} / right {} fresh samples.",
+            samples[0].len(),
+            samples[1].len()
+        );
+    }
     Ok(samples)
 }
 
@@ -1696,39 +1968,75 @@ fn reload_inputs() -> Result<(), String> {
 }
 
 fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
+    calibrate_inputs_with(out, reset, false)
+}
+
+/// `guided`: the setup guide's version: each step records as soon as both hands are in position,
+/// with buzzes and beeps instead of Enter, and nothing printed but the steps.
+fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
+    match calibrate_inputs_result(out, reset, guided) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            if interrupted() {
+                130
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// `calibrate_inputs_with`, the error as the guide shows it.
+fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Result<(), String> {
     catch_interrupts();
     let path = out
         .map(Path::to_path_buf)
         .unwrap_or_else(cv1touch::input_calibration::default_path);
-    let result = (|| -> Result<(), String> {
+    (|| -> Result<(), String> {
         if reset {
             write_input_calibration(&path, None, Some(&mut reload_inputs))?;
             println!("Input calibration reset; factory input mapping reloaded.");
             return Ok(());
         }
-        input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
+        if guided {
+            human_action(INPUTS_GUIDE);
+        } else {
+            input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
+        }
         let first = raw_inputs()?;
         let identities = std::array::from_fn(|hand| first.hands[hand].identity.clone());
         for hand in 0..2 {
             InputPhase::default().observe(&first, &identities, hand, shm::now_ns())?;
         }
+        let mut last_ns = std::array::from_fn(|hand| first.hands[hand].received_host_ns);
+        let mut phases: [[Vec<RawInput>; 4]; 2] =
+            std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+        for (phase, step) in CalStep::ALL.into_iter().enumerate() {
+            let (seconds, minimum) = step.length();
+            if guided {
+                human_action(&format!("  {}/4 {}", phase + 1, step.guided()));
+                input_gate(step)?;
+                cue(1);
+            } else {
+                input_enter(step.prompt())?;
+            }
+            let samples = collect_inputs(&identities, &mut last_ns, seconds, minimum, guided)?;
+            if guided {
+                cue(2);
+            }
+            for (hand, samples) in samples.into_iter().enumerate() {
+                phases[hand][phase] = samples;
+            }
+        }
         let mut measured = Vec::new();
         for (hand, identity) in identities.iter().enumerate() {
             let name = ["left", "right"][hand];
-            let mut last_ns = 0;
-            input_enter(&format!("{name} Touch: release trigger and grip, let the thumbstick center.\nKeep all three neutral for 2 seconds after Enter."))?;
-            let neutral = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
-            input_enter(&format!(
-                "{name} Touch: pull the trigger fully and hold it for 2 seconds after Enter."
-            ))?;
-            let trigger = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
-            input_enter(&format!("{name} Touch: release the trigger, squeeze the grip fully and hold for 2 seconds after Enter."))?;
-            let grip = collect_inputs(hand, &identities, &mut last_ns, 2, 30)?;
-            input_enter(&format!("{name} Touch: release the grip. After Enter, roll the thumbstick around its FULL outer edge\ncontinuously for 10 seconds, covering forward, back, left and right. Keep it at the edge."))?;
-            let circles = collect_inputs(hand, &identities, &mut last_ns, 10, 150)?;
-            let calibration = measured_inputs(identity, &[neutral, trigger, grip, circles])?;
+            let calibration = measured_inputs(identity, &phases[hand])?;
             calibration.validate().map_err(|e| format!("{name} input measurements rejected: {e}; retry with released controls and full travel"))?;
-            println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
+            if !guided {
+                println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
+            }
             measured.push(calibration);
         }
         let candidate = cv1touch::input_calibration::CalibrationFile::new(
@@ -1736,7 +2044,9 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
                 .try_into()
                 .map_err(|_| "both hands must be calibrated")?,
         )?;
-        input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+        if !guided {
+            input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+        }
         let final_inputs = raw_inputs()?;
         for hand in 0..2 {
             InputPhase::default().observe(&final_inputs, &identities, hand, shm::now_ns())?;
@@ -1752,24 +2062,15 @@ fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
             );
         } else {
             write_input_calibration(&path, Some(&candidate), Some(&mut reload_inputs))?;
-            println!(
-                "Saved {} and reloaded inputs. Run `cv1touch input-test` to verify full travel.",
-                path.display()
-            );
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("cv1touch: {error}");
-            if interrupted() {
-                130
-            } else {
-                1
+            if !guided {
+                println!(
+                    "Saved {} and reloaded inputs. Run `cv1touch input-test` to verify full travel.",
+                    path.display()
+                );
             }
         }
-    }
+        Ok(())
+    })()
 }
 
 /// The Oculus Touch profile's legacy input mapping (axis 0 joystick, 1 trigger, 2 grip;
@@ -2185,6 +2486,162 @@ fn capture_free(max_s: u64, instructions: &str) -> Result<PathBuf, i32> {
 
 /// As `capture_free`; with `frames` the recording keeps the sensors' pixels too.
 fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<PathBuf, i32> {
+    capture_free_named(max_s, instructions, frames, None)
+}
+
+fn guided_record_start_with(
+    cancelled: impl FnOnce() -> bool,
+    request: impl FnOnce() -> Result<String, String>,
+    reconcile: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if cancelled() {
+        return Err(
+            "capture interrupted before record-start dispatch; no recording started".into(),
+        );
+    }
+    let response = request();
+    if response.as_ref().is_ok_and(|reply| reply.trim() == "ok") {
+        return Ok(());
+    }
+    if let Ok(reply) = &response {
+        if reply.starts_with("err ") {
+            return Err(reply.clone()); // An explicit rejection did not start our recorder.
+        }
+    }
+    let error = response
+        .err()
+        .unwrap_or_else(|| "missing or malformed record-start acknowledgement".into());
+    reconcile().map_err(|cleanup| format!("{error}; scoped recorder cleanup failed: {cleanup}"))?;
+    Err(format!(
+        "{error}; own recording safely stopped if it started"
+    ))
+}
+
+struct ScopedRecordingGuard {
+    command: String,
+    armed: bool,
+}
+impl Drop for ScopedRecordingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = control::request(
+                &control::socket_path(),
+                &self.command,
+                Duration::from_millis(750),
+            );
+        }
+    }
+}
+
+fn scoped_cleanup_reply(reply: &str) -> bool {
+    reply.trim() == "ok not-matching" || reply.starts_with("ok stopped ")
+}
+
+fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGuard, String> {
+    let capability = control::request(
+        &control::socket_path(),
+        "status",
+        Duration::from_millis(750),
+    )
+    .ok()
+    .and_then(|reply| {
+        reply
+            .strip_prefix("ok ")
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    });
+    if capability.as_ref().is_none_or(|status| {
+        status["recording_scoped_stop"] != true || status["recording"] != false
+    }) {
+        return Err("guided capture requires an idle matching daemon with scoped recording cleanup; no recording started".into());
+    }
+    let command = control::record_stop_if_line(rec)?;
+    let start_command = control::record_start_line(rec, frames)?;
+    let mut scoped = ScopedRecordingGuard {
+        command,
+        armed: true,
+    };
+    let command = start_command;
+    let rejected = std::cell::Cell::new(false);
+    let cleaned = std::cell::Cell::new(false);
+    let result = guided_record_start_with(
+        || {
+            let cancelled = interrupted();
+            if cancelled {
+                rejected.set(true);
+            }
+            cancelled
+        },
+        || {
+            let reply = control::request(
+                &control::socket_path(),
+                &command,
+                Duration::from_millis(750),
+            )
+            .map_err(|error| error.to_string());
+            rejected.set(reply.as_ref().is_ok_and(|reply| reply.starts_with("err ")));
+            reply
+        },
+        || {
+            let reply = control::request(
+                &control::socket_path(),
+                &scoped.command,
+                Duration::from_millis(750),
+            )
+            .map_err(|error| error.to_string())?;
+            if !scoped_cleanup_reply(&reply) {
+                return Err(reply);
+            }
+            cleaned.set(true);
+            Ok(())
+        },
+    );
+    if let Err(error) = result {
+        // Explicit rejections must never stop a pre-existing recording. Other failures
+        // already attempted path-scoped cleanup; Drop retries only our path if necessary.
+        if rejected.get() || cleaned.get() {
+            scoped.armed = false;
+        }
+        return Err(error);
+    }
+    Ok(scoped)
+}
+
+/// The headset's orientation (SteamVR) and each Touch's (cv1touchd) at one instant.
+struct PoseFrame {
+    t_ns: u64,
+    hmd: nalgebra::UnitQuaternion<f64>,
+    touch: [Option<nalgebra::UnitQuaternion<f64>>; 2],
+}
+
+/// A guided capture's hooks. An error from one ends the capture with Err(1); the hook reports
+/// it in its own words.
+trait CaptureFeedback {
+    fn before_start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Every pose frame, in order, before the `poll` that follows it.
+    fn pose(&mut self, _frame: &PoseFrame) {}
+    fn started(&mut self) -> Result<(), String>;
+    fn poll(&mut self) -> Result<bool, String>;
+    fn stopped(&mut self) -> Result<(), String>;
+}
+
+fn capture_free_named(
+    max_s: u64,
+    instructions: &str,
+    frames: bool,
+    base: Option<&Path>,
+) -> Result<PathBuf, i32> {
+    capture_free_named_with_feedback(max_s, instructions, frames, base, None)
+}
+
+fn capture_free_named_with_feedback(
+    max_s: u64,
+    instructions: &str,
+    frames: bool,
+    base: Option<&Path>,
+    mut feedback: Option<&mut dyn CaptureFeedback>,
+) -> Result<PathBuf, i32> {
     catch_interrupts();
     if status_json()
         .and_then(|v| v["mode"].as_str().map(str::to_string))
@@ -2210,16 +2667,45 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
                 .filter(|&u| u != 0)
         })
         .unwrap_or(0);
-    let base = state_dir().join(format!("eval-{}", unix_now()));
+    let base = base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state_dir().join(format!("eval-{}", unix_now())));
     let rec = base.with_extension("rec");
     if let Err(e) = std::fs::create_dir_all(state_dir()) {
         eprintln!("cv1touch: {e}");
         return Err(1);
     }
-    if send_path(control::record_start_line(&rec, frames)) != 0 {
-        return Err(1);
+    // the Touches as cv1touchd tracks them, for the feedback: SteamVR's copy may be paused
+    let (reader, frames_out, frames_in) = if feedback.is_some() {
+        let reader = touch_reader().map_err(|error| {
+            eprintln!("cv1touch: {error}; no recording started");
+            1
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel::<PoseFrame>();
+        (Some(reader), Some(tx), Some(rx))
+    } else {
+        (None, None, None)
+    };
+    if let Some(hook) = feedback.as_mut() {
+        if hook.before_start().is_err() {
+            return Err(1);
+        }
+        if interrupted() {
+            return Err(130);
+        }
     }
-    let mut guard = StopRecordingGuard(true);
+    let mut scoped_guard = if feedback.is_some() {
+        Some(guided_start_recording(&rec, frames).map_err(|error| {
+            eprintln!("cv1touch: {error}; no registration fit installed");
+            1
+        })?)
+    } else {
+        if send_path(control::record_start_line(&rec, frames)) != 0 {
+            return Err(1);
+        }
+        None
+    };
+    let mut guard = StopRecordingGuard(scoped_guard.is_none());
     let start = shm::now_ns();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -2228,12 +2714,17 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
             let mut tracks: BTreeMap<String, Vec<[f64; 8]>> = BTreeMap::new();
             let mut kinds: BTreeMap<String, String> = BTreeMap::new();
             let mut serials: Vec<Option<String>> = Vec::new();
+            let mut hmd_index = None;
             let mut next_scan = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let now = shm::now_ns();
                 if now >= next_scan {
                     let devs = client.devices();
                     serials = vec![None; 64];
+                    hmd_index = devs
+                        .iter()
+                        .find(|d| d.class == vr::CLASS_HMD)
+                        .map(|d| d.index as usize);
                     // every Lighthouse device (controllers, the headset, the base stations), and our
                     // Touches as SteamVR shows them
                     for d in devs.iter().filter(|d| {
@@ -2255,7 +2746,8 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
                     }
                     next_scan = now + 500_000_000;
                 }
-                for (i, p) in client.raw_poses().iter().enumerate() {
+                let raw = client.raw_poses();
+                for (i, p) in raw.iter().enumerate() {
                     if let (Some(p), Some(Some(serial))) = (p, serials.get(i)) {
                         tracks
                             .entry(serial.clone())
@@ -2263,21 +2755,56 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
                             .push(eval::truth_row(now, p));
                     }
                 }
+                if let (Some(out), Some(reader), Some(Some(hmd))) =
+                    (&frames_out, &reader, hmd_index.and_then(|i| raw.get(i)))
+                {
+                    let touch = [HAND_LEFT, HAND_RIGHT].map(|hand| {
+                        reader
+                            .hand(hand)
+                            .filter(|st| st.flags & cv1touch::hand::FLAG_CONNECTED != 0)
+                            .map(|st| register::extrapolate(&st, now).rotation)
+                    });
+                    let _ = out.send(PoseFrame {
+                        t_ns: now,
+                        hmd: hmd.rotation,
+                        touch,
+                    });
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
             (tracks, kinds)
         })
     };
-    println!(
-        "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
-        rec.display()
-    );
-    println!("{instructions}");
+    // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
+    let chatty = feedback.is_none();
+    // an Enter typed before the recording started must not end it
+    discard_typed_ahead();
+    if chatty {
+        println!(
+            "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
+            rec.display()
+        );
+    }
+    human_action(instructions);
+    let mut feedback_error = feedback.as_mut().and_then(|hook| hook.started().err());
     let deadline = start + max_s * 1_000_000_000;
     let mut last_print = 0u64;
     loop {
-        if interrupted() {
+        if interrupted() || feedback_error.is_some() {
             break;
+        }
+        if let Some(hook) = feedback.as_mut() {
+            for frame in frames_in.iter().flat_map(|rx| rx.try_iter()) {
+                hook.pose(&frame);
+            }
+            match hook.poll() {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    feedback_error = Some(error);
+                    break;
+                }
+            }
         }
         let mut fds = libc::pollfd {
             fd: 0,
@@ -2285,7 +2812,7 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
             revents: 0,
         };
         // SAFETY: one valid pollfd.
-        if unsafe { libc::poll(&mut fds, 1, 200) } > 0 {
+        if unsafe { libc::poll(&mut fds, 1, if feedback.is_some() { 20 } else { 200 }) } > 0 {
             let mut line = String::new();
             let _ = io::stdin().lock().read_line(&mut line);
             break;
@@ -2305,19 +2832,45 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
     let (tracks, kinds) = sampler.join().unwrap_or_default();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
+    let stop_command = scoped_guard
+        .as_ref()
+        .map_or("record stop", |guard| guard.command.as_str());
     let stopped = control::request(
         &control::socket_path(),
-        "record stop",
+        stop_command,
         Duration::from_secs(5),
     );
-    guard.0 = false;
+    let stopped_ok = stopped.as_ref().is_ok_and(|reply| {
+        if scoped_guard.is_some() {
+            reply.starts_with("ok stopped ")
+        } else {
+            reply.starts_with("ok")
+        }
+    });
+    if stopped_ok {
+        guard.0 = false;
+        if let Some(scoped) = scoped_guard.as_mut() {
+            scoped.armed = false;
+        }
+        if let Some(hook) = feedback.as_mut() {
+            if let Err(error) = hook.stopped() {
+                feedback_error.get_or_insert(error);
+            }
+        }
+    }
     let kind = |serial: &str| kinds.get(serial).cloned().unwrap_or_default();
     let mut out = io::stdout();
-    let _ = writeln!(
-        out,
-        "\n{}",
-        stopped.unwrap_or_else(|e| format!("record stop failed: {e}"))
-    );
+    match &stopped {
+        Ok(reply) if chatty => {
+            let _ = writeln!(out, "\n{reply}");
+        }
+        Ok(_) => {
+            let _ = writeln!(out);
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "\ncv1touch: record stop failed: {e}");
+        }
+    }
     let Some(((reference, samples), rest)) = reference_first(tracks.into_iter().collect(), kind)
     else {
         let _ = writeln!(
@@ -2327,14 +2880,16 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
         );
         return Err(1);
     };
-    let _ = writeln!(
-        out,
-        "  {reference} ({}, the reference): {} poses",
-        kind(&reference),
-        samples.len()
-    );
-    for (serial, rows) in &rest {
-        let _ = writeln!(out, "  {serial} ({}): {} poses", kind(serial), rows.len());
+    if chatty {
+        let _ = writeln!(
+            out,
+            "  {reference} ({}, the reference): {} poses",
+            kind(&reference),
+            samples.len()
+        );
+        for (serial, rows) in &rest {
+            let _ = writeln!(out, "  {serial} ({}): {} poses", kind(serial), rows.len());
+        }
     }
     let others = rest
         .iter()
@@ -2361,12 +2916,20 @@ fn capture_free_with(max_s: u64, instructions: &str, frames: bool) -> Result<Pat
         let _ = writeln!(io::stderr(), "cv1touch: {}: {e}", truth_path.display());
         return Err(1);
     }
-    let _ = writeln!(
-        out,
-        "recording {}\ntruth {}",
-        rec.display(),
-        truth_path.display()
-    );
+    if chatty {
+        let _ = writeln!(
+            out,
+            "recording {}\ntruth {}",
+            rec.display(),
+            truth_path.display()
+        );
+    }
+    if feedback_error.is_some() {
+        return Err(1);
+    }
+    if !stopped_ok {
+        return Err(1);
+    }
     Ok(base)
 }
 
@@ -3276,6 +3839,30 @@ fn register_follow(base: &Path, write: bool, reference: Option<&str>) -> i32 {
 }
 
 fn register_from_capture(base: &Path, write: bool, reference: Option<&str>, follow: bool) -> i32 {
+    register_from_capture_with(base, write, reference, follow, true)
+}
+
+fn registration_seed(
+    path: &Path,
+    universe_id: u64,
+    reuse: bool,
+) -> Result<(bool, align::Registration), String> {
+    let had_registration = reuse && path.exists();
+    let reg = if had_registration {
+        align::load_registration(path)?
+    } else {
+        initial_registration(universe_id)
+    };
+    Ok((had_registration, reg))
+}
+
+fn register_from_capture_with(
+    base: &Path,
+    write: bool,
+    reference: Option<&str>,
+    follow: bool,
+    reuse: bool,
+) -> i32 {
     let run = || -> Result<(), String> {
         let truth_path = base.with_extension("truth.json");
         let tf: eval::TruthFile = serde_json::from_str(
@@ -3284,12 +3871,7 @@ fn register_from_capture(base: &Path, write: bool, reference: Option<&str>, foll
         )
         .map_err(|e| e.to_string())?;
         let reg_path = align::registration_path();
-        let had_registration = reg_path.exists();
-        let mut reg = if had_registration {
-            align::load_registration(&reg_path)?
-        } else {
-            initial_registration(tf.universe_id)
-        };
+        let (had_registration, mut reg) = registration_seed(&reg_path, tf.universe_id, reuse)?;
         let (ref_serial, ref_samples) = truth_track(&tf, reference)?;
         println!("reference {ref_serial}");
         let holds = calib::rig::holds(&ref_samples, 1_500_000_000);
@@ -3518,7 +4100,11 @@ fn register_from_capture(base: &Path, write: bool, reference: Option<&str>, foll
         reg.pairs = fits.iter().map(|f| f.3).sum();
         reg.pos_rms_mm = fits.iter().map(|f| f.1).sum::<f64>() / fits.len() as f64 * 1e3;
         reg.rot_rms_deg = fits.iter().map(|f| f.2).sum::<f64>() / fits.len() as f64;
-        let b = align::save(&reg_path, &reg)?;
+        let mut b = None;
+        commit_fit(interrupted(), || {
+            b = align::save(&reg_path, &reg)?;
+            Ok(())
+        })?;
         println!(
             "wrote {} (previous: {:?}); run `cv1touch alignment reload`",
             reg_path.display(),
@@ -4024,7 +4610,11 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
             changed.join(", "),
             rec.display()
         );
-        let backup = file::save(path, &cal)?;
+        let mut backup = None;
+        commit_fit(interrupted(), || {
+            backup = file::save(path, &cal)?;
+            Ok(())
+        })?;
         println!(
             "wrote {}{}",
             path.display(),
@@ -4159,7 +4749,11 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
             observations: rf.pairs,
         });
         cal.source = format!("{}; placed {serial} against {}", cal.source, rec.display());
-        let backup = file::save(path, &cal)?;
+        let mut backup = None;
+        commit_fit(interrupted(), || {
+            backup = file::save(path, &cal)?;
+            Ok(())
+        })?;
         println!(
             "wrote {}{}; restart cv1touchd to use it",
             path.display(),
@@ -4265,6 +4859,15 @@ fn save_gravity_files(
 /// orientations carry the measured up into the world. Turning the world turns the registration
 /// with it, so SteamVR sees the same poses.
 fn calibrate_gravity(rec: &Path, path: &Path, write: bool) -> i32 {
+    calibrate_gravity_with(rec, path, write, true)
+}
+
+fn calibrate_gravity_with(
+    rec: &Path,
+    path: &Path,
+    write: bool,
+    compensate_registration: bool,
+) -> i32 {
     use cv1touch::calib::gravity;
     use nalgebra::{UnitQuaternion, Vector3};
     let run = || -> Result<(), String> {
@@ -4401,7 +5004,7 @@ fn calibrate_gravity(rec: &Path, path: &Path, write: bool) -> i32 {
         );
         cal.validate()?;
         let reg_path = align::registration_path();
-        let turned_reg = if reg_path.exists() {
+        let turned_reg = if compensate_registration && reg_path.exists() {
             let mut reg = align::load_registration(&reg_path)?;
             let turn = nalgebra::Isometry3::from_parts(nalgebra::Translation3::identity(), total);
             reg.lighthouse_from_world =
@@ -4411,11 +5014,13 @@ fn calibrate_gravity(rec: &Path, path: &Path, write: bool) -> i32 {
             None
         };
         let cal_bytes = serde_json::to_vec_pretty(&cal).map_err(|e| e.to_string())?;
-        save_gravity_files(
-            path,
-            &cal_bytes,
-            turned_reg.as_deref().map(|b| (reg_path.as_path(), b)),
-        )?;
+        commit_fit(interrupted(), || {
+            save_gravity_files(
+                path,
+                &cal_bytes,
+                turned_reg.as_deref().map(|b| (reg_path.as_path(), b)),
+            )
+        })?;
         println!("restart cv1touchd to use them");
         Ok(())
     };
@@ -4731,6 +5336,13 @@ fn consistency_cmd(rec: &Path, cal: &Path) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["setup"] => guided_setup::run(false, false),
+        ["setup", "--no-slip-check"] => {
+            guided_setup::SLIP_CHECK.store(false, Ordering::Relaxed);
+            guided_setup::run(false, false)
+        }
+        ["setup", "--check"] => guided_setup::run(true, false),
+        ["setup", "--check", "--json"] | ["setup", "--json", "--check"] => guided_setup::run(true, true),
         ["status"] => status_board(shm::DEFAULT_NAME),
         ["status", "--shm", name] => status_board(name),
         ["status", "--json"] => json_status(),
@@ -4893,8 +5505,146 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_hand(trigger: f32, grip: f32, stick: [f32; 2]) -> RawInput {
+        RawInput {
+            buttons: Some(0),
+            identity: "1".repeat(32),
+            connected: true,
+            received_host_ns: 1,
+            trigger,
+            grip,
+            stick,
+        }
+    }
+
+    #[test]
+    fn only_enter_starts_a_step_and_quit_works_in_any_case() {
+        assert_eq!(start_line("\n"), Some(true));
+        assert_eq!(start_line("  "), Some(true));
+        for quit in ["q", "Q", "quit", "EXIT\n"] {
+            assert_eq!(start_line(quit), Some(false), "{quit}");
+        }
+        for again in ["n", "no", "yes", "qq", "x"] {
+            assert_eq!(start_line(again), None, "{again}");
+        }
+    }
+
+    #[test]
+    fn each_input_step_knows_when_a_hand_is_in_position() {
+        let rest = raw_hand(0.02, 0.05, [0.03, -0.04]);
+        let triggers = raw_hand(0.93, 0.1, [0.0, 0.0]);
+        let grips = raw_hand(0.1, 0.9, [0.0, 0.0]);
+        let edge = raw_hand(0.0, 0.0, [0.55, 0.6]);
+        assert!(CalStep::Rest.in_position(&rest) && !CalStep::Rest.in_position(&triggers));
+        assert!(CalStep::Triggers.in_position(&triggers) && !CalStep::Triggers.in_position(&grips));
+        assert!(CalStep::Grips.in_position(&grips) && !CalStep::Grips.in_position(&triggers));
+        assert!(CalStep::Sticks.in_position(&edge) && !CalStep::Sticks.in_position(&rest));
+        let mut asleep = triggers.clone();
+        asleep.connected = false;
+        assert!(
+            !CalStep::Triggers.in_position(&asleep),
+            "a sleeping controller is not in position"
+        );
+    }
+
+    #[test]
+    fn a_step_starts_once_both_hands_hold_position_long_enough() {
+        let mut gate = InPosition::default();
+        let both = |t, g| RawInputs {
+            hands: [raw_hand(t, g, [0.; 2]), raw_hand(t, g, [0.; 2])],
+        };
+        let one = RawInputs {
+            hands: [raw_hand(0.95, 0., [0.; 2]), raw_hand(0.1, 0., [0.; 2])],
+        };
+        assert!(!gate.update(CalStep::Triggers, &one, 0));
+        assert!(!gate.update(CalStep::Triggers, &both(0.95, 0.), 100_000_000));
+        assert!(
+            !gate.update(CalStep::Triggers, &both(0.95, 0.), 300_000_000),
+            "held only 200 ms"
+        );
+        assert!(
+            !gate.update(CalStep::Triggers, &one, 350_000_000),
+            "a dropout restarts the hold"
+        );
+        assert!(!gate.update(CalStep::Triggers, &both(0.9, 0.), 400_000_000));
+        assert!(gate.update(CalStep::Triggers, &both(0.9, 0.), 700_000_000));
+    }
     use cv1touch::shm::ControllerState;
 
+    #[test]
+    fn guided_start_requires_ack_and_reconciles_ambiguous_failures() {
+        for response in [
+            Err("timeout".to_owned()),
+            Ok(String::new()),
+            Ok("unexpected".into()),
+        ] {
+            let stops = std::cell::Cell::new(0);
+            assert!(guided_record_start_with(
+                || false,
+                || response,
+                || {
+                    stops.set(stops.get() + 1);
+                    Ok(())
+                }
+            )
+            .is_err());
+            assert_eq!(stops.get(), 1);
+        }
+        let stops = std::cell::Cell::new(0);
+        assert!(guided_record_start_with(
+            || false,
+            || Ok("err already recording".into()),
+            || {
+                stops.set(1);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(stops.get(), 0);
+        assert!(guided_record_start_with(
+            || false,
+            || Ok("ok".into()),
+            || panic!("acknowledged start needs no reconciliation")
+        )
+        .is_ok());
+        assert!(guided_record_start_with(
+            || false,
+            || Ok(String::new()),
+            || Err("stop failed".into())
+        )
+        .unwrap_err()
+        .contains("stop failed"));
+    }
+    #[test]
+    fn cancelled_guided_dispatch_never_starts_or_stops_recording() {
+        let requests = std::cell::Cell::new(0);
+        let cleanup = std::cell::Cell::new(0);
+        let result = guided_record_start_with(
+            || true,
+            || {
+                requests.set(1);
+                Ok("ok".into())
+            },
+            || {
+                cleanup.set(1);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(requests.get(), 0);
+        assert_eq!(cleanup.get(), 0);
+    }
+    #[test]
+    fn scoped_cleanup_accepts_stopped_or_absent_but_not_empty_or_rejection() {
+        assert!(scoped_cleanup_reply(
+            "ok stopped records=1 dropped=0 write_errors=0 bytes=48"
+        ));
+        assert!(scoped_cleanup_reply("ok not-matching"));
+        for reply in ["", "ok", "err failed", "ok stopping", "unexpected"] {
+            assert!(!scoped_cleanup_reply(reply));
+        }
+    }
     /// Review fix 1: samples from before Enter (reading the briefing, picking things up) or after the
     /// final beep do not enter the solve.
     #[test]
@@ -4958,9 +5708,18 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn human_color_policy_respects_no_color_dumb_and_pipes() {
+        assert!(human_color_enabled(false, false, true, false));
+        assert!(human_color_enabled(false, false, false, true));
+        assert!(!human_color_enabled(false, false, false, false));
+        assert!(!human_color_enabled(true, false, true, true));
+        assert!(!human_color_enabled(false, true, true, true));
+    }
     fn raw_input_snapshot(timestamp: u64) -> RawInputs {
         RawInputs {
             hands: std::array::from_fn(|hand| RawInput {
+                buttons: None,
                 identity: format!("{:032x}", hand + 1),
                 connected: true,
                 received_host_ns: timestamp,
@@ -4968,6 +5727,99 @@ mod tests {
                 grip: 0.0,
                 stick: [0.0; 2],
             }),
+        }
+    }
+
+    #[test]
+    fn paired_input_capture_tracks_each_hand_and_phase_independently() {
+        let mut readings = raw_input_snapshot(1_000_000_000);
+        let identities = std::array::from_fn(|hand| readings.hands[hand].identity.clone());
+        let mut phase = PairedInputPhase::new([0; 2]);
+        phase
+            .observe(&readings, &identities, 1_000_000_010)
+            .unwrap();
+        readings.hands[0].received_host_ns += 1;
+        phase
+            .observe(&readings, &identities, 1_000_000_010)
+            .unwrap();
+        readings.hands[1].received_host_ns += 2;
+        phase
+            .observe(&readings, &identities, 1_000_000_010)
+            .unwrap();
+        // A duplicate response contributes neither hand; independent advances contribute one.
+        phase
+            .observe(&readings, &identities, 1_000_000_010)
+            .unwrap();
+        let last = phase.last_ns();
+        let samples = phase.finish(2).unwrap();
+        assert_eq!(
+            samples[0]
+                .iter()
+                .map(|s| s.received_host_ns)
+                .collect::<Vec<_>>(),
+            [1_000_000_000, 1_000_000_001]
+        );
+        assert_eq!(
+            samples[1]
+                .iter()
+                .map(|s| s.received_host_ns)
+                .collect::<Vec<_>>(),
+            [1_000_000_000, 1_000_000_002]
+        );
+        let mut next = PairedInputPhase::new(last);
+        next.observe(&readings, &identities, 1_000_000_010).unwrap();
+        assert!(
+            next.finish(1).is_err(),
+            "prior phase timestamps must not count again"
+        );
+    }
+
+    #[test]
+    fn paired_input_capture_rejects_invalid_peer_despite_fresh_other_hand() {
+        for bad_hand in 0..2 {
+            for fault in 0..6 {
+                let mut readings = raw_input_snapshot(1_000_000_000);
+                let identities = std::array::from_fn(|hand| readings.hands[hand].identity.clone());
+                let mut phase = PairedInputPhase::new([0; 2]);
+                phase
+                    .observe(&readings, &identities, 1_000_000_001)
+                    .unwrap();
+                readings.hands[1 - bad_hand].received_host_ns += 100;
+                match fault {
+                    0 => readings.hands[bad_hand].connected = false,
+                    1 => readings.hands[bad_hand].received_host_ns = 400_000_000,
+                    2 => readings.hands[bad_hand].identity = "f".repeat(32),
+                    3 => readings.hands[bad_hand].received_host_ns -= 1,
+                    4 => readings.hands[bad_hand].received_host_ns = 1_000_000_200,
+                    _ => {
+                        readings.hands[bad_hand].received_host_ns += 1;
+                        readings.hands[bad_hand].trigger = f32::NAN;
+                    }
+                }
+                assert!(
+                    phase
+                        .observe(&readings, &identities, 1_000_000_100)
+                        .is_err(),
+                    "hand {bad_hand}, fault {fault}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paired_input_capture_requires_minimum_samples_from_both_hands() {
+        for slower in 0..2 {
+            let mut readings = raw_input_snapshot(1_000_000_000);
+            let identities = std::array::from_fn(|hand| readings.hands[hand].identity.clone());
+            let mut phase = PairedInputPhase::new([0; 2]);
+            phase
+                .observe(&readings, &identities, 1_000_000_001)
+                .unwrap();
+            readings.hands[1 - slower].received_host_ns += 1;
+            phase
+                .observe(&readings, &identities, 1_000_000_002)
+                .unwrap();
+            assert!(phase.finish(2).is_err());
         }
     }
 
@@ -5044,6 +5896,72 @@ mod tests {
             measured_inputs(&format!("{:032x}", hand + 1), &input_wizard_phases(hand)).unwrap()
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn paired_input_capture_preserves_both_measurements_through_four_phases() {
+        let fixtures = [input_wizard_phases(0), input_wizard_phases(1)];
+        let identities = [format!("{:032x}", 1), format!("{:032x}", 2)];
+        let mut last = [0; 2];
+        let mut captured: [[Vec<RawInput>; 4]; 2] =
+            std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+        let mut timestamp = 1_000_000_000;
+        for phase_index in 0..4 {
+            let mut phase = PairedInputPhase::new(last);
+            for (left, right) in fixtures[0][phase_index]
+                .iter()
+                .zip(&fixtures[1][phase_index])
+            {
+                timestamp += 10;
+                let mut readings = RawInputs {
+                    hands: [left.clone(), right.clone()],
+                };
+                for (hand, sample) in readings.hands.iter_mut().enumerate() {
+                    sample.received_host_ns = timestamp + hand as u64;
+                }
+                // Distinct right-hand endpoints must not be replaced with left-hand data.
+                readings.hands[1].trigger *= 0.8;
+                readings.hands[1].grip *= 0.9;
+                phase
+                    .observe(&readings, &identities, timestamp + 2)
+                    .unwrap();
+            }
+            last = phase.last_ns();
+            for (hand, samples) in phase
+                .finish(if phase_index == 3 { 150 } else { 30 })
+                .unwrap()
+                .into_iter()
+                .enumerate()
+            {
+                captured[hand][phase_index] = samples;
+            }
+        }
+        let candidate =
+            cv1touch::input_calibration::CalibrationFile::new(std::array::from_fn(|hand| {
+                measured_inputs(&identities[hand], &captured[hand]).unwrap()
+            }))
+            .unwrap();
+        assert_eq!(candidate.hands[0].trigger.pressed, 1.0);
+        assert_eq!(candidate.hands[1].trigger.pressed, 0.8);
+        assert_eq!(candidate.hands[0].grip.pressed, 1.0);
+        assert_eq!(candidate.hands[1].grip.pressed, 0.9);
+        for bad_hand in 0..2 {
+            for bad_phase in 1..4 {
+                let mut incomplete = captured.clone();
+                for sample in &mut incomplete[bad_hand][bad_phase] {
+                    sample.trigger = 0.0;
+                    sample.grip = 0.0;
+                    sample.stick = [0.0; 2];
+                }
+                assert!(
+                    cv1touch::input_calibration::CalibrationFile::new(std::array::from_fn(
+                        |hand| measured_inputs(&identities[hand], &incomplete[hand]).unwrap()
+                    ))
+                    .is_err(),
+                    "hand {bad_hand}, phase {bad_phase} lacks required travel"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5352,6 +6270,76 @@ mod tests {
         assert_eq!(r.universe_id, 42);
         assert_eq!(r.format, align::REGISTRATION_FORMAT);
         assert!(r.stations.is_empty());
+    }
+
+    #[test]
+    fn cancelled_fits_never_call_the_writer_or_replace_previous_files() {
+        let path = std::env::temp_dir().join(format!("cv1t-cancel-fit-{}", process::id()));
+        std::fs::write(&path, b"previous configuration").unwrap();
+        let result = commit_fit(true, || {
+            std::fs::write(&path, b"new fit").map_err(|e| e.to_string())
+        });
+        assert!(result.unwrap_err().contains("not installed"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous configuration");
+        commit_fit(false, || {
+            std::fs::write(&path, b"accepted fit").map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"accepted fit");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stale_registration_does_not_seed_a_new_world_and_is_retained_until_fit() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+        let path = std::env::temp_dir().join(format!("cv1t-new-world-seed-{}", process::id()));
+        std::fs::write(&path, b"malformed previous registration").unwrap();
+        let (reuse, fresh) = registration_seed(&path, 42, false).unwrap();
+        assert!(!reuse);
+        assert_eq!(fresh.universe_id, 42);
+        assert!(registration_seed(&path, 42, true).is_err());
+        let world = Isometry3::from_parts(
+            Translation3::new(2.0, -1.0, 3.0),
+            UnitQuaternion::from_euler_angles(0.4, -0.7, 0.2),
+        );
+        let offset = Isometry3::translation(0.1, 0.05, 0.0);
+        let timed: Vec<_> = (0..1000)
+            .map(|i| {
+                let t = i as f64 * 0.02;
+                let reference = Isometry3::from_parts(
+                    Translation3::new(0.1 * t.sin(), 1.6, 0.1 * t.cos()),
+                    UnitQuaternion::from_scaled_axis(Vector3::new(
+                        0.6 * t.sin(),
+                        0.7 * (0.8 * t).cos(),
+                        0.5 * (1.3 * t).sin(),
+                    )),
+                );
+                (
+                    i * 20_000_000,
+                    reference,
+                    world.inverse() * reference * offset,
+                )
+            })
+            .collect();
+        let range = register::bootstrap_span(&timed).unwrap();
+        let pairs: Vec<_> = timed[range].iter().map(|p| (p.1, p.2)).collect();
+        let fit = register::solve(
+            &pairs,
+            &register::Options {
+                min_pairs: 500,
+                min_axis_ratio: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = fit.lighthouse_from_world.inverse() * world;
+        assert!(error.translation.vector.norm() < 0.001);
+        assert!(error.rotation.angle() < 0.001);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"malformed previous registration"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

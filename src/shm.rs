@@ -375,6 +375,11 @@ impl ShmWriter {
         self.seg.generation()
     }
 
+    /// The name readers open this segment by.
+    pub fn name(&self) -> &str {
+        self.name.to_str().unwrap_or_default()
+    }
+
     pub fn hand(&self, hand: usize) -> Option<ControllerState> {
         self.seg.hand(hand)
     }

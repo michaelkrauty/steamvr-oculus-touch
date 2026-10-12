@@ -4,6 +4,9 @@ Start with `cv1touch doctor`, `cv1touch status --json`, and `journalctl --user -
 
 | Symptom | Checks and recovery |
 | --- | --- |
+| Development setup reports unknown stages | Existing camera/gravity/render/registration files lack setup-journal evidence. Visually verify the relevant tracking and deliberately adopt them, retaining the files, or recapture. File validity alone is not an accuracy check. |
+| Development setup reports stale or blocked stages | Run `cv1touch setup --check` for the reason. Resolve device/daemon/SteamVR prerequisites or repeat the affected calibration. Full camera-world replacement invalidates dependent gravity and registration evidence; unrelated valid input settings remain reusable. |
+| Development setup cannot capture from a script | Captures require an interactive terminal. Use `cv1touch setup --check --json` for read-only automation and run captures interactively. |
 | Daemon not reachable | Check `systemctl --user status cv1touchd`; for manual runs check the runtime directory and socket permissions. Only one daemon may run per user. |
 | No controllers | Wake them with a button, check batteries, and confirm they are paired to the connected CV1 headset. Headset USB and hidraw access are both required. |
 | No sensor frames | Check device ACLs, cables, USB bandwidth, and kernel transfer errors. Restart the daemon after fixing USB transport; do not calibrate with a missing sensor. |
@@ -17,6 +20,8 @@ Start with `cv1touch doctor`, `cv1touch status --json`, and `journalctl --user -
 | Haptics unavailable | Check the controller is awake/connected, the driver is loaded, and the game's haptic binding is active. |
 | Real-time scheduling denied | The daemon falls back to normal scheduling. Use the reported reason to diagnose rtkit/session policy; normal scheduling remains supported. No permissive polkit rule is required by this project. |
 | Custom Steam library not found | Set `CV1TOUCH_STEAMVR` to the actual runtime directory and `CV1TOUCH_STEAM_ROOT` for its Steam config root. Flatpak/sandboxed Steam is not validated. |
+
+The unreleased development setup guide retains completion evidence and recording paths in `$XDG_STATE_HOME/cv1touch/setup.json`. Keep it private along with calibration files and recordings; deleting it removes reuse evidence, not calibration. `cv1touch setup --check` is read-only and does not replace physical verification.
 
 Configuration is under `$XDG_CONFIG_HOME/cv1touch` (default `~/.config/cv1touch`); recordings and learned IMU state are under `$XDG_STATE_HOME/cv1touch` (default `~/.local/state/cv1touch`). Do not copy another user's camera calibration: it encodes their room. Camera/alignment writes preserve timestamped backups; input calibration is replaced atomically and rolls back if live application fails. Raw recordings can contain camera imagery if `--frames` was used; inspect them before sharing.
 

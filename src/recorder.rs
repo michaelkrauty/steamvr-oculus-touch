@@ -12,7 +12,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,7 +142,7 @@ struct Shared {
 
 pub struct Recorder {
     shared: Arc<Shared>,
-    writer: Mutex<Option<JoinHandle<()>>>,
+    writer: Mutex<Option<(PathBuf, JoinHandle<()>)>>,
 }
 
 fn writer_main(shared: Arc<Shared>, mut file: File) {
@@ -231,7 +231,7 @@ impl Recorder {
                 self.shared.active.store(false, Ordering::Release);
                 format!("cannot start recorder thread: {e}")
             })?;
-        *writer = Some(handle);
+        *writer = Some((path.to_path_buf(), handle));
         Ok(())
     }
 
@@ -278,8 +278,22 @@ impl Recorder {
 
     /// Drains the ring, closes the file and returns the session's stats.
     pub fn stop(&self) -> Stats {
-        let handle = self.writer.lock().unwrap().take();
-        if let Some(handle) = handle {
+        let mut writer = self.writer.lock().unwrap();
+        self.stop_locked(&mut writer)
+    }
+
+    /// Exact-path ownership check and drain happen under the same session lock. A failed
+    /// writer remains a matching session until it is joined; another session is untouched.
+    pub fn stop_if(&self, path: &Path) -> Option<Stats> {
+        let mut writer = self.writer.lock().unwrap();
+        if writer.as_ref().is_none_or(|(owned, _)| owned != path) {
+            return None;
+        }
+        Some(self.stop_locked(&mut writer))
+    }
+
+    fn stop_locked(&self, writer: &mut Option<(PathBuf, JoinHandle<()>)>) -> Stats {
+        if let Some((_, handle)) = writer.take() {
             self.shared.active.store(false, Ordering::Release);
             self.shared.ring.lock().unwrap().stop = true;
             self.shared.cond.notify_one();
@@ -601,6 +615,33 @@ mod tests {
         info.serial[..3].copy_from_slice(&[b'W' as c_char, b'M' as c_char, b'T' as c_char]);
         let b = blobs();
         r.write(FRAME_OBS, 444, &[as_bytes(&info), slice_bytes(&b)]);
+    }
+
+    #[test]
+    fn scoped_stop_preserves_other_sessions_and_reaps_failed_writer() {
+        let path = tmp("scoped-stop");
+        let other = tmp("scoped-other");
+        let r = Recorder::new(1 << 20);
+        assert!(r.stop_if(&path).is_none());
+        r.start(&path, 111).unwrap();
+        write_three(&r);
+        assert!(r.stop_if(&other).is_none());
+        assert!(r.active());
+        assert!(r.has_session());
+        let stats = r.stop_if(&path).unwrap();
+        assert_eq!(stats.records, 3);
+        assert!(!r.has_session());
+        assert!(r.stop_if(&path).is_none());
+        r.start(&other, 222).unwrap();
+        // Model the writer-error state: active is false but its session still needs reaping.
+        r.shared.active.store(false, Ordering::Release);
+        r.shared.ring.lock().unwrap().stats.write_errors = 1;
+        assert!(r.stop_if(&path).is_none());
+        assert!(r.has_session());
+        assert_eq!(r.stop_if(&other).unwrap().write_errors, 1);
+        assert!(!r.has_session());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(other).unwrap();
     }
 
     #[test]

@@ -46,6 +46,37 @@ The installer refuses to overwrite unmanaged or modified installed files, includ
 
 SteamVR is discovered from its OpenVR path registry and common native Steam paths. Set `CV1TOUCH_STEAMVR` to the SteamVR runtime directory if needed, and `CV1TOUCH_STEAM_ROOT` to the Steam directory containing `config/steamvr.vrsettings` if discovery is ambiguous. Export these for installation and CLI commands; add them to a systemd user-service override when the daemon needs custom paths.
 
+## Guided setup (development `main`)
+
+The following commands are unreleased and available on development `main`, not in the v0.1.0 quick start:
+
+```sh
+cv1touch setup --check
+cv1touch setup --check --json
+cv1touch setup
+cv1touch setup --no-slip-check
+```
+
+`setup --check` is read-only: it lists each stage as done, not done, saved but not verified, needing redoing, or waiting on something, and starts nothing. A done stage means its saved settings still fit together; it does not measure tracking accuracy. Check that in SteamVR afterwards.
+
+Before you start: install the CLI and daemon from the same build, start the daemon, wake both already-paired controllers, and make sure every sensor shows frames. Headset alignment needs SteamVR running with the headset tracking. Setup never pairs controllers, resets hardware, changes firmware or permissions, or restarts services.
+
+`cv1touch setup` shows the checks (only the failing ones are explained), the stage list, and a prompt for the next stage: Enter starts it, `q` quits. It runs only the stages that need work and remembers finished ones in `$XDG_STATE_HOME/cv1touch/setup.json` (default `~/.local/state/cv1touch/setup.json`), so rerunning it continues where you left off. Each finished stage prints one line with its headline result; solver output goes to a log next to the recordings, shown when a stage fails. A failed stage offers to try again right away; earlier stages stay done. Instructions are bold in a terminal; `NO_COLOR` or `TERM=dumb` turns that off (and a dumb terminal gets ASCII marks), and JSON reports stay plain.
+
+Settings saved before you used the guide show as saved but not verified. `k` keeps such a stage as it is: do that only if tracking already looks right (sensor coverage, level, controller models, and the controllers' position against the SteamVR headset across the play area). Keeping records your judgement; it measures nothing. When in doubt, redo the stage.
+
+Whenever your hands are full, A on the right controller does what Enter does, and timed steps are marked by a haptic pulse in both controllers and a beep from the speakers: one starts, two end. The stages:
+
+- **Sensor positions**: works out where each of your Rift sensors is in the room. The sensors find their places by watching the lights in the controllers' rings, and moments when two sensors see a controller at once matter most. For 60 seconds, slowly wave both controllers around the whole play area: high and low, close to each sensor and far from it, turning your wrists so the rings face every way. A good result also levels the floor.
+- **Floor level** (only when the sensor positions did not already do it): finds which way is down, so the floor in VR is level. Each controller can feel gravity, but only while held perfectly still, and only accurately in many different positions. Twelve times: turn and tilt both controllers into a new position with their rings in view of the sensors, hold them still, press A, and keep them still until the double beep (3 seconds).
+- **Controller model**: lines up the controller you see in VR with the real one. Each controller reports where its lights are, and the guide moves SteamVR's 3D model to match. Nothing to aim or hold: keep both controllers awake for 5 seconds.
+- **Buttons and sticks**: measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads as a full pull. Let go of everything, pull both triggers all the way, squeeze both grips all the way, then circle both thumbsticks around their edges. Each step starts as soon as both hands are in position (Enter also starts it) and ends at the double beep.
+- **Headset alignment**: lines up the controllers' tracking with the headset's, so in VR the controllers appear exactly where your hands are. First a button and pulse check (press X, feel the pulse, press X again; the same with A), because with the headset on you will press A and go by haptic pulses. Then the guide shows the whole procedure, since you will not see the screen with the headset on: put on the headset; press the real controllers firmly against the outside of it, left controller on the left side, right on the right, hands off the rings and the headset's sensors, and from then on do not let them slide or twist on the headset (if one does, the calibration fails and you start the step again); press A on the right controller, and you feel a 10-second countdown via controller haptic pulses, one a second, while nothing is recorded yet: use it to press the controllers back into place in case pressing A moved them; two quick pulses start the recording: slowly turn your whole body around on the spot, two full circles to your left and then two to your right, 5 to 10 seconds per circle, until a single pulse; then look up and down and tilt your head toward each shoulder, as far as is comfortable, a few times each, until one long pulse, and take the headset off. What you see in the headset during this step does not matter. The recording ends by itself; you never press anything while holding the controllers to the headset, except B to cancel. While recording, the guide watches each controller against the headset: if one turns on it by more than about 3 degrees within a second, the recording stops with three quick pulses (as it does after B or any other problem; the screen says which), and the guide offers to try again with or without this slip check (`setup --no-slip-check` turns it off from the start, for when it keeps stopping careful recordings). A hold that shifts very slowly is tolerated rather than stopped, and a controller sliding without turning is not noticed; both still make the calibration fail at the end if the controllers did not stay put. If a controller falls asleep before the countdown, the guide names it and waits; once the countdown starts, a sleeping controller cancels the step.
+
+After setup, check both hands in SteamVR: position, buttons, haptics, recovery from occlusion and from sleep, and a daemon restart (see below). Live hardware validation of this unreleased guide is still pending. Linux is the supported target; Windows is not.
+
+The manual commands below remain available for explicit recordings, inspection, alternative registration paths, and expert control.
+
 ## Calibrate and align
 
 Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. A previously paired CV1 headset supplies the radio link; your other SteamVR headset supplies the reference pose.
@@ -78,7 +109,7 @@ Camera calibration estimates the sensors' poses in a shared world. Registration 
    ```
 
    Replace `BASE` with the printed path. The fit must have sufficient motion and agreement. If the two controllers move relative to the headset, repeat the capture. No separate tracked controller is required for this path.
-6. Run `cv1touch calibrate inputs`. For each controller, the guide captures released triggers/grips and the centered stick, full trigger and grip presses, then full thumbstick circles. Follow the prompts, press firmly at the normal mechanical stop, and move the stick against its gate through several complete circles. Settings apply immediately and survive restarts; SteamVR can stay open. See [input calibration](input-calibration.md) for reset and expert controls.
+6. Run `cv1touch calibrate inputs`. In v0.1.0, the guide captures each controller separately. On development `main`, both hands share four phases: released triggers/grips and centered sticks, full trigger presses, full grip presses, then full thumbstick circles. Follow the prompts, press firmly at the normal mechanical stop, and move the stick against its gate through several complete circles. Settings apply immediately and survive restarts; SteamVR can stay open. See [input calibration](input-calibration.md) for reset and expert controls.
 7. Verify position and orientation in SteamVR. Run `cv1touch input-test` and follow its button prompts with a focused VR app running. The tool checks the exact supported SteamVR inputs and reports menu/thumb-rest delivery as a manual app check. Test haptics with a game or `cv1touch haptic left 0.1 100 0.5`. Check occlusion recovery, sleeping/waking, both hands, and a daemon restart before relying on the setup.
 
 Sensor movement requires recalibration or `calibrate refine`/`calibrate place` with a new observable capture. A new SteamVR room setup or a substantial non-rigid base-station re-solve can require repeating headset registration. See [troubleshooting](troubleshooting.md).

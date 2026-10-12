@@ -39,6 +39,10 @@ cv1touch status --json
 
 The initial doctor check reports missing calibration/alignment until setup is complete. Follow [setup and calibration](docs/setup.md#calibrate-and-align). Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, registration to your SteamVR headset, and guided trigger/grip/thumbstick calibration. Once complete, the daemon starts automatically and reconnects to devices.
 
+## Development setup guide
+
+On development `main`, `cv1touch setup` guides camera calibration, gravity alignment, render fitting, input calibration, and finally headset registration, retaining completed stages across runs. A fresh accepted camera solve also completes gravity alignment from the same capture. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. These commands are unreleased and are not included in v0.1.0; see [guided setup](docs/setup.md#guided-setup-development-main) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
+
 ## Documentation
 
 - [Setup, calibration, upgrades, and removal](docs/setup.md)
