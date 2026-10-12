@@ -197,11 +197,11 @@ pub(super) fn answer(line: &str, offered: &[Answer]) -> Option<Answer> {
 /// What to type, for someone who typed something else at a prompt allowing `allowed`.
 pub(super) fn hint(allowed: &[&str]) -> String {
     if allowed.contains(&"") {
-        let extra: String = ["k", "d"]
-            .iter()
-            .filter(|key| allowed.contains(key))
-            .map(|key| format!(", {key}"))
-            .collect();
+        let mut extra = String::new();
+        for key in ["k", "d"].iter().filter(|key| allowed.contains(key)) {
+            extra.push_str(", ");
+            extra.push_str(key);
+        }
         format!("Press Enter{extra}, or q to quit.")
     } else {
         format!("Enter {}.", allowed.join(" / "))
