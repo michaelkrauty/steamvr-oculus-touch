@@ -197,13 +197,9 @@ pub fn factory_values(trigger: f32, grip: f32, stick: [f32; 2]) -> (f32, f32, [f
     )
 }
 pub fn default_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".config")
-        })
-        .join("cv1touch/input-calibration.json")
+    crate::platform::dirs::get()
+        .config
+        .join("input-calibration.json")
 }
 pub fn load(path: &Path) -> Result<Option<CalibrationFile>, String> {
     let file = match crate::platform::fs::open_read_nofollow(path) {

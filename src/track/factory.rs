@@ -12,12 +12,9 @@ use nalgebra::Vector3;
 
 use crate::calib::capture::Led;
 
-/// $XDG_CONFIG_HOME/openhmd, else ~/.config/openhmd (as the engine resolves it).
+/// OpenHMD's cache directory, as the engine resolves it (platform::dirs::openhmd).
 pub fn openhmd_config_dir() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(x) => PathBuf::from(x).join("openhmd"),
-        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config/openhmd"),
-    }
+    crate::platform::dirs::openhmd()
 }
 
 /// (LED positions, IMU position) from one cached configuration.

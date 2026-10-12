@@ -534,14 +534,9 @@ fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// $XDG_STATE_HOME/cv1touch, falling back to ~/.local/state/cv1touch: calibration recordings.
+/// cv1touch's state directory (platform::dirs): calibration recordings.
 fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("cv1touch")
+    cv1touch::platform::dirs::get().state
 }
 
 fn status_json() -> Option<serde_json::Value> {

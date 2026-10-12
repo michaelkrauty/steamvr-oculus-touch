@@ -181,15 +181,9 @@ pub fn missing_from(previous: &CalibrationFile, serials: &[String]) -> Vec<Strin
         .collect()
 }
 
-/// $XDG_CONFIG_HOME/cv1touch/calibration.json, falling back to ~/.config.
+/// calibration.json in cv1touch's configuration directory (platform::dirs).
 pub fn default_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-        })
-        .join("cv1touch")
-        .join("calibration.json")
+    crate::platform::dirs::get().config.join("calibration.json")
 }
 
 pub fn load(path: &Path) -> Result<CalibrationFile, String> {

@@ -190,6 +190,72 @@ pub mod shm {
     }
 }
 
+pub mod dirs {
+    //! Per-user directories. Linux follows the XDG base directories (an empty or relative value is
+    //! ignored, as the specification says); Windows keeps everything under %LOCALAPPDATA%, where
+    //! SteamVR keeps its openvrpaths and the engine its cache.
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[derive(Debug, PartialEq)]
+    pub struct Dirs {
+        /// Other programs' per-user configuration (OpenHMD's cache, SteamVR's openvrpaths).
+        pub config_home: PathBuf,
+        /// cv1touch's configuration: calibration, registration, render offsets, input calibration.
+        pub config: PathBuf,
+        /// cv1touch's state: IMU biases, recordings, setup and pairing records.
+        pub state: PathBuf,
+        /// cv1touch's data: the installed SteamVR driver.
+        pub data: PathBuf,
+    }
+
+    /// The directories for an environment (`var` looks a variable up).
+    #[cfg(unix)]
+    pub fn resolve(var: &dyn Fn(&str) -> Option<OsString>) -> Dirs {
+        let home = PathBuf::from(var("HOME").unwrap_or_default());
+        let xdg = |name: &str, fallback: &str| {
+            var(name)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join(fallback))
+        };
+        let config_home = xdg("XDG_CONFIG_HOME", ".config");
+        Dirs {
+            config: config_home.join("cv1touch"),
+            state: xdg("XDG_STATE_HOME", ".local/state").join("cv1touch"),
+            data: xdg("XDG_DATA_HOME", ".local/share").join("cv1touch"),
+            config_home,
+        }
+    }
+
+    /// The directories for an environment (`var` looks a variable up). The SteamVR driver finds
+    /// the daemon under the same %LOCALAPPDATA%\cv1touch (driver/src/haptics.cpp).
+    #[cfg(windows)]
+    pub fn resolve(var: &dyn Fn(&str) -> Option<OsString>) -> Dirs {
+        let local = var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(std::env::temp_dir);
+        let cv1touch = local.join("cv1touch");
+        Dirs {
+            config: cv1touch.clone(),
+            state: cv1touch.join("state"),
+            data: cv1touch.join("data"),
+            config_home: local,
+        }
+    }
+
+    pub fn get() -> Dirs {
+        resolve(&|name| std::env::var_os(name))
+    }
+
+    /// OpenHMD's cache of sensor and controller configuration, as the engine resolves it
+    /// (ohmd_get_config_dir).
+    pub fn openhmd() -> PathBuf {
+        get().config_home.join("openhmd")
+    }
+}
+
 pub mod ipc {
     //! The control channel: one stream per request, private to this user (a Unix-domain socket on
     //! Linux, a named pipe on Windows), and the lock that keeps one daemon per user.
@@ -448,6 +514,81 @@ mod tests {
         assert_eq!(super::ticks_to_ns(3, 3_000_000_000), 1);
         let (a, b) = (super::now_ns(), super::now_ns());
         assert!(a > 0 && b >= a);
+    }
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| vars.get(name).map(Into::into)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_directories_follow_xdg_and_fall_back_under_home() {
+        use super::dirs::{resolve, Dirs};
+        use std::path::PathBuf;
+        let home = env(&[("HOME", "/home/u")]);
+        assert_eq!(
+            resolve(&home),
+            Dirs {
+                config_home: PathBuf::from("/home/u/.config"),
+                config: PathBuf::from("/home/u/.config/cv1touch"),
+                state: PathBuf::from("/home/u/.local/state/cv1touch"),
+                data: PathBuf::from("/home/u/.local/share/cv1touch"),
+            }
+        );
+        let xdg = env(&[
+            ("HOME", "/home/u"),
+            ("XDG_CONFIG_HOME", "/c"),
+            ("XDG_STATE_HOME", "/s"),
+            ("XDG_DATA_HOME", "/d"),
+        ]);
+        let d = resolve(&xdg);
+        assert_eq!(
+            (d.config_home, d.config, d.state, d.data),
+            (
+                PathBuf::from("/c"),
+                PathBuf::from("/c/cv1touch"),
+                PathBuf::from("/s/cv1touch"),
+                PathBuf::from("/d/cv1touch")
+            )
+        );
+        // the specification: an empty or relative value counts as unset
+        let odd = env(&[
+            ("HOME", "/home/u"),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_STATE_HOME", "relative"),
+        ]);
+        let d = resolve(&odd);
+        assert_eq!(d.config, PathBuf::from("/home/u/.config/cv1touch"));
+        assert_eq!(d.state, PathBuf::from("/home/u/.local/state/cv1touch"));
+        // no home: relative (the engine agrees: tests/test_config_dir.c)
+        assert_eq!(resolve(&env(&[])).config_home, PathBuf::from(".config"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directories_live_in_local_app_data() {
+        use super::dirs::{resolve, Dirs};
+        use std::path::PathBuf;
+        let local = env(&[("LOCALAPPDATA", r"C:\Users\a b\AppData\Local")]);
+        assert_eq!(
+            resolve(&local),
+            Dirs {
+                config_home: PathBuf::from(r"C:\Users\a b\AppData\Local"),
+                config: PathBuf::from(r"C:\Users\a b\AppData\Local\cv1touch"),
+                state: PathBuf::from(r"C:\Users\a b\AppData\Local\cv1touch\state"),
+                data: PathBuf::from(r"C:\Users\a b\AppData\Local\cv1touch\data"),
+            }
+        );
+        // the control endpoint sits in the configuration directory, as the driver expects
+        assert_eq!(super::ipc::runtime_dir(), super::dirs::get().config);
+        // unset or relative: the temp directory (the engine agrees: tests/test_config_dir.c)
+        for odd in [env(&[]), env(&[("LOCALAPPDATA", r"AppData\Local")])] {
+            assert_eq!(resolve(&odd).config_home, std::env::temp_dir());
+        }
     }
 
     #[test]

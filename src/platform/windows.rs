@@ -422,10 +422,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken,
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 pub fn runtime_dir() -> std::path::PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cv1touch")
+    super::dirs::get().config
 }
 
 pub fn lock_exclusive(path: &Path) -> io::Result<File> {

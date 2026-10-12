@@ -19,10 +19,9 @@ pub fn steam_root() -> PathBuf {
 }
 
 fn registry_path() -> PathBuf {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    config.join("openvr/openvrpaths.vrpath")
+    crate::platform::dirs::get()
+        .config_home
+        .join("openvr/openvrpaths.vrpath")
 }
 
 fn path_registry() -> Option<serde_json::Value> {
@@ -119,10 +118,7 @@ pub fn driver_assets() -> Result<(PathBuf, PathBuf), String> {
 }
 
 pub fn driver_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share"))
-        .join("cv1touch/steamvr/cv1touch")
+    crate::platform::dirs::get().data.join("steamvr/cv1touch")
 }
 
 const OWNERSHIP_FILE: &str = ".cv1touch-owned.json";

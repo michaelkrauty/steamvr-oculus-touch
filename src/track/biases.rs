@@ -57,14 +57,9 @@ impl Default for BiasFile {
     }
 }
 
-/// $XDG_STATE_HOME/cv1touch/imu-biases.json, else ~/.local/state/cv1touch/imu-biases.json.
+/// imu-biases.json in cv1touch's state directory (platform::dirs).
 pub fn default_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("cv1touch/imu-biases.json")
+    crate::platform::dirs::get().state.join("imu-biases.json")
 }
 
 /// "left-1a2b3c4d": the hand and a fingerprint of the LED model at 0.1 mm.
