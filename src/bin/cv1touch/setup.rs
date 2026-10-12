@@ -315,7 +315,7 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
     io::stdout().flush().map_err(|e| e.to_string())?;
     loop {
         if interrupted() {
-            return Err("setup interrupted; earlier files and recordings are retained".into());
+            return Err("setup interrupted; completed steps are kept".into());
         }
         let mut fd = libc::pollfd {
             fd: 0,
@@ -569,7 +569,7 @@ fn timed_window(seconds: u64) -> Result<(), String> {
     loop {
         if interrupted() {
             println!();
-            return Err("interrupted; the capture is kept".into());
+            return Err("interrupted; your previous calibration is unchanged".into());
         }
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -655,7 +655,9 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     let raw = raw_inputs()?;
     input_identities_match(&raw, ids)?;
     PairedInputPhase::new([0, 0]).observe(&raw, ids, shm::now_ns())?;
-    let status = read_status().ok_or("daemon unavailable after capture")?;
+    let status = read_status().ok_or(
+        "cv1touchd stopped responding after the recording; check it is running and try again",
+    )?;
     if inspection.generation.is_none() || status["generation"].as_u64() != inspection.generation {
         return Err(
             "cv1touchd restarted during the recording; your previous calibration is unchanged"
@@ -663,7 +665,10 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
         );
     }
     if status["recording"] != false {
-        return Err("recording is still active; finish it before fitting".into());
+        return Err(
+            "another recording is still running; stop it (cv1touch record stop) and try again"
+                .into(),
+        );
     }
     if let Artifact::Valid(before) = &inspection.snapshot.camera {
         let now = setup::fingerprint(&file::default_path()).map_err(|e| e.to_string())?;
@@ -683,7 +688,7 @@ fn verify_fitted_dependencies(
     after: &Inspection,
 ) -> Result<(), String> {
     if after.generation != before.generation || after.identities != before.identities {
-        return Err("daemon or controller identities changed during fitting; stage remains incomplete, previous backups retained".into());
+        return Err("cv1touchd restarted or a different controller connected meanwhile; your previous calibration is unchanged".into());
     }
     if stage == Stage::Render && after.snapshot.render_sources != before.snapshot.render_sources {
         return Err("SteamVR's controller model files changed meanwhile; try again".into());
@@ -726,13 +731,15 @@ fn wait_reload_with(
             .and_then(|v| v["generation"].as_u64())
             .is_some_and(|g| g != generation)
         {
-            return Err("daemon restarted during reload; stage remains incomplete".into());
+            return Err("cv1touchd restarted unexpectedly; try again".into());
         }
         if status
             .as_ref()
             .is_some_and(|v| v["engine_ready"].as_bool().is_none())
         {
-            return Err("guided reload requires a matching cv1touchd with engine readiness diagnostics; stage remains incomplete".into());
+            return Err(
+                "this cv1touchd is older than cv1touch; install both from the same build".into(),
+            );
         }
         if let Some(raw) = &raw {
             for (hand, expected) in raw.hands.iter().zip(ids) {
@@ -743,7 +750,7 @@ fn wait_reload_with(
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
                 if known && &hand.identity != expected {
                     return Err(
-                        "physical controller changed during reload; stage remains incomplete"
+                        "a different controller connected meanwhile; use the same two controllers and try again"
                             .into(),
                     );
                 }
@@ -795,7 +802,7 @@ fn wait_reload_with(
         }
         pause();
     }
-    Err(format!("timed out waiting for {expected_mode} sensor streams and awake matching controllers after reload; stage remains incomplete, rerun setup when ready"))
+    Err("tracking did not come back after restarting (a sensor not sending images, or a controller asleep); wake both controllers, check the sensors' USB cables and try again".into())
 }
 
 fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
@@ -807,12 +814,12 @@ fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
         Duration::from_secs(30),
         || {
             if interrupted() {
-                return Err("setup interrupted during reload; stage remains incomplete".into());
+                return Err("setup interrupted; this step was not saved".into());
             }
             let status = read_status();
             let raw = raw_inputs().ok();
             if interrupted() {
-                return Err("setup interrupted during reload; stage remains incomplete".into());
+                return Err("setup interrupted; this step was not saved".into());
             }
             Ok((status, raw, shm::now_ns()))
         },
@@ -856,7 +863,9 @@ impl ButtonEdges {
     ) -> Result<Option<[u32; 2]>, String> {
         input_identities_match(raw, ids)?;
         for (hand, sample) in raw.hands.iter().enumerate() {
-            let buttons = sample.buttons.ok_or("controller-guided registration requires a matching cv1touchd with raw button support; update the daemon")?;
+            let buttons = sample
+                .buttons
+                .ok_or("this cv1touchd is older than cv1touch; install both from the same build")?;
             if sample.received_host_ns == 0 || sample.received_host_ns > now_ns {
                 return Err(
                     "controller input has an invalid timestamp; registration not started or fitted"
@@ -898,14 +907,16 @@ impl ButtonEdges {
         input_identities_match(raw, ids)?;
         let mut edges = [0; 2];
         for (hand, sample) in raw.hands.iter().enumerate() {
-            let buttons = sample.buttons.ok_or("controller-guided registration requires a matching cv1touchd with raw button support; update the daemon")?;
+            let buttons = sample
+                .buttons
+                .ok_or("this cv1touchd is older than cv1touch; install both from the same build")?;
             if !sample.connected
                 || sample.received_host_ns == 0
                 || now_ns
                     .checked_sub(sample.received_host_ns)
                     .is_none_or(|age| age > FRESH_INPUT_NS)
             {
-                return Err("controller input is disconnected, stale or has an invalid timestamp; registration not started or fitted".into());
+                return Err("a controller stopped responding (asleep or out of range); your previous calibration is unchanged".into());
             }
             if sample.received_host_ns < self.last_ns[hand] {
                 return Err(
@@ -972,7 +983,7 @@ fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
     let status: serde_json::Value = serde_json::from_str(
         reply
             .strip_prefix("ok ")
-            .ok_or("cannot read daemon status during registration")?,
+            .ok_or("cannot reach cv1touchd; check it is running")?,
     )
     .map_err(|e| e.to_string())?;
     if before.generation.is_none() || status["generation"].as_u64() != before.generation {
@@ -1010,7 +1021,9 @@ fn registration_inputs(before: &Inspection) -> Result<RawInputs, String> {
         .ok_or("controller identities unavailable")?;
     PairedInputPhase::new([0, 0]).observe(&raw, identities, shm::now_ns())?;
     if raw.hands.iter().any(|hand| hand.buttons.is_none()) {
-        return Err("guided controller controls require a matching cv1touchd with raw button support; update the daemon and retry".into());
+        return Err(
+            "this cv1touchd is older than cv1touch; install both from the same build".into(),
+        );
     }
     if raw.hands[HAND_RIGHT]
         .buttons
@@ -1036,10 +1049,12 @@ fn registration_haptic(
         &command,
         Duration::from_millis(500),
     )
-    .map_err(|e| format!("haptic command failed: {e}; cancel and verify controller feedback"))?;
+    .map_err(|e| {
+        format!("a haptic pulse could not be sent ({e}); check both controllers are awake")
+    })?;
     if reply.trim() != "ok" {
         return Err(format!(
-            "haptic command rejected: {reply}; cancel and verify controller feedback"
+            "a haptic pulse was refused ({reply}); check both controllers are awake"
         ));
     }
     Ok(())
@@ -1073,7 +1088,7 @@ fn wait_preparation_press(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    Err("timed out waiting for a fresh controller release and press; rerun setup when ready".into())
+    Err("no button press within 5 minutes; nothing was recorded".into())
 }
 
 /// The line to show when the controllers' readiness changes: which one fell asleep, or, once
@@ -1293,7 +1308,7 @@ fn verify_registration_preparation(before: &Inspection, after: &Inspection) -> R
         || !after.unplaced.is_empty()
         || after.sensors != before.sensors
     {
-        return Err("camera placement or connected sensors changed during preparation; no recording started".into());
+        return Err("the sensors changed meanwhile (one connected, disconnected or recalibrated); nothing was recorded".into());
     }
     Ok(())
 }
@@ -1317,7 +1332,9 @@ fn run_stage(
     checkpoint: &mut Checkpoint,
 ) -> Result<(), String> {
     if matches!(stage, Stage::Camera | Stage::Gravity) && inspection.engine_ready.is_none() {
-        return Err("guided reload requires a matching cv1touchd with engine readiness diagnostics; no capture was started".into());
+        return Err(
+            "this cv1touchd is older than cv1touch; install both from the same build (nothing was recorded)".into(),
+        );
     }
     let old = checkpoint.clone();
     let preserve = stage == Stage::Camera
@@ -1336,7 +1353,7 @@ fn run_stage(
             verify_capture(inspection)?;
             for serial in &inspection.unplaced {
                 if log.quiet(|| calibrate_place(serial, &rec, &file::default_path(), true)) != 0 {
-                    return Err(log.failure("sensor placement rejected; earlier backups retained"));
+                    return Err(log.failure("the new sensors could not be placed; your previous calibration is unchanged"));
                 }
             }
             log.quiet(|| restore_mode(&file::default_path()))
@@ -1344,7 +1361,7 @@ fn run_stage(
         Stage::Camera => {
             let mut restore = RestoreCamera(true);
             if log.quiet(|| send_quiet("calibration capture")) != 0 {
-                return Err("cannot enter camera capture mode".into());
+                return Err("cv1touchd did not switch to sensor calibration; try again".into());
             }
             wait_reload(inspection, "capture")?;
             let rec = timed_capture(stage, checkpoint, false)?;
@@ -1413,17 +1430,13 @@ fn run_stage(
                 |checkpoint| {
                     let current = inspect(checkpoint);
                     if interrupted() {
-                        return Err(
-                            "setup interrupted during preparation; no recording started".into()
-                        );
+                        return Err("setup interrupted; nothing was recorded".into());
                     }
                     verify_registration_preparation(inspection, &current)
                 },
                 |checkpoint| {
                     if interrupted() {
-                        return Err(
-                            "setup interrupted during preparation; no recording started".into()
-                        );
+                        return Err("setup interrupted; nothing was recorded".into());
                     }
                     let rec = capture_path(stage, checkpoint)?;
                     let base = rec.with_extension("");
@@ -1434,9 +1447,7 @@ fn run_stage(
                         .push(base.with_extension("truth.json"));
                     persist(checkpoint)?;
                     if interrupted() {
-                        return Err(
-                            "setup interrupted during preparation; no recording started".into()
-                        );
+                        return Err("setup interrupted; nothing was recorded".into());
                     }
                     print!("\r                            \r");
                     let mut feedback =
@@ -1473,7 +1484,7 @@ fn run_stage(
         Stage::Inputs => calibrate_inputs_result(None, false, true).map(|()| 0)?,
     };
     if interrupted() {
-        return Err("interrupted; earlier settings and the capture are kept".into());
+        return Err("interrupted; your previous calibration is unchanged".into());
     }
     if code != 0 {
         return Err(log.failure("the calibration failed; your previous calibration is unchanged"));
@@ -1500,12 +1511,12 @@ fn run_stage(
         *checkpoint = carried;
     }
     if interrupted() {
-        return Err("setup interrupted; stage remains incomplete and captures retained".into());
+        return Err("setup interrupted; this step was not saved".into());
     }
     if stage == Stage::Camera && !preserve {
         let accepted = accepted_camera_sha256
             .as_deref()
-            .ok_or("accepted camera output fingerprint unavailable; stage remains incomplete")?;
+            .ok_or("the new sensor calibration could not be read back; try again")?;
         setup::record_full_camera_success(&next.snapshot, checkpoint, accepted, recordings)?;
     } else {
         setup::record_success(stage, &next.snapshot, checkpoint, recordings)?;
@@ -1774,7 +1785,7 @@ mod tests {
                                 Ok(())
                             }
                         },
-                        || Err("B on the right controller or interrupt cancelled countdown".into()),
+                        || Err("cancelled during the countdown; nothing was recorded".into()),
                     )
                 },
                 |_| Ok(()),
@@ -1856,6 +1867,33 @@ mod tests {
         raw.hands[0].received_host_ns -= 1;
         assert!(edges.observe(&raw, &ids, 1_000_000_010).is_err());
     }
+    #[test]
+    fn the_guides_messages_avoid_engineer_speak() {
+        // everything after a stage's ✗ is read by someone who just wants it to work
+        let source = include_str!("setup.rs");
+        let code = &source[..source.find("#[cfg(test)]").unwrap()];
+        for (n, line) in code.lines().enumerate() {
+            let Some(quote) = line.find('"') else {
+                continue;
+            };
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for jargon in [
+                "remains incomplete",
+                "rerun setup",
+                "retained",
+                "no fit installed",
+                "matching cv1touchd",
+                "fitting",
+                "timed out waiting",
+                "stale or has",
+            ] {
+                assert!(!line[quote..].contains(jargon), "line {}: {jargon}", n + 1);
+            }
+        }
+    }
+
     /// `text` with its line breaks and indents as single spaces.
     fn one_line(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -2220,11 +2258,15 @@ mod tests {
     }
     #[test]
     fn reload_outage_or_stopped_streams_time_out() {
-        assert!(simulated_reload(vec![]).unwrap_err().contains("timed out"));
+        assert!(simulated_reload(vec![])
+            .unwrap_err()
+            .contains("did not come back"));
         let stopped = (0..10)
             .map(|_| (Some(reload_sample(1, 1)), Some(reload_inputs())))
             .collect();
-        assert!(simulated_reload(stopped).unwrap_err().contains("timed out"));
+        assert!(simulated_reload(stopped)
+            .unwrap_err()
+            .contains("did not come back"));
     }
     #[test]
     fn reload_requires_matching_daemon_readiness_capability() {
@@ -2233,7 +2275,7 @@ mod tests {
         assert!(
             simulated_reload(vec![(Some(legacy), Some(reload_inputs()))])
                 .unwrap_err()
-                .contains("matching cv1touchd")
+                .contains("older than cv1touch")
         );
     }
     #[test]
@@ -2245,7 +2287,9 @@ mod tests {
                 (Some(status), Some(reload_inputs()))
             })
             .collect();
-        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
+        assert!(simulated_reload(samples)
+            .unwrap_err()
+            .contains("did not come back"));
     }
     #[test]
     fn reload_restart_or_replaced_controller_is_fatal() {
@@ -2259,7 +2303,7 @@ mod tests {
         assert!(
             simulated_reload(vec![(Some(reload_sample(1, 1)), Some(replaced))])
                 .unwrap_err()
-                .contains("controller changed")
+                .contains("different controller connected")
         );
     }
     #[test]
@@ -2269,7 +2313,9 @@ mod tests {
         let samples = (0..10)
             .map(|_| (Some(changed.clone()), Some(reload_inputs())))
             .collect();
-        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
+        assert!(simulated_reload(samples)
+            .unwrap_err()
+            .contains("did not come back"));
         let samples = (1..11)
             .map(|frames| {
                 let mut asleep = reload_inputs();
@@ -2277,7 +2323,9 @@ mod tests {
                 (Some(reload_sample(1, frames)), Some(asleep))
             })
             .collect();
-        assert!(simulated_reload(samples).unwrap_err().contains("timed out"));
+        assert!(simulated_reload(samples)
+            .unwrap_err()
+            .contains("did not come back"));
     }
     #[test]
     fn registration_cannot_complete_against_a_world_changed_during_fit() {

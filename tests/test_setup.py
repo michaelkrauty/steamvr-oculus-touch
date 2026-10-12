@@ -237,7 +237,7 @@ class SetupTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         before = {p: p.read_bytes() for p in directory.iterdir()}
         output = self.terminal_guide("new\nq\n", expected_code=1)
-        self.assertIn("cannot enter camera capture mode", output)
+        self.assertIn("did not switch to sensor calibration", output)
         mutations = [command for command in self.commands if command not in {"status", "inputs"}]
         self.assertEqual(mutations, ["calibration capture",
                                      "calibration load " + json.dumps(str(path)),
@@ -259,7 +259,7 @@ class SetupTests(unittest.TestCase):
         (directory / "calibration.json").write_text("{malformed camera")
         before = {p: p.read_bytes() for p in directory.iterdir()}
         output = self.terminal_guide("new\nq\n", expected_code=1)
-        self.assertIn("cannot enter camera capture mode", output)
+        self.assertIn("did not switch to sensor calibration", output)
         mutations = [command for command in self.commands if command not in {"status", "inputs"}]
         self.assertEqual(mutations, ["calibration capture", "calibration provisional"])
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
@@ -333,8 +333,8 @@ class SetupTests(unittest.TestCase):
         journal = self.root / "state/cv1touch/setup.json"
         checkpoint = journal.read_bytes()
         output = self.terminal_guide("new\nq\n", expected_code=1)
-        self.assertIn("matching cv1touchd", output)
-        self.assertIn("no capture was started", output)
+        self.assertIn("older than cv1touch", output)
+        self.assertIn("nothing was recorded", output)
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)

@@ -59,9 +59,10 @@ fn state_words(report: &StageReport) -> String {
         State::Ready => "done".into(),
         State::Missing => "not done".into(),
         State::Stale if report.reason.contains("did not complete") => "not finished".into(),
-        State::Stale => format!("needs redoing ({})", report.reason),
+        // the planner's reasons are file fingerprints and dependencies: setup --check --json has them
+        State::Stale => "needs redoing (its result or an earlier step changed)".into(),
         State::Unknown => "saved earlier, not verified".into(),
-        State::Invalid => format!("saved file unusable ({})", report.reason),
+        State::Invalid => "saved file unusable: redo it".into(),
         // the report's reason is "what blocks it; its own state": the blocker is what to act on
         State::Blocked => format!(
             "waiting: {}",
@@ -326,6 +327,26 @@ mod tests {
         assert_eq!(
             waiting,
             "  ✗ Buttons and sticks  waiting: wake both controllers with a face button"
+        );
+        // the planner's reasons are for --check --json; the list says what it means to a person
+        let changed = checklist(
+            &[
+                report(
+                    Stage::Camera,
+                    State::Stale,
+                    "artifact or dependency fingerprint changed",
+                ),
+                report(
+                    Stage::Gravity,
+                    State::Invalid,
+                    "invalid fingerprint or dependency",
+                ),
+            ],
+            &g,
+        );
+        assert_eq!(
+            changed,
+            "  ● Sensor positions  needs redoing (its result or an earlier step changed)\n  ✗ Floor level       saved file unusable: redo it"
         );
     }
 

@@ -277,7 +277,10 @@ pub fn record_full_camera_success(
         return Err("accepted full camera capture provenance is required".into());
     }
     if valid(&snapshot.camera) != Some(accepted_camera_sha256) {
-        return Err("camera calibration changed after the accepted solve; Camera and Gravity remain incomplete, capture retained".into());
+        return Err(
+            "the sensor calibration changed while it was being saved; do Sensor positions again"
+                .into(),
+        );
     }
     let mut next = checkpoint.clone();
     record_success(Stage::Camera, snapshot, &mut next, recordings.clone())?;
