@@ -13,6 +13,27 @@
 
 #include "openhmd.h"
 
+#ifdef _WIN32
+#include <stdlib.h>
+/* cv1touch: glibc's qsort_r, on MSVC's qsort_s, which passes the context first */
+typedef struct {
+	int (*compare)(const void *, const void *, void *);
+	void *arg;
+} ohmd_qsort_r_context;
+
+static inline int ohmd_qsort_r_compare(void *context, const void *a, const void *b)
+{
+	ohmd_qsort_r_context *c = (ohmd_qsort_r_context *)context;
+	return c->compare(a, b, c->arg);
+}
+
+static inline void qsort_r(void *base, size_t n, size_t size, int (*compare)(const void *, const void *, void *), void *arg)
+{
+	ohmd_qsort_r_context c = { compare, arg };
+	qsort_s(base, n, size, ohmd_qsort_r_compare, &c);
+}
+#endif
+
 double ohmd_get_tick();
 void ohmd_toggle_ovr_service(int state);
 
@@ -35,6 +56,9 @@ void ohmd_cond_broadcast(ohmd_cond* cond);
 
 ohmd_thread* ohmd_create_thread(ohmd_context* ctx, unsigned int (*routine)(void* arg), void* arg);
 void ohmd_destroy_thread(ohmd_thread* thread);
+
+/* cv1touch: names the calling thread (Linux: 15 characters), so the daemon and profilers find it */
+void ohmd_set_thread_name(const char* name);
 
 int ohmd_ensure_path(const char* pathname);
 int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len);

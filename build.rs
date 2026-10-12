@@ -46,10 +46,10 @@ fn cross_target_args() -> Vec<&'static str> {
 
 /// Builds the pinned native engine with meson and links it.
 fn build_engine(root: &Path, out: &Path) {
-    assert_eq!(
-        env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("linux"),
-        "the native engine builds on Linux only so far"
+    let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    assert!(
+        windows || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux"),
+        "the native engine builds on Linux and Windows"
     );
     assert_eq!(
         env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
@@ -67,34 +67,102 @@ fn build_engine(root: &Path, out: &Path) {
     if native.join("build.ninja").exists() {
         meson.arg("--reconfigure");
     }
+    let deps = windows.then(|| windows_deps(&mut meson));
     run(meson.arg("--wrap-mode=nodownload").arg(&native).arg(root));
     let jobs = env::var("CARGO_BUILD_JOBS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(4);
-    run(Command::new("ninja")
-        .arg("-C")
-        .arg(&native)
-        .arg("-j")
-        .arg(jobs.to_string()));
+    if windows {
+        // meson compile re-enters the Visual Studio environment the setup found
+        run(Command::new("meson")
+            .arg("compile")
+            .arg("-C")
+            .arg(&native)
+            .arg("-j")
+            .arg(jobs.to_string()));
+    } else {
+        run(Command::new("ninja")
+            .arg("-C")
+            .arg(&native)
+            .arg("-j")
+            .arg(jobs.to_string()));
+    }
     println!("cargo:rerun-if-env-changed=CARGO_BUILD_JOBS");
     let lib_dir = native.join("third_party/openhmd");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=openhmd");
-    // Installed executables live in bin, with the native engine in lib/cv1touch.
-    // Cargo supplies the native search path for `cargo run` and `cargo test`.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/cv1touch");
-    println!("cargo:rustc-env=CV1TOUCH_NATIVE_DIR={}", native.display());
     let profile_dir = out
         .ancestors()
         .nth(3)
         .expect("Cargo OUT_DIR profile directory");
+    if let Some(deps) = deps {
+        // No rpath on Windows: the engine and libusb DLLs go beside the executables Cargo
+        // builds (binaries, tests in deps, examples), as the installer puts them beside its own.
+        let dlls = [
+            find_dll(&lib_dir, "openhmd"),
+            find_dll(&deps.join("bin"), "libusb-1.0"),
+        ];
+        for dir in [
+            profile_dir.to_path_buf(),
+            profile_dir.join("deps"),
+            profile_dir.join("examples"),
+        ] {
+            fs::create_dir_all(&dir).expect("Cargo output directory");
+            for dll in &dlls {
+                fs::copy(dll, dir.join(dll.file_name().unwrap())).expect("copy engine DLL");
+            }
+        }
+    } else {
+        // Installed executables live in bin, with the native engine in lib/cv1touch.
+        // Cargo supplies the native search path for `cargo run` and `cargo test`.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/cv1touch");
+    }
+    println!("cargo:rustc-env=CV1TOUCH_NATIVE_DIR={}", native.display());
     fs::write(
         profile_dir.join("cv1touch-native-dir"),
         format!("{}\n", native.display()),
     )
     .expect("write native artifact marker");
+}
+
+/// Points meson at the vcpkg tree of the engine's dependencies (vcpkg.json, triplet
+/// x64-windows-cv1touch) named by CV1TOUCH_DEPS, and at clang-cl in the Visual Studio environment.
+fn windows_deps(meson: &mut Command) -> PathBuf {
+    println!("cargo:rerun-if-env-changed=CV1TOUCH_DEPS");
+    let deps = PathBuf::from(env::var_os("CV1TOUCH_DEPS").expect(
+        "CV1TOUCH_DEPS: the vcpkg installed tree of the engine's dependencies, \
+         e.g. vcpkg_installed\\x64-windows-cv1touch (docs/building-windows.md)",
+    ));
+    // vcpkg's own pkg-config, installed beside the triplet as a host tool
+    let pkgconf = deps
+        .with_file_name("x64-windows")
+        .join("tools/pkgconf/pkgconf.exe");
+    if pkgconf.exists() {
+        meson.env("PKG_CONFIG", pkgconf);
+    }
+    meson
+        .env("CC", "clang-cl")
+        .env("CXX", "clang-cl")
+        .env("PKG_CONFIG_PATH", deps.join("lib/pkgconfig"))
+        .env("CMAKE_PREFIX_PATH", &deps)
+        .arg("--vsenv")
+        .arg("-Dengine=enabled");
+    deps
+}
+
+/// The DLL in `dir` named `stem` or `stem-<version>`.
+fn find_dll(dir: &Path, stem: &str) -> PathBuf {
+    fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.ends_with(".dll")
+                && (name == format!("{stem}.dll") || name.starts_with(&format!("{stem}-")))
+        })
+        .unwrap_or_else(|| panic!("no {stem} DLL in {}", dir.display()))
 }
 
 fn generate_engine(root: &Path, out: &Path) {

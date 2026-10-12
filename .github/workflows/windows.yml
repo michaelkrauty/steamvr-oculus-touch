@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   library:
-    # The native engine does not build on Windows yet: this checks the platform layer and the
-    # tracking, calibration and protocol code on GitHub's isolated Windows runners.
+    # The library without the native engine on GitHub's isolated Windows runners: the platform
+    # layer and the tracking, calibration and protocol code, on the oldest supported Rust too.
     runs-on: windows-2025
     timeout-minutes: 45
     strategy:
@@ -57,3 +57,54 @@ jobs:
         run: meson test -C build-driver --print-errorlogs
       - name: Contract with the daemon
         run: cargo run --locked --no-default-features --example driver_contract -- build-driver\driver\test_daemon_contract.exe
+  engine:
+    # The native engine on the maintainer's persistent Windows runner, whose vcpkg binary cache
+    # keeps OpenCV built between runs; Rust, LLVM, Python with meson and vcpkg are preinstalled.
+    # Fork PRs must pass GitHub's server-side approval gate before this job starts. These
+    # conditions select jobs; they cannot replace that repository setting. Pull requests only
+    # read the binary cache; pushes to main also write it.
+    if: >-
+      github.repository == 'michaelkrauty/steamvr-oculus-touch' &&
+      (
+        (github.event_name == 'pull_request' &&
+          (github.event.pull_request.head.repo.full_name != github.repository ||
+            (github.event.pull_request.user.login == 'michaelkrauty' && github.actor == 'michaelkrauty'))) ||
+        ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.actor == 'michaelkrauty')
+      )
+    runs-on: [self-hosted, Windows, steamvr-oculus-touch]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        rust: ["1.85.0", stable]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      RUSTUP_HOME: C:\rust\rustup
+      CARGO_HOME: C:\rust\cargo
+      CV1TOUCH_DEPS: ${{ github.workspace }}\vcpkg_installed\x64-windows-cv1touch
+      VCPKG_BINARY_SOURCES: ${{ github.event_name == 'push' && 'clear;files,C:\vcpkg-cache,readwrite' || 'clear;files,C:\vcpkg-cache,read' }}
+      VCPKG_DISABLE_METRICS: "1"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the preinstalled tools
+        run: |
+          "C:\Python312", "C:\Python312\Scripts", "C:\Program Files\LLVM\bin", "$env:CARGO_HOME\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Verify the preinstalled tools
+        run: foreach ($tool in "meson", "ninja", "clang-cl", "rustup", "C:\vcpkg\vcpkg.exe") { (Get-Command $tool).Source }
+      - name: Install Rust toolchain for this job
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy
+      - name: Dependencies
+        run: C:\vcpkg\vcpkg.exe install --x-manifest-root=. --overlay-triplets=windows\triplets --triplet x64-windows-cv1touch --x-install-root=vcpkg_installed
+      - name: Lint
+        # the library and its tests (the daemon and the command do not build on Windows yet)
+        run: |
+          cargo clippy --locked --lib -- -D warnings
+          cargo clippy --locked --lib --profile test -- -D warnings
+      - name: Test
+        run: cargo test --locked --lib
+      - name: Engine tests
+        run: meson test -C (Get-Content target\debug\cv1touch-native-dir) --print-errorlogs

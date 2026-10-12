@@ -13,7 +13,6 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <inttypes.h>
-#include <sys/prctl.h>
 
 #include "rift-sensor.h"
 #include "rift-sensor-pose-search.h"
@@ -550,7 +549,7 @@ static unsigned int long_analysis_thread(void *arg)
 	rift_sensor_ctx *ctx = arg;
 	char name[16];
 	snprintf(name, sizeof name, "cv1t-long%d", ctx->id);
-	prctl(PR_SET_NAME, name); /* cv1touch: findable in profiles */
+	ohmd_set_thread_name(name); /* cv1touch: findable in profiles */
 
 	ohmd_lock_mutex (ctx->sensor_lock);
 
@@ -651,7 +650,7 @@ static unsigned int fast_analysis_thread(void *arg)
 	rift_sensor_ctx *sensor = arg;
 	char name[16];
 	snprintf(name, sizeof name, "cv1t-fast%d", sensor->id);
-	prctl(PR_SET_NAME, name); /* cv1touch: findable in profiles */
+	ohmd_set_thread_name(name); /* cv1touch: findable in profiles */
 
 	ohmd_lock_mutex (sensor->sensor_lock);
 	rift_sensor_analysis_frame *frame = POP_QUEUE(&sensor->fast_analysis_q);

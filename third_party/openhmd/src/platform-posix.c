@@ -25,6 +25,9 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "platform.h"
 #include "openhmdi.h"
@@ -219,6 +222,15 @@ void ohmd_cond_broadcast(ohmd_cond* cond)
 
 
 /// Handling ovr service
+void ohmd_set_thread_name(const char* name)
+{
+#ifdef __linux__
+	prctl(PR_SET_NAME, name);
+#else
+	(void)name;
+#endif
+}
+
 void ohmd_toggle_ovr_service(int state) //State is 0 for Disable, 1 for Enable
 {
 	//Empty implementation
@@ -342,25 +354,26 @@ int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len)
 	return fclose(f);
 }
 
+/* cv1touch: the XDG rule cv1touch resolves this directory with (src/platform/mod.rs,
+ * dirs::openhmd): an empty or relative XDG_CONFIG_HOME is ignored, as the specification says, and
+ * without HOME the directory is relative rather than the shared /tmp/openhmd. */
 const char *ohmd_get_config_dir(ohmd_context *ctx)
 {
-  char *env;
+  const char *env;
 
   if (ctx->config_dir[0] != 0)
     return ctx->config_dir;
 
   env = getenv("XDG_CONFIG_HOME");
-  if (env) {
+  if (env && env[0] == '/') {
     snprintf (ctx->config_dir, OHMD_STR_SIZE, "%s/openhmd", env);
     return ctx->config_dir;
   }
   env = getenv("HOME");
-  if (env) {
+  if (env && env[0] != 0)
     snprintf (ctx->config_dir, OHMD_STR_SIZE, "%s/.config/openhmd", env);
-    return ctx->config_dir;
-  }
-
-  snprintf (ctx->config_dir, OHMD_STR_SIZE, "/tmp/openhmd");
+  else
+    snprintf (ctx->config_dir, OHMD_STR_SIZE, ".config/openhmd");
   return ctx->config_dir;
 }
 

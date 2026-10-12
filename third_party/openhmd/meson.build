@@ -72,6 +72,10 @@ endif
 
 c_args = []
 publish_c_args = []
+if host_machine.system() == 'windows'
+	# cv1touch: the C library functions are used as on Linux; M_PI from math.h
+	c_args += ['-D_CRT_SECURE_NO_WARNINGS', '-D_USE_MATH_DEFINES']
+endif
 
 debugging_mode = get_option('debugging_mode')
 have_pipewire = false

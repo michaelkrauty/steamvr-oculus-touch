@@ -11,14 +11,21 @@ int main(void)
 {
 	int n, per;
 	/* CV1 sensor, raw 1280x960 over USB 3: 75 packets a frame, 3 transfers of 25 a frame */
-	uvc_transfer_layout(1280 * 960, 16384, &n, &per);
+	uvc_transfer_layout(1280 * 960, 16384, false, &n, &per);
 	CHECK(per == 25 && n == 6);
 	/* CV1 sensor over USB 2 (JPEG, 2 KB packets): 600 packets a frame */
-	uvc_transfer_layout(1280 * 960, 2048, &n, &per);
+	uvc_transfer_layout(1280 * 960, 2048, false, &n, &per);
 	CHECK(per <= 32 && n * per >= 2 * 600 - 2 * 19);
 	/* DK2 sensor 752x480: 118 packets a frame */
-	uvc_transfer_layout(752 * 480, 3060, &n, &per);
+	uvc_transfer_layout(752 * 480, 3060, false, &n, &per);
 	CHECK(per <= 32 && n == 8 && per == 29);
+	/* Windows: libusb's WinUSB backend takes whole 1 ms frames (8 packets), still two frames' worth */
+	uvc_transfer_layout(1280 * 960, 16384, true, &n, &per);
+	CHECK(per == 32 && n == 5);
+	uvc_transfer_layout(1280 * 960, 2048, true, &n, &per);
+	CHECK(per % 8 == 0 && per <= 32 && n * per >= 2 * 600);
+	uvc_transfer_layout(752 * 480, 3060, true, &n, &per);
+	CHECK(per % 8 == 0 && per <= 32 && n * per >= 2 * 118);
 	puts("test_uvc_layout: ok");
 	return 0;
 }

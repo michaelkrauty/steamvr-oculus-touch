@@ -27,11 +27,13 @@
 #define __le32_to_cpu
 #endif
 
-#ifdef _MSC_VER
+/* cv1touch: clang-cl defines _MSC_VER and takes the GNU attribute; the pragma pair closed
+ * before the struct body and packed nothing */
+#if defined(__GNUC__) || defined(__clang__)
+#define PACKED_STRUCT(name) struct __attribute__((packed)) name
+#elif defined(_MSC_VER)
 #define PACKED_STRUCT(name) \
     __pragma(pack(push, 1)) struct name __pragma(pack(pop))
-#elif defined(__GNUC__)
-#define PACKED_STRUCT(name) struct __attribute__((packed)) name
 #endif
 
 
@@ -186,8 +188,14 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		}
 
 		/* Start of new frame */
+#ifdef _WIN32
+		/* cv1touch: the platform layer's nanosecond clock, which is the daemon's clock there */
+		(void)ts;
+		time = ohmd_monotonic_get(stream->ohmd_ctx);
+#else
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		time = ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
 
 		/* Get a frame to capture into */
 		if (stream->cur_frame == NULL) {
@@ -363,7 +371,8 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	stream->skip_frame_start = 0;
 
 	ret = libusb_set_auto_detach_kernel_driver(devh, 1);
-	if (ret < 0) {
+	/* cv1touch: there is no kernel driver to detach on Windows: libusb says not supported */
+	if (ret < 0 && ret != LIBUSB_ERROR_NOT_SUPPORTED) {
 		printf("could not detach uvcvideo driver\n");
 		return ret;
 	}
@@ -470,7 +479,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	stream->alt_setting = alt_setting;
 	stream->frame_size = stream->stride * stream->height;
 
-	uvc_transfer_layout(stream->frame_size, packet_size, &stream->num_transfers, &num_packets);
+	uvc_transfer_layout(stream->frame_size, packet_size, UVC_WHOLE_MS_TRANSFERS, &stream->num_transfers, &num_packets);
 
 	stream->transfer = ohmd_alloc(ohmd_ctx, stream->num_transfers * sizeof(*stream->transfer));
 	if (!stream->transfer)

@@ -14,42 +14,69 @@
 #define WIN32_EXTRA_LEAN
 
 #include <windows.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wctype.h>
 
 #include "platform.h"
 #include "openhmdi.h"
 
-double ohmd_get_tick()
+/* cv1touch: the monotonic clock is QueryPerformanceCounter in nanoseconds, computed exactly as
+ * cv1touchd's now_ns (ticks * 1e9 / frequency), so engine timestamps share the daemon's clock as
+ * CLOCK_MONOTONIC does on Linux. The upstream code used the wall clock in 100 ns units. */
+static uint64_t qpc_ns(void)
 {
-	double high, low;
-	FILETIME filetime;
-
-	GetSystemTimeAsFileTime(&filetime);
-
-	high = filetime.dwHighDateTime;
-	low = filetime.dwLowDateTime;
-
-	return (high * 4294967296.0 + low) / 10000000;
+	/* fixed at boot and cheap to read: no cache to share between threads */
+	LARGE_INTEGER f, t;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&t);
+	const uint64_t freq = f.QuadPart > 0 ? (uint64_t)f.QuadPart : 1;
+	const uint64_t ticks = (uint64_t)t.QuadPart;
+	return ticks / freq * 1000000000ull + ticks % freq * 1000000000ull / freq;
 }
 
-static const uint64_t NUM_10_000_000 = 10000000;
+double ohmd_get_tick()
+{
+	return (double)qpc_ns() / 1e9;
+}
+
+static const uint64_t NUM_1_000_000_000 = 1000000000;
 
 void ohmd_monotonic_init(ohmd_context* ctx)
 {
-	ctx->monotonic_ticks_per_sec = NUM_10_000_000;
+	ctx->monotonic_ticks_per_sec = NUM_1_000_000_000;
 }
 
 uint64_t ohmd_monotonic_get(ohmd_context* ctx)
 {
-	FILETIME filetime;
-	GetSystemTimeAsFileTime(&filetime);
-
-	return ((uint64_t)filetime.dwHighDateTime << 32) | filetime.dwLowDateTime;
+	(void)ctx;
+	return qpc_ns();
 }
 
-// TODO higher resolution
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+/* cv1touch: sub-millisecond sleeps through a high-resolution waitable timer (Windows 10 1803+);
+ * Sleep() rounds up to the scheduler tick. */
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_sleep(double seconds)
 {
-	Sleep((DWORD)(seconds * 1000));
+	if (seconds <= 0)
+		return;
+	HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+	if (timer) {
+		LARGE_INTEGER due;
+		due.QuadPart = -(LONGLONG)(seconds * 1e7); /* relative, 100 ns units */
+		if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+			WaitForSingleObject(timer, INFINITE);
+			CloseHandle(timer);
+			return;
+		}
+		CloseHandle(timer);
+	}
+	Sleep((DWORD)(seconds * 1000 + 0.5));
 }
 
 // threads
@@ -90,7 +117,7 @@ ohmd_thread* ohmd_create_thread(ohmd_context* ctx, unsigned int (*routine)(void*
 
 void ohmd_destroy_thread(ohmd_thread* thread)
 {
-	ohmd_sleep(3);
+	/* cv1touch: the upstream 3 s sleep before joining delayed every engine shutdown */
 	WaitForSingleObject(thread->handle, INFINITE);
 	CloseHandle(thread->handle);
 	free(thread);
@@ -132,6 +159,8 @@ ohmd_cond* ohmd_create_cond(ohmd_context* ctx)
 		return NULL;
 	
 	InitializeConditionVariable (&cond->cond);
+
+	return cond;
 }
 
 void ohmd_destroy_cond(ohmd_cond* cond)
@@ -171,40 +200,167 @@ int findEndPoint(char* path, int endpoint)
 	return 0;
 }
 
-/// Handling ovr service
-static int _enable_ovr_service = 0;
+/* SetThreadDescription is Windows 10 1607 and later: looked up once, not linked */
+typedef HRESULT (WINAPI *set_description_fn)(HANDLE, PCWSTR);
+static set_description_fn set_description;
+static INIT_ONCE set_description_once = INIT_ONCE_STATIC_INIT;
 
-void ohmd_toggle_ovr_service(int state) //State is 0 for Disable, 1 for Enable
+static BOOL CALLBACK look_up_set_description(PINIT_ONCE once, PVOID parameter, PVOID *context)
 {
-	SC_HANDLE serviceDbHandle = OpenSCManager(NULL,NULL,SC_MANAGER_ALL_ACCESS);
-	SC_HANDLE serviceHandle = OpenService(serviceDbHandle, "OVRService", SC_MANAGER_ALL_ACCESS);
+	(void)once;
+	(void)parameter;
+	(void)context;
+	HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+	if (kernel)
+		set_description = (set_description_fn)(void (*)(void))GetProcAddress(kernel, "SetThreadDescription");
+	return TRUE;
+}
 
-	SERVICE_STATUS_PROCESS status;
-	DWORD bytesNeeded;
-	QueryServiceStatusEx(serviceHandle, SC_STATUS_PROCESS_INFO,(LPBYTE) &status,sizeof(SERVICE_STATUS_PROCESS), &bytesNeeded);
+void ohmd_set_thread_name(const char* name)
+{
+	wchar_t wide[64];
+	if (InitOnceExecuteOnce(&set_description_once, look_up_set_description, NULL, NULL) && set_description &&
+	    MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64) > 0)
+		set_description(GetCurrentThread(), wide);
+}
 
-	if (state == 0 || status.dwCurrentState == SERVICE_RUNNING)
-	{
-		// Stop it
-		BOOL b = ControlService(serviceHandle, SERVICE_CONTROL_STOP, (LPSERVICE_STATUS) &status);
-		if (b)
-		{
-			printf("OVRService stopped\n");
-			_enable_ovr_service = 1;
-		}
-		else 
-			printf("Error: OVRService failed to stop, please try running with Administrator rights\n");
+/* cv1touch: never stop or start Oculus services (upstream stopped OVRService here, which needs
+ * administrator rights). cv1touchd detects a running Oculus runtime itself and asks the user. */
+void ohmd_toggle_ovr_service(int state)
+{
+	(void)state;
+}
+
+/* cv1touch: the file helpers the POSIX layer has, which openhmd.c's config cache needs. Paths are
+ * UTF-8, as on Linux, and wide at the Windows API, so an account name outside the ANSI code page
+ * works. */
+static wchar_t *widen(const char *utf8)
+{
+	const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, NULL, 0);
+	if (n <= 0)
+		return NULL;
+	wchar_t *wide = malloc((size_t)n * sizeof *wide);
+	if (wide && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, n) != n) {
+		free(wide);
+		wide = NULL;
 	}
-	else if (state == 1 && _enable_ovr_service)
-	{
-		// Start it 
-		BOOL b = StartService(serviceHandle, 0, NULL);
-		if (b) 
-			printf("OVRService started\n");
-		else 
-			printf("Error: OVRService failed to start, please try running with Administrator rights\n");
-	} 
-	CloseServiceHandle(serviceHandle); 
-	CloseServiceHandle(serviceDbHandle); 
+	return wide;
+}
+
+static FILE *open_utf8(const char *filename, const wchar_t *mode)
+{
+	wchar_t *wide = widen(filename);
+	if (!wide) {
+		errno = EINVAL;
+		return NULL;
+	}
+	FILE *f = _wfopen(wide, mode);
+	free(wide);
+	return f;
+}
+
+int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len)
+{
+	FILE* f = open_utf8(filename, L"rb");
+	if (f == NULL)
+		return errno;
+	int ret = 0;
+	char *buffer = NULL;
+	long file_len;
+	if (fseek(f, 0, SEEK_END) != 0 || (file_len = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
+		ret = errno ? errno : EIO;
+		goto fail;
+	}
+	buffer = malloc((size_t)file_len + 1);
+	if (!buffer) {
+		ret = ENOMEM;
+		goto fail;
+	}
+	if (fread(buffer, 1, (size_t)file_len, f) != (size_t)file_len) {
+		ret = ferror(f) ? EIO : 0;
+		if (ret)
+			goto fail;
+	}
+	buffer[file_len] = 0;
+	*out_buf = buffer;
+	*out_len = (unsigned long)file_len;
+	buffer = NULL;
+fail:
+	free(buffer);
+	fclose(f);
+	return ret;
+}
+
+/* Creates every missing directory of pathname ("/" or "\" separated). */
+int ohmd_ensure_path(const char* pathname)
+{
+	char pathbuf[OHMD_STR_SIZE + 1];
+	if (strlen(pathname) < 2 || strlen(pathname) > OHMD_STR_SIZE)
+		return EINVAL;
+	strcpy(pathbuf, pathname);
+	for (char *cur = pathbuf + 1;; cur++) {
+		const char c = *cur;
+		if (c != '/' && c != '\\' && c != 0)
+			continue;
+		*cur = 0;
+		/* "C:" alone is a drive, not a directory to create */
+		if (!(cur - pathbuf == 2 && pathbuf[1] == ':')) {
+			wchar_t *wide = widen(pathbuf);
+			if (!wide)
+				return EINVAL;
+			const DWORD attributes = GetFileAttributesW(wide);
+			int error = 0;
+			if (attributes == INVALID_FILE_ATTRIBUTES) {
+				if (!CreateDirectoryW(wide, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+					error = EIO;
+			} else if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+				error = ENOTDIR;
+			}
+			free(wide);
+			if (error)
+				return error;
+		}
+		if (c == 0)
+			return 0;
+		*cur = c;
+	}
+}
+
+int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len)
+{
+	FILE* f = open_utf8(filename, L"wb");
+	if (f == NULL)
+		return errno;
+	const int failed = fwrite(buf, 1, buf_len, f) != buf_len;
+	if (fclose(f) != 0 || failed)
+		return EIO;
+	return 0;
+}
+
+static int absolute(const wchar_t *path)
+{
+	return (iswalpha(path[0]) && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) ||
+	       (path[0] == L'\\' && path[1] == L'\\');
+}
+
+/* %LOCALAPPDATA%\openhmd (the temp directory's openhmd when LOCALAPPDATA is unset or relative),
+ * in UTF-8: where cv1touch looks for the cached sensor and controller configs (src/platform/mod.rs,
+ * dirs::openhmd). */
+const char *ohmd_get_config_dir(ohmd_context *ctx)
+{
+	if (ctx->config_dir[0] != 0)
+		return ctx->config_dir;
+	wchar_t dir[MAX_PATH + 16];
+	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH + 1);
+	if (n == 0 || n > MAX_PATH || !absolute(dir))
+		n = GetTempPathW(MAX_PATH + 1, dir);
+	if (n == 0 || n > MAX_PATH)
+		n = 0;
+	if (n > 0 && (dir[n - 1] == L'\\' || dir[n - 1] == L'/'))
+		n--;
+	wcscpy(dir + n, n > 0 ? L"\\openhmd" : L"openhmd");
+	if (WideCharToMultiByte(CP_UTF8, 0, dir, -1, ctx->config_dir, OHMD_STR_SIZE, NULL, NULL) == 0)
+		strcpy(ctx->config_dir, "openhmd");
+	return ctx->config_dir;
 }
 #endif

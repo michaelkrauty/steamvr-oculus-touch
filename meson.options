@@ -1,0 +1,2 @@
+option('engine', type: 'feature', value: 'auto',
+  description: 'The native engine (OpenHMD and its dependencies): always built on Linux; on Windows only when enabled, from the vcpkg manifest')

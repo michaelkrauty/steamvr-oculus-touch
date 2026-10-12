@@ -255,7 +255,9 @@ impl Engine {
             for i in 0..n {
                 let mut flags: c_int = 0;
                 ffi::ohmd_list_geti(ctx, i, ffi::OHMD_DEVICE_FLAGS, &mut flags);
-                let flags = flags as u32;
+                // a C enum: unsigned under GCC, int under MSVC
+                #[allow(clippy::unnecessary_cast)]
+                let flags = flags as ffi::ohmd_device_flags;
                 if flags & ffi::OHMD_DEVICE_FLAGS_NULL_DEVICE != 0 {
                     continue;
                 }

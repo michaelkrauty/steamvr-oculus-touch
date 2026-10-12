@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
 #include <assert.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -253,7 +252,7 @@ static unsigned int uvc_handle_events(void *arg)
 
 	/* cv1touch: the daemon finds this thread by its name to make it real-time: it resubmits every
 	 * sensor's video transfers, and a stall of it loses video on all of them at once */
-	prctl(PR_SET_NAME, "cv1t-usb");
+	ohmd_set_thread_name("cv1t-usb");
 
 	while (!tracker_ctx->usb_completed) {
 		struct timeval timeout;
