@@ -158,6 +158,8 @@ struct rift_tracker_ctx_s
 
 	rift_tracked_device_priv devices[RIFT_MAX_TRACKED_DEVICES];
 	uint8_t n_devices;
+
+	uint32_t cv1touch_search_skip; /* atomic: rift_tracker_set_search_skip */
 };
 
 static void rift_tracked_device_send_imu_debug(rift_tracked_device_priv *dev);
@@ -1174,6 +1176,16 @@ void rift_tracked_device_get_export(rift_tracked_device *dev_base, rift_tracked_
 	out->last_observed_pose_ts = dev->last_observed_pose_ts;
 	out->last_observed_orient_ts = dev->last_observed_orient_ts;
 	ohmd_unlock_mutex (dev->device_lock);
+}
+
+void rift_tracker_set_search_skip(rift_tracker_ctx *ctx, uint32_t device_mask)
+{
+	__atomic_store_n(&ctx->cv1touch_search_skip, device_mask, __ATOMIC_RELAXED);
+}
+
+uint32_t rift_tracker_get_search_skip(rift_tracker_ctx *ctx)
+{
+	return __atomic_load_n(&ctx->cv1touch_search_skip, __ATOMIC_RELAXED);
 }
 
 int rift_tracker_get_sensor_count(rift_tracker_ctx *ctx)

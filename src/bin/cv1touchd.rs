@@ -1124,6 +1124,7 @@ fn radio_main(
     let mut holds = HoldStats::default();
     let mut newest: [Option<engine::Controller>; 2] = [None; 2];
     let mut last_publish = [0u64; 2];
+    let mut search_skip = SearchSkip::default();
     let mut next_stats = 0u64;
     let mut buf = [0u8; 64];
     let (radio_fd, wake_fd) = (radio.as_raw_fd(), d.radio_wake.as_raw_fd());
@@ -1286,6 +1287,20 @@ fn radio_main(
         if refreshed {
             d.shm.signal();
         }
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            // only hands our tracker publishes, and only while fits keep coming
+            let since_fix = pipe
+                .tracker(h)
+                .filter(|t| t.last_fix() != 0)
+                .and_then(|t| Some(t.newest_imu()?.saturating_sub(t.last_fix())));
+            let since_sample = newest[h].map(|s| now.saturating_sub(s.received_host_ns));
+            search_skip.hands[h] = link.hands.radio_publishes(h)
+                && pipe.has_body(h)
+                && search_needless(since_fix, since_sample);
+        }
+        if let Some(hands) = search_skip.changed() {
+            dec.set_search_skip(hands);
+        }
         if let Some(f) = biases.update(&pipe, now) {
             *link.biases.lock().unwrap() = Some(f);
         }
@@ -1304,6 +1319,39 @@ fn radio_main(
     }
     if let Some(f) = biases.take_changed() {
         *link.biases.lock().unwrap() = Some(f);
+    }
+}
+
+/// How recent our tracker's last optical fit of a controller must be for OpenHMD's brute-force
+/// search to leave it out (about five camera frames): once fits stop, the engine searches again.
+const SEARCH_SKIP_FIX_NS: u64 = 100_000_000;
+/// How long a controller is silent on the radio before the search leaves it out as asleep (its
+/// LEDs dark); a shorter radio dropout keeps it searched.
+const SEARCH_SKIP_ASLEEP_NS: u64 = 1_000_000_000;
+
+/// Whether OpenHMD's brute-force pose search can leave a controller out, from the controller time
+/// since our tracker's last fit of it and the host time since its last radio sample (None: none
+/// yet). Those long searches for a controller we already fit found little we use (in replays,
+/// under 0.5% of the tracker's updates) at up to a core of CPU in play.
+fn search_needless(since_fix_ns: Option<u64>, since_sample_ns: Option<u64>) -> bool {
+    since_fix_ns.is_some_and(|t| t <= SEARCH_SKIP_FIX_NS)
+        || since_sample_ns.is_none_or(|t| t >= SEARCH_SKIP_ASLEEP_NS)
+}
+
+/// The controllers the engine is told to leave out of its brute-force search (`search_needless`).
+#[derive(Default)]
+struct SearchSkip {
+    hands: [bool; 2],
+    told: Option<[bool; 2]>,
+}
+
+impl SearchSkip {
+    /// What to tell the engine, when it changed.
+    fn changed(&mut self) -> Option<[bool; 2]> {
+        (self.told != Some(self.hands)).then(|| {
+            self.told = Some(self.hands);
+            self.hands
+        })
     }
 }
 
@@ -2402,6 +2450,27 @@ mod tests {
             inject: Injection::default(),
             inputs: Mutex::new(Default::default()),
         }
+    }
+
+    /// OpenHMD's brute-force search leaves out a controller our tracker fitted within the last
+    /// SEARCH_SKIP_FIX_NS, or one silent on the radio for SEARCH_SKIP_ASLEEP_NS, and searches for
+    /// any other: never fitted, fits stopped, or a short radio dropout.
+    #[test]
+    fn the_search_skips_freshly_fitted_and_sleeping_controllers_only() {
+        let ms = 1_000_000;
+        assert!(search_needless(Some(0), Some(0)), "fitted this frame");
+        assert!(search_needless(Some(100 * ms), Some(0)));
+        assert!(!search_needless(Some(101 * ms), Some(0)), "fits stopped");
+        assert!(!search_needless(None, Some(0)), "never fitted");
+        assert!(!search_needless(None, Some(999 * ms)), "a radio dropout");
+        assert!(search_needless(None, Some(1000 * ms)), "asleep");
+        assert!(search_needless(None, None), "no sample yet");
+
+        let mut skip = SearchSkip::default();
+        assert_eq!(skip.changed(), Some([false, false]));
+        assert_eq!(skip.changed(), None, "told only on change");
+        skip.hands = [true, false];
+        assert_eq!(skip.changed(), Some([true, false]));
     }
 
     #[test]

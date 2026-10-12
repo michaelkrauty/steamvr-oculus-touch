@@ -46,6 +46,12 @@ test_sensor_config = executable('test_sensor_config', 'test_sensor_config.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
   dependencies: [openhmd_dep], link_args: ['-lm'])
 test('sensor_config', test_sensor_config)
+# The brute-force search leaves out the devices cv1touch's tracker holds or that are asleep.
+test_search_skip = executable('test_search_skip', 'test_search_skip.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections',
+    '-Wno-sign-compare'],
+  link_args: ['-Wl,--gc-sections', '-lm'])
+test('search_skip', test_search_skip)
 test_sensor_lifetime = executable('test_sensor_lifetime', 'test_sensor_lifetime.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])

@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Changed
+
+- `cv1touchd` no longer runs OpenHMD's brute-force pose search for a controller its own tracker fitted within the last 100 ms, or one asleep, except on a sensor that has no pose yet. That search took most of the daemon's CPU time during play. The per-sensor OpenHMD fix counts in `cv1touch status` are lower for tracked controllers as a result.
+
 ## [0.2.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.2.0) - 2026-10-11
 
 ### Added

@@ -152,6 +152,12 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_free(ohmd_cv1tou
  * IMU samples and inputs of its calibrated, non-empty Touch messages and returns n. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radio_decoder *dec, const unsigned char *buf, int size,
 		uint64_t received_ns, ohmd_cv1touch_controller *out);
+/* The controllers (bit 1 << OpenHMD device id: 1 right, 2 left) the engine's brute-force pose search
+ * leaves out while the decoder lives, because its owner tracks them itself or they are asleep. The
+ * engine still matches them against its own priors, and a sensor with no pose yet still searches
+ * for them. Freeing the decoder searches for all again. */
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_search_skip(ohmd_cv1touch_radio_decoder *dec,
+		uint32_t device_mask);
 /* Stable factory-calibration identity, 32 lowercase hex bytes + NUL. Returns -1 until
  * calibrated or on invalid arguments. Engine thread only. Does not change sample ABI. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller_identity(ohmd_device *device, char *out, int size);

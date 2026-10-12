@@ -42,10 +42,13 @@ void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *cali
 void rift_pose_finder_clear(rift_pose_finder *pf);
 void rift_pose_finder_set_camera_pose(rift_pose_finder *pf, const posef *camera_pose);
 
+/* `skip_mask` (bit 1 << device id): devices another tracker holds or that are asleep. The fast
+ * path still matches them against their priors, but a frame goes to long analysis only for the
+ * others, and long analysis searches only for the others, except on a sensor with no pose yet. */
 void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
-	rift_tracked_device **devs);
+	rift_tracked_device **devs, uint32_t skip_mask);
 void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
-	rift_tracked_device **devs);
+	rift_tracked_device **devs, uint32_t skip_mask);
 void rift_pose_finder_exp_info_to_dev_state (rift_pose_finder *pf,
   const rift_tracked_device_exposure_info *exp_dev_info, rift_sensor_frame_device_state *dev_state);
 

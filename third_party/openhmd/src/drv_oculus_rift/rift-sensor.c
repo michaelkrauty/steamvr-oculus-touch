@@ -322,7 +322,8 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 	frame->blob_extract_finish_ts = ohmd_monotonic_get(sensor->ohmd_ctx);
 
 	if (frame->bwobs && frame->bwobs->num_blobs > 0) {
-		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices);
+		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices,
+			rift_tracker_get_search_skip(sensor->tracker));
 #if 0
 		printf("Sensor %d phase %d Blobs: %d\n", sensor->id, led_pattern_phase, sensor->bwobs->num_blobs);
 
@@ -560,7 +561,8 @@ static unsigned int long_analysis_thread(void *arg)
 				ohmd_unlock_mutex (ctx->sensor_lock);
 
 				frame->long_analysis_start_ts = ohmd_monotonic_get(ctx->ohmd_ctx);
-				rift_pose_finder_process_blobs_long(&ctx->pf, frame, ctx->devices);
+				rift_pose_finder_process_blobs_long(&ctx->pf, frame, ctx->devices,
+					rift_tracker_get_search_skip(ctx->tracker));
 				frame->long_analysis_finish_ts = ohmd_monotonic_get(ctx->ohmd_ctx);
 
 				ohmd_lock_mutex (ctx->sensor_lock);

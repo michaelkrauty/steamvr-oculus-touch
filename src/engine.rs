@@ -398,6 +398,26 @@ impl RadioDecoder {
         };
         (out, n.clamp(0, 2) as usize)
     }
+
+    /// Leaves the controllers of `hands` (by hand index) out of the engine's brute-force pose
+    /// search until the next call or the decoder's drop: the caller's tracker holds them, or they
+    /// are asleep. The engine still matches them against its own priors.
+    pub fn set_search_skip(&mut self, hands: [bool; 2]) {
+        // SAFETY: valid decoder.
+        unsafe { ffi::ohmd_cv1touch_radio_decoder_set_search_skip(self.0, search_skip_mask(hands)) }
+    }
+}
+
+/// The engine's device mask for hands (bit 1 << OpenHMD device id; the headset, 0, never).
+fn search_skip_mask(hands: [bool; 2]) -> u32 {
+    let mut mask = 0u32;
+    if hands[HAND_LEFT] {
+        mask |= 1 << crate::calib::DEVICE_LEFT;
+    }
+    if hands[HAND_RIGHT] {
+        mask |= 1 << crate::calib::DEVICE_RIGHT;
+    }
+    mask
 }
 
 impl Drop for RadioDecoder {
@@ -435,6 +455,14 @@ pub fn radio_hidraw(sys_class_hidraw: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_search_skip_mask_names_controllers_by_engine_device_id() {
+        assert_eq!(search_skip_mask([false, false]), 0);
+        assert_eq!(search_skip_mask([true, false]), 1 << 2, "left is device 2");
+        assert_eq!(search_skip_mask([false, true]), 1 << 1, "right is device 1");
+        assert_eq!(search_skip_mask([true, true]), 0b110, "never the headset");
+    }
 
     #[test]
     fn finds_the_radio_interface_among_the_hidraw_nodes() {

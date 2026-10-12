@@ -115,7 +115,7 @@ void rift_pose_finder_exp_info_to_dev_state (rift_pose_finder *pf,
 
 void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
         rift_sensor_analysis_frame *frame,
-        rift_tracked_device **devs)
+        rift_tracked_device **devs, uint32_t skip_mask)
 {
 	rift_tracker_exposure_info *exposure_info = &frame->exposure_info;
 	blobservation* bwobs = frame->bwobs;
@@ -242,7 +242,7 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 			used_blobs += update_device_and_blobs (pf, frame, dev, dev_state, exp_dev_info, &obj_cam_pose);
 		}
 
-		if (!dev_state->found_device_pose)
+		if (!dev_state->found_device_pose && !(skip_mask & (1u << dev->id)))
 			have_unfound_devices = true;
 	}
 
@@ -277,7 +277,7 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 }
 
 void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
-        rift_tracked_device **devs)
+        rift_tracked_device **devs, uint32_t skip_mask)
 {
 	rift_tracker_exposure_info *exposure_info = &frame->exposure_info;
 	blobservation* bwobs = frame->bwobs;
@@ -300,6 +300,10 @@ void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analy
 
 			if (dev_state->found_device_pose)
 				continue; /* We already found a pose for this device */
+			/* held by cv1touch's tracker, or asleep; but a sensor with no pose yet labels blobs only
+			 * here (calibrate place), so it searches for every device */
+			if (pf->have_camera_pose && (skip_mask & (1u << dev->id)))
+				continue;
 
 			LOGV("*** Starting long search for device %d pass %d", dev->id, pass);
 
