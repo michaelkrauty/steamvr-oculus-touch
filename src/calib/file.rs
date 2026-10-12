@@ -408,6 +408,7 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
+    #[cfg(unix)]
     fn dynamic_sensors_reject_fifo_without_waiting_for_a_writer() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;

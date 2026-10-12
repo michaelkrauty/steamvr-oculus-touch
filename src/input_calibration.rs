@@ -393,6 +393,7 @@ mod tests {
         assert_eq!(left, (0.2, 0.3, [0.4, 0.5]));
     }
     #[test]
+    #[cfg(unix)]
     fn bounded_atomic_private_storage_and_bad_loads() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("cv1touch-input-test-{}", std::process::id()));

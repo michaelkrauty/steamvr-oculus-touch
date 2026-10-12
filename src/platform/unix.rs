@@ -342,6 +342,83 @@ impl Drop for OpenedSegment {
     }
 }
 
+pub fn runtime_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        // SAFETY: getuid has no arguments and cannot fail.
+        .unwrap_or_else(|| format!("/run/user/{}", unsafe { libc::getuid() }).into())
+        .join("cv1touch")
+}
+
+pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: valid fd owned by `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+pub struct Connection(std::os::unix::net::UnixStream);
+
+impl Connection {
+    pub fn connect(endpoint: &Path) -> io::Result<Connection> {
+        std::os::unix::net::UnixStream::connect(endpoint).map(Connection)
+    }
+
+    pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_read_timeout(timeout)?;
+        self.0.set_write_timeout(timeout)
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.0, buf)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.0, buf)
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.0)
+    }
+}
+
+pub struct Listener(std::os::unix::net::UnixListener);
+
+impl Listener {
+    pub fn bind(endpoint: &Path) -> io::Result<Listener> {
+        use std::os::unix::fs::PermissionsExt;
+        if endpoint.exists() {
+            if std::os::unix::net::UnixStream::connect(endpoint).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another process listens there",
+                ));
+            }
+            // nobody answers: left by a crashed owner
+            std::fs::remove_file(endpoint)?;
+        }
+        let listener = std::os::unix::net::UnixListener::bind(endpoint)?;
+        std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Listener(listener))
+    }
+
+    pub fn accept(&mut self, wait: bool) -> io::Result<Connection> {
+        self.0.set_nonblocking(!wait)?;
+        let (stream, _) = self.0.accept()?;
+        stream.set_nonblocking(false)?;
+        Ok(Connection(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

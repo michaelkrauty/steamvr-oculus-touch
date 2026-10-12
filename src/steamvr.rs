@@ -519,6 +519,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unknown_content_and_symlinks_block_install_before_any_replacement() {
         use std::os::unix::fs::symlink;
         for symbolic in [false, true] {

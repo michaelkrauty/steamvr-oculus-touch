@@ -36,7 +36,8 @@ fn main() {
 }
 
 fn cross_target_args() -> Vec<&'static str> {
-    if env::var("HOST") == env::var("TARGET") {
+    let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    if env::var("HOST") == env::var("TARGET") && !windows {
         Vec::new()
     } else {
         vec!["-ffreestanding"]
@@ -105,8 +106,8 @@ fn generate_engine(root: &Path, out: &Path) {
         ))
         .clang_arg(format!("-I{}", root.join("common").display()))
         .clang_arg("-DCV1T_SHM_TYPES_ONLY")
-        // checking another target from this host: the target's C library headers are absent, and
-        // the bindings need only clang's own (stdint, stddef, stdbool)
+        // another target, or Windows (whose C headers clang would have to find in a Visual Studio
+        // installation): the bindings need only clang's own headers (stdint, stddef, stdbool)
         .clang_args(cross_target_args())
         .allowlist_function("ohmd_.*")
         .allowlist_type("(ohmd|cv1t)_.*")

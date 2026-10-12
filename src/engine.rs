@@ -61,6 +61,8 @@ pub struct EngineOptions {
     pub fixed_poses: Vec<SensorPose>,
 }
 
+// used by the engine, and by tests on any build
+#[cfg_attr(not(feature = "engine"), allow(dead_code))]
 fn copy_cstr(dst: &mut [c_char], s: &str) {
     let room = dst.len() - 1;
     for (d, b) in dst.iter_mut().zip(s.bytes().take(room)) {
@@ -78,11 +80,15 @@ pub fn build_config(opts: &EngineOptions) -> ffi::ohmd_cv1touch_config {
     }
 }
 
+// used by the engine, and by tests on any build
+#[cfg_attr(not(feature = "engine"), allow(dead_code))]
 struct SensorConfig {
     ignored: Vec<[c_char; 32]>,
     poses: Vec<ffi::ohmd_cv1touch_sensor_pose>,
 }
 
+// used by the engine, and by tests on any build
+#[cfg_attr(not(feature = "engine"), allow(dead_code))]
 fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
     fn serial(s: &str) -> Result<[c_char; 32], String> {
         if s.is_empty() || s.len() > 31 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {

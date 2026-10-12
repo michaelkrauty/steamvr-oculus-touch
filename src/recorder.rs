@@ -800,6 +800,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_write_error_stops_the_recording() {
         const CHILD: &str = "CV1TOUCH_TEST_WRITE_ERROR";
         if std::env::var_os(CHILD).is_none() {

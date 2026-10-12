@@ -835,6 +835,7 @@ mod tests {
         assert!(record_success(Stage::Camera, &s, &mut c, vec![recording]).is_err());
     }
     #[test]
+    #[cfg(unix)]
     fn private_atomic_journal_round_trip_and_failed_save_preserves_previous() {
         use std::os::unix::fs::PermissionsExt;
         let temp = Temp::new();
@@ -857,6 +858,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 1);
     }
     #[test]
+    #[cfg(unix)]
     fn rejects_malformed_unknown_oversized_symlink_fifo_and_directory() {
         use std::os::unix::fs::symlink;
         let temp = Temp::new();

@@ -4,11 +4,8 @@
 //! Control protocol over $XDG_RUNTIME_DIR/cv1touch/control.sock (AF_UNIX stream): one request line
 //! gets one reply line starting with "ok" or "err <reason>".
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,6 +13,7 @@ use crate::hand::{
     BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, TOUCH_A, TOUCH_B, TOUCH_STICK,
     TOUCH_TRIGGER, TOUCH_X, TOUCH_Y,
 };
+use crate::platform::ipc;
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,27 +307,13 @@ pub fn parse(line: &str) -> Result<Command, String> {
     }
 }
 
-/// Exclusive, non-blocking flock on `path`; held until the returned File is dropped.
+/// Exclusive, non-blocking lock on `path`; held until the returned File is dropped.
 pub fn lock_single_instance(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    // SAFETY: valid fd owned by `file`.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(file)
+    ipc::lock_exclusive(path)
 }
 
 pub fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
-        .join("cv1touch")
+    ipc::runtime_dir()
 }
 
 pub fn socket_path() -> PathBuf {
@@ -337,9 +321,8 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub fn request(socket: &Path, line: &str, timeout: Duration) -> io::Result<String> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let mut stream = ipc::Connection::connect(socket)?;
+    stream.set_timeout(Some(timeout))?;
     stream.write_all(line.trim_end().as_bytes())?;
     stream.write_all(b"\n")?;
     let mut reply = String::new();
@@ -351,7 +334,6 @@ pub fn request(socket: &Path, line: &str, timeout: Duration) -> io::Result<Strin
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
     use std::thread;
 
     /// Review Focus 5: values the engine would silently mangle must be rejected.
@@ -417,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generated_control_paths_reject_non_utf8_and_nul() {
         use std::os::unix::ffi::OsStringExt;
         let bad = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
@@ -630,18 +613,18 @@ mod tests {
     fn request_roundtrip() {
         let path = std::env::temp_dir().join(format!("cv1t-ctl-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+        let mut listener = ipc::Listener::bind(&path).unwrap();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(listener.accept(true).unwrap());
             let mut line = String::new();
-            BufReader::new(&stream).read_line(&mut line).unwrap();
-            (&stream).write_all(b"ok pong\n").unwrap();
+            stream.read_line(&mut line).unwrap();
+            stream.get_mut().write_all(b"ok pong\n").unwrap();
             line
         });
         let reply = request(&path, "status", Duration::from_secs(2)).unwrap();
         assert_eq!(reply, "ok pong");
         assert_eq!(server.join().unwrap(), "status\n");
-        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

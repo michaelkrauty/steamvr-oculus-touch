@@ -86,7 +86,7 @@ pub mod dylib {
         }
 
         /// A handle to nothing, for tests that build a client without a library; never drop it.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(crate) fn null() -> Library {
             Library(std::ptr::null_mut())
         }
@@ -174,9 +174,154 @@ pub mod shm {
     }
 }
 
+pub mod ipc {
+    //! The control channel: one stream per request, private to this user (a Unix-domain socket on
+    //! Linux, a named pipe on Windows), and the lock that keeps one daemon per user.
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::os;
+
+    /// Where this user's daemon keeps its control endpoint and locks.
+    pub fn runtime_dir() -> PathBuf {
+        os::runtime_dir()
+    }
+
+    /// An exclusive lock on `path` (created if missing), held until the file is dropped; fails at
+    /// once (WouldBlock) while another process holds it.
+    pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+        os::lock_exclusive(path)
+    }
+
+    pub struct Connection(pub(super) os::Connection);
+
+    impl Connection {
+        /// Connects to the listener at `endpoint`; NotFound when nobody listens there.
+        pub fn connect(endpoint: &Path) -> io::Result<Connection> {
+            os::Connection::connect(endpoint).map(Connection)
+        }
+
+        /// How long a read or a write may wait (None: as long as it takes).
+        pub fn set_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.0.set_timeout(timeout)
+        }
+    }
+
+    impl Read for Connection {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Connection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    pub struct Listener(pub(super) os::Listener);
+
+    impl Listener {
+        /// Listens at `endpoint`, reachable by this user only. A stale endpoint left by a crashed
+        /// owner is replaced: hold the daemon's lock first, so there is no live one.
+        pub fn bind(endpoint: &Path) -> io::Result<Listener> {
+            os::Listener::bind(endpoint).map(Listener)
+        }
+
+        /// The next connection; with `wait` false, WouldBlock when none is pending.
+        pub fn accept(&mut self, wait: bool) -> io::Result<Connection> {
+            self.0.accept(wait).map(Connection)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fs;
+    use super::ipc::{Connection, Listener};
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    fn endpoint(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cv1t-ipc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("control.sock")
+    }
+
+    #[test]
+    fn a_connection_carries_a_line_each_way() {
+        let path = endpoint("line");
+        assert_eq!(
+            Connection::connect(&path).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        let mut listener = Listener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept(true).unwrap();
+            let mut reader = BufReader::new(conn);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            reader
+                .get_mut()
+                .write_all(format!("ok {line}").as_bytes())
+                .unwrap();
+            // the next client is accepted too
+            listener.accept(true).unwrap();
+        });
+        let mut client = Connection::connect(&path).unwrap();
+        client
+            .set_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"status\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        assert_eq!(reply, "ok status\n");
+        drop(Connection::connect(&path).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_silent_listener_times_a_read_out_and_a_second_listener_is_refused() {
+        let path = endpoint("timeout");
+        let mut listener = Listener::bind(&path).unwrap();
+        let mut client = Connection::connect(&path).unwrap();
+        let _server = listener.accept(true).unwrap();
+        client
+            .set_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = client.read(&mut [0u8; 8]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // nothing else pending
+        assert_eq!(
+            listener.accept(false).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
+        // (on Linux, finding out that someone listens leaves it an empty connection)
+        assert!(Listener::bind(&path).is_err(), "one listener per endpoint");
+    }
+
+    #[test]
+    fn the_daemon_lock_is_exclusive_until_released() {
+        let path = endpoint("lock").with_file_name("cv1touchd.lock");
+        let first = super::ipc::lock_exclusive(&path).unwrap();
+        assert!(super::ipc::lock_exclusive(&path).is_err());
+        drop(first);
+        drop(super::ipc::lock_exclusive(&path).unwrap());
+    }
     use super::shm::{OpenError, OpenedSegment, OwnedSegment};
     use std::sync::atomic::{AtomicU32, Ordering};
 

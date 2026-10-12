@@ -373,3 +373,370 @@ impl Drop for OpenedSegment {
         };
     }
 }
+
+use windows_sys::Win32::Foundation::{
+    LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, INFINITE};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+pub fn runtime_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cv1touch")
+}
+
+pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+                io::Error::new(io::ErrorKind::WouldBlock, "held by another process")
+            } else {
+                e
+            }
+        })
+}
+
+/// The pipe for an endpoint path: named after the path, which lies in this user's profile.
+fn pipe_name(endpoint: &Path) -> Vec<u16> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(endpoint.to_string_lossy().as_bytes());
+    let mut id = String::new();
+    for b in &digest[..16] {
+        let _ = std::fmt::Write::write_fmt(&mut id, format_args!("{b:02x}"));
+    }
+    wide(&format!("\\\\.\\pipe\\cv1touch-{id}"))
+}
+
+fn manual_event() -> io::Result<Handle> {
+    // SAFETY: an unnamed manual-reset event.
+    let event = Handle(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
+    if event.0.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(event)
+}
+
+/// Waits for the overlapped operation on `handle` to finish within `timeout`, cancelling it if
+/// it does not; the bytes it moved.
+fn finish(handle: HANDLE, ov: &mut OVERLAPPED, timeout: Option<Duration>) -> io::Result<usize> {
+    let ms = timeout.map_or(INFINITE, |t| {
+        t.as_millis().clamp(1, INFINITE as u128 - 1) as u32
+    });
+    let mut moved = 0u32;
+    // SAFETY: `ov` is the live overlapped structure of an operation on `handle`.
+    unsafe {
+        if WaitForSingleObject(ov.hEvent, ms) == WAIT_TIMEOUT {
+            CancelIoEx(handle, ov);
+            GetOverlappedResult(handle, ov, &mut moved, 1);
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        if GetOverlappedResult(handle, ov, &mut moved, 0) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(moved as usize)
+}
+
+pub struct Connection {
+    pipe: Handle,
+    event: Handle,
+    timeout: Option<Duration>,
+}
+
+// SAFETY: pipe handles may be used from any thread.
+unsafe impl Send for Connection {}
+
+impl Connection {
+    pub fn connect(endpoint: &Path) -> io::Result<Connection> {
+        let name = pipe_name(endpoint);
+        for _ in 0..3 {
+            // SAFETY: a NUL-terminated pipe name; the handle is owned below.
+            let pipe = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                )
+            };
+            if pipe != INVALID_HANDLE_VALUE {
+                return Ok(Connection {
+                    pipe: Handle(pipe),
+                    event: manual_event()?,
+                    timeout: None,
+                });
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+                return Err(e);
+            }
+            // every instance is busy: wait for the listener to offer the next
+            // SAFETY: a NUL-terminated pipe name.
+            unsafe { WaitNamedPipeW(name.as_ptr(), 2000) };
+        }
+        Err(io::Error::from(io::ErrorKind::TimedOut))
+    }
+
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.timeout = timeout;
+        Ok(())
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: zeroed is a valid OVERLAPPED; `buf` outlives the operation, which `finish`
+        // completes or cancels before returning.
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = self.event.0;
+            let len = buf.len().min(u32::MAX as usize) as u32;
+            if ReadFile(
+                self.pipe.0,
+                buf.as_mut_ptr(),
+                len,
+                std::ptr::null_mut(),
+                &mut ov,
+            ) == 0
+            {
+                match GetLastError() {
+                    ERROR_IO_PENDING => {}
+                    ERROR_BROKEN_PIPE => return Ok(0),
+                    e => return Err(io::Error::from_raw_os_error(e as i32)),
+                }
+            }
+            match finish(self.pipe.0, &mut ov, self.timeout) {
+                Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => Ok(0),
+                other => other,
+            }
+        }
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // SAFETY: as in `read`.
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = self.event.0;
+            let len = buf.len().min(u32::MAX as usize) as u32;
+            if WriteFile(
+                self.pipe.0,
+                buf.as_ptr(),
+                len,
+                std::ptr::null_mut(),
+                &mut ov,
+            ) == 0
+                && GetLastError() != ERROR_IO_PENDING
+            {
+                return Err(io::Error::last_os_error());
+            }
+            finish(self.pipe.0, &mut ov, self.timeout)
+        }
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A security descriptor granting the current user, and nobody else, full access.
+struct UserOnly(PSECURITY_DESCRIPTOR);
+
+impl UserOnly {
+    fn new() -> io::Result<UserOnly> {
+        // SAFETY: Win32 calls with valid out-pointers; buffers are freed below.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = Handle(token);
+            let mut needed = 0u32;
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut sid_text = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut sid_text) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut len = 0;
+            while *sid_text.add(len) != 0 {
+                len += 1;
+            }
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, len));
+            LocalFree(sid_text.cast());
+            let sddl = wide(&format!("D:P(A;;GA;;;{sid})"));
+            let mut descriptor = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(UserOnly(descriptor))
+        }
+    }
+}
+
+impl Drop for UserOnly {
+    fn drop(&mut self) {
+        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+/// A pipe instance waiting for its client.
+struct Pending {
+    pipe: Handle,
+    event: Handle,
+    // boxed: the system writes to it until the connect completes
+    ov: Box<OVERLAPPED>,
+}
+
+pub struct Listener {
+    name: Vec<u16>,
+    security: UserOnly,
+    pending: Option<Pending>,
+}
+
+// SAFETY: pipe handles may be used from any thread.
+unsafe impl Send for Listener {}
+
+impl Listener {
+    pub fn bind(endpoint: &Path) -> io::Result<Listener> {
+        let mut listener = Listener {
+            name: pipe_name(endpoint),
+            security: UserOnly::new()?,
+            pending: None,
+        };
+        listener.offer(true)?;
+        Ok(listener)
+    }
+
+    /// Creates the next pipe instance and starts waiting for a client on it.
+    fn offer(&mut self, first: bool) -> io::Result<()> {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.security.0,
+            bInheritHandle: 0,
+        };
+        let open_mode = PIPE_ACCESS_DUPLEX
+            | FILE_FLAG_OVERLAPPED
+            | if first {
+                FILE_FLAG_FIRST_PIPE_INSTANCE
+            } else {
+                0
+            };
+        // SAFETY: a NUL-terminated name and a valid security descriptor.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                self.name.as_ptr(),
+                open_mode,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                0,
+                &attributes,
+            )
+        };
+        if pipe == INVALID_HANDLE_VALUE {
+            let e = io::Error::last_os_error();
+            return Err(if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+                io::Error::new(io::ErrorKind::AddrInUse, "another process listens there")
+            } else {
+                e
+            });
+        }
+        let pipe = Handle(pipe);
+        let event = manual_event()?;
+        // SAFETY: zeroed is a valid OVERLAPPED.
+        let mut ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        ov.hEvent = event.0;
+        // SAFETY: the boxed OVERLAPPED stays put until the connect completes or is cancelled.
+        unsafe {
+            if ConnectNamedPipe(pipe.0, &mut *ov) == 0 {
+                match GetLastError() {
+                    ERROR_IO_PENDING => {}
+                    // a client arrived between creating and connecting
+                    ERROR_PIPE_CONNECTED => {
+                        SetEvent(event.0);
+                    }
+                    e => return Err(io::Error::from_raw_os_error(e as i32)),
+                }
+            }
+        }
+        self.pending = Some(Pending { pipe, event, ov });
+        Ok(())
+    }
+
+    pub fn accept(&mut self, wait: bool) -> io::Result<Connection> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no pipe instance"))?;
+        // SAFETY: the pending instance's event.
+        if unsafe { WaitForSingleObject(pending.event.0, if wait { INFINITE } else { 0 }) }
+            == WAIT_TIMEOUT
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let Pending { pipe, event, .. } = self.pending.take().expect("checked above");
+        self.offer(false)?;
+        Ok(Connection {
+            pipe,
+            event,
+            timeout: None,
+        })
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if let Some(p) = self.pending.as_mut() {
+            let mut moved = 0;
+            // SAFETY: cancel the pending connect and wait it out before the box is freed.
+            unsafe {
+                CancelIoEx(p.pipe.0, &*p.ov);
+                GetOverlappedResult(p.pipe.0, &*p.ov, &mut moved, 1);
+            }
+        }
+    }
+}
