@@ -399,19 +399,20 @@ impl Drop for OpenedSegment {
 }
 
 use windows_sys::Win32::Foundation::{
-    LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
+    LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    EqualSid, GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE,
@@ -508,13 +509,16 @@ impl Connection {
                     0,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,
+                    // identification only: the server may check who we are, not act as us
+                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                     std::ptr::null_mut(),
                 )
             };
             if pipe != INVALID_HANDLE_VALUE {
+                let pipe = Handle(pipe);
+                served_by(pipe.0, &TokenUserInfo::current()?)?;
                 return Ok(Connection {
-                    pipe: Handle(pipe),
+                    pipe,
                     event: manual_event()?,
                     timeout: None,
                 });
@@ -589,12 +593,15 @@ impl Connection {
     }
 }
 
-/// A security descriptor granting the current user, and nobody else, full access.
-struct UserOnly(PSECURITY_DESCRIPTOR);
+/// The account this process runs as, from its token.
+struct TokenUserInfo {
+    // u64s: TOKEN_USER and the SID after it need pointer alignment
+    buf: Vec<u64>,
+}
 
-impl UserOnly {
-    fn new() -> io::Result<UserOnly> {
-        // SAFETY: Win32 calls with valid out-pointers; buffers are freed below.
+impl TokenUserInfo {
+    fn current() -> io::Result<TokenUserInfo> {
+        // SAFETY: Win32 calls with valid out-pointers into a buffer of the size asked for.
         unsafe {
             let mut token = std::ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -603,7 +610,7 @@ impl UserOnly {
             let token = Handle(token);
             let mut needed = 0u32;
             GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-            let mut buf = vec![0u8; needed as usize];
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
             if GetTokenInformation(
                 token.0,
                 TokenUser,
@@ -614,18 +621,79 @@ impl UserOnly {
             {
                 return Err(io::Error::last_os_error());
             }
-            let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut sid_text = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut sid_text) == 0 {
+            Ok(TokenUserInfo { buf })
+        }
+    }
+
+    fn sid(&self) -> PSID {
+        // SAFETY: the buffer holds the TOKEN_USER that GetTokenInformation wrote.
+        unsafe { (*(self.buf.as_ptr() as *const TOKEN_USER)).User.Sid }
+    }
+
+    fn sid_string(&self) -> io::Result<String> {
+        // SAFETY: a valid SID; the string ConvertSidToStringSidW allocates is freed here.
+        unsafe {
+            let mut text = std::ptr::null_mut();
+            if ConvertSidToStringSidW(self.sid(), &mut text) == 0 {
                 return Err(io::Error::last_os_error());
             }
             let mut len = 0;
-            while *sid_text.add(len) != 0 {
+            while *text.add(len) != 0 {
                 len += 1;
             }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, len));
-            LocalFree(sid_text.cast());
-            let sddl = wide(&format!("D:P(A;;GA;;;{sid})"));
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            Ok(sid)
+        }
+    }
+}
+
+/// Refuses a pipe that `user` does not own. Pipe names are global, so another account could
+/// create ours before the daemon does; the daemon makes its user the owner of its pipe, and
+/// only an account with the restore privilege can make another account an owner.
+fn served_by(pipe: HANDLE, user: &TokenUserInfo) -> io::Result<()> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: an open pipe handle and valid out-pointers; `owner` points into `descriptor`,
+    // which is freed after the comparison.
+    let ours = unsafe {
+        let error = GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let ours = EqualSid(owner, user.sid()) != 0;
+        LocalFree(descriptor);
+        ours
+    };
+    if ours {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the pipe belongs to another account",
+        ))
+    }
+}
+
+/// A security descriptor owned by the current user and granting it, and nobody else, full
+/// access.
+struct UserOnly(PSECURITY_DESCRIPTOR);
+
+impl UserOnly {
+    fn new() -> io::Result<UserOnly> {
+        let sid = TokenUserInfo::current()?.sid_string()?;
+        // SAFETY: a NUL-terminated SDDL string and a valid out-pointer; freed on drop.
+        unsafe {
+            let sddl = wide(&format!("O:{sid}D:P(A;;GA;;;{sid})"));
             let mut descriptor = std::ptr::null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -678,6 +746,17 @@ impl Listener {
 
     /// Creates the next pipe instance and starts waiting for a client on it.
     fn offer(&mut self, first: bool) -> io::Result<()> {
+        // a client that opens an instance and closes it before the connect spoils that
+        // instance only: offer a fresh one
+        loop {
+            match self.offer_once(first) {
+                Err(e) if e.raw_os_error() == Some(ERROR_NO_DATA as i32) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    fn offer_once(&mut self, first: bool) -> io::Result<()> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: self.security.0,
@@ -734,10 +813,11 @@ impl Listener {
     }
 
     pub fn accept(&mut self, wait: bool) -> io::Result<Connection> {
-        let pending = self
-            .pending
-            .as_ref()
-            .ok_or_else(|| io::Error::other("no pipe instance"))?;
+        if self.pending.is_none() {
+            // offering after the last accept failed: try again
+            self.offer(false)?;
+        }
+        let pending = self.pending.as_ref().expect("offered above");
         // SAFETY: the pending instance's event.
         if unsafe { WaitForSingleObject(pending.event.0, if wait { INFINITE } else { 0 }) }
             == WAIT_TIMEOUT
@@ -745,7 +825,9 @@ impl Listener {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         let Pending { pipe, event, .. } = self.pending.take().expect("checked above");
-        self.offer(false)?;
+        // the client is served either way; if no instance can be offered now, the next
+        // accept tries again and reports why it cannot
+        let _ = self.offer(false);
         Ok(Connection {
             pipe,
             event,

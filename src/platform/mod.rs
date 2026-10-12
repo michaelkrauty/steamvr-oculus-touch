@@ -214,7 +214,8 @@ pub mod ipc {
     pub struct Connection(pub(super) os::Connection);
 
     impl Connection {
-        /// Connects to the listener at `endpoint`; NotFound when nobody listens there.
+        /// Connects to the listener at `endpoint`; NotFound when nobody listens there, and
+        /// PermissionDenied when another account does.
         pub fn connect(endpoint: &Path) -> io::Result<Connection> {
             os::Connection::connect(endpoint).map(Connection)
         }
@@ -328,6 +329,96 @@ mod tests {
         );
         // (on Linux, finding out that someone listens leaves it an empty connection)
         assert!(Listener::bind(&path).is_err(), "one listener per endpoint");
+    }
+
+    #[test]
+    fn the_listener_keeps_serving_after_clients_vanish() {
+        let path = endpoint("vanish");
+        let mut listener = Listener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || loop {
+            // clients that came and went read as an immediate end of stream
+            let mut conn = listener.accept(true).unwrap();
+            let mut byte = [0u8; 1];
+            if conn.read(&mut byte).unwrap() == 1 {
+                conn.write_all(&byte).unwrap();
+                return;
+            }
+        });
+        for _ in 0..200 {
+            drop(Connection::connect(&path).unwrap());
+        }
+        let mut client = Connection::connect(&path).unwrap();
+        client
+            .set_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        server.join().unwrap();
+    }
+
+    /// Another account could create the daemon's pipe first (pipe names are global): a client
+    /// refuses to talk to it. Owning a pipe as another account needs a group that may own
+    /// objects, which an elevated administrator has; other tokens skip the test.
+    #[cfg(windows)]
+    #[test]
+    fn a_client_refuses_a_pipe_another_account_owns() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
+
+        let path = endpoint("squat");
+        let mut name =
+            super::pipe_name(&path.as_os_str().encode_wide().collect::<Vec<u16>>()).unwrap();
+        name.push(0);
+        // owned by the administrators group, open to everyone
+        let sddl: Vec<u16> = std::ffi::OsStr::new("O:BAD:(A;;GA;;;WD)")
+            .encode_wide()
+            .chain([0])
+            .collect();
+        // SAFETY: NUL-terminated strings, valid out-pointers; everything is freed below.
+        unsafe {
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let squat = CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE,
+                1,
+                512,
+                512,
+                0,
+                &attributes,
+            );
+            LocalFree(descriptor);
+            if squat == INVALID_HANDLE_VALUE {
+                let e = std::io::Error::last_os_error();
+                // ERROR_INVALID_OWNER: this token may not name the administrators as owner
+                assert_eq!(e.raw_os_error(), Some(1307), "{e}");
+                eprintln!("skipped: needs an elevated administrator token");
+                return;
+            }
+            let refused = Connection::connect(&path).err().map(|e| e.kind());
+            CloseHandle(squat);
+            assert_eq!(refused, Some(std::io::ErrorKind::PermissionDenied));
+        }
     }
 
     #[test]
