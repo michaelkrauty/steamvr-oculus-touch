@@ -945,7 +945,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         VelocityShaper::new(ShapeParams::default()),
         VelocityShaper::new(ShapeParams::default()),
     ];
-    let (mut was_tracking, mut wrong_locks) = ([false; 2], [0u64; 2]);
+    let mut memory: [HandMemory; 2] = Default::default();
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
     let (mut failures, mut next_sensors) = (0u32, 0u64);
@@ -1002,8 +1002,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
                 &mut hands[h],
                 None,
                 &mut shapers[h],
-                &mut was_tracking[h],
-                &mut wrong_locks[h],
+                &mut memory[h],
             );
             published = true;
         }
@@ -1127,7 +1126,7 @@ fn radio_main(
         VelocityShaper::new(ShapeParams::default()),
         VelocityShaper::new(ShapeParams::default()),
     ];
-    let (mut was_tracking, mut wrong_locks) = ([false; 2], [0u64; 2]);
+    let mut memory: [HandMemory; 2] = Default::default();
     let mut holds = HoldStats::default();
     let mut newest: [Option<engine::Controller>; 2] = [None; 2];
     let mut last_publish = [0u64; 2];
@@ -1217,8 +1216,7 @@ fn radio_main(
                     &mut hands[h],
                     Some(&mut pipe),
                     &mut shapers[h],
-                    &mut was_tracking[h],
-                    &mut wrong_locks[h],
+                    &mut memory[h],
                 );
                 newest[h] = Some(*s);
                 last_publish[h] = now;
@@ -1284,8 +1282,7 @@ fn radio_main(
                     &mut hands[h],
                     Some(&mut pipe),
                     &mut shapers[h],
-                    &mut was_tracking[h],
-                    &mut wrong_locks[h],
+                    &mut memory[h],
                 );
                 last_publish[h] = now;
                 refreshed = true;
@@ -1420,6 +1417,90 @@ fn voluntary_switches() -> i64 {
     u.ru_nvcsw
 }
 
+/// What `publish_hand_state` keeps per hand from one sample to the next.
+#[derive(Debug, Default)]
+struct HandMemory {
+    /// The tracker's wrong-lock count at the last sample, to log each drop.
+    wrong_locks: u64,
+    /// Whether the connected controller had a position at the last sample.
+    was_tracking: bool,
+    /// Since when a connected controller has been without a position: its wake or its loss.
+    unfixed_since: Option<u64>,
+    /// Where the tracker last had the controller (see `hold_unfixed`).
+    last_seen: Option<[f32; 3]>,
+}
+
+impl HandMemory {
+    /// Notes whether the controller is connected and has a position at `now`; returns what
+    /// changed for the log: a loss, or a position regained and how long that took. A controller
+    /// going to sleep is not losing its position, and one waking is without one from then.
+    fn observe(&mut self, connected: bool, tracking: bool, now: u64) -> Option<String> {
+        if !connected {
+            self.was_tracking = false;
+            self.unfixed_since = None;
+            return None;
+        }
+        let was = std::mem::replace(&mut self.was_tracking, tracking);
+        match (was, tracking) {
+            (false, true) => Some(match self.unfixed_since.take() {
+                Some(t) => format!(
+                    "tracking after {:.0} ms without a position",
+                    now.saturating_sub(t) as f64 * 1e-6
+                ),
+                None => "tracking".into(),
+            }),
+            (true, false) => {
+                self.unfixed_since = Some(now);
+                Some("position lost".into())
+            }
+            (false, false) => {
+                self.unfixed_since.get_or_insert(now);
+                None
+            }
+            (true, true) => None,
+        }
+    }
+}
+
+/// The tracker's part of a hand's state: while the controller is connected, `tracked` puts the
+/// tracker's newest output in, and `memory` keeps where a tracking output left the controller, or
+/// without an output the controller is held there (`hold_unfixed`).
+fn apply_tracker(
+    state: &mut ControllerState,
+    latest: Option<&Stamped>,
+    memory: &mut HandMemory,
+    tracked: impl FnOnce(&mut ControllerState, &Stamped),
+) {
+    let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
+    match latest {
+        Some(s) if connected => {
+            tracked(state, s);
+            if s.output.tracking {
+                memory.last_seen = Some(state.pos);
+            }
+        }
+        None if connected => hold_unfixed(state, memory.last_seen),
+        _ => state.flags &= !ffi::CV1T_FLAG_POSITION,
+    }
+}
+
+/// For a connected controller the tracker has no state for (it woke, or a wrong lock was dropped,
+/// and it has not been fixed since): SteamVR is shown it where the tracker last had it, turning
+/// with the engine's IMU orientation but neither moving nor extrapolated, without a position. Not
+/// at the engine's position: the engine's own searches leave out the controllers the tracker
+/// holds, so its position can be metres off by then. Before the tracker's first fix the engine's
+/// position is all there is.
+fn hold_unfixed(state: &mut ControllerState, last_seen: Option<[f32; 3]>) {
+    if let Some(pos) = last_seen {
+        state.pos = pos;
+    }
+    state.lin_vel = [0.0; 3];
+    // the driver extrapolates the turn orient * (ang_vel - gyro_bias)
+    state.ang_vel = state.gyro_bias;
+    state.flags &= !ffi::CV1T_FLAG_POSITION;
+    state.last_position_fix_host_ns = 0;
+}
+
 /// The radio thread's sample `s` over the engine's view of its controller. The engine's fix
 /// times run on the engine's device clock, not the decoder's, so they are dropped: the tracker
 /// says whether the hand has a position.
@@ -1442,8 +1523,7 @@ fn publish_hand_state(
     hand: &mut Hand,
     pipe: Option<&mut Pipeline>,
     shaper: &mut VelocityShaper,
-    was_tracking: &mut bool,
-    wrong_locks: &mut u64,
+    memory: &mut HandMemory,
 ) {
     let mut state = hand.update(c, now);
     if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
@@ -1459,38 +1539,28 @@ fn publish_hand_state(
             v(c.imu_accel),
         );
         let wl = p.stats(h).wrong_locks;
-        if wl != *wrong_locks {
-            *wrong_locks = wl;
+        if wl != memory.wrong_locks {
+            memory.wrong_locks = wl;
             log(format!(
                 "{}: dropped a wrong lock (accelerometer bias ran off)",
                 ["left", "right"][h]
             ));
         }
-        if let Some(s) = p.latest(h) {
-            if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
-                apply_tracked(
-                    &mut state,
-                    &s,
-                    d.extra_latency_ns.load(Ordering::Relaxed),
-                    shaper,
-                    d.shaping_on.load(Ordering::Relaxed),
-                    d.prediction_percent.load(Ordering::Relaxed),
-                );
-            } else {
-                state.flags &= !ffi::CV1T_FLAG_POSITION;
-            }
-            if s.output.tracking != *was_tracking {
-                *was_tracking = s.output.tracking;
-                log(format!(
-                    "{}: {}",
-                    ["left", "right"][h],
-                    if s.output.tracking {
-                        "tracking"
-                    } else {
-                        "position lost"
-                    }
-                ));
-            }
+        let latest = p.latest(h);
+        apply_tracker(&mut state, latest.as_ref(), memory, |state, s| {
+            apply_tracked(
+                state,
+                s,
+                d.extra_latency_ns.load(Ordering::Relaxed),
+                shaper,
+                d.shaping_on.load(Ordering::Relaxed),
+                d.prediction_percent.load(Ordering::Relaxed),
+            )
+        });
+        let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
+        let tracking = latest.is_some_and(|s| s.output.tracking);
+        if let Some(change) = memory.observe(connected, tracking, now) {
+            log(format!("{}: {change}", ["left", "right"][h]));
         }
     }
     d.inputs.lock().unwrap().apply(h, &mut state);
@@ -2546,18 +2616,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
 
-    /// `prediction` scales the velocities SteamVR extrapolates with, shaped or not, and nothing
-    /// else: at 0 the driver hands SteamVR no motion at all, at 50 half the motion it does at 100,
-    /// and the pose and its stamps are the same at every setting.
+    /// A connected controller the tracker has no state for (it woke, or a wrong lock was dropped)
+    /// is published where the tracker last had it, not at the engine's own position, without a
+    /// position and not moving; with the engine tracking, the engine's pose is published as before.
     #[test]
-    fn prediction_scales_only_the_published_velocities() {
+    fn an_unfixed_controller_is_published_where_the_tracker_last_had_it() {
+        let d = status_daemon();
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        // any body will do: the tracker never gets a frame to fix it with
+        let leds = (0..8)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::FRAC_PI_4;
+                let out = nalgebra::Vector3::new(a.cos(), a.sin(), 0.0);
+                calib::capture::Led {
+                    pos: out * 0.05,
+                    dir: out,
+                }
+            })
+            .collect();
+        pipe.body(calib::DEVICE_LEFT, leds, nalgebra::Vector3::zeros());
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        let now = shm::now_ns();
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: now,
+            view_pos: [3.0, 0.5, 4.0],
+            view_orient: [0.0, 0.6, 0.0, 0.8],
+            view_lin_vel: [1.0, 0.0, 0.0],
+            view_ang_vel: [0.0, 2.0, 0.0],
+            ..Default::default()
+        };
+        let mut memory = HandMemory {
+            last_seen: Some([0.1, 1.0, -0.2]),
+            ..HandMemory::default()
+        };
+        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+        publish_hand_state(
+            &d,
+            HAND_LEFT,
+            &c,
+            now,
+            &mut hand,
+            Some(&mut pipe),
+            &mut shaper,
+            &mut memory,
+        );
+        let st = d.shm.hand(HAND_LEFT).unwrap();
+        assert_ne!(st.flags & ffi::CV1T_FLAG_CONNECTED, 0);
+        assert_eq!(st.flags & ffi::CV1T_FLAG_POSITION, 0);
+        assert_eq!((st.pos, st.orient), ([0.1, 1.0, -0.2], c.view_orient));
+        assert_eq!(st.lin_vel, [0.0; 3]);
+        assert_eq!(
+            st.ang_vel, st.gyro_bias,
+            "no turn for SteamVR to extrapolate"
+        );
+
+        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+        publish_hand_state(
+            &d,
+            HAND_LEFT,
+            &c,
+            now,
+            &mut hand,
+            None,
+            &mut shaper,
+            &mut memory,
+        );
+        assert_eq!(d.shm.hand(HAND_LEFT).unwrap().pos, c.view_pos);
+    }
+
+    /// The log names each loss of a connected controller's position and, when it comes back, how
+    /// long the hand was without one, counted from its wake or its loss; sleep is no loss.
+    #[test]
+    fn the_log_says_how_long_regaining_a_position_took() {
+        let ms = 1_000_000;
+        let mut m = HandMemory::default();
+        assert_eq!(m.observe(true, false, 0), None, "woke");
+        assert_eq!(m.observe(true, false, 100 * ms), None);
+        assert_eq!(
+            m.observe(true, true, 340 * ms).as_deref(),
+            Some("tracking after 340 ms without a position")
+        );
+        assert_eq!(m.observe(true, true, 400 * ms), None);
+        assert_eq!(
+            m.observe(true, false, 1000 * ms).as_deref(),
+            Some("position lost")
+        );
+        assert_eq!(
+            m.observe(true, true, 1250 * ms).as_deref(),
+            Some("tracking after 250 ms without a position")
+        );
+        assert_eq!(m.observe(false, true, 9000 * ms), None, "asleep");
+        assert_eq!(m.observe(true, false, 20_000 * ms), None, "woke again");
+        assert_eq!(
+            m.observe(true, true, 20_100 * ms).as_deref(),
+            Some("tracking after 100 ms without a position")
+        );
+    }
+
+    /// A tracked sample, turning and moving.
+    fn tracked_sample() -> Stamped {
         use cv1touch::track::tracker::Output;
         use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
         let q = UnitQuaternion::from_euler_angles(0.3, -0.2, 1.1);
         let bias = Vector3::new(0.01, -0.02, 0.03);
         let rate = Vector3::new(1.0, 2.0, -3.0);
-        let s = Stamped {
+        Stamped {
             host_ns: 5_000_000_000,
             output: Output {
                 t: 0,
@@ -2571,7 +2737,18 @@ mod tests {
             gyro: q.inverse() * rate + bias,
             gyro_bias: bias,
             last_fix_host_ns: 4_990_000_000,
-        };
+        }
+    }
+
+    /// `prediction` scales the velocities SteamVR extrapolates with, shaped or not, and nothing
+    /// else: at 0 the driver hands SteamVR no motion at all, at 50 half the motion it does at 100,
+    /// and the pose and its stamps are the same at every setting.
+    #[test]
+    fn prediction_scales_only_the_published_velocities() {
+        use nalgebra::Vector3;
+
+        let s = tracked_sample();
+        let (q, rate) = (s.output.world_from_model.rotation, s.output.ang_vel_world);
         let v3 = |a: [f32; 3]| Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
         for shaping in [false, true] {
             let publish = |percent| {
@@ -2610,6 +2787,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// While the controller is connected the tracker's pose is published and remembered, and once
+    /// the tracker has no state (a wake, a dropped lock) the controller is held where it was,
+    /// whatever the engine's own position; a sleeping one has no position.
+    #[test]
+    fn the_tracked_position_is_remembered_and_held_once_the_state_is_gone() {
+        let s = tracked_sample();
+        let mut memory = HandMemory::default();
+        let mut state = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            pos: [3.0, 0.5, 4.0],
+            ..Default::default()
+        };
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        apply_tracker(&mut state, Some(&s), &mut memory, |st, s| {
+            apply_tracked(st, s, 0, &mut shaper, false, 100)
+        });
+        let seen = s.output.world_from_model.translation.vector.cast::<f32>();
+        assert_eq!(state.pos, [seen.x, seen.y, seen.z]);
+        assert_eq!(memory.last_seen, Some(state.pos));
+        // an output without a position (held, or none to show) is not where it was seen
+        let mut untracked = s;
+        untracked.output.tracking = false;
+        untracked.output.world_from_model.translation.vector.x += 1.0;
+        let mut st = state;
+        apply_tracker(&mut st, Some(&untracked), &mut memory, |st, s| {
+            apply_tracked(st, s, 0, &mut shaper, false, 100)
+        });
+        assert_eq!(memory.last_seen, Some(state.pos));
+
+        let mut engine = ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_POSITION,
+            pos: [3.0, 0.5, 4.0],
+            ..Default::default()
+        };
+        apply_tracker(&mut engine, None, &mut memory, |_, _| unreachable!());
+        assert_eq!(engine.pos, [seen.x, seen.y, seen.z]);
+        assert_eq!(engine.flags, ffi::CV1T_FLAG_CONNECTED);
+
+        let mut asleep = ControllerState {
+            flags: ffi::CV1T_FLAG_POSITION,
+            ..Default::default()
+        };
+        apply_tracker(&mut asleep, Some(&s), &mut memory, |_, _| unreachable!());
+        assert_eq!(asleep.flags, 0);
     }
 
     /// OpenHMD's brute-force search leaves out a controller our tracker fitted within the last
