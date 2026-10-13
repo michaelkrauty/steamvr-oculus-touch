@@ -11,7 +11,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cv1touch::{
-    calib::{self, capture::Led, file},
+    calib::{
+        self,
+        capture::{Led, MATCH_GOOD, MATCH_STRONG},
+        file,
+    },
     engine::cstr_field,
     ffi,
     recorder::{self, Reader},
@@ -40,6 +44,13 @@ struct Stretch {
     /// host time and camera.
     engine_frames: u64,
     first_engine: Option<(u64, usize)>,
+    /// Frames in which OpenHMD's own evaluation found a GOOD but not STRONG pose for this
+    /// controller, and the most blobs such a pose matched.
+    good_only: u64,
+    good_matched: i32,
+    first_good: Option<u64>,
+    /// Frames with five or more blobs no other controller claims (it may be in view).
+    blobby: u64,
     stats_at_start: Stats,
     stats_at_end: Stats,
     /// Published positions (live) while the stretch lasted.
@@ -92,6 +103,9 @@ fn main() {
     let mut open: [Option<Stretch>; 2] = [None, None];
     let mut done: Vec<Stretch> = Vec::new();
     let mut seen_events = 0usize;
+    // OpenHMD's poses while the tracker holds the controller, against the tracked pose at the
+    // same exposure: (good-only or strong) -> (position errors m, turn errors rad)
+    let mut agreement: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for rec in Reader::open(&path).expect("recording") {
         first_t.get_or_insert(rec.host_ns);
         match rec.rtype {
@@ -202,7 +216,55 @@ fn main() {
             }
             recorder::FRAME_OBS => {
                 if let Some((info, blobs)) = recorder::decode_frame_obs(&rec.payload) {
+                    for o in open.iter_mut().flatten() {
+                        let device = [calib::DEVICE_LEFT, calib::DEVICE_RIGHT][o.hand];
+                        let n = info.n_devices as usize;
+                        if let Some(d) = info.devices[..n.min(info.devices.len())]
+                            .iter()
+                            .find(|d| d.device_id == device && d.pose_valid != 0)
+                        {
+                            if d.match_flags & MATCH_GOOD != 0 && d.match_flags & MATCH_STRONG == 0
+                            {
+                                o.good_only += 1;
+                                o.good_matched = o.good_matched.max(d.matched_blobs);
+                                o.first_good.get_or_insert(info.frame_start_host_ns);
+                            }
+                        }
+                        let free = blobs
+                            .iter()
+                            .filter(|b| b.led_id < 0 || b.led_id >> 8 == device)
+                            .count();
+                        o.blobby += u64::from(free >= 5);
+                    }
                     p.frame(&info, &blobs);
+                    let serial = cstr_field(&info.serial);
+                    let n = (info.n_devices as usize).min(info.devices.len());
+                    for e in p.events[seen_events..]
+                        .iter()
+                        .filter(|e| e.frame_start_host_ns == info.frame_start_host_ns)
+                    {
+                        let (Some(tracked), Some(world_from_cam)) = (e.tracked, poses.get(&serial))
+                        else {
+                            continue;
+                        };
+                        let device = [calib::DEVICE_LEFT, calib::DEVICE_RIGHT][e.hand];
+                        for d in info.devices[..n].iter().filter(|d| {
+                            d.device_id == device
+                                && d.pose_valid != 0
+                                && d.match_flags & MATCH_GOOD != 0
+                        }) {
+                            let pose =
+                                world_from_cam * calib::iso_from_xyzw(d.cam_orient, d.cam_pos);
+                            let kind = if d.match_flags & MATCH_STRONG != 0 {
+                                "strong"
+                            } else {
+                                "good-only"
+                            };
+                            let a = agreement.entry(kind).or_default();
+                            a.0.push((pose.translation.vector - tracked.translation.vector).norm());
+                            a.1.push(pose.rotation.angle_to(&tracked.rotation));
+                        }
+                    }
                 }
                 for e in &p.events[seen_events..] {
                     let Some(o) = open[e.hand].as_mut() else {
@@ -220,8 +282,39 @@ fn main() {
             _ => {}
         }
     }
+    for (kind, (pos, rot)) in agreement.iter_mut() {
+        pos.sort_by(f64::total_cmp);
+        let near = pos
+            .iter()
+            .zip(rot.iter())
+            .filter(|(p, r)| **p < 0.03 && **r < 10f64.to_radians())
+            .count();
+        let far = pos.iter().filter(|p| **p > 0.10).count();
+        println!(
+            "OpenHMD {kind} poses while tracked: {}, within 3 cm and 10 deg {:.1}%, over 10 cm {:.1}%, position median {:.1} mm",
+            pos.len(),
+            100.0 * near as f64 / pos.len().max(1) as f64,
+            100.0 * far as f64 / pos.len().max(1) as f64,
+            pos.get(pos.len() / 2).copied().unwrap_or(f64::NAN) * 1e3
+        );
+    }
     let t0 = first_t.unwrap_or(0);
     let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * 1e-6;
+    for hand in 0..2 {
+        let st = p.stats(hand);
+        if st.frames > 0 {
+            println!(
+                "{}: {} acquisitions ({} from good poses, {} searched, {} unconfirmed), {} wrong locks dropped, {} updates",
+                ["left", "right"][hand],
+                st.acquisitions,
+                st.good_acquisitions,
+                st.searched_acquisitions,
+                st.unconfirmed_acquisitions,
+                st.wrong_locks,
+                st.updates
+            );
+        }
+    }
     let mut by_kind: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for s in &done {
         let kind = if s.wake { "wake" } else { "loss" };
@@ -259,20 +352,27 @@ fn main() {
                 .fold(0.0, f64::max)
         });
         println!(
-            "{:<5} {} at {:7.2} s: {}; frames {} {:?}; first strong OpenHMD pose {}; {} such frames; refused {}, ambiguous {}, failed {}, relocks {}, alias turns {}{}; published pose up to {} from the fix",
+            "{:<5} {} at {:7.2} s: {}; frames {} {:?}, {} with 5+ free blobs; first strong OpenHMD pose {}; {} such frames; {} good-only (up to {} blobs, first after {}); refused {}, ambiguous {}, failed {}, relocks {}, alias turns {}, good {}, searched {}, unconfirmed {}{}; published pose up to {} from the fix",
             ["left", "right"][s.hand],
             if s.wake { "wake" } else { "loss" },
             ms(t0, s.start) * 1e-3,
             s.end.map_or("never fixed".into(), |e| format!("fixed after {:.0} ms", ms(s.start, e))),
             s.frames,
             s.outcomes,
+            s.blobby,
             s.first_engine.map_or("none".into(), |(t, c)| format!("after {:.0} ms (camera {c})", ms(s.start, t))),
             s.engine_frames,
+            s.good_only,
+            s.good_matched,
+            s.first_good.map_or("-".into(), |t| format!("{:.0} ms", ms(s.start, t))),
             b.refused_acquisitions.saturating_sub(a.refused_acquisitions),
             b.ambiguous_acquisitions.saturating_sub(a.ambiguous_acquisitions),
             b.failed_acquisitions.saturating_sub(a.failed_acquisitions),
             b.relocks.saturating_sub(a.relocks),
             b.alias_turns.saturating_sub(a.alias_turns),
+            b.good_acquisitions.saturating_sub(a.good_acquisitions),
+            b.searched_acquisitions.saturating_sub(a.searched_acquisitions),
+            b.unconfirmed_acquisitions.saturating_sub(a.unconfirmed_acquisitions),
             if s.wrong_lock_after { "; WRONG LOCK dropped within 3 s" } else { "" },
             float.map_or("-".into(), |m| format!("{:.0} mm", m * 1e3)),
         );
