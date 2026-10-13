@@ -48,6 +48,9 @@ pub enum Command {
     UniverseWatch(Option<bool>),
     /// Turn the velocity shaping for SteamVR's prediction on or off (None shows it).
     Shaping(Option<bool>),
+    /// Percent of the velocities SteamVR extrapolates poses with: 100 as tracked (and shaped), 0
+    /// none, so SteamVR shows each pose where it was measured (None shows it).
+    Prediction(Option<u32>),
     /// Arm or disarm input injection for automated tests (None shows it). Armed, it disarms
     /// itself after a while.
     TestInject(Option<bool>),
@@ -240,6 +243,14 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["shaping", "on"] => Ok(Command::Shaping(Some(true))),
         ["shaping", "off"] => Ok(Command::Shaping(Some(false))),
         ["shaping", ..] => Err("usage: shaping [on|off]".into()),
+        ["prediction"] => Ok(Command::Prediction(None)),
+        ["prediction", percent] => percent
+            .parse::<u32>()
+            .ok()
+            .filter(|p| *p <= 100)
+            .map(|p| Command::Prediction(Some(p)))
+            .ok_or_else(|| "prediction must be a whole percent from 0 to 100".into()),
+        ["prediction", ..] => Err("usage: prediction [PERCENT]".into()),
         ["universe-watch"] => Ok(Command::UniverseWatch(None)),
         ["universe-watch", "on"] => Ok(Command::UniverseWatch(Some(true))),
         ["universe-watch", "off"] => Ok(Command::UniverseWatch(Some(false))),
@@ -476,6 +487,22 @@ mod tests {
             "inject up x 100",
             "inject left x",
             "test-inject maybe",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_prediction() {
+        assert_eq!(parse("prediction"), Ok(Command::Prediction(None)));
+        assert_eq!(parse("prediction 0"), Ok(Command::Prediction(Some(0))));
+        assert_eq!(parse("prediction 100"), Ok(Command::Prediction(Some(100))));
+        for bad in [
+            "prediction 101",
+            "prediction -1",
+            "prediction 50.5",
+            "prediction half",
+            "prediction 50 50",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

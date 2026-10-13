@@ -17,6 +17,7 @@ pub mod modes;
 pub mod recorder;
 pub mod register;
 pub mod rendermodel;
+pub mod settings;
 pub mod setup;
 pub mod shm;
 pub mod status;

@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- `cv1touch prediction [PERCENT]` sets how much of the tracked motion SteamVR extrapolates poses with: 100 (the default) as before, 0 none, so each pose is shown where it was measured. It applies at once and is kept for later runs in `settings.json` in the configuration directory.
+
 ### Changed
 
 - `cv1touchd` no longer runs OpenHMD's brute-force pose search for a controller its own tracker fitted within the last 100 ms, or one asleep, except on a sensor that has no pose yet. That search took most of the daemon's CPU time during play. The per-sensor OpenHMD fix counts in `cv1touch status` are lower for tracked controllers as a result.
