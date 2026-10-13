@@ -1292,10 +1292,11 @@ fn radio_main(
             d.shm.signal();
         }
         for h in [HAND_LEFT, HAND_RIGHT] {
-            // only hands our tracker publishes, and only while fits keep coming
+            // only hands our tracker publishes, and only while fits keep coming: a track no second
+            // sensor has confirmed yet may be wrong, and the engine keeps searching meanwhile
             let since_fix = pipe
                 .tracker(h)
-                .filter(|t| t.last_fix() != 0)
+                .filter(|t| t.tracking())
                 .and_then(|t| Some(t.newest_imu()?.saturating_sub(t.last_fix())));
             let since_sample = newest[h].map(|s| now.saturating_sub(s.received_host_ns));
             search_skip.hands[h] = link.hands.radio_publishes(h)
@@ -1334,9 +1335,10 @@ const SEARCH_SKIP_FIX_NS: u64 = 100_000_000;
 const SEARCH_SKIP_ASLEEP_NS: u64 = 1_000_000_000;
 
 /// Whether OpenHMD's brute-force pose search can leave a controller out, from the controller time
-/// since our tracker's last fit of it and the host time since its last radio sample (None: none
-/// yet). Those long searches for a controller we already fit found little we use (in replays,
-/// under 0.5% of the tracker's updates) at up to a core of CPU in play.
+/// since our tracker last fitted it while publishing it (an unconfirmed track does not count) and
+/// the host time since its last radio sample (None: none yet). Those long searches for a
+/// controller we already fit found little we use (in replays, under 0.5% of the tracker's
+/// updates) at up to a core of CPU in play.
 fn search_needless(since_fix_ns: Option<u64>, since_sample_ns: Option<u64>) -> bool {
     since_fix_ns.is_some_and(|t| t <= SEARCH_SKIP_FIX_NS)
         || since_sample_ns.is_none_or(|t| t >= SEARCH_SKIP_ASLEEP_NS)
@@ -1484,12 +1486,12 @@ fn apply_tracker(
     }
 }
 
-/// For a connected controller the tracker has no state for (it woke, or a wrong lock was dropped,
-/// and it has not been fixed since): SteamVR is shown it where the tracker last had it, turning
-/// with the engine's IMU orientation but neither moving nor extrapolated, without a position. Not
-/// at the engine's position: the engine's own searches leave out the controllers the tracker
-/// holds, so its position can be metres off by then. Before the tracker's first fix the engine's
-/// position is all there is.
+/// For a connected controller the tracker shows no position for (it woke, its track was dropped,
+/// or its new track awaits a second sensor's confirmation): SteamVR is shown it where the tracker
+/// last had it, turning with the engine's IMU orientation but neither moving nor extrapolated,
+/// without a position. Not at the engine's position: the engine's own searches leave out the
+/// controllers the tracker holds, so its position can be metres off by then. Before the tracker's
+/// first fix the engine's position is all there is.
 fn hold_unfixed(state: &mut ControllerState, last_seen: Option<[f32; 3]>) {
     if let Some(pos) = last_seen {
         state.pos = pos;
@@ -1661,8 +1663,8 @@ fn status_json(d: &Daemon) -> String {
         .zip(d.track_stats.lock().unwrap().iter())
         .map(|((s, name), (t, tracking))| {
             format!(
-                "{{\"hand\":\"{name}\",\"flags\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
-                s.flags, t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
+                "{{\"hand\":\"{name}\",\"flags\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
+                s.flags, t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
             )
         })
         .collect();
@@ -2733,6 +2735,7 @@ mod tests {
                 gyro_bias: bias,
                 accel_bias: Vector3::zeros(),
                 tracking: true,
+                last_fix: 0,
             },
             gyro: q.inverse() * rate + bias,
             gyro_bias: bias,

@@ -14,10 +14,10 @@ use std::collections::BTreeMap;
 use nalgebra::{Isometry3, Vector2, Vector3};
 
 use super::clock::{LinearClock, Unwrap32};
-use super::tracker::{ImuSample, Outcome, Output, Params, Stats, Tracker};
+use super::tracker::{EnginePose, ImuSample, Outcome, Output, Params, Stats, Tracker};
 use super::vision::{Blob, Body, Camera};
 use crate::calib::camera::CameraModel;
-use crate::calib::capture::{Led, MATCH_STRONG};
+use crate::calib::capture::{Led, MATCH_GOOD, MATCH_STRONG};
 use crate::calib::{iso_from_xyzw, DEVICE_LEFT, DEVICE_RIGHT};
 use crate::engine::{cstr_field, FrameInfo};
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
@@ -94,8 +94,8 @@ pub struct FrameEvent {
     /// The frame's start on the host clock (its FRAME_OBS / RAW_FRAME stamp).
     pub frame_start_host_ns: u64,
     pub outcome: Outcome,
-    /// The engine's strong pose on this frame, and the tracker's at the exposure before it.
-    pub engine: Option<Isometry3<f64>>,
+    /// The engine's pose on this frame, and the tracker's at the exposure before it.
+    pub engine: Option<EnginePose>,
     pub tracked: Option<Isometry3<f64>>,
 }
 
@@ -132,7 +132,7 @@ struct Pending {
     camera: usize,
     cam: Camera,
     blobs: Vec<Blob>,
-    engine: Option<Isometry3<f64>>,
+    engine: Option<EnginePose>,
 }
 
 #[derive(Clone, Copy)]
@@ -329,7 +329,8 @@ impl Pipeline {
             }
         }
         let Some(out) = tr.output() else {
-            // no state yet (or dropped after a gap): nothing of ours to publish
+            // no state yet, dropped, or a track no second sensor has confirmed with no position
+            // held from before: nothing of ours to publish
             self.latest[hand] = None;
             return None;
         };
@@ -342,7 +343,11 @@ impl Pipeline {
         };
         let host_ns = physical(self.clocks[hand].to_host(device_ns)?);
         let bg = out.gyro_bias;
-        let last_fix_host_ns = self.clocks[hand].to_host(tr.last_fix()).map_or(0, physical);
+        // a fix counts only while the track is published (see `Output::last_fix`)
+        let last_fix_host_ns = match out.last_fix {
+            0 => 0,
+            t => self.clocks[hand].to_host(t).map_or(0, physical),
+        };
         let s = Stamped {
             host_ns,
             output: out,
@@ -400,9 +405,12 @@ impl Pipeline {
                 .find(|d| {
                     d.device_id == tr.device_id
                         && d.pose_valid != 0
-                        && d.match_flags & MATCH_STRONG != 0
+                        && d.match_flags & (MATCH_GOOD | MATCH_STRONG) != 0
                 })
-                .map(|d| cam.world_from_cam * iso_from_xyzw(d.cam_orient, d.cam_pos));
+                .map(|d| EnginePose {
+                    world_from_model: cam.world_from_cam * iso_from_xyzw(d.cam_orient, d.cam_pos),
+                    strong: d.match_flags & MATCH_STRONG != 0,
+                });
             // Bound each registered camera independently: a fast producer cannot evict another
             // camera's sole pending frame. Drop its oldest exposure, including a late incoming one.
             let at = self.pending[hand].partition_point(|p| p.t_e <= t_e);
@@ -536,7 +544,8 @@ mod tests {
     /// the published stamp less the headset link's delay: stamps are meant to be the motion's own
     /// time, as near as the headset's clock can tell it.
     fn run_with(seconds: f64, gap: Option<(f64, f64)>, imu_delay: u64) -> (Vec<(f64, f64)>, bool) {
-        let (errors, stale, _, _) = run_with_sensors(seconds, gap, imu_delay, 3, None);
+        let (errors, stale, _, _) =
+            run_with_sensors(seconds, gap, imu_delay, 3, None, MATCH_GOOD | MATCH_STRONG);
         (errors, stale)
     }
 
@@ -553,6 +562,7 @@ mod tests {
         imu_delay: u64,
         camera_count: usize,
         recording: Option<&crate::recorder::Recorder>,
+        match_flags: u32,
     ) -> Simulation {
         use crate::recorder::{self, as_bytes, slice_bytes};
         let mut rng = Rng::new(5);
@@ -686,7 +696,7 @@ mod tests {
                 };
                 let (o, q) = crate::calib::iso_to_xyzw(&cam_from_obj);
                 info.devices[0].device_id = crate::calib::DEVICE_RIGHT;
-                info.devices[0].match_flags = 3;
+                info.devices[0].match_flags = match_flags;
                 info.devices[0].pose_valid = 1;
                 info.devices[0].cam_orient = o;
                 info.devices[0].cam_pos = q;
@@ -763,6 +773,37 @@ mod tests {
         (errors, stale, p, calibration)
     }
 
+    /// The engine's poses reach the tracker rated as the engine rated them: one rated only good
+    /// is taken too, and published once a second sensor confirms it.
+    #[test]
+    fn a_pose_the_engine_rates_only_good_is_tracked_once_confirmed() {
+        let (errors, _, p, _) = run_with_sensors(3.0, None, IMU_DELAY, 3, None, MATCH_GOOD);
+        let st = p.stats(HAND_RIGHT);
+        assert!(
+            st.good_acquisitions >= 1 && st.unconfirmed_acquisitions == 0,
+            "{st:?}"
+        );
+        let late: Vec<f64> = errors.iter().filter(|e| e.0 > 1.0).map(|e| e.1).collect();
+        assert!(late.len() > 900 && late.iter().all(|e| *e < 5e-3), "{st:?}");
+    }
+
+    /// What one sensor alone sees is never published: no tracking sample, and no fix time
+    /// either (which the driver would report as a pose in range).
+    #[test]
+    fn nothing_one_sensor_alone_sees_is_published() {
+        let (errors, _, p, _) = run_with_sensors(3.0, None, IMU_DELAY, 1, None, MATCH_GOOD);
+        let st = p.stats(HAND_RIGHT);
+        assert!(
+            errors.is_empty() && st.unconfirmed_acquisitions > 0,
+            "{st:?}"
+        );
+        assert!(
+            p.latest(HAND_RIGHT)
+                .is_none_or(|s| !s.output.tracking && s.last_fix_host_ns == 0),
+            "{st:?}"
+        );
+    }
+
     #[test]
     fn dynamic_sensors_fifth_camera_survives_recording_and_replay() {
         let path = std::env::temp_dir().join(format!(
@@ -772,7 +813,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let recorder = crate::recorder::Recorder::new(4 << 20);
         recorder.start(&path, H0).unwrap();
-        let (_, _, p, calibration) = run_with_sensors(1.5, None, IMU_DELAY, 5, Some(&recorder));
+        let (_, _, p, calibration) = run_with_sensors(
+            1.5,
+            None,
+            IMU_DELAY,
+            5,
+            Some(&recorder),
+            MATCH_GOOD | MATCH_STRONG,
+        );
         let stats = recorder.stop();
         assert_eq!(stats.dropped, 0);
         assert_eq!(stats.write_errors, 0);

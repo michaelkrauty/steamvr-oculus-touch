@@ -21,7 +21,7 @@ Native SteamVR driver (C++)
   poses, inputs, capacitive touch, battery, haptics
 ```
 
-OpenHMD owns device discovery and USB/camera acquisition. The Rust tracker fuses gyroscope and accelerometer data with multi-camera LED observations; OpenHMD poses provide acquisition priors/fallback. The headset is used as a radio receiver and does not become a SteamVR display device. The driver is deliberately thin and shares the C ABI in `common/cv1touch_shm.h` with the daemon.
+OpenHMD owns device discovery and USB/camera acquisition. The Rust tracker fuses gyroscope and accelerometer data with multi-camera LED observations; OpenHMD poses provide acquisition priors/fallback. A pose it rates strong starts a published track at once; one it rates only good starts a provisional track, shown only once a second sensor's frame (or a strong pose) confirms it. After a loss, while the gyro still holds the controller's orientation, the tracker also searches for its position by itself (`track::search`), with a bounded cost per frame, and treats what it finds as provisional too. The headset is used as a radio receiver and does not become a SteamVR display device. The driver is deliberately thin and shares the C ABI in `common/cv1touch_shm.h` with the daemon.
 
 ## Coordinates and timestamps
 

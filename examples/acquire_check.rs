@@ -210,7 +210,7 @@ fn main() {
                     };
                     o.frames += 1;
                     *o.outcomes.entry(outcome_name(e.outcome)).or_default() += 1;
-                    if e.engine.is_some() {
+                    if e.engine.is_some_and(|p| p.strong) {
                         o.engine_frames += 1;
                         o.first_engine.get_or_insert((e.exposure_host_ns, e.camera));
                     }

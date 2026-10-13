@@ -19,7 +19,8 @@ use crate::shm::{HAND_LEFT, HAND_RIGHT};
 /// Frames from different sensors belong to one exposure when their exposure counters match and
 /// their start times are this close (the counter is 16-bit and wraps every ~22 minutes).
 pub const SAME_EXPOSURE_NS: u64 = 15_000_000;
-/// RIFT_POSE_MATCH_STRONG.
+/// RIFT_POSE_MATCH_GOOD and RIFT_POSE_MATCH_STRONG.
+pub const MATCH_GOOD: u32 = 0x1;
 pub const MATCH_STRONG: u32 = 0x2;
 /// Fewest labelled LEDs for a sighting to be used.
 pub const MIN_VIEW_OBS: usize = 4;
