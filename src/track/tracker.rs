@@ -426,6 +426,7 @@ impl Tracker {
             self.track_camera = None;
             self.track_confirmed = false;
             self.refusing_since = 0;
+            self.ambiguous_since = 0;
             self.provisional = None;
             self.held = None;
         }
@@ -592,6 +593,7 @@ impl Tracker {
         self.track_camera = None;
         self.track_confirmed = false;
         self.refusing_since = 0;
+        self.ambiguous_since = 0;
         self.provisional = None;
         self.held = None;
     }
@@ -2069,6 +2071,21 @@ mod tests {
         };
         let (tr, _) = run_with(&w, 9.0, 0.3, &crowded);
         assert_eq!(tr.stats.searches, 0);
+    }
+
+    /// A track ending, by a radio gap or by being dropped, restarts the wait on an ambiguous
+    /// acquisition: a timer left from before would let the next ambiguous one through at once.
+    #[test]
+    fn a_track_ending_restarts_the_ambiguity_timer() {
+        let w = world(3);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr.imu(imu(&w, 0.1));
+        tr.ambiguous_since = 123;
+        tr.imu(imu(&w, 0.5));
+        assert_eq!((tr.stats.imu_gaps, tr.ambiguous_since), (1, 0));
+        tr.ambiguous_since = 456;
+        tr.forget_track();
+        assert_eq!(tr.ambiguous_since, 0);
     }
 
     /// After a blackout longer than the re-lock window the engine first reports a flipped pose;
