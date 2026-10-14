@@ -1127,6 +1127,10 @@ pub fn show_file(_path: &Path) -> bool {
     false
 }
 
+pub fn alert(title: &str, text: &str) {
+    eprintln!("{title}: {text}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

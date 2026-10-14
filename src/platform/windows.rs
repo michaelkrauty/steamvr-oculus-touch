@@ -1663,6 +1663,20 @@ pub fn show_file(path: &Path) -> bool {
         .is_ok()
 }
 
+pub fn alert(title: &str, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let (title, text) = (wide(title), wide(text));
+    // SAFETY: NUL-terminated strings that outlive the call; no owner window.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
 /// A device node, opened alone in a device information set of its own.
 struct DeviceNode {
     set: windows_sys::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,

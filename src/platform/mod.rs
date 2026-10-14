@@ -801,6 +801,12 @@ pub mod process {
         os::run_elevated(args)
     }
 
+    /// Tells the person `text` from a program that has no console to print it in: a message box
+    /// titled `title` on Windows, standard error on Linux. Returns once it is dismissed.
+    pub fn alert(title: &str, text: &str) {
+        os::alert(title, text)
+    }
+
     /// Starts the program `command` runs without a console window of its own (Windows); on
     /// Linux nothing changes.
     pub fn without_window(command: &mut std::process::Command) {
