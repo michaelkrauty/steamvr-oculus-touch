@@ -52,7 +52,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -5273,6 +5273,7 @@ fn main() {
         ["doctor"] => doctor(false),
         ["doctor", "--json"] => doctor(true),
         ["alignment", "reload"] => send("alignment reload"),
+        ["stop"] => send("stop"),
         ["calibration", "capture"] => send("calibration capture"),
         ["calibration", "provisional"] => send("calibration provisional"),
         ["calibration", "load", path] => {

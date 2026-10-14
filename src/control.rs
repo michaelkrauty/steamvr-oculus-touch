@@ -33,6 +33,8 @@ pub enum Command {
     RecordStop,
     RecordStopIf(PathBuf),
     Status,
+    /// Stop the daemon, as SIGTERM or Ctrl+C would; exit status 0.
+    Stop,
     /// Factory-normalized inputs, before optional user calibration and output clamping.
     Inputs,
     InputsReload,
@@ -216,6 +218,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
     match words.as_slice() {
         [] => Err("empty command".into()),
         ["status"] => Ok(Command::Status),
+        ["stop"] => Ok(Command::Stop),
         ["inputs"] => Ok(Command::Inputs),
         ["inputs", "reload"] => Ok(Command::InputsReload),
         ["inputs", ..] => Err("usage: inputs [reload]".into()),
@@ -601,6 +604,8 @@ mod tests {
     fn parse_other() {
         assert_eq!(parse("status"), Ok(Command::Status));
         assert!(parse("status now").is_err());
+        assert_eq!(parse("stop"), Ok(Command::Stop));
+        assert!(parse("stop now").is_err());
         assert_eq!(parse("record stop"), Ok(Command::RecordStop));
         assert_eq!(
             parse(&format!("record start {TMP}/a.rec")),

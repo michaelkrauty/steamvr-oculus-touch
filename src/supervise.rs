@@ -5,7 +5,7 @@
 //! process whose output goes to a log file, each line stamped with the time it arrived. After a
 //! failure it is started again 2 s later, as systemd's Restart=on-failure and RestartSec=2 do on
 //! Linux, unless it refused its arguments or has failed five times in a row within 30 s of
-//! starting.
+//! starting. Asked to stop, the supervisor asks the daemon to stop and waits for it.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -202,8 +202,28 @@ fn note(log: &mut Log, text: &str) {
 /// output is left to whatever it started that still holds it.
 const LAST_LINES: Duration = Duration::from_secs(1);
 
+/// How the supervisor learns that it is to stop, and how it asks the daemon to.
+pub struct Stopping<'a> {
+    /// A request to stop, if one came: what it was (polled often, so quick).
+    pub requested: Box<dyn FnMut() -> Option<String> + 'a>,
+    /// Asks the running daemon to stop.
+    pub ask: Box<dyn FnMut() -> Result<(), String> + 'a>,
+    /// How long the daemon has to stop once asked; then it is ended. (After its console window
+    /// is closed, Windows ends the supervisor 5 s later whatever this says.)
+    pub within: Duration,
+}
+
+/// How often a daemon not yet taking requests (it is just starting) is asked again.
+const ASK_AGAIN: Duration = Duration::from_millis(250);
+
+/// A daemon's end: its exit status, and whether the supervisor had asked it to stop.
+struct Ended {
+    status: ExitStatus,
+    asked: bool,
+}
+
 /// Runs one daemon to its end, its output to `log`.
-fn run_once(command: &mut Command, log: &mut Log) -> io::Result<ExitStatus> {
+fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io::Result<Ended> {
     if let Err(e) = platform::process::end_with_this_process(command) {
         note(
             log,
@@ -228,9 +248,16 @@ fn run_once(command: &mut Command, log: &mut Log) -> io::Result<ExitStatus> {
         drop(tx);
     }
     let mut ended: Option<(ExitStatus, Instant)> = None;
+    let mut asked: Option<Instant> = None;
+    let mut last_ask: Option<Instant> = None;
+    let mut accepted = false;
+    let mut ending = false;
     loop {
         let wait = match ended {
-            Some((status, at)) if at.elapsed() >= LAST_LINES => return Ok(status),
+            Some((status, at)) if at.elapsed() >= LAST_LINES => {
+                let asked = asked.is_some();
+                return Ok(Ended { status, asked });
+            }
             Some((_, at)) => LAST_LINES - at.elapsed(),
             None => Duration::from_millis(100),
         };
@@ -239,42 +266,78 @@ fn run_once(command: &mut Command, log: &mut Log) -> io::Result<ExitStatus> {
                 let _ = log.line(SystemTime::now(), &line);
             }
             Err(RecvTimeoutError::Disconnected) => match ended {
-                Some((status, _)) => return Ok(status),
+                Some((status, _)) => {
+                    let asked = asked.is_some();
+                    return Ok(Ended { status, asked });
+                }
                 None => std::thread::sleep(Duration::from_millis(100)),
             },
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if ended.is_none() {
-            ended = child.try_wait()?.map(|status| (status, Instant::now()));
+        if ended.is_some() {
+            continue;
         }
+        if asked.is_none() {
+            if let Some(why) = (stopping.requested)() {
+                note(log, &format!("{why}: asking the daemon to stop"));
+                asked = Some(Instant::now());
+            }
+        }
+        if asked.is_some() && !accepted && last_ask.is_none_or(|t| t.elapsed() >= ASK_AGAIN) {
+            match (stopping.ask)() {
+                Ok(()) => accepted = true,
+                Err(e) if last_ask.is_none() => {
+                    note(log, &format!("cannot ask it yet ({e}); asking again"))
+                }
+                Err(_) => {}
+            }
+            last_ask = Some(Instant::now());
+        }
+        if asked.is_some_and(|at| at.elapsed() >= stopping.within) && !ending {
+            note(
+                log,
+                &format!(
+                    "the daemon did not stop within {} s; ending it",
+                    stopping.within.as_secs_f64()
+                ),
+            );
+            let _ = child.kill();
+            ending = true;
+        }
+        ended = child.try_wait()?.map(|status| (status, Instant::now()));
     }
 }
 
-/// Runs the daemons `command` makes, one at a time, until one stops cleanly (exit status 0), each
-/// line it writes to its standard output or error going to `log`; each ends with the thread that
-/// calls this, so call it from the main thread. After a failure the next starts once
-/// `policy.delay` has passed, unless the daemon refused its arguments (exit status 2) or the
-/// policy allows no more quick failures. What the supervisor has to say goes to the log as
-/// "cv1touchd supervisor: ...". The exit code for the supervisor: 0 once the daemon stopped
-/// cleanly, 1 when it gave up.
-pub fn run(mut command: impl FnMut() -> Command, log: &mut Log, policy: Policy) -> i32 {
+/// Runs the daemons `command` makes, one at a time, until one stops cleanly (exit status 0) or
+/// the supervisor is asked to stop, each line the daemon writes to its standard output or error
+/// going to `log`; each ends with the thread that calls this, so call it from the main thread.
+/// After a failure the next starts once `policy.delay` has passed, unless the daemon refused its
+/// arguments (exit status 2) or the policy allows no more quick failures. What the supervisor has
+/// to say goes to the log as "cv1touchd supervisor: ...". The exit code for the supervisor: 0
+/// once the daemon stopped, 1 when it gave up.
+pub fn run(
+    mut command: impl FnMut() -> Command,
+    log: &mut Log,
+    policy: Policy,
+    stopping: &mut Stopping,
+) -> i32 {
     let mut failures = Failures::new(policy);
     let delay = policy.delay.as_secs_f64();
     loop {
         let started = Instant::now();
-        match run_once(&mut command(), log) {
-            Ok(status) if status.success() => {
-                note(log, "the daemon stopped");
+        match run_once(&mut command(), log, stopping) {
+            Ok(Ended { status, asked }) if asked || status.success() => {
+                note(log, &format!("the daemon stopped ({status})"));
                 return 0;
             }
-            Ok(status) if status.code() == Some(USAGE_ERROR) => {
+            Ok(Ended { status, .. }) if status.code() == Some(USAGE_ERROR) => {
                 note(
                     log,
                     &format!("the daemon refused its arguments ({status}); not starting it again"),
                 );
                 return 1;
             }
-            Ok(status) => note(log, &format!("the daemon ended ({status})")),
+            Ok(Ended { status, .. }) => note(log, &format!("the daemon ended ({status})")),
             Err(e) => note(log, &format!("cannot start the daemon ({e})")),
         }
         if !failures.failed(started.elapsed()) {
@@ -290,7 +353,14 @@ pub fn run(mut command: impl FnMut() -> Command, log: &mut Log, policy: Policy) 
             return 1;
         }
         note(log, &format!("starting it again in {delay} s"));
-        std::thread::sleep(policy.delay);
+        let until = Instant::now() + policy.delay;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Some(why) = (stopping.requested)() {
+                note(log, &format!("{why}: not starting the daemon again"));
+                return 0;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
     }
 }
 
@@ -423,6 +493,167 @@ mod tests {
         c
     }
 
+    /// Never asked to stop.
+    fn never() -> Stopping<'static> {
+        Stopping {
+            requested: Box::new(|| None),
+            ask: Box::new(|| Ok(())),
+            within: Duration::from_secs(10),
+        }
+    }
+
+    /// The file whose appearance the stand-in daemon waits for.
+    const STAND_IN: &str = "CV1TOUCH_TEST_STAND_IN";
+
+    /// Stands in for a daemon in other tests, which run this test binary for it: it ends cleanly
+    /// once the file named by CV1TOUCH_TEST_STAND_IN exists, and runs at most 30 s.
+    #[test]
+    #[ignore = "run by other tests"]
+    fn stand_in_daemon() {
+        let Some(file) = std::env::var_os(STAND_IN) else {
+            return;
+        };
+        let until = Instant::now() + Duration::from_secs(30);
+        while !Path::new(&file).exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stand_in(file: &Path) -> Command {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "supervise::tests::stand_in_daemon", "--ignored"])
+            .env(STAND_IN, file);
+        c
+    }
+
+    /// A stop request after `after`, and how many times the daemon was asked to stop.
+    fn stop_after(
+        after: Duration,
+        ask: impl FnMut() + 'static,
+        within: Duration,
+    ) -> Stopping<'static> {
+        let at = Instant::now() + after;
+        let mut ask = ask;
+        let mut sent = false;
+        Stopping {
+            requested: Box::new(move || {
+                (!sent && Instant::now() >= at).then(|| {
+                    sent = true;
+                    "Ctrl+C".to_string()
+                })
+            }),
+            ask: Box::new(move || {
+                ask();
+                Ok(())
+            }),
+            within,
+        }
+    }
+
+    #[test]
+    fn asked_to_stop_the_supervisor_asks_the_daemon_and_waits_for_it() {
+        let d = dir("asked");
+        let mut log = Log::open(&d).unwrap();
+        let file = d.join("stop");
+        let asked = file.clone();
+        let mut stopping = stop_after(
+            Duration::from_millis(200),
+            move || std::fs::write(&asked, b"").unwrap(),
+            Duration::from_secs(20),
+        );
+        let code = run(|| stand_in(&file), &mut log, quick(10, 5), &mut stopping);
+        assert_eq!(code, 0);
+        let lines = texts(&log.path());
+        assert!(
+            lines.contains(&"cv1touchd supervisor: Ctrl+C: asking the daemon to stop".into()),
+            "{lines:?}"
+        );
+        assert!(lines
+            .last()
+            .unwrap()
+            .starts_with("cv1touchd supervisor: the daemon stopped"));
+        assert!(!lines.iter().any(|l| l.contains("ending it")), "{lines:?}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A daemon that does not take requests yet (it is just starting) is asked again.
+    #[test]
+    fn a_daemon_not_yet_taking_requests_is_asked_again() {
+        let d = dir("not-yet");
+        let mut log = Log::open(&d).unwrap();
+        let file = d.join("stop");
+        let asked = file.clone();
+        let mut tries = 0;
+        let at = Instant::now() + Duration::from_millis(100);
+        let mut stopping = Stopping {
+            requested: Box::new(move || (Instant::now() >= at).then(|| "Ctrl+C".to_string())),
+            ask: Box::new(move || {
+                tries += 1;
+                if tries < 3 {
+                    return Err("no daemon there yet".into());
+                }
+                std::fs::write(&asked, b"").map_err(|e| e.to_string())
+            }),
+            within: Duration::from_secs(20),
+        };
+        let code = run(|| stand_in(&file), &mut log, quick(10, 5), &mut stopping);
+        assert_eq!(code, 0);
+        let lines = texts(&log.path());
+        let not_yet = "cv1touchd supervisor: cannot ask it yet (no daemon there yet); asking again";
+        assert_eq!(
+            lines.iter().filter(|l| *l == not_yet).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("ending it")), "{lines:?}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_daemon_that_does_not_stop_when_asked_is_ended() {
+        let d = dir("deaf");
+        let mut log = Log::open(&d).unwrap();
+        let file = d.join("never");
+        let mut stopping = stop_after(
+            Duration::from_millis(100),
+            || {},
+            Duration::from_millis(300),
+        );
+        let started = Instant::now();
+        let code = run(|| stand_in(&file), &mut log, quick(10, 5), &mut stopping);
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let lines = texts(&log.path());
+        assert!(
+            lines.contains(
+                &"cv1touchd supervisor: the daemon did not stop within 0.3 s; ending it".into()
+            ),
+            "{lines:?}"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_stop_while_waiting_to_start_the_daemon_again_ends_the_supervisor() {
+        let d = dir("waiting");
+        let mut log = Log::open(&d).unwrap();
+        let mut stopping = stop_after(Duration::from_millis(300), || {}, Duration::from_secs(10));
+        let started = Instant::now();
+        let code = run(
+            || shell("exit 1"),
+            &mut log,
+            quick(20_000, 5),
+            &mut stopping,
+        );
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            texts(&log.path()).last().unwrap(),
+            "cv1touchd supervisor: Ctrl+C: not starting the daemon again"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     fn quick(delay_ms: u64, quick_failures: usize) -> Policy {
         Policy {
             delay: Duration::from_millis(delay_ms),
@@ -449,6 +680,7 @@ mod tests {
             },
             &mut log,
             quick(150, 3),
+            &mut never(),
         );
         assert_eq!((code, runs), (1, 3));
         // two waits between three runs
@@ -483,12 +715,13 @@ mod tests {
             },
             &mut log,
             quick(10, 5),
+            &mut never(),
         );
         assert_eq!((code, runs), (0, 2));
-        assert_eq!(
-            texts(&log.path()).last().unwrap(),
-            "cv1touchd supervisor: the daemon stopped"
-        );
+        assert!(texts(&log.path())
+            .last()
+            .unwrap()
+            .starts_with("cv1touchd supervisor: the daemon stopped"));
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -504,6 +737,7 @@ mod tests {
             },
             &mut log,
             quick(10, 5),
+            &mut never(),
         );
         assert_eq!((code, runs), (1, 1));
         std::fs::remove_dir_all(d).unwrap();
@@ -517,6 +751,7 @@ mod tests {
             || Command::new(d.join("no-such-daemon")),
             &mut log,
             quick(10, 2),
+            &mut never(),
         );
         assert_eq!(code, 1);
         let lines = texts(&log.path());
@@ -540,7 +775,10 @@ mod tests {
             "sleep 30 & exit 0"
         };
         let started = Instant::now();
-        assert_eq!(run(|| shell(script), &mut log, quick(10, 5)), 0);
+        assert_eq!(
+            run(|| shell(script), &mut log, quick(10, 5), &mut never()),
+            0
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
         std::fs::remove_dir_all(d).unwrap();
     }

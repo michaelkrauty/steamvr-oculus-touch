@@ -135,6 +135,8 @@ struct Daemon {
     shm: ShmWriter,
     rec: Recorder,
     quit: AtomicBool,
+    /// A client asked the daemon to stop (control `stop`).
+    stop_requested: AtomicBool,
     haptics: Mutex<[Option<Haptic>; 2]>,
     /// Sensor intrinsics and LED models still to be written into the active recording.
     session: Mutex<recorder::SessionInfo>,
@@ -1664,6 +1666,10 @@ fn status_json(d: &Daemon) -> String {
 fn handle(d: &Daemon, line: &str) -> String {
     match control::parse(line) {
         Err(e) => format!("err {e}"),
+        Ok(Command::Stop) => {
+            d.stop_requested.store(true, Ordering::Release);
+            "ok stopping".into()
+        }
         Ok(Command::Haptic {
             hand,
             duration_s,
@@ -2116,6 +2122,12 @@ fn supervise(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--supervise") {
         usage();
     }
+    // before any thread: as the daemon does, so Ctrl+C, closing the console or SIGTERM reaches
+    // the supervisor as a request to stop, which it passes on to the daemon
+    let requests = shutdown::Requests::take().unwrap_or_else(|e| {
+        eprintln!("cv1touchd: cannot take over shutdown requests: {e}");
+        process::exit(1);
+    });
     // the last one, as the daemon takes it
     let runtime = args
         .iter()
@@ -2162,7 +2174,17 @@ fn supervise(args: &[String]) -> i32 {
         daemon.args(args);
         daemon
     };
-    supervise::run(daemon, &mut log, supervise::POLICY)
+    let endpoint = runtime.join("control.sock");
+    let mut stopping = supervise::Stopping {
+        requested: Box::new(|| requests.wait(Duration::ZERO)),
+        ask: Box::new(|| {
+            control::request(&endpoint, "stop", Duration::from_secs(2))
+                .map_err(|e| e.to_string())
+                .and_then(|reply| reply.starts_with("ok").then_some(()).ok_or(reply))
+        }),
+        within: Duration::from_secs(10),
+    };
+    supervise::run(daemon, &mut log, supervise::POLICY, &mut stopping)
 }
 
 fn random_u64() -> u64 {
@@ -2365,6 +2387,7 @@ fn main() {
         shm,
         rec,
         quit: AtomicBool::new(false),
+        stop_requested: AtomicBool::new(false),
         haptics: Mutex::new([None; 2]),
         session: Mutex::new(recorder::SessionInfo::default()),
         opts: Mutex::new(opts),
@@ -2432,6 +2455,10 @@ fn main() {
             log(format!("{why}: shutting down"));
             break;
         }
+        if d.stop_requested.load(Ordering::Acquire) {
+            log("asked to stop: shutting down");
+            break;
+        }
     }
 
     // nothing a client asks for runs while the daemon stops
@@ -2461,6 +2488,7 @@ mod tests {
             shm: ShmWriter::create(&name, 1).unwrap(),
             rec: Recorder::new(4096),
             quit: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
             haptics: Mutex::new([None; 2]),
             session: Mutex::new(Default::default()),
             opts: Mutex::new(Default::default()),
@@ -2497,6 +2525,15 @@ mod tests {
             inject: Injection::default(),
             inputs: Mutex::new(Default::default()),
         }
+    }
+
+    /// `stop` asks the main loop to shut down, as a signal would.
+    #[test]
+    fn stop_asks_the_daemon_to_shut_down() {
+        let d = status_daemon();
+        assert!(!d.stop_requested.load(Ordering::Acquire));
+        assert_eq!(handle(&d, "stop"), "ok stopping");
+        assert!(d.stop_requested.load(Ordering::Acquire));
     }
 
     /// `prediction` is saved as it is set, for the next daemon to start from; showing it saves
