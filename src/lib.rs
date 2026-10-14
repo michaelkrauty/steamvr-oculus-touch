@@ -4,6 +4,7 @@
 //! cv1touch: Rift CV1 Touch controller tracking daemon library.
 
 pub mod align;
+pub mod calendar;
 pub mod calib;
 pub mod clock_map;
 pub mod control;
