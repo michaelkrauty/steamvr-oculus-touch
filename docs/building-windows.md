@@ -1,6 +1,6 @@
 # Building on Windows (work in progress)
 
-Windows support is being built. Today the SteamVR driver and the native engine build and pass their tests on Windows 11 x64. The daemon and the `cv1touch` command do not run on Windows yet, so there is nothing to install. This page is for developers.
+Windows support is being built. Today the SteamVR driver, the native engine, the daemon and the `cv1touch` command build and pass their tests on Windows 11 x64. There is no installer yet, so this page is for developers.
 
 Like the Linux build, the Windows build uses no Oculus software. The Rift headset needs no driver. The sensors will need a WinUSB driver package of our own, which is not written yet.
 
@@ -39,7 +39,15 @@ cargo run --no-default-features --example driver_contract -- build-driver\driver
 ```powershell
 vcpkg install --x-manifest-root=. --overlay-triplets=windows\triplets --triplet x64-windows-cv1touch --x-install-root=vcpkg_installed
 $env:CV1TOUCH_DEPS = "$PWD\vcpkg_installed\x64-windows-cv1touch"
-cargo test --lib
+cargo test --lib --bins
 ```
 
 The first `vcpkg install` compiles OpenCV, which takes a long time. `build.rs` builds the engine with meson, links `openhmd`, and copies `openhmd-0.dll` and `libusb-1.0.dll` next to the executables Cargo builds.
+
+## Type-checking without the engine
+
+With `CV1TOUCH_CHECK_ONLY=1` the build script does not build the engine, so `cargo check` and `cargo clippy` work without its dependencies, on Windows or from Linux with the `x86_64-pc-windows-msvc` target installed (`libclang` is still needed, for the bindings). A build that links fails. CI's hosted Windows jobs check the daemon and the command this way:
+
+```sh
+CV1TOUCH_CHECK_ONLY=1 cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
