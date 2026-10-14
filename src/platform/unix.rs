@@ -789,6 +789,83 @@ pub fn opt_out_of_throttling() -> io::Result<()> {
     Ok(())
 }
 
+pub fn append_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+pub fn flush_console_input() {
+    // SAFETY: a plain terminal call on stdin; it fails harmlessly when stdin is not a terminal.
+    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+pub fn catch_interrupts() {
+    // SAFETY: installing an async-signal-safe handler (one atomic store).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_interrupt as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Copies of the original stdout and stderr, put back when dropped.
+pub struct OutputRedirect([i32; 2]);
+
+impl OutputRedirect {
+    pub fn to(file: &File) -> io::Result<OutputRedirect> {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let _ = io::stdout().flush();
+        // SAFETY: plain descriptor duplication; the copies are owned by the guard or closed here.
+        let saved = unsafe { [libc::dup(1), libc::dup(2)] };
+        if saved.contains(&-1) {
+            let e = io::Error::last_os_error();
+            for fd in saved.into_iter().filter(|&fd| fd >= 0) {
+                // SAFETY: closing a descriptor just duplicated.
+                unsafe { libc::close(fd) };
+            }
+            return Err(e);
+        }
+        // SAFETY: redirecting our own stdout and stderr; the guard undoes it.
+        unsafe {
+            libc::dup2(file.as_raw_fd(), 1);
+            libc::dup2(file.as_raw_fd(), 2);
+        }
+        Ok(OutputRedirect(saved))
+    }
+}
+
+impl Drop for OutputRedirect {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = io::stdout().flush();
+        // SAFETY: restoring and closing descriptors this guard owns.
+        unsafe {
+            libc::dup2(self.0[0], 1);
+            libc::dup2(self.0[1], 2);
+            libc::close(self.0[0]);
+            libc::close(self.0[1]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

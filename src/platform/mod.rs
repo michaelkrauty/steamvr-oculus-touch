@@ -42,6 +42,12 @@ pub mod fs {
         os::create_private_dir_all(path)
     }
 
+    /// Opens `path` for appending, creating it readable and writable by this user only; a link
+    /// at its end is not followed.
+    pub fn append_private(path: &Path) -> io::Result<File> {
+        os::append_private(path)
+    }
+
     /// Flushes the file at `path` to disk.
     pub fn sync_file(path: &Path) -> io::Result<()> {
         os::sync_file(path)
@@ -395,6 +401,153 @@ pub mod system {
     }
 }
 
+pub mod console {
+    //! The terminal a command-line tool talks to. Lines typed at it are read on a thread of their
+    //! own, so that waiting for one ends at a timeout or an interrupt: on Windows a console's
+    //! input is ready at the first key, and a read then blocks until Enter. Interrupts set a flag
+    //! instead of ending the process: SIGINT, SIGTERM and SIGHUP on Linux; Ctrl+C, Ctrl+Break and
+    //! closing the console on Windows.
+    use std::fs::File;
+    use std::io::{self, BufRead, IsTerminal};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    use super::os;
+
+    /// What a wait for a typed line found.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Line {
+        Typed(String),
+        /// The input ended (or failed). From a pipe or a file no line comes after it; at a
+        /// terminal it was Ctrl+D (Ctrl+Z on Windows), and typing goes on.
+        Closed,
+        NotYet,
+    }
+
+    /// Lines read from a source on a thread of their own.
+    pub struct Lines {
+        lines: Mutex<Receiver<Line>>,
+        /// Lets the reader go on once an end of input it reported has been taken.
+        resume: Sender<()>,
+    }
+
+    impl Lines {
+        /// With `terminal`, an end of input ends only the read it interrupts, as Ctrl+D does at a
+        /// terminal; the reader reads on once the end has been taken (so an input that keeps
+        /// ending, a terminal that hung up, is read once per wait, not in a loop).
+        pub fn spawn(mut source: impl BufRead + Send + 'static, terminal: bool) -> Lines {
+            let (tx, rx) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("cv1t-input".into())
+                .spawn(move || loop {
+                    let mut line = Vec::new();
+                    match source.read_until(b'\n', &mut line) {
+                        // an end of input, or a failed read (a character the console cannot
+                        // give): at a terminal it ends this wait only
+                        Ok(0) | Err(_) if terminal => {
+                            if tx.send(Line::Closed).is_err() || resumed.recv().is_err() {
+                                break;
+                            }
+                        }
+                        // dropping the sender: every wait from now on reads as closed
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&line).into_owned();
+                            if tx.send(Line::Typed(line)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                })
+                .expect("start the input reader");
+            Lines {
+                lines: Mutex::new(rx),
+                resume,
+            }
+        }
+
+        /// The next line, waiting up to `timeout` for it.
+        pub fn next(&self, timeout: Duration) -> Line {
+            match self.lines.lock().unwrap().recv_timeout(timeout) {
+                Ok(Line::Closed) => {
+                    let _ = self.resume.send(());
+                    Line::Closed
+                }
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => Line::NotYet,
+                Err(RecvTimeoutError::Disconnected) => Line::Closed,
+            }
+        }
+
+        /// Drops the lines read and not yet taken.
+        pub fn discard(&self) {
+            let lines = self.lines.lock().unwrap();
+            while let Ok(line) = lines.try_recv() {
+                if line == Line::Closed {
+                    let _ = self.resume.send(());
+                }
+            }
+        }
+    }
+
+    fn stdin() -> &'static Lines {
+        static LINES: OnceLock<Lines> = OnceLock::new();
+        LINES.get_or_init(|| {
+            Lines::spawn(io::BufReader::new(io::stdin()), io::stdin().is_terminal())
+        })
+    }
+
+    /// The next line typed at the terminal (or read from standard input), waiting up to
+    /// `timeout`. All reads of standard input go through here once one has.
+    pub fn next_line(timeout: Duration) -> Line {
+        stdin().next(timeout)
+    }
+
+    /// The next line typed, however long it takes; None once the input ends or, with
+    /// interrupts caught, at an interrupt.
+    pub fn wait_line() -> Option<String> {
+        loop {
+            match next_line(Duration::from_millis(200)) {
+                Line::Typed(line) => return Some(line),
+                Line::Closed => return None,
+                Line::NotYet if interrupted() => return None,
+                Line::NotYet => {}
+            }
+        }
+    }
+
+    /// Drops what was typed before a prompt, the lines read and the unfinished one the terminal
+    /// still holds, so that an Enter pressed during a capture cannot answer the next question.
+    pub fn discard_typed_ahead() {
+        // the terminal first: a line the reader takes from it meanwhile is then dropped too
+        os::flush_console_input();
+        stdin().discard();
+    }
+
+    /// From now on interrupts set the flag `interrupted` reads instead of ending the process.
+    pub fn catch_interrupts() {
+        os::catch_interrupts();
+    }
+
+    pub fn interrupted() -> bool {
+        os::interrupted()
+    }
+
+    /// Sends standard output and error to `to` until the guard is dropped, which puts them back.
+    /// On Windows only the process's standard handles move: this process's Rust output and the
+    /// programs it starts follow them, but a loaded library's C runtime writes where it did.
+    pub fn redirect_output(to: &File) -> io::Result<OutputRedirect> {
+        os::OutputRedirect::to(to).map(|guard| OutputRedirect { _guard: guard })
+    }
+
+    /// Output going to a file; the guard holds its own handle to it.
+    pub struct OutputRedirect {
+        _guard: os::OutputRedirect,
+    }
+}
+
 pub mod shutdown {
     //! Requests to stop the daemon: SIGINT and SIGTERM on Linux; on Windows the console's
     //! control events: Ctrl+C, Ctrl+Break, closing the console, and logoff and shutdown, which
@@ -665,6 +818,266 @@ mod tests {
 
     fn segment_name(tag: &str) -> String {
         format!("/cv1t-platform-{tag}-{}", std::process::id())
+    }
+
+    /// Input fed through a channel: a read blocks until something is sent, and ends when the
+    /// sender is dropped. `reads` counts the reads begun.
+    struct Fed(
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        Vec<u8>,
+        std::sync::Arc<AtomicU32>,
+    );
+
+    impl Fed {
+        fn new(from: std::sync::mpsc::Receiver<Vec<u8>>) -> (Fed, std::sync::Arc<AtomicU32>) {
+            let reads = std::sync::Arc::new(AtomicU32::new(0));
+            (Fed(from, Vec::new(), reads.clone()), reads)
+        }
+    }
+
+    impl std::io::Read for Fed {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.2.fetch_add(1, Ordering::SeqCst);
+            if self.1.is_empty() {
+                match self.0.recv() {
+                    Ok(bytes) => self.1 = bytes,
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = buf.len().min(self.1.len());
+            buf[..n].copy_from_slice(&self.1[..n]);
+            self.1.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn typed_lines_arrive_as_they_come_and_waiting_for_one_ends() {
+        use super::console::{Line, Lines};
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (fed, reads) = Fed::new(rx);
+        let lines = Lines::spawn(std::io::BufReader::new(fed), false);
+        assert_eq!(lines.next(Duration::from_millis(20)), Line::NotYet);
+        tx.send(b"half a ".to_vec()).unwrap();
+        assert_eq!(
+            lines.next(Duration::from_millis(20)),
+            Line::NotYet,
+            "no Enter yet"
+        );
+        tx.send(b"line\ntyped ahead\n".to_vec()).unwrap();
+        assert_eq!(
+            lines.next(Duration::from_secs(5)),
+            Line::Typed("half a line\n".into())
+        );
+        // the second line was read with the first and is queued without any I/O: once the
+        // reader has begun a third read, both lines are queued
+        assert!(within_five_seconds(|| reads.load(Ordering::SeqCst) == 3));
+        lines.discard();
+        assert_eq!(lines.next(Duration::from_millis(20)), Line::NotYet);
+        drop(tx);
+        assert_eq!(lines.next(Duration::from_secs(5)), Line::Closed);
+        assert_eq!(lines.next(Duration::from_millis(20)), Line::Closed);
+    }
+
+    /// Waits up to five seconds for `done`; whether it came.
+    fn within_five_seconds(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// An empty read is an end of input: Ctrl+D at a terminal, which ends that read only; the
+    /// end of a pipe or a file, which ends them all.
+    #[test]
+    fn at_a_terminal_typing_goes_on_after_an_end_of_input() {
+        use super::console::{Line, Lines};
+        use std::time::Duration;
+        for terminal in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (fed, reads) = Fed::new(rx);
+            let lines = Lines::spawn(std::io::BufReader::new(fed), terminal);
+            tx.send(Vec::new()).unwrap();
+            assert_eq!(lines.next(Duration::from_secs(5)), Line::Closed);
+            let _ = tx.send(b"hello\n".to_vec());
+            let next = lines.next(Duration::from_secs(5));
+            if !terminal {
+                assert_eq!(next, Line::Closed);
+                continue;
+            }
+            assert_eq!(next, Line::Typed("hello\n".into()));
+            // the reader waits in its third read; an end of input it reports is then dropped as
+            // typed ahead, which lets it read on
+            assert!(within_five_seconds(|| reads.load(Ordering::SeqCst) == 3));
+            tx.send(Vec::new()).unwrap();
+            assert!(within_five_seconds(|| {
+                lines.discard();
+                reads.load(Ordering::SeqCst) == 4
+            }));
+            tx.send(b"again\n".to_vec()).unwrap();
+            assert_eq!(
+                lines.next(Duration::from_secs(5)),
+                Line::Typed("again\n".into())
+            );
+        }
+    }
+
+    /// In a process of its own, with a console of its own: keys typed without Enter while the
+    /// reader waits for a line are dropped with the rest, so the next line holds only what is
+    /// typed after.
+    #[cfg(windows)]
+    #[test]
+    fn an_unfinished_line_at_a_console_is_discarded() {
+        use super::console::{self, Line};
+        use std::os::windows::io::IntoRawHandle;
+        use std::time::Duration;
+        use windows_sys::Win32::System::Console::{
+            AllocConsole, FreeConsole, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
+            SetStdHandle, WriteConsoleInputW, WriteConsoleW, CONSOLE_SCREEN_BUFFER_INFO,
+            INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
+        };
+        const CHILD: &str = "CV1TOUCH_TEST_CONSOLE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::an_unfinished_line_at_a_console_is_discarded",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        // SAFETY: this process's console is its own (it runs only this test).
+        unsafe {
+            FreeConsole();
+            assert_ne!(AllocConsole(), 0, "{}", std::io::Error::last_os_error());
+        }
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .unwrap()
+            .into_raw_handle();
+        // SAFETY: an open console input handle, kept for the rest of the process.
+        assert_ne!(unsafe { SetStdHandle(STD_INPUT_HANDLE, input) }, 0);
+        let screen = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONOUT$")
+            .unwrap()
+            .into_raw_handle();
+        let cursor = || {
+            // SAFETY: a plain structure filled in through the open screen buffer handle.
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { GetConsoleScreenBufferInfo(screen, &mut info) }, 0);
+            (info.dwCursorPosition.X, info.dwCursorPosition.Y)
+        };
+        let print = |text: &str| {
+            let text: Vec<u16> = text.encode_utf16().collect();
+            let mut written = 0;
+            // SAFETY: the screen buffer handle and a buffer of the stated length.
+            let ok = unsafe {
+                WriteConsoleW(
+                    screen,
+                    text.as_ptr(),
+                    text.len() as u32,
+                    &mut written,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(ok, 0);
+        };
+        // the waiting read has taken every key typed so far
+        let taken = || {
+            within_five_seconds(|| {
+                let mut events = 0;
+                // SAFETY: the console input handle and an output count.
+                unsafe { GetNumberOfConsoleInputEvents(input, &mut events) };
+                events == 0
+            })
+        };
+        let type_keys = |text: &str| {
+            let records: Vec<INPUT_RECORD> = text
+                .encode_utf16()
+                .flat_map(|c| {
+                    [1, 0].map(|down| {
+                        // SAFETY: a plain record, zeroed and then filled in.
+                        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+                        record.EventType = KEY_EVENT as u16;
+                        record.Event.KeyEvent.bKeyDown = down;
+                        record.Event.KeyEvent.wRepeatCount = 1;
+                        // the virtual-key code of a letter is its upper case; Enter's is
+                        // its character
+                        record.Event.KeyEvent.wVirtualKeyCode =
+                            u8::try_from(c).map_or(c, |b| u16::from(b.to_ascii_uppercase()));
+                        record.Event.KeyEvent.uChar.UnicodeChar = c;
+                        record
+                    })
+                })
+                .collect();
+            let mut written = 0;
+            // SAFETY: the console input handle and records it copies.
+            let ok = unsafe {
+                WriteConsoleInputW(input, records.as_ptr(), records.len() as u32, &mut written)
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        };
+        // the reader starts, and waits in a read for a line; the tool goes on printing
+        assert_eq!(console::next_line(Duration::from_millis(200)), Line::NotYet);
+        print("a capture's output\r\nand more\r\n");
+        let before = cursor();
+        type_keys("q");
+        assert!(taken());
+        console::discard_typed_ahead();
+        assert!(taken());
+        // the line is cleared where it was typed, and the cursor stays there
+        assert_eq!(cursor(), before);
+        type_keys("y\r");
+        match console::next_line(Duration::from_secs(5)) {
+            Line::Typed(line) => assert_eq!(line.trim_end(), "y"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// In a process of its own: the redirect moves the whole process's output, and the test
+    /// harness prints from other threads.
+    #[test]
+    fn output_goes_to_a_file_until_the_redirect_ends() {
+        use std::io::Write;
+        const CHILD: &str = "CV1TOUCH_TEST_REDIRECT";
+        let Some(path) = std::env::var_os(CHILD) else {
+            let dir = std::env::temp_dir().join(format!("cv1t-redirect-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("log");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::output_goes_to_a_file_until_the_redirect_ends",
+                    "--nocapture",
+                ])
+                .env(CHILD, &path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "to the log\n");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        };
+        let log = super::fs::append_private(std::path::Path::new(&path)).unwrap();
+        let redirect = super::console::redirect_output(&log).unwrap();
+        std::io::stdout().write_all(b"to the log\n").unwrap();
+        drop(redirect);
+        std::io::stdout()
+            .write_all(b"back on the terminal\n")
+            .unwrap();
     }
 
     #[test]

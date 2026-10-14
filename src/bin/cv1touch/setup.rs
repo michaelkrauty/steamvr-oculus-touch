@@ -317,31 +317,18 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
         if interrupted() {
             return Err("setup interrupted; completed steps are kept".into());
         }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        // SAFETY: one initialized poll descriptor; no device access.
-        let result = unsafe { libc::poll(&mut fd, 1, 100) };
-        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return Err(io::Error::last_os_error().to_string());
-        }
-        if result > 0 {
-            let mut line = String::new();
-            if io::stdin()
-                .lock()
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?
-                == 0
-            {
-                return Err("setup requires an interactive terminal; input closed".into());
+        match console::next_line(Duration::from_millis(100)) {
+            Line::Closed => {
+                return Err("setup requires an interactive terminal; input closed".into())
             }
-            let answer = line.trim().to_ascii_lowercase();
-            if allowed.contains(&answer.as_str()) {
-                return Ok(answer);
+            Line::Typed(line) => {
+                let answer = line.trim().to_ascii_lowercase();
+                if allowed.contains(&answer.as_str()) {
+                    return Ok(answer);
+                }
+                human_action(&ui::hint(allowed));
             }
-            human_action(&ui::hint(allowed));
+            Line::NotYet => {}
         }
     }
 }
@@ -362,46 +349,12 @@ impl StageLog {
     /// Runs `f` (which must not prompt) with stdout and stderr appended to the log; both are
     /// restored afterwards, also if the log cannot be opened (then `f` prints as usual).
     fn quiet<T>(&self, f: impl FnOnce() -> T) -> T {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let _ = io::stdout().flush();
-        let Ok(log) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)
-        else {
+        let Ok(log) = platform::fs::append_private(&self.path) else {
             return f();
         };
-        /// Puts stdout and stderr back however `f` ends, a panic included.
-        struct Restore([i32; 2]);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let _ = io::stdout().flush();
-                // SAFETY: restoring and closing descriptors this guard owns.
-                unsafe {
-                    libc::dup2(self.0[0], 1);
-                    libc::dup2(self.0[1], 2);
-                    libc::close(self.0[0]);
-                    libc::close(self.0[1]);
-                }
-            }
-        }
-        // SAFETY: plain descriptor duplication; the copies are owned by `Restore` or closed here.
-        let saved = unsafe { [libc::dup(1), libc::dup(2)] };
-        if saved.contains(&-1) {
-            for fd in saved.into_iter().filter(|&fd| fd >= 0) {
-                // SAFETY: closing a descriptor just duplicated.
-                unsafe { libc::close(fd) };
-            }
+        let Ok(_to_log) = console::redirect_output(&log) else {
             return f();
-        }
-        let _restore = Restore(saved);
-        // SAFETY: redirecting our own stdout/stderr to the log; `_restore` undoes it.
-        unsafe {
-            libc::dup2(log.as_raw_fd(), 1);
-            libc::dup2(log.as_raw_fd(), 2);
-        }
+        };
         f()
     }
 
@@ -534,27 +487,16 @@ fn go_signal(prompt: &str) -> Result<(), String> {
         if interrupted() {
             return Err("interrupted; nothing was recorded".into());
         }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        // SAFETY: one initialized poll descriptor.
-        if unsafe { libc::poll(&mut fd, 1, 20) } > 0 {
-            let mut line = String::new();
-            if io::stdin()
-                .lock()
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?
-                == 0
-            {
-                return Err("setup requires an interactive terminal; input closed".into());
+        match console::next_line(Duration::from_millis(20)) {
+            Line::Closed => {
+                return Err("setup requires an interactive terminal; input closed".into())
             }
-            match start_line(&line) {
+            Line::Typed(line) => match start_line(&line) {
                 Some(true) => return Ok(()),
                 Some(false) => return Err("stopped; nothing was recorded".into()),
                 None => println!("  (Enter or A starts, q quits)"),
-            }
+            },
+            Line::NotYet => {}
         }
         if raw_inputs().is_ok_and(|raw| a.pressed(&raw, shm::now_ns())) {
             return Ok(());

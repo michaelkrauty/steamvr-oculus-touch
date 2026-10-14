@@ -1507,3 +1507,143 @@ pub fn opt_out_of_throttling() -> io::Result<()> {
     }
     Ok(())
 }
+
+pub fn append_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+pub fn flush_console_input() {
+    use windows_sys::Win32::System::Console::{
+        FlushConsoleInputBuffer, GetConsoleMode, GetConsoleScreenBufferInfo,
+        GetNumberOfConsoleInputEvents, GetStdHandle, SetConsoleCursorPosition, WriteConsoleInputW,
+        CONSOLE_SCREEN_BUFFER_INFO, INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    const VK_ESCAPE: u16 = 0x1b;
+    // SAFETY: the standard handles, used only when they are a console; plain records and
+    // structures.
+    unsafe {
+        let input = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(input, &mut mode) == 0 {
+            return;
+        }
+        FlushConsoleInputBuffer(input);
+        // A read waiting for Enter keeps the keys typed so far in a line of its own, which the
+        // flush does not reach. Esc clears that line, as it does at a prompt.
+        let key = |down| {
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            record.EventType = KEY_EVENT as u16;
+            record.Event.KeyEvent.bKeyDown = down;
+            record.Event.KeyEvent.wRepeatCount = 1;
+            record.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE;
+            record.Event.KeyEvent.wVirtualScanCode = 1;
+            record.Event.KeyEvent.uChar.UnicodeChar = VK_ESCAPE;
+            record
+        };
+        let output = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut before: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        let screen = GetConsoleScreenBufferInfo(output, &mut before) != 0;
+        let escape = [key(1), key(0)];
+        let mut written = 0;
+        WriteConsoleInputW(input, escape.as_ptr(), 2, &mut written);
+        // Older consoles also put the cursor back where the waiting read began, before what
+        // was printed since: once the read has taken the Esc, the cursor goes back where it was.
+        if !screen {
+            return;
+        }
+        let until = std::time::Instant::now() + Duration::from_millis(100);
+        let mut events = 1;
+        while events > 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+            GetNumberOfConsoleInputEvents(input, &mut events);
+        }
+        let mut after: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if events == 0
+            && GetConsoleScreenBufferInfo(output, &mut after) != 0
+            && (after.dwCursorPosition.X, after.dwCursorPosition.Y)
+                != (before.dwCursorPosition.X, before.dwCursorPosition.Y)
+        {
+            SetConsoleCursorPosition(output, before.dwCursorPosition);
+        }
+    }
+}
+
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "system" fn interrupt_control(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT};
+    if !matches!(kind, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
+        return 0;
+    }
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    if kind == CTRL_CLOSE_EVENT {
+        // Windows ends the process when this returns: hold it while the tool puts things back
+        // (it exits from main; the system gives up after a few seconds)
+        std::thread::sleep(Duration::from_secs(10));
+    }
+    1
+}
+
+pub fn catch_interrupts() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: a handler that only stores a flag (and holds the process on a close).
+    unsafe { SetConsoleCtrlHandler(Some(interrupt_control), 1) };
+}
+
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// The original standard output and error handles, put back when dropped, and the file the
+/// standard handles name meanwhile (its own handle, so it stays open while they do).
+pub struct OutputRedirect {
+    saved: [HANDLE; 2],
+    _file: File,
+}
+
+impl OutputRedirect {
+    pub fn to(file: &File) -> io::Result<OutputRedirect> {
+        use std::io::Write;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let file = file.try_clone()?;
+        let _ = io::stdout().flush();
+        // SAFETY: plain queries and settings of this process's standard handles; Rust looks
+        // them up on every write, so its output follows.
+        unsafe {
+            let saved = [
+                GetStdHandle(STD_OUTPUT_HANDLE),
+                GetStdHandle(STD_ERROR_HANDLE),
+            ];
+            let to = file.as_raw_handle() as HANDLE;
+            if SetStdHandle(STD_OUTPUT_HANDLE, to) == 0 || SetStdHandle(STD_ERROR_HANDLE, to) == 0 {
+                let e = io::Error::last_os_error();
+                SetStdHandle(STD_OUTPUT_HANDLE, saved[0]);
+                SetStdHandle(STD_ERROR_HANDLE, saved[1]);
+                return Err(e);
+            }
+            Ok(OutputRedirect { saved, _file: file })
+        }
+    }
+}
+
+impl Drop for OutputRedirect {
+    fn drop(&mut self) {
+        use std::io::Write;
+        use windows_sys::Win32::System::Console::{
+            SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let _ = io::stdout().flush();
+        // SAFETY: putting back the handles saved at the redirect.
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, self.saved[0]);
+            SetStdHandle(STD_ERROR_HANDLE, self.saved[1]);
+        }
+    }
+}

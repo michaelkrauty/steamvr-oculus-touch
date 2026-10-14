@@ -5,7 +5,7 @@
 //! calibrate, consistency.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{self, Command as Process};
@@ -15,6 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cv1touch::calib::{self, capture, consistency, file, solve};
 use cv1touch::control;
+use cv1touch::platform::{
+    self,
+    console::{self, Line},
+};
 use cv1touch::recorder::{self, Reader};
 use cv1touch::shm::{self, ShmReader, HAND_LEFT, HAND_RIGHT};
 use cv1touch::status;
@@ -385,30 +389,14 @@ fn beeps(count: usize) {
     }
 }
 
-/// Enter-paced phases: one beep starts a phase, two end it, three end the whole run.
-/// Prints `--window NAME:START_NS:END_NS` arguments for rec-summary.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_interrupt(_: libc::c_int) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
-
-/// From now on SIGINT/SIGTERM/SIGHUP set a flag instead of killing the process, so `calibrate`
-/// can stop the recording and restore the daemon's mode however it is left.
+/// From now on an interrupt (Ctrl+C, closing the terminal) sets a flag instead of ending the
+/// process, so `calibrate` can stop the recording and restore the daemon's mode however it is left.
 fn catch_interrupts() {
-    // SAFETY: installing an async-signal-safe handler (one atomic store).
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_interrupt as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
-        }
-    }
+    console::catch_interrupts();
 }
 
 fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    console::interrupted()
 }
 
 fn commit_fit(interrupted: bool, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
@@ -418,27 +406,20 @@ fn commit_fit(interrupted: bool, save: impl FnOnce() -> Result<(), String>) -> R
     save()
 }
 
-/// Waits for Enter (or end of input). False when interrupted. Polls stdin because read_line
-/// retries through EINTR and would never notice the signal.
+/// Waits for Enter (or end of input). False when interrupted.
 fn wait_enter() -> bool {
     loop {
         if interrupted() {
             return false;
         }
-        let mut fds = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd.
-        if unsafe { libc::poll(&mut fds, 1, 200) } > 0 {
-            let mut line = String::new();
-            let _ = io::stdin().lock().read_line(&mut line);
+        if console::next_line(Duration::from_millis(200)) != Line::NotYet {
             return !interrupted();
         }
     }
 }
 
+/// Enter-paced phases: one beep starts a phase, two end it, three end the whole run.
+/// Prints `--window NAME:START_NS:END_NS` arguments for rec-summary.
 /// Exit code 130: interrupted.
 fn pace(phases: &[String]) -> i32 {
     match pace_windows(phases) {
@@ -1591,8 +1572,7 @@ fn measured_inputs(
 /// Drops whatever was typed before a prompt, so an Enter pressed during a capture cannot answer
 /// the next question or start the next step.
 fn discard_typed_ahead() {
-    // SAFETY: plain terminal ioctl on stdin; harmlessly fails when stdin is not a terminal.
-    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+    console::discard_typed_ahead();
 }
 
 /// A line typed at a start prompt: Some(true) Enter starts, Some(false) quit, None ask again.
@@ -1700,27 +1680,16 @@ fn input_gate(step: CalStep) -> Result<(), String> {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd.
-        if unsafe { libc::poll(&mut fd, 1, 30) } > 0 {
-            let mut line = String::new();
-            if io::stdin()
-                .lock()
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?
-                == 0
-            {
-                return Err("input calibration needs an interactive terminal; input closed".into());
+        match console::next_line(Duration::from_millis(30)) {
+            Line::Closed => {
+                return Err("input calibration needs an interactive terminal; input closed".into())
             }
-            match start_line(&line) {
+            Line::Typed(line) => match start_line(&line) {
                 Some(true) => return Ok(()),
                 Some(false) => return Err("input calibration stopped; no calibration saved".into()),
                 None => println!("      (Enter records now, q quits)"),
-            }
+            },
+            Line::NotYet => {}
         }
         if gate.update(step, &raw_inputs()?, shm::now_ns()) {
             return Ok(());
@@ -1757,30 +1726,15 @@ fn input_enter(prompt: &str) -> Result<(), String> {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd.
-        let ready = unsafe { libc::poll(&mut fd, 1, 100) };
-        if ready > 0 {
-            let mut line = String::new();
-            if io::stdin()
-                .lock()
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?
-                == 0
-            {
+        match console::next_line(Duration::from_millis(100)) {
+            Line::Closed => {
                 return Err(
                     "input calibration requires Enter confirmation; standard input is closed"
                         .into(),
-                );
+                )
             }
-            return Ok(());
-        }
-        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return Err(io::Error::last_os_error().to_string());
+            Line::Typed(_) => return Ok(()),
+            Line::NotYet => {}
         }
     }
 }
@@ -1818,7 +1772,6 @@ fn collect_inputs(
 }
 
 fn private_input_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1831,20 +1784,13 @@ fn private_input_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     ));
     let mut created = false;
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staged)
-            .map_err(|e| e.to_string())?;
+        let mut file = platform::fs::create_private(&staged).map_err(|e| e.to_string())?;
         created = true;
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| e.to_string())?;
-        std::fs::rename(&staged, path).map_err(|e| e.to_string())?;
-        std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())
+        platform::fs::rename_replacing(&staged, path).map_err(|e| e.to_string())?;
+        platform::fs::sync_dir(parent).map_err(|e| e.to_string())
     })();
     if created {
         let _ = std::fs::remove_file(staged);
@@ -1862,12 +1808,7 @@ fn remove_input_file(path: &Path) -> Result<(), String> {
 
 fn previous_input_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match platform::fs::open_read_nofollow(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -2346,15 +2287,7 @@ fn input_test() -> i32 {
                     };
                     break;
                 }
-                let mut fds = libc::pollfd {
-                    fd: 0,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one valid pollfd.
-                if unsafe { libc::poll(&mut fds, 1, 10) } > 0 {
-                    let mut line = String::new();
-                    let _ = io::stdin().lock().read_line(&mut line);
+                if console::next_line(Duration::from_millis(10)) != Line::NotYet {
                     break;
                 }
             }
@@ -2406,8 +2339,11 @@ fn input_test() -> i32 {
                 c.haptic_pulse(i, 3999);
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let mut line = String::new();
-            let _ = io::stdin().lock().read_line(&mut line);
+            let line = console::wait_line();
+            if interrupted() {
+                return 130;
+            }
+            let line = line.unwrap_or_default();
             results.push((
                 format!("{name}: haptic"),
                 line.trim().eq_ignore_ascii_case("y"),
@@ -2801,15 +2737,8 @@ fn capture_free_named_with_feedback(
                 }
             }
         }
-        let mut fds = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd.
-        if unsafe { libc::poll(&mut fds, 1, if feedback.is_some() { 20 } else { 200 }) } > 0 {
-            let mut line = String::new();
-            let _ = io::stdin().lock().read_line(&mut line);
+        let wait = Duration::from_millis(if feedback.is_some() { 20 } else { 200 });
+        if console::next_line(wait) != Line::NotYet {
             break;
         }
         let now = shm::now_ns();
@@ -5646,7 +5575,10 @@ mod tests {
     /// final beep do not enter the solve.
     #[test]
     fn wizard_recording_path_is_a_single_control_argument() {
-        let state = Path::new("/tmp/custom state directory/quoted \"name\"\nstate");
+        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        let state = PathBuf::from(format!(
+            "{root}/custom state directory/quoted \"name\"\nstate"
+        ));
         let recording = state.join("cv1touch/calib-123.rec");
         let line = control::record_start_line(&recording, false).unwrap();
         assert!(!line.contains('\n'));
@@ -5990,7 +5922,6 @@ mod tests {
 
     #[test]
     fn input_wizard_save_and_reset_restore_only_input_file_on_reload_failure() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("cv1t-input-transaction-{}", process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("input-calibration.json");
@@ -6015,10 +5946,14 @@ mod tests {
                     && std::fs::read(entry.path()).unwrap() == original
             }));
         write_input_calibration(&path, Some(&candidate), None).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             cv1touch::input_calibration::load(&path).unwrap(),
             Some(candidate)
@@ -6070,6 +6005,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Unix only: a symlink takes privileges to make on Windows.
+    #[cfg(unix)]
     #[test]
     fn input_wizard_never_follows_a_config_symlink_for_backup_or_reset() {
         let dir = std::env::temp_dir().join(format!("cv1t-input-symlink-{}", process::id()));
