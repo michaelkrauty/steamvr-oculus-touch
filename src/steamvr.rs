@@ -73,7 +73,12 @@ pub fn runtime_root() -> PathBuf {
     std::env::var_os("CV1TOUCH_STEAMVR")
         .map(PathBuf::from)
         .or_else(|| registered_path("runtime"))
-        .unwrap_or_else(|| steam_root().join("steamapps/common/SteamVR"))
+        .unwrap_or_else(|| {
+            steam_root()
+                .join("steamapps")
+                .join("common")
+                .join("SteamVR")
+        })
 }
 
 pub fn vrsettings_path() -> PathBuf {
