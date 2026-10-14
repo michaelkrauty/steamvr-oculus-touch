@@ -55,7 +55,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor, and waits until they have ended)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -104,6 +104,79 @@ fn send(line: &str) -> i32 {
             );
             1
         }
+    }
+}
+
+/// `cv1touch stop`'s exit code when the daemon, or its supervisor, still runs 10 s after it was
+/// asked to stop, or ran but never answered; 1 means it could not be reached at all, or refused.
+const STILL_RUNNING: i32 = 2;
+
+/// `cv1touch stop`: asks the daemon to stop, then waits until it, and a supervisor running it,
+/// have ended (10 s at most), so that what comes next, an uninstaller say, finds their files
+/// free. Each holds a lock in the runtime directory while it runs: this user's daemon, not
+/// another's. A daemon that does not answer yet, because it is starting or its supervisor is
+/// about to start it again, is asked again while either lock is held.
+fn stop() -> i32 {
+    const PATIENCE: Duration = Duration::from_secs(10);
+    const STEP: Duration = Duration::from_millis(200);
+    let runtime = control::runtime_dir();
+    let locks = [runtime.join("daemon.lock"), runtime.join("supervisor.lock")];
+    let running = || locks.iter().any(|lock| locked(lock));
+    let start = Instant::now();
+    let mut asked = ask_to_stop();
+    while asked.is_err() && running() && start.elapsed() < PATIENCE {
+        std::thread::sleep(STEP);
+        asked = ask_to_stop();
+    }
+    match asked {
+        Err(e) if running() => {
+            eprintln!("cv1touch: cv1touchd runs but did not answer within 10 s: {e}");
+            STILL_RUNNING
+        }
+        Err(e) => {
+            eprintln!(
+                "cv1touch: cannot reach cv1touchd at {}: {e}",
+                control::socket_path().display()
+            );
+            1
+        }
+        Ok(reply) if reply.starts_with("err") => {
+            println!("{reply}");
+            1
+        }
+        Ok(_) => {
+            let left = PATIENCE.saturating_sub(start.elapsed());
+            if ended(running, left, STEP) {
+                println!("stopped");
+                0
+            } else {
+                eprintln!("cv1touch: cv1touchd still runs 10 s after it was asked to stop");
+                STILL_RUNNING
+            }
+        }
+    }
+}
+
+fn ask_to_stop() -> io::Result<String> {
+    control::request(&control::socket_path(), "stop", Duration::from_secs(5))
+}
+
+/// Whether another process holds the lock file `path`.
+fn locked(path: &Path) -> bool {
+    matches!(control::lock_single_instance(path), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+}
+
+/// Whether `running` turns false within `timeout`, looked at every `step`.
+fn ended(mut running: impl FnMut() -> bool, timeout: Duration, step: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if !running() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(step);
     }
 }
 
@@ -5282,7 +5355,7 @@ fn main() {
         ["doctor"] => doctor(false),
         ["doctor", "--json"] => doctor(true),
         ["alignment", "reload"] => send("alignment reload"),
-        ["stop"] => send("stop"),
+        ["stop"] => stop(),
         ["report"] => report::run(None),
         ["sensors"] => sensors::status(),
         ["sensors", "install"] => sensors::install(),
@@ -5445,6 +5518,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `stop` waits for the daemon to end: true once it has, false when the time is up while it
+    /// still runs. The first look comes before any sleep, so a zero timeout still looks once.
+    #[test]
+    fn stop_waits_until_the_daemon_has_ended_or_the_time_is_up() {
+        let mut looks = 0;
+        let gone_at_third = || {
+            looks += 1;
+            looks < 3
+        };
+        assert!(ended(
+            gone_at_third,
+            Duration::from_secs(5),
+            Duration::from_millis(1)
+        ));
+        assert_eq!(looks, 3);
+        let mut looks = 0;
+        let forever = || {
+            looks += 1;
+            true
+        };
+        assert!(!ended(
+            forever,
+            Duration::from_millis(20),
+            Duration::from_millis(5)
+        ));
+        assert!(looks >= 2, "{looks}");
+        assert!(ended(|| false, Duration::ZERO, Duration::from_secs(1)));
+    }
+
+    /// A lock file is `locked` while a process holds it, and a missing one is not.
+    #[test]
+    fn a_lock_held_by_the_daemon_is_seen() {
+        let dir = std::env::temp_dir().join(format!("cv1t-stop-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.lock");
+        assert!(!locked(&path));
+        let held = control::lock_single_instance(&path).unwrap();
+        assert!(locked(&path));
+        drop(held);
+        assert!(!locked(&path));
+        assert!(!locked(&dir.join("no-such-dir").join("daemon.lock")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn raw_hand(trigger: f32, grip: f32, stick: [f32; 2]) -> RawInput {
         RawInput {
