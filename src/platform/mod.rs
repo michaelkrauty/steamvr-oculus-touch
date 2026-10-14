@@ -547,6 +547,14 @@ pub mod console {
         os::interrupted()
     }
 
+    /// Whether this process is the only one at its console, so that Windows closes the window
+    /// when it ends: a program started from Explorer or as an administrator by `run_elevated`
+    /// gets a console of its own, whose output vanishes with it. On Linux the terminal stays:
+    /// false.
+    pub fn closes_with_us() -> bool {
+        os::console_closes_with_us()
+    }
+
     /// Sends standard output and error to `to` until the guard is dropped, which puts them back.
     /// On Windows only the process's standard handles move: this process's Rust output and the
     /// programs it starts follow them, but a loaded library's C runtime writes where it did.
@@ -675,6 +683,8 @@ pub mod usb {
         pub driver: Option<String>,
         /// Why Windows does not run it: its Device Manager problem code (28: no driver).
         pub problem: Option<u32>,
+        /// The `id` of what it hangs off: an interface's device; on Windows a device's hub too.
+        pub parent: Option<String>,
     }
 
     /// The present devices of the USB vendor `vendor`, and their interfaces (on Windows, also
@@ -682,6 +692,39 @@ pub mod usb {
     /// on Windows by `id`.
     pub fn devices(vendor: u16) -> io::Result<Vec<Node>> {
         os::usb_devices(vendor)
+    }
+
+    /// The device interface a device node set up by `use_winusb` is offered under (Windows):
+    /// libusb finds a WinUSB device by the interface its registry entry names.
+    pub const WINUSB_INTERFACE: &str = "{00CFBFC2-E6AB-4A1F-98D6-1E197D3841CC}";
+
+    /// Gives the device node `id` Windows' own WinUSB driver, the "WinUsb Device" of the
+    /// Microsoft-signed winusb.inf, as choosing it in Device Manager does, offered under
+    /// `WINUSB_INTERFACE`. No other driver or certificate is installed. True when Windows could
+    /// not restart the device (a program holds it) and needs a restart to finish. Needs an
+    /// administrator. Linux has no such step (udev rules give access): Unsupported.
+    pub fn use_winusb(id: &str) -> io::Result<bool> {
+        os::use_winusb(id)
+    }
+
+    /// Whether `use_winusb` set up the device node `id`: it names `WINUSB_INTERFACE`.
+    pub fn set_up_by_us(id: &str) -> bool {
+        os::set_up_by_us(id)
+    }
+
+    /// Takes the device node `id` out and finds it again, as Device Manager's "Uninstall
+    /// device" does: Windows then gives it the driver it would choose itself, or none. True when
+    /// Windows needs a restart to finish, as `use_winusb` says. Needs an administrator;
+    /// Unsupported on Linux.
+    pub fn remove_driver(id: &str) -> io::Result<bool> {
+        os::remove_driver(id)
+    }
+
+    /// Whether this process may open the device `id` the way the engine does (Linux: its file
+    /// under /dev/bus/usb, for reading and writing, which the udev rules allow the active
+    /// session): PermissionDenied when not. On Windows the driver decides: Unsupported.
+    pub fn can_open(id: &str) -> io::Result<()> {
+        os::can_open(id)
     }
 }
 
@@ -734,6 +777,28 @@ pub mod process {
     /// where there is none to ask (Linux, from a command-line tool).
     pub fn show_file(path: &std::path::Path) -> bool {
         os::show_file(path)
+    }
+
+    /// Whether this process has an administrator's rights: an elevated token on Windows, root on
+    /// Linux.
+    pub fn elevated() -> bool {
+        os::elevated()
+    }
+
+    /// Runs this program again with `args` (plain words: letters, digits and '-') as an
+    /// administrator, Windows asking the user first, and waits for it: its exit code.
+    /// PermissionDenied when the user says no; Unsupported on Linux.
+    pub fn run_elevated(args: &[&str]) -> io::Result<i32> {
+        if !args
+            .iter()
+            .all(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{args:?} are not plain words"),
+            ));
+        }
+        os::run_elevated(args)
     }
 
     /// Starts the program `command` runs without a console window of its own (Windows); on
@@ -1363,6 +1428,74 @@ mod tests {
                 .iter()
                 .all(|n| n.id.to_uppercase().contains("VID_2833")));
         }
+    }
+
+    /// Gives a spare USB device Windows' WinUSB, reads its interface back, and takes the driver
+    /// off again, which hands it back to the driver it had. Run as an administrator with the
+    /// device's vendor and instance ID: CV1TOUCH_TEST_WINUSB_DEVICE=46F4,USB\VID_46F4&PID_0001\...
+    /// cargo test -- --ignored winusb
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an administrator and a spare USB device"]
+    fn winusb_is_given_and_taken_off() {
+        use super::usb;
+        let spec = std::env::var("CV1TOUCH_TEST_WINUSB_DEVICE").unwrap();
+        let (vendor, id) = spec.split_once(',').unwrap();
+        let vendor = u16::from_str_radix(vendor, 16).unwrap();
+        let driver = || {
+            usb::devices(vendor)
+                .unwrap()
+                .into_iter()
+                .find(|n| n.id.eq_ignore_ascii_case(id))
+                .unwrap()
+                .driver
+        };
+        let before = driver();
+        assert!(!before
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case("WinUSB")));
+        assert!(super::process::elevated());
+        assert!(!usb::use_winusb(id).unwrap(), "a restart was asked for");
+        assert!(driver().is_some_and(|d| d.eq_ignore_ascii_case("WinUSB")));
+        assert!(usb::set_up_by_us(id));
+        assert!(!usb::remove_driver(id).unwrap(), "a restart was asked for");
+        assert_eq!(driver(), before);
+        assert!(!usb::set_up_by_us(id));
+    }
+
+    /// Under cargo the console is shared with cargo and the shell (Linux has no console that
+    /// closes); only a program started on its own, as `run_elevated` does, is alone at one.
+    #[test]
+    fn the_console_is_shared_under_cargo() {
+        assert!(!super::console::closes_with_us());
+    }
+
+    /// In a process of its own, with a console of its own, as a program started from Explorer
+    /// or by `run_elevated` has: that console closes with it.
+    #[cfg(windows)]
+    #[test]
+    fn the_console_closes_with_a_program_alone_at_it() {
+        use windows_sys::Win32::System::Console::{AllocConsole, FreeConsole};
+        const CHILD: &str = "CV1TOUCH_TEST_OWN_CONSOLE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::the_console_closes_with_a_program_alone_at_it",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        // SAFETY: this process's console is its own (it runs only this test).
+        unsafe {
+            FreeConsole();
+            assert_ne!(AllocConsole(), 0, "{}", std::io::Error::last_os_error());
+        }
+        assert!(super::console::closes_with_us());
     }
 
     #[test]

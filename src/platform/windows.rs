@@ -1499,9 +1499,9 @@ unsafe fn device_property(
 pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
     use crate::platform::usb::Node;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_DevNode_Status, SetupDiEnumDeviceInfo, SetupDiGetDeviceInstanceIdW, CR_SUCCESS,
-        DIGCF_ALLCLASSES, DN_HAS_PROBLEM, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_SERVICE,
-        SP_DEVINFO_DATA,
+        CM_Get_DevNode_Status, CM_Get_Device_IDW, CM_Get_Parent, SetupDiEnumDeviceInfo,
+        SetupDiGetDeviceInstanceIdW, CR_SUCCESS, DIGCF_ALLCLASSES, DN_HAS_PROBLEM,
+        SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_SERVICE, SP_DEVINFO_DATA,
     };
     let wanted = format!("VID_{vendor:04X}");
     // SAFETY: SetupAPI calls with valid out-pointers and correctly sized structures; the device
@@ -1551,6 +1551,15 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
                 == CR_SUCCESS
                 && status & DN_HAS_PROBLEM != 0)
                 .then_some(problem);
+            let mut parent_node = 0;
+            let mut parent = [0u16; 512];
+            let parent = (CM_Get_Parent(&mut parent_node, data.DevInst, 0) == CR_SUCCESS
+                && CM_Get_Device_IDW(parent_node, parent.as_mut_ptr(), parent.len() as u32, 0)
+                    == CR_SUCCESS)
+                .then(|| {
+                    let len = parent.iter().position(|&c| c == 0).unwrap_or(parent.len());
+                    String::from_utf16_lossy(&parent[..len])
+                });
             nodes.push(Node {
                 id,
                 product,
@@ -1559,6 +1568,7 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
                     .unwrap_or_default(),
                 driver: device_property(set, &data, SPDRP_SERVICE),
                 problem,
+                parent,
             });
         }
         SetupDiDestroyDeviceInfoList(set);
@@ -1651,6 +1661,338 @@ pub fn show_file(path: &Path) -> bool {
         .raw_arg(format!("/select,\"{}\"", path.display()))
         .spawn()
         .is_ok()
+}
+
+/// A device node, opened alone in a device information set of its own.
+struct DeviceNode {
+    set: windows_sys::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+    data: windows_sys::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
+}
+
+impl DeviceNode {
+    fn open(id: &str) -> io::Result<DeviceNode> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            SetupDiCreateDeviceInfoList, SetupDiOpenDeviceInfoW, SP_DEVINFO_DATA,
+        };
+        // SAFETY: an empty set, then the node by its instance ID into it; the set is destroyed
+        // with the DeviceNode.
+        unsafe {
+            let set = SetupDiCreateDeviceInfoList(std::ptr::null(), std::ptr::null_mut());
+            if set == INVALID_HANDLE_VALUE as isize {
+                return Err(io::Error::last_os_error());
+            }
+            let mut node = DeviceNode {
+                set,
+                data: std::mem::zeroed(),
+            };
+            node.data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+            let id = wide(id);
+            if SetupDiOpenDeviceInfoW(set, id.as_ptr(), std::ptr::null_mut(), 0, &mut node.data)
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(node)
+        }
+    }
+
+    /// The node's own registry key (its "Device Parameters"), opened or created.
+    fn key(&self, create: bool) -> io::Result<windows_sys::Win32::System::Registry::HKEY> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            SetupDiCreateDevRegKeyW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DEV,
+        };
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        // SAFETY: the node of a live set; the key is closed by the caller.
+        let key = unsafe {
+            if create {
+                SetupDiCreateDevRegKeyW(
+                    self.set,
+                    &self.data,
+                    DICS_FLAG_GLOBAL,
+                    0,
+                    DIREG_DEV,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } else {
+                SetupDiOpenDevRegKey(
+                    self.set,
+                    &self.data,
+                    DICS_FLAG_GLOBAL,
+                    0,
+                    DIREG_DEV,
+                    KEY_READ,
+                )
+            }
+        };
+        if key == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(key)
+    }
+}
+
+impl Drop for DeviceNode {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::SetupDiDestroyDeviceInfoList;
+        // SAFETY: the set this node owns, destroyed once.
+        unsafe { SetupDiDestroyDeviceInfoList(self.set) };
+    }
+}
+
+/// The class of winusb.inf's devices, USBDevice.
+const USB_DEVICE_CLASS: &str = "{88BAE032-5A81-49F0-BC3D-A4FF138216D6}";
+/// The generic "WinUsb Device" in winusb.inf, by the compatible ID it lists it under.
+const WINUSB_GENERIC: &str = "USB\\MS_COMP_WINUSB";
+
+pub fn use_winusb(id: &str) -> io::Result<bool> {
+    use crate::platform::usb::WINUSB_INTERFACE;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        DiInstallDevice, SetupDiBuildDriverInfoList, SetupDiEnumDriverInfoW,
+        SetupDiGetDeviceInstallParamsW, SetupDiGetDriverInfoDetailW,
+        SetupDiSetDeviceInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+        SetupDiSetSelectedDriverW, DI_ENUMSINGLEINF, DI_FLAGSEX_ALLOWEXCLUDEDDRVS,
+        SPDIT_CLASSDRIVER, SPDRP_CLASSGUID, SP_DEVINSTALL_PARAMS_W, SP_DRVINFO_DATA_V2_W,
+        SP_DRVINFO_DETAIL_DATA_W,
+    };
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegSetValueExW, REG_MULTI_SZ};
+    let mut node = DeviceNode::open(id)?;
+    // SAFETY: SetupAPI and registry calls on the node of a live set, with correctly sized
+    // structures and buffers; the registry key is closed once.
+    unsafe {
+        // the device interface WinUSB offers the node under, for libusb to find it by
+        let key = node.key(true)?;
+        let guids: Vec<u16> = WINUSB_INTERFACE.encode_utf16().chain([0, 0]).collect();
+        let status = RegSetValueExW(
+            key,
+            wide("DeviceInterfaceGUIDs").as_ptr(),
+            0,
+            REG_MULTI_SZ,
+            guids.as_ptr().cast(),
+            (guids.len() * 2) as u32,
+        );
+        RegCloseKey(key);
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // winusb.inf's class, so its drivers are the node's class drivers
+        let class = wide(USB_DEVICE_CLASS);
+        if SetupDiSetDeviceRegistryPropertyW(
+            node.set,
+            &mut node.data,
+            SPDRP_CLASSGUID,
+            class.as_ptr().cast(),
+            (class.len() * 2) as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // the drivers of winusb.inf alone, those that do not list the node's IDs included
+        let mut params: SP_DEVINSTALL_PARAMS_W = std::mem::zeroed();
+        params.cbSize = std::mem::size_of::<SP_DEVINSTALL_PARAMS_W>() as u32;
+        if SetupDiGetDeviceInstallParamsW(node.set, &node.data, &mut params) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let windows = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let inf = std::path::Path::new(&windows).join(r"INF\winusb.inf");
+        let inf: Vec<u16> = inf.as_os_str().encode_wide().chain([0]).collect();
+        if inf.len() > params.DriverPath.len() {
+            return Err(io::Error::other("the Windows directory's path is too long"));
+        }
+        params.DriverPath[..inf.len()].copy_from_slice(&inf);
+        params.Flags |= DI_ENUMSINGLEINF;
+        params.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
+        if SetupDiSetDeviceInstallParamsW(node.set, &node.data, &params) == 0
+            || SetupDiBuildDriverInfoList(node.set, &mut node.data, SPDIT_CLASSDRIVER) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut chosen = None;
+        for index in 0.. {
+            let mut driver: SP_DRVINFO_DATA_V2_W = std::mem::zeroed();
+            driver.cbSize = std::mem::size_of::<SP_DRVINFO_DATA_V2_W>() as u32;
+            if SetupDiEnumDriverInfoW(node.set, &node.data, SPDIT_CLASSDRIVER, index, &mut driver)
+                == 0
+            {
+                break;
+            }
+            // the details end in the hardware IDs; 4 KB holds winusb.inf's
+            let mut storage = vec![0u64; 512];
+            let detail = storage.as_mut_ptr() as *mut SP_DRVINFO_DETAIL_DATA_W;
+            (*detail).cbSize = std::mem::size_of::<SP_DRVINFO_DETAIL_DATA_W>() as u32;
+            if SetupDiGetDriverInfoDetailW(
+                node.set,
+                &node.data,
+                &driver,
+                detail,
+                (storage.len() * 8) as u32,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+            let ids = std::ptr::addr_of!((*detail).HardwareID) as *const u16;
+            let mut len = 0;
+            while *ids.add(len) != 0 {
+                len += 1;
+            }
+            let id = String::from_utf16_lossy(std::slice::from_raw_parts(ids, len));
+            if id.eq_ignore_ascii_case(WINUSB_GENERIC) {
+                chosen = Some(driver);
+                break;
+            }
+        }
+        let mut driver = chosen.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "winusb.inf has no WinUsb Device")
+        })?;
+        if SetupDiSetSelectedDriverW(node.set, &mut node.data, &mut driver) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut reboot = 0;
+        if DiInstallDevice(
+            std::ptr::null_mut(),
+            node.set,
+            &node.data,
+            &driver,
+            0,
+            &mut reboot,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(reboot != 0)
+    }
+}
+
+pub fn set_up_by_us(id: &str) -> bool {
+    use crate::platform::usb::WINUSB_INTERFACE;
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegQueryValueExW};
+    let Ok(node) = DeviceNode::open(id) else {
+        return false;
+    };
+    let Ok(key) = node.key(false) else {
+        return false;
+    };
+    let mut buf = [0u16; 128];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: an open key and a buffer of the stated size in bytes; the key is closed once.
+    let status = unsafe {
+        let status = RegQueryValueExW(
+            key,
+            wide("DeviceInterfaceGUIDs").as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        );
+        RegCloseKey(key);
+        status
+    };
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    status == 0 && String::from_utf16_lossy(&buf[..len]).eq_ignore_ascii_case(WINUSB_INTERFACE)
+}
+
+pub fn remove_driver(id: &str) -> io::Result<bool> {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Locate_DevNodeW, CM_Reenumerate_DevNode, DiUninstallDevice, CM_LOCATE_DEVNODE_NORMAL,
+        CM_REENUMERATE_SYNCHRONOUS, CR_SUCCESS,
+    };
+    let node = DeviceNode::open(id)?;
+    // SAFETY: the node of a live set; then the device tree's root, looked up and rescanned.
+    unsafe {
+        let mut reboot = 0;
+        if DiUninstallDevice(std::ptr::null_mut(), node.set, &node.data, 0, &mut reboot) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut root = 0;
+        if CM_Locate_DevNodeW(&mut root, std::ptr::null(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS
+            || CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS) != CR_SUCCESS
+        {
+            return Err(io::Error::other(
+                "Windows did not look for the device again: unplug it and plug it back in",
+            ));
+        }
+        Ok(reboot != 0)
+    }
+}
+
+pub fn can_open(_id: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "on Windows the driver a device runs with says whether it can be opened",
+    ))
+}
+
+pub fn elevated() -> bool {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: this process's token, queried with a correctly sized structure and closed once.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut size = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        ) != 0;
+        CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+pub fn run_elevated(args: &[&str]) -> io::Result<i32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    const SW_SHOWNORMAL: i32 = 1;
+    const ERROR_CANCELLED: i32 = 1223;
+    let exe: Vec<u16> = std::env::current_exe()?
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let (verb, parameters) = (wide("runas"), wide(&args.join(" ")));
+    // SAFETY: a correctly sized structure of NUL-terminated strings that outlive the call; the
+    // process handle it returns is waited on and closed once.
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = exe.as_ptr();
+        info.lpParameters = parameters.as_ptr();
+        info.nShow = SW_SHOWNORMAL;
+        if ShellExecuteExW(&mut info) == 0 {
+            let e = io::Error::last_os_error();
+            return Err(if e.raw_os_error() == Some(ERROR_CANCELLED) {
+                io::Error::new(io::ErrorKind::PermissionDenied, "the user said no")
+            } else {
+                e
+            });
+        }
+        if info.hProcess.is_null() {
+            return Err(io::Error::other("Windows started no process"));
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code = 0;
+        let got = GetExitCodeProcess(info.hProcess, &mut code) != 0;
+        CloseHandle(info.hProcess);
+        if !got {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(code as i32)
+    }
 }
 
 pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
@@ -1786,6 +2128,14 @@ pub fn append_private(path: &Path) -> io::Result<File> {
         .append(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+}
+
+pub fn console_closes_with_us() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut processes = [0u32; 2];
+    // SAFETY: a buffer of the stated length; the count of processes at this console comes back,
+    // 0 when there is none.
+    unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) == 1 }
 }
 
 pub fn flush_console_input() {

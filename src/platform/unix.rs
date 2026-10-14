@@ -803,6 +803,10 @@ pub fn flush_console_input() {
     unsafe { libc::tcflush(0, libc::TCIFLUSH) };
 }
 
+pub fn console_closes_with_us() -> bool {
+    false
+}
+
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_interrupt(_: libc::c_int) {
@@ -994,12 +998,13 @@ pub(crate) fn usb_devices_in(
             },
             driver: driver(&dir),
             problem: None,
+            parent: None,
         });
     }
     for name in &names {
-        let Some(product) = name
+        let Some((device, product)) = name
             .split_once(':')
-            .and_then(|(device, _)| products.get(device))
+            .and_then(|(device, _)| Some((device, products.get(device)?)))
         else {
             continue;
         };
@@ -1012,6 +1017,7 @@ pub(crate) fn usb_devices_in(
             name: format!("interface {number} ({class})"),
             driver: driver(&dir),
             problem: None,
+            parent: Some(device.to_string()),
         });
     }
     // by device, then interface: "3-1" and its interfaces before "3-1.1", which ':' after '.'
@@ -1056,6 +1062,65 @@ pub fn system_description() -> String {
 
 pub fn desktop() -> Option<std::path::PathBuf> {
     None
+}
+
+fn udev_gives_access() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux needs no driver for the sensors: udev rules give access",
+    )
+}
+
+pub fn use_winusb(_id: &str) -> io::Result<bool> {
+    Err(udev_gives_access())
+}
+
+pub fn set_up_by_us(_id: &str) -> bool {
+    false
+}
+
+pub fn remove_driver(_id: &str) -> io::Result<bool> {
+    Err(udev_gives_access())
+}
+
+pub fn can_open(id: &str) -> io::Result<()> {
+    can_open_in(
+        Path::new("/sys/bus/usb/devices"),
+        Path::new("/dev/bus/usb"),
+        id,
+    )
+}
+
+/// `can_open` with the sysfs devices directory `root` and the device files' directory `dev`:
+/// the device's file is named by the bus and device numbers sysfs gives.
+pub(crate) fn can_open_in(root: &Path, dev: &Path, id: &str) -> io::Result<()> {
+    let number = |name: &str| -> io::Result<u32> {
+        let text = std::fs::read_to_string(root.join(id).join(name))?;
+        text.trim().parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{id}: {name} is not a number"),
+            )
+        })
+    };
+    let (bus, device) = (number("busnum")?, number("devnum")?);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dev.join(format!("{bus:03}")).join(format!("{device:03}")))
+        .map(drop)
+}
+
+pub fn elevated() -> bool {
+    // SAFETY: a plain query.
+    unsafe { libc::geteuid() == 0 }
+}
+
+pub fn run_elevated(_args: &[&str]) -> io::Result<i32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "run it with sudo instead",
+    ))
 }
 
 pub fn show_file(_path: &Path) -> bool {
@@ -1153,23 +1218,64 @@ mod tests {
         file("1-4/idVendor", "046d");
         file("1-4/idProduct", "c52b");
         file("1-4:1.0/bInterfaceClass", "03");
-        let node = |id: &str, product, name: &str, driver: Option<&str>| Node {
-            id: id.into(),
-            product,
-            name: name.into(),
-            driver: driver.map(String::from),
-            problem: None,
-        };
+        let node =
+            |id: &str, product, name: &str, driver: Option<&str>, parent: Option<&str>| Node {
+                id: id.into(),
+                product,
+                name: name.into(),
+                driver: driver.map(String::from),
+                problem: None,
+                parent: parent.map(String::from),
+            };
         assert_eq!(
             usb_devices_in(&root, 0x2833).unwrap(),
             [
-                node("1-2", 0x0211, "Rift Sensor (5000 Mb/s)", Some("usb")),
-                node("1-2:1.0", 0x0211, "interface 00 (video)", Some("uvcvideo")),
-                node("3-1", 0x0031, "", None),
-                node("3-1:1.1", 0x0031, "interface 01 (HID)", None),
-                node("3-1.2", 0x0330, "", None),
+                node("1-2", 0x0211, "Rift Sensor (5000 Mb/s)", Some("usb"), None),
+                node(
+                    "1-2:1.0",
+                    0x0211,
+                    "interface 00 (video)",
+                    Some("uvcvideo"),
+                    Some("1-2")
+                ),
+                node("3-1", 0x0031, "", None, None),
+                node("3-1:1.1", 0x0031, "interface 01 (HID)", None, Some("3-1")),
+                node("3-1.2", 0x0330, "", None, None),
             ]
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A sensor is opened through its file under /dev/bus/usb, which sysfs names by bus and
+    /// device number; one the udev rules do not cover is denied.
+    #[test]
+    fn a_sensor_is_opened_through_its_device_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cv1t-usb-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (sys, dev) = (root.join("sys"), root.join("dev"));
+        std::fs::create_dir_all(sys.join("2-5")).unwrap();
+        std::fs::create_dir_all(dev.join("002")).unwrap();
+        std::fs::write(sys.join("2-5/busnum"), "2\n").unwrap();
+        std::fs::write(sys.join("2-5/devnum"), "5\n").unwrap();
+        std::fs::write(dev.join("002/005"), "").unwrap();
+        can_open_in(&sys, &dev, "2-5").unwrap();
+        assert_eq!(
+            can_open_in(&sys, &dev, "2-6").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // the engine writes to the device too: a file it may only read is as good as none
+        for mode in [0o444, 0o000] {
+            std::fs::set_permissions(dev.join("002/005"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            if !elevated() {
+                assert_eq!(
+                    can_open_in(&sys, &dev, "2-5").unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "mode {mode:o}"
+                );
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

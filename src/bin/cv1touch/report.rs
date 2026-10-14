@@ -484,6 +484,7 @@ mod tests {
             name: "interface 00 (video)".into(),
             driver: None,
             problem: Some(28),
+            parent: Some("1-2".into()),
         };
         assert_eq!(
             usb_lines(&[node]),
