@@ -2,8 +2,9 @@
 // Copyright 2026 michaelkrauty
 
 //! Settings changed while the daemon runs that outlast it: how much of the tracked motion SteamVR
-//! extrapolates poses with (`cv1touch prediction`). The daemon saves them on every change and
-//! reads them when it starts; without a usable file it goes on with the defaults.
+//! extrapolates positions and orientations with (`cv1touch prediction`). The daemon saves them on
+//! every change and reads them when it starts; without a usable file it goes on with the
+//! defaults.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,22 @@ pub const FORMAT: &str = "cv1touch-settings";
 pub struct Settings {
     pub format: String,
     pub version: u32,
-    /// Percent of the tracked velocities SteamVR extrapolates poses with: 100 as tracked, 0 none.
+    /// Percent of the tracked linear velocity SteamVR extrapolates positions with: 100 as
+    /// tracked, 0 none.
     pub prediction_percent: u32,
+    /// Percent of the tracked angular velocity SteamVR extrapolates orientations with; a file
+    /// without it (written before positions and orientations had their own) means the same as
+    /// for positions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_prediction_percent: Option<u32>,
+}
+
+impl Settings {
+    /// The percent for orientations.
+    pub fn rotation_percent(&self) -> u32 {
+        self.rotation_prediction_percent
+            .unwrap_or(self.prediction_percent)
+    }
 }
 
 impl Default for Settings {
@@ -26,6 +41,7 @@ impl Default for Settings {
             format: FORMAT.into(),
             version: 1,
             prediction_percent: 100,
+            rotation_prediction_percent: None,
         }
     }
 }
@@ -50,8 +66,8 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if s.format != FORMAT {
         return Err(format!("{}: not a {FORMAT} file", path.display()));
     }
-    if s.prediction_percent > 100 {
-        return Err(format!("{}: prediction_percent over 100", path.display()));
+    if s.prediction_percent > 100 || s.rotation_percent() > 100 {
+        return Err(format!("{}: a prediction percent over 100", path.display()));
     }
     Ok(s)
 }
@@ -96,11 +112,27 @@ mod tests {
     fn saved_settings_load_back() {
         let path = temp("round-trip");
         let s = Settings {
-            prediction_percent: 0,
+            prediction_percent: 100,
+            rotation_prediction_percent: Some(0),
             ..Settings::default()
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), Ok(s));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A file written before orientations had their own percent sets both.
+    #[test]
+    fn an_older_file_sets_positions_and_orientations_alike() {
+        let path = temp("older");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":0}"#,
+        )
+        .unwrap();
+        let s = load(&path).unwrap();
+        assert_eq!((s.prediction_percent, s.rotation_percent()), (0, 0));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -112,6 +144,7 @@ mod tests {
         for text in [
             "not json",
             r#"{"format":"cv1touch-settings","version":1,"prediction_percent":101}"#,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":0,"rotation_prediction_percent":101}"#,
             r#"{"format":"something-else","version":1,"prediction_percent":0}"#,
         ] {
             std::fs::write(&path, text).unwrap();

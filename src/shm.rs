@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(size_of::<SensorStatus>(), 80);
         assert_eq!(size_of::<Alignment>(), 104);
         assert_eq!(size_of::<ffi::cv1t_shm>(), 1328);
-        assert_eq!(ffi::CV1T_SHM_VERSION, 3);
+        assert_eq!(ffi::CV1T_SHM_VERSION, 4);
     }
 
     #[test]

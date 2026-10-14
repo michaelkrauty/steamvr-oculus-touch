@@ -43,11 +43,17 @@ vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment
 			p.vecDriverFromHeadTranslation[i] = al->render_pos[hand][i];
 	}
 	p.qRotation = quat(st->orient);
+	// SteamVR extrapolates with the share of the tracked motion `cv1touch prediction` set: all of
+	// it until the daemon has said
+	const bool set = al && (al->valid & CV1T_ALIGN_PREDICTION);
+	const double position_share = set ? al->prediction_position / 100.0 : 1.0;
+	const double rotation_share = set ? al->prediction_rotation / 100.0 : 1.0;
 	const double w_body[3] = {(double)st->ang_vel[0] - st->gyro_bias[0], (double)st->ang_vel[1] - st->gyro_bias[1], (double)st->ang_vel[2] - st->gyro_bias[2]};
 	rotate(st->orient, w_body, p.vecAngularVelocity);
 	for (int i = 0; i < 3; i++) {
 		p.vecPosition[i] = st->pos[i];
-		p.vecVelocity[i] = st->lin_vel[i];
+		p.vecVelocity[i] = st->lin_vel[i] * position_share;
+		p.vecAngularVelocity[i] *= rotation_share;
 	}
 	p.poseTimeOffset = age > 0 ? -static_cast<double>(age) * 1e-9 : 0.0;
 	const bool fixed = st->last_position_fix_host_ns != 0 &&

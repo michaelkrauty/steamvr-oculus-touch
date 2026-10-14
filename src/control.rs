@@ -48,9 +48,13 @@ pub enum Command {
     UniverseWatch(Option<bool>),
     /// Turn the velocity shaping for SteamVR's prediction on or off (None shows it).
     Shaping(Option<bool>),
-    /// Percent of the velocities SteamVR extrapolates poses with: 100 as tracked (and shaped), 0
-    /// none, so SteamVR shows each pose where it was measured (None shows it).
-    Prediction(Option<u32>),
+    /// Percent of the tracked velocities SteamVR extrapolates positions (linear velocity) and
+    /// orientations (angular velocity) with: 100 as tracked (and shaped), 0 none, so SteamVR shows
+    /// each where it was measured. None leaves that one as it is; both None shows them.
+    Prediction {
+        position: Option<u32>,
+        rotation: Option<u32>,
+    },
     /// Arm or disarm input injection for automated tests (None shows it). Armed, it disarms
     /// itself after a while.
     TestInject(Option<bool>),
@@ -244,14 +248,36 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["shaping", "on"] => Ok(Command::Shaping(Some(true))),
         ["shaping", "off"] => Ok(Command::Shaping(Some(false))),
         ["shaping", ..] => Err("usage: shaping [on|off]".into()),
-        ["prediction"] => Ok(Command::Prediction(None)),
-        ["prediction", percent] => percent
-            .parse::<u32>()
-            .ok()
-            .filter(|p| *p <= 100)
-            .map(|p| Command::Prediction(Some(p)))
-            .ok_or_else(|| "prediction must be a whole percent from 0 to 100".into()),
-        ["prediction", ..] => Err("usage: prediction [PERCENT]".into()),
+        ["prediction"] => Ok(Command::Prediction {
+            position: None,
+            rotation: None,
+        }),
+        ["prediction", rest @ ..] => {
+            let percent = |p: &str| {
+                p.parse::<u32>()
+                    .ok()
+                    .filter(|p| *p <= 100)
+                    .ok_or_else(|| "prediction must be a whole percent from 0 to 100".to_string())
+            };
+            match rest {
+                ["position" | "rotation"] => {
+                    Err("usage: prediction position|rotation PERCENT".into())
+                }
+                [p] => percent(p).map(|p| Command::Prediction {
+                    position: Some(p),
+                    rotation: Some(p),
+                }),
+                ["position", p] => percent(p).map(|p| Command::Prediction {
+                    position: Some(p),
+                    rotation: None,
+                }),
+                ["rotation", p] => percent(p).map(|p| Command::Prediction {
+                    position: None,
+                    rotation: Some(p),
+                }),
+                _ => Err("usage: prediction [PERCENT] | prediction position|rotation PERCENT".into()),
+            }
+        }
         ["universe-watch"] => Ok(Command::UniverseWatch(None)),
         ["universe-watch", "on"] => Ok(Command::UniverseWatch(Some(true))),
         ["universe-watch", "off"] => Ok(Command::UniverseWatch(Some(false))),
@@ -502,15 +528,24 @@ mod tests {
 
     #[test]
     fn parse_prediction() {
-        assert_eq!(parse("prediction"), Ok(Command::Prediction(None)));
-        assert_eq!(parse("prediction 0"), Ok(Command::Prediction(Some(0))));
-        assert_eq!(parse("prediction 100"), Ok(Command::Prediction(Some(100))));
+        let set = |position, rotation| Ok(Command::Prediction { position, rotation });
+        assert_eq!(parse("prediction"), set(None, None));
+        assert_eq!(parse("prediction 0"), set(Some(0), Some(0)));
+        assert_eq!(parse("prediction 100"), set(Some(100), Some(100)));
+        assert_eq!(parse("prediction position 100"), set(Some(100), None));
+        assert_eq!(parse("prediction rotation 0"), set(None, Some(0)));
+        assert_eq!(
+            parse("prediction position"),
+            Err("usage: prediction position|rotation PERCENT".into())
+        );
         for bad in [
             "prediction 101",
             "prediction -1",
             "prediction 50.5",
             "prediction half",
             "prediction 50 50",
+            "prediction rotation 101",
+            "prediction both 50",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

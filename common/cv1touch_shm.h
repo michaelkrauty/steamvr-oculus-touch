@@ -39,7 +39,7 @@
  * saw n waits on update<(n + 1) % 2> (cv1t_shm_wait_events). */
 #define CV1T_SHM_NAME "/cv1touch"
 #define CV1T_SHM_MAGIC 0x54315643u /* "CV1T" little-endian */
-#define CV1T_SHM_VERSION 3u
+#define CV1T_SHM_VERSION 4u
 /* Legacy sensor diagnostics prefix; complete diagnostics are available via control JSON.
  * This is not a tracking/acquisition limit. Keep the controller/alignment ABI fixed. */
 #define CV1T_MAX_SENSORS 8
@@ -85,8 +85,9 @@ typedef struct cv1t_controller_state {
 	float pos[3];                       /* metres */
 	float raw_orient[4];                /* unfiltered UKF pose */
 	float raw_pos[3];
-	float lin_vel[3];
-	float ang_vel[3];
+	float lin_vel[3];                   /* m/s world, as tracked (and shaped for SteamVR's prediction) */
+	float ang_vel[3];                   /* the world rate w as body (q^-1 w) + gyro_bias, so that
+	                                     * q (ang_vel - gyro_bias) = w; as tracked (and shaped) */
 	float lin_acc[3];
 	float gyro_raw[3];                  /* rad/s IMU frame, bias not removed */
 	float gyro_bias[3];
@@ -124,6 +125,7 @@ typedef struct cv1t_sensor_status {
 #define CV1T_ALIGN_LIGHTHOUSE (1u << 0)   /* lighthouse_orient/pos are set */
 #define CV1T_ALIGN_RENDER_LEFT (1u << 1)  /* render_*[CV1T_HAND_LEFT] are set */
 #define CV1T_ALIGN_RENDER_RIGHT (1u << 2) /* render_*[CV1T_HAND_RIGHT] are set */
+#define CV1T_ALIGN_PREDICTION (1u << 3)   /* prediction_* are set; otherwise SteamVR gets all of it */
 
 /* How the SteamVR driver places a controller: lighthouse_from_world * world_from_model (the
  * published orient/pos) * model_from_render[hand]. The daemon publishes it from
@@ -131,12 +133,12 @@ typedef struct cv1t_sensor_status {
 typedef struct cv1t_alignment {
 	uint64_t universe_id;                    /* SteamVR universe of the registration, 0 = unknown */
 	uint32_t valid;                          /* CV1T_ALIGN_* */
-	uint32_t reserved;
+	uint32_t prediction_position;            /* percent of lin_vel SteamVR extrapolates with, 0..100 */
 	float lighthouse_orient[4];              /* Lighthouse raw universe <- cv1touch world, x y z w */
 	float lighthouse_pos[3];
 	float render_orient[CV1T_HAND_COUNT][4]; /* LED model frame <- render model frame, x y z w */
 	float render_pos[CV1T_HAND_COUNT][3];
-	uint32_t reserved2;
+	uint32_t prediction_rotation;            /* percent of the angular rate, 0..100 */
 } cv1t_alignment;
 
 typedef struct cv1t_shm {

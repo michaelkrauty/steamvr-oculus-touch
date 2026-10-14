@@ -166,9 +166,15 @@ struct Daemon {
     universe_watch_on: AtomicBool,
     /// `shaping off` publishes the tracked velocities as they are (see `track::predict`).
     shaping_on: AtomicBool,
-    /// Percent of the velocities published for SteamVR's extrapolation (`prediction`), saved
-    /// in `settings_path` on every change and read from it at start.
-    prediction_percent: AtomicU32,
+    /// Percent of the tracked linear velocity SteamVR extrapolates positions with
+    /// (`prediction position`), published in the alignment for the driver; saved in
+    /// `settings_path` on every change and read from it at start.
+    position_prediction: AtomicU32,
+    /// The same for the angular velocity and orientations (`prediction rotation`).
+    rotation_prediction: AtomicU32,
+    /// Held while the alignment is published, so that the prediction percents published are the
+    /// newest (see `publish_alignment`).
+    alignment_publish: Mutex<()>,
     settings_path: PathBuf,
     /// The current recording keeps the sensors' pixels (RAW_FRAME records).
     record_frames: AtomicBool,
@@ -538,18 +544,74 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
     Some(p)
 }
 
+/// The prediction percents a daemon starts with: (positions, orientations).
+fn start_prediction(settings: &settings::Settings) -> (u32, u32) {
+    (settings.prediction_percent, settings.rotation_percent())
+}
+
+/// `alignment` carrying the prediction percents (positions, orientations) the driver applies.
+fn with_prediction(
+    mut alignment: shm::Alignment,
+    (position, rotation): (u32, u32),
+) -> shm::Alignment {
+    alignment.prediction_position = position;
+    alignment.prediction_rotation = rotation;
+    alignment.valid |= ffi::CV1T_ALIGN_PREDICTION;
+    alignment
+}
+
+/// The daemon's prediction percents.
+fn prediction_percents(d: &Daemon) -> (u32, u32) {
+    (
+        d.position_prediction.load(Ordering::Acquire),
+        d.rotation_prediction.load(Ordering::Acquire),
+    )
+}
+
+/// Publishes `alignment` with the daemon's prediction percents. One at a time, the percents read
+/// while publishing: a reload or the universe watch cannot put back percents a `prediction`
+/// request has just changed.
+fn publish_alignment(d: &Daemon, alignment: shm::Alignment) {
+    let _one = d.alignment_publish.lock().unwrap();
+    d.shm
+        .publish_alignment(&with_prediction(alignment, prediction_percents(d)));
+}
+
+/// Publishes the alignment in place with the daemon's prediction percents. Read while holding
+/// the publishers' lock, it is the newest: a registration the universe watch has just moved is
+/// not put back.
+fn republish_prediction(d: &Daemon) {
+    let _one = d.alignment_publish.lock().unwrap();
+    if let Some(alignment) = d.shm.alignment() {
+        d.shm
+            .publish_alignment(&with_prediction(alignment, prediction_percents(d)));
+    }
+}
+
+/// What SteamVR extrapolates positions and orientations with, in words.
+fn prediction_text(position: u32, rotation: u32) -> String {
+    if position == rotation {
+        format!("SteamVR extrapolates with {position}% of the tracked velocities")
+    } else {
+        format!(
+            "SteamVR extrapolates positions with {position}% of the tracked velocity and \
+             orientations with {rotation}%"
+        )
+    }
+}
+
 /// Puts the tracker's pose into the published state, stamped `extra_ns` earlier than the
 /// pipeline's estimate of when the controller was there (the `latency` adjustment).
 /// `shaper` turns the velocities into the ones SteamVR's constant-velocity prediction should use
-/// (see `track::predict`), and `prediction_percent` of them is published: at 0 SteamVR shows the
-/// pose where it was measured. The pose is published as tracked.
+/// (see `track::predict`). They are published as they are, for the tools that carry a pose
+/// forward too; the driver hands SteamVR the share of them the alignment's prediction percents
+/// say. The pose is published as tracked.
 fn apply_tracked(
     state: &mut ControllerState,
     s: &Stamped,
     extra_ns: i64,
     shaper: &mut VelocityShaper,
     shaping: bool,
-    prediction_percent: u32,
 ) {
     let q = s.output.world_from_model.rotation;
     let t = s.output.world_from_model.translation.vector;
@@ -566,8 +628,7 @@ fn apply_tracked(
     } else {
         (s.output.ang_vel_world, Some(s.output.vel))
     };
-    let scale = f64::from(prediction_percent) / 100.0;
-    let (w, v) = (w * scale, v.unwrap_or(s.output.vel) * scale);
+    let v = v.unwrap_or(s.output.vel);
     state.lin_vel = [v.x as f32, v.y as f32, v.z as f32];
     // the driver takes orient * (ang_vel - gyro_bias) as the world rate: the shaped one, in the body
     let body = q.inverse() * w + s.gyro_bias;
@@ -682,7 +743,7 @@ fn universe_watch(d: Arc<Daemon>) {
         if moved {
             *d.universe_shift.lock().unwrap() = Some((reg.created_unix_s, s));
             let (alignment, _) = align::load_with(Some(&s));
-            d.shm.publish_alignment(&alignment);
+            publish_alignment(&d, alignment);
             if s != nalgebra::Isometry3::identity()
                 || prev.is_some_and(|p| p != nalgebra::Isometry3::identity())
             {
@@ -1509,7 +1570,6 @@ fn publish_hand_state(
                 d.extra_latency_ns.load(Ordering::Relaxed),
                 shaper,
                 d.shaping_on.load(Ordering::Relaxed),
-                d.prediction_percent.load(Ordering::Relaxed),
             )
         });
         let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
@@ -1798,30 +1858,35 @@ fn handle(d: &Daemon, line: &str) -> String {
                 }
             )
         }
-        Ok(Command::Prediction(percent)) => {
+        Ok(Command::Prediction { position, rotation }) => {
             let mut unsaved = String::new();
-            if let Some(p) = percent {
-                d.prediction_percent.store(p, Ordering::Release);
+            if position.is_some() || rotation.is_some() {
+                // one request at a time (serve_client): the pair saved is the pair set
+                if let Some(p) = position {
+                    d.position_prediction.store(p, Ordering::Release);
+                }
+                if let Some(p) = rotation {
+                    d.rotation_prediction.store(p, Ordering::Release);
+                }
                 let s = settings::Settings {
-                    prediction_percent: p,
+                    prediction_percent: d.position_prediction.load(Ordering::Acquire),
+                    rotation_prediction_percent: Some(
+                        d.rotation_prediction.load(Ordering::Acquire),
+                    ),
                     ..settings::Settings::default()
                 };
                 if let Err(e) = settings::save(&d.settings_path, &s) {
                     unsaved = format!(" (not saved: {e})");
                 }
+                republish_prediction(d);
             }
-            // the dial scales what the tracker publishes; without a calibration, or with
-            // `--tracker openhmd`, OpenHMD's own poses are published instead
-            let engine_poses =
-                d.tracker == TrackerKind::OpenHmd || d.opts.lock().unwrap().fixed_poses.is_empty();
-            let idle = if engine_poses {
-                " (no effect while OpenHMD's own poses are published)"
-            } else {
-                ""
-            };
+            // the driver applies the percents to whatever is published, OpenHMD's poses too
             format!(
-                "ok prediction: SteamVR extrapolates with {}% of the tracked velocities{idle}{unsaved}",
-                d.prediction_percent.load(Ordering::Acquire)
+                "ok prediction: {}{unsaved}",
+                prediction_text(
+                    d.position_prediction.load(Ordering::Acquire),
+                    d.rotation_prediction.load(Ordering::Acquire)
+                )
             )
         }
         Ok(Command::UniverseWatch(on)) => {
@@ -1873,7 +1938,7 @@ fn handle(d: &Daemon, line: &str) -> String {
                 .map(|p| p.1);
             d.universe_recheck.store(true, Ordering::Release);
             let (alignment, notes) = align::load_with(shift.as_ref());
-            d.shm.publish_alignment(&alignment);
+            publish_alignment(d, alignment);
             format!("ok {}", notes.join("; "))
         }
     }
@@ -2344,11 +2409,23 @@ fn main() {
         log(format!("shared memory {shm_name}: {e}"));
         process::exit(1);
     });
+    let settings_path = settings::default_path();
+    let settings = settings::load(&settings_path).unwrap_or_else(|e| {
+        log(format!("settings: {e}; using the defaults"));
+        settings::Settings::default()
+    });
+    if (settings.prediction_percent, settings.rotation_percent()) != (100, 100) {
+        log(format!(
+            "prediction: {} ({})",
+            prediction_text(settings.prediction_percent, settings.rotation_percent()),
+            settings_path.display()
+        ));
+    }
     let (alignment, notes) = align::load_default();
     for n in notes {
         log(n);
     }
-    shm.publish_alignment(&alignment);
+    shm.publish_alignment(&with_prediction(alignment, start_prediction(&settings)));
     let rec = Recorder::new(RECORDER_RING_BYTES);
     if let Some(path) = &record {
         if let Err(e) = rec.start(path, shm::now_ns()) {
@@ -2370,18 +2447,6 @@ fn main() {
             log(format!("{error}; using factory input defaults"));
             inputs.error = Some(error);
         }
-    }
-    let settings_path = settings::default_path();
-    let settings = settings::load(&settings_path).unwrap_or_else(|e| {
-        log(format!("settings: {e}; using the defaults"));
-        settings::Settings::default()
-    });
-    if settings.prediction_percent != 100 {
-        log(format!(
-            "prediction: SteamVR extrapolates with {}% of the tracked velocities ({})",
-            settings.prediction_percent,
-            settings_path.display()
-        ));
     }
     let d = Arc::new(Daemon {
         shm,
@@ -2406,7 +2471,9 @@ fn main() {
         driver_stations: Mutex::new(None),
         universe_watch_on: AtomicBool::new(true),
         shaping_on: AtomicBool::new(true),
-        prediction_percent: AtomicU32::new(settings.prediction_percent),
+        position_prediction: AtomicU32::new(start_prediction(&settings).0),
+        rotation_prediction: AtomicU32::new(start_prediction(&settings).1),
+        alignment_publish: Mutex::new(()),
         settings_path,
         record_frames: AtomicBool::new(false),
         extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
@@ -2507,7 +2574,9 @@ mod tests {
             driver_stations: Mutex::new(None),
             universe_watch_on: AtomicBool::new(true),
             shaping_on: AtomicBool::new(true),
-            prediction_percent: AtomicU32::new(100),
+            position_prediction: AtomicU32::new(100),
+            rotation_prediction: AtomicU32::new(100),
+            alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
                 .join(format!(
                     "cv1t-daemon-settings-{}",
@@ -2559,19 +2628,45 @@ mod tests {
             settings::load(&d.settings_path).map(|s| s.prediction_percent),
             Ok(0)
         );
-        // with OpenHMD's poses published, the reply says the dial does nothing: without a
-        // calibration, and with `--tracker openhmd`
-        let note = "(no effect while OpenHMD's own poses are published)";
-        d.opts.lock().unwrap().fixed_poses.clear();
-        assert!(handle(&d, "prediction 50").ends_with(note));
-        let mut d = d;
-        d.opts.lock().unwrap().fixed_poses.push(engine::SensorPose {
-            serial: "WMTD000000001".into(),
-            orient: [0.0, 0.0, 0.0, 1.0],
-            pos: [0.0; 3],
-        });
-        d.tracker = TrackerKind::OpenHmd;
-        assert!(handle(&d, "prediction 50").ends_with(note));
+        // positions and orientations each on their own, both kept
+        assert_eq!(
+            handle(&d, "prediction position 100"),
+            "ok prediction: SteamVR extrapolates positions with 100% of the tracked velocity and \
+             orientations with 0%"
+        );
+        assert_eq!(
+            (
+                d.position_prediction.load(Ordering::Acquire),
+                d.rotation_prediction.load(Ordering::Acquire)
+            ),
+            (100, 0)
+        );
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| (s.prediction_percent, s.rotation_percent())),
+            Ok((100, 0))
+        );
+        // the driver reads them from the alignment
+        let published = d.shm.alignment().unwrap();
+        assert_eq!(
+            (published.prediction_position, published.prediction_rotation),
+            (100, 0)
+        );
+        assert!(handle(&d, "prediction rotation 30").ends_with("orientations with 30%"));
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| (s.prediction_percent, s.rotation_percent())),
+            Ok((100, 30))
+        );
+        // republished in place: a registration published meanwhile stays
+        let mut moved = d.shm.alignment().unwrap();
+        moved.lighthouse_pos = [1.0, 2.0, 3.0];
+        d.shm.publish_alignment(&moved);
+        handle(&d, "prediction 0");
+        let published = d.shm.alignment().unwrap();
+        assert_eq!(published.lighthouse_pos, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            (published.prediction_position, published.prediction_rotation),
+            (0, 0)
+        );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
 
@@ -2700,53 +2795,43 @@ mod tests {
         }
     }
 
-    /// `prediction` scales the velocities SteamVR extrapolates with, shaped or not, and nothing
-    /// else: at 0 the driver hands SteamVR no motion at all, at 50 half the motion it does at 100,
-    /// and the pose and its stamps are the same at every setting.
+    /// The tracked velocities are published as they are, shaped or not (the driver applies the
+    /// prediction percents): the tools that carry a pose forward see the real motion.
     #[test]
-    fn prediction_scales_only_the_published_velocities() {
+    fn the_tracked_velocities_are_published_as_they_are() {
         use nalgebra::Vector3;
 
         let s = tracked_sample();
         let (q, rate) = (s.output.world_from_model.rotation, s.output.ang_vel_world);
         let v3 = |a: [f32; 3]| Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
-        for shaping in [false, true] {
-            let publish = |percent| {
-                let mut st = ControllerState::default();
-                let mut shaper = VelocityShaper::new(ShapeParams::default());
-                apply_tracked(&mut st, &s, 0, &mut shaper, shaping, percent);
-                // what the driver hands SteamVR: the world rate and the linear velocity
-                let world_rate = q * (v3(st.ang_vel) - v3(st.gyro_bias));
-                (st, world_rate, v3(st.lin_vel))
-            };
-            let (full, full_rate, full_vel) = publish(100);
-            assert!((full_rate - rate).norm() < 1e-5 && full_vel.norm() > 0.5);
-            let (none, none_rate, none_vel) = publish(0);
-            assert!(none_rate.norm() < 1e-6 && none_vel.norm() < 1e-6);
-            let (half, half_rate, half_vel) = publish(50);
-            assert!((half_rate - full_rate / 2.0).norm() < 1e-5);
-            assert!((half_vel - full_vel / 2.0).norm() < 1e-6);
-            for st in [none, half] {
-                assert_eq!(
-                    (
-                        st.orient,
-                        st.pos,
-                        st.gyro_bias,
-                        st.sample_host_ns,
-                        st.last_position_fix_host_ns,
-                        st.flags
-                    ),
-                    (
-                        full.orient,
-                        full.pos,
-                        full.gyro_bias,
-                        full.sample_host_ns,
-                        full.last_position_fix_host_ns,
-                        full.flags
-                    )
-                );
-            }
-        }
+        let mut st = ControllerState::default();
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        apply_tracked(&mut st, &s, 0, &mut shaper, false);
+        // what the driver turns into SteamVR's world rate, and the linear velocity
+        assert!((q * (v3(st.ang_vel) - v3(st.gyro_bias)) - rate).norm() < 1e-5);
+        assert!((v3(st.lin_vel) - s.output.vel).norm() < 1e-6);
+        let mut shaped = ControllerState::default();
+        apply_tracked(&mut shaped, &s, 0, &mut shaper, true);
+        assert!(v3(shaped.lin_vel).norm() > 0.5 && v3(shaped.ang_vel).norm() > 0.5);
+    }
+
+    /// The percents a daemon starts with come from the settings, orientations' own or else the
+    /// positions'.
+    #[test]
+    fn the_prediction_starts_as_saved() {
+        let saved = |position, rotation| settings::Settings {
+            prediction_percent: position,
+            rotation_prediction_percent: rotation,
+            ..settings::Settings::default()
+        };
+        assert_eq!(start_prediction(&saved(100, Some(0))), (100, 0));
+        assert_eq!(start_prediction(&saved(30, None)), (30, 30));
+        let alignment = with_prediction(shm::Alignment::default(), (100, 0));
+        assert_eq!(
+            (alignment.prediction_position, alignment.prediction_rotation),
+            (100, 0)
+        );
+        assert_ne!(alignment.valid & ffi::CV1T_ALIGN_PREDICTION, 0);
     }
 
     /// While the controller is connected the tracker's pose is published and remembered, and once
@@ -2763,7 +2848,7 @@ mod tests {
         };
         let mut shaper = VelocityShaper::new(ShapeParams::default());
         apply_tracker(&mut state, Some(&s), &mut memory, |st, s| {
-            apply_tracked(st, s, 0, &mut shaper, false, 100)
+            apply_tracked(st, s, 0, &mut shaper, false)
         });
         let seen = s.output.world_from_model.translation.vector.cast::<f32>();
         assert_eq!(state.pos, [seen.x, seen.y, seen.z]);
@@ -2774,7 +2859,7 @@ mod tests {
         untracked.output.world_from_model.translation.vector.x += 1.0;
         let mut st = state;
         apply_tracker(&mut st, Some(&untracked), &mut memory, |st, s| {
-            apply_tracked(st, s, 0, &mut shaper, false, 100)
+            apply_tracked(st, s, 0, &mut shaper, false)
         });
         assert_eq!(memory.last_seen, Some(state.pos));
 

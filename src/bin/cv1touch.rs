@@ -57,7 +57,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
          cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
          cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
-         cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS] | prediction [PERCENT]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
+         cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS] | prediction [PERCENT] | prediction position|rotation PERCENT\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
          cv1touch fit-render [REC]\n  cv1touch steamvr install|check [--legacy-assets SO MANIFEST] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
          cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
          cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
@@ -5404,6 +5404,9 @@ fn main() {
         ["latency", ms] => send(&format!("latency {ms}")),
         ["prediction"] => send("prediction"),
         ["prediction", percent] => send(&format!("prediction {percent}")),
+        ["prediction", which @ ("position" | "rotation"), percent] => {
+            send(&format!("prediction {which} {percent}"))
+        }
         ["vr-pulse", index] => vr_pulse(index, "300"),
         ["vr-pulse", index, ms] => vr_pulse(index, ms),
         ["fit-render"] => fit_render(None),

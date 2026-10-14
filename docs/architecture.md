@@ -27,7 +27,7 @@ OpenHMD owns device discovery and USB/camera acquisition. The Rust tracker fuses
 
 Factory LED geometry, per-camera optical coordinates, the calibrated tracking world, the SteamVR tracking universe, and the rendered controller model are different frames. Camera calibration supplies world-from-camera transforms; registration supplies SteamVR-from-world; render fitting supplies the controller-model offset. Orientation serialization uses XYZW quaternions. See the ABI headers and `src/calib` for units and transform direction.
 
-Host/device clock mapping and exposure-time compensation place measurements on a monotonic timeline. Published poses carry their sample time and velocities. The driver reports pose age to SteamVR, which performs its own prediction. Software delivery time, hardware radio cadence, optical exposure age, and display latency must not be combined into one misleading latency number.
+Host/device clock mapping and exposure-time compensation place measurements on a monotonic timeline. Published poses carry their sample time and velocities. The driver reports pose age to SteamVR, which performs its own prediction with the share of those velocities `cv1touch prediction` sets (positions and orientations separately). Software delivery time, hardware radio cadence, optical exposure age, and display latency must not be combined into one misleading latency number.
 
 ## Reliability boundaries
 
@@ -49,4 +49,4 @@ The acquisition engine discovers sensors dynamically and supports one controller
 
 `cv1touch status --json` returns every admitted sensor in `sensors`, with `sensor_total` and camera queue/drop counters. The live status board uses this complete list. A newly attached sensor needs a daemon restart; a sensor without a calibrated pose can record observations but does not contribute to the Rust pose estimate until calibrated. Failed USB opens/starts are logged, and stalled streams are visible as non-advancing frame counters.
 
-The controller/alignment shared-memory ABI remains version 3. Its eight sensor slots are a legacy diagnostic prefix, not a tracking limit. `sensor_shm_count` and `sensor_shm_truncated` describe that prefix explicitly. Use control JSON for the full list; the status board warns when it must fall back to shared memory. Recording records already identify sensors individually by serial, so the recording schema is unchanged.
+The controller/alignment shared-memory ABI is version 4: the published velocities are the tracked ones, and the alignment block carries the prediction percents the driver applies. Its eight sensor slots are a legacy diagnostic prefix, not a tracking limit. `sensor_shm_count` and `sensor_shm_truncated` describe that prefix explicitly. Use control JSON for the full list; the status board warns when it must fall back to shared memory. Recording records already identify sensors individually by serial, so the recording schema is unchanged.
