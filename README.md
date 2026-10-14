@@ -14,7 +14,7 @@ SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a nati
 - A working native Linux SteamVR installation and an independently tracked SteamVR headset for coordinate registration. A separate reference controller is optional.
 - Linux x86-64, Rust 1.85 or newer, and the native build dependencies below. The default service setup uses systemd user services and logind device access.
 
-This repository supplies controllers, not a CV1 display/headset driver. Sandboxed Steam installations and Windows are not validated.
+This repository supplies controllers, not a CV1 display/headset driver. Sandboxed Steam installations are not validated. Windows has an installer, new and waiting for its first players: [cv1touch on Windows](docs/windows.md).
 
 ## Quick start
 

@@ -18,4 +18,17 @@ The unused upstream GStreamer plugin and 3Glasses driver are not distributed in 
 
 Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.
 
+## Windows bundle
+
+The Windows installer ships binaries, which Linux leaves to the distribution's packages, so `windows\bundle.ps1` puts the terms of every library they carry into `third_party\licenses` beside the program, as vcpkg built them: `windows-bundle.txt` names each port and its version, `<port>-copyright.txt` holds its terms, `rust-crates.txt` lists the Rust crates the build uses for this target (linked into the executables, or building them) with the licence each declares, and `rust\<crate>-<version>\` holds each crate's own licence files.
+
+| Component | How it ships | Applicable terms |
+| --- | --- | --- |
+| libusb | `libusb-1.0.dll`, its own DLL, so that it can be replaced by any compatible build; its source is at [libusb/libusb](https://github.com/libusb/libusb) under the version `windows-bundle.txt` names | LGPL-2.1-or-later (`libusb-copyright.txt`) |
+| OpenCV (calib3d and what it needs) | statically linked into `openhmd-0.dll` | Apache-2.0 (`opencv4-copyright.txt`) |
+| libjpeg-turbo | statically linked into `openhmd-0.dll` | IJG, BSD-3-Clause and zlib (`libjpeg-turbo-copyright.txt`) |
+| hidapi | statically linked into `openhmd-0.dll` | BSD-3-Clause option (`hidapi-copyright.txt`) |
+| zlib | statically linked, through the above | Zlib (`zlib-copyright.txt`) |
+| Rust crates | statically linked into `cv1touchd.exe`, `cv1touch.exe` and `cv1touchd-quiet.exe`, or used to build them | each crate's own, listed in `rust-crates.txt` with the texts in `rust\` (MIT, Apache-2.0, BSD-3-Clause and the like) |
+
 SteamVR is installed separately. Its Oculus input profiles and controller meshes are referenced from that installation; no Oculus firmware, proprietary runtime, mesh, texture, input-profile asset, or SteamVR binary is redistributed here. Oculus, Touch, Meta, Steam, SteamVR, and OpenVR names are used to identify interoperability targets and do not imply endorsement.

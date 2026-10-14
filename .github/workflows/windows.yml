@@ -2,6 +2,7 @@ name: Windows checks
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -110,3 +111,94 @@ jobs:
         run: cargo test --locked --lib --bins
       - name: Engine tests
         run: meson test -C (Get-Content target\debug\cv1touch-native-dir) --print-errorlogs
+      # What a release ships: the bundle the installer job packs.
+      - name: Release build
+        if: matrix.rust == 'stable'
+        run: cargo build --locked --release --bins
+      - name: Bundle
+        if: matrix.rust == 'stable'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File windows\bundle.ps1 -Target target -Out target\bundle
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.rust == 'stable'
+        with:
+          name: cv1touch-windows-bundle
+          path: target/bundle
+          if-no-files-found: error
+          retention-days: 14
+  installer:
+    # The installer, packed on GitHub's runner from the bundle the engine job built; Inno Setup
+    # is preinstalled there. The runner has none of the build's libraries, so running the bundle
+    # and then installing and uninstalling it silently show that it is complete. Skipped with the
+    # engine job.
+    needs: engine
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cv1touch-windows-bundle
+          path: target/bundle
+      - name: The bundle runs without the build's libraries
+        run: |
+          & target\bundle\bin\cv1touchd.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "cv1touchd exit $LASTEXITCODE" }
+          & target\bundle\bin\cv1touch.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "cv1touch exit $LASTEXITCODE" }
+      - name: Pack
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw "tag $env:GITHUB_REF_NAME, but Cargo.toml says $version" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$version" "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC exit $LASTEXITCODE" }
+      - name: Install and uninstall silently
+        run: |
+          $setup = (Get-Item target\installer\cv1touch-setup-*.exe).FullName
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=setup.log' -PassThru
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { Get-Content setup.log; throw "setup exit $($p.ExitCode)" }
+          $app = "$env:LOCALAPPDATA\Programs\cv1touch"
+          & "$app\bin\cv1touch.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "installed cv1touch exit $LASTEXITCODE" }
+          if (-not (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').cv1touch) { throw 'no Run entry' }
+          Start-Sleep 5
+          if (-not (Get-Process cv1touchd -ErrorAction SilentlyContinue)) { Get-Content "$env:LOCALAPPDATA\cv1touch\state\logs\cv1touchd.log"; throw 'the daemon is not running' }
+          $p = Start-Process -FilePath "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=unins.log' -PassThru
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { Get-Content unins.log; throw "uninstall exit $($p.ExitCode)" }
+          # the uninstaller's exit code comes before its copy removes the last files
+          $waited = 0
+          while ((Test-Path $app) -and $waited -lt 20) { Start-Sleep 1; $waited++ }
+          if (Test-Path $app) { throw 'files left behind' }
+          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').cv1touch) { throw 'Run entry left behind' }
+          if (Get-Process cv1touchd -ErrorAction SilentlyContinue) { throw 'the daemon is still running' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cv1touch-setup
+          path: target/installer/cv1touch-setup-*.exe
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    # A tag v* attaches the installer to its release (a draft, if none exists yet). The only job
+    # that may write to the repository, and it runs nothing it built.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cv1touch-setup
+          path: setup
+      - name: Attach to the release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" setup/cv1touch-setup-*.exe --clobber

@@ -1,6 +1,6 @@
-# Building on Windows (work in progress)
+# Building on Windows
 
-Windows support is being built. Today the SteamVR driver, the native engine, the daemon and the `cv1touch` command build and pass their tests on Windows 11 x64. There is no installer yet, so this page is for developers.
+This page is for developers. Testers and players want [cv1touch on Windows](windows.md): one installer, built by CI from the bundle `windows\bundle.ps1` collects, with the Inno Setup script `windows\installer\cv1touch.iss`. The SteamVR driver, the native engine, the daemon and the `cv1touch` command build and pass their tests on Windows 11 x64.
 
 Like the Linux build, the Windows build uses no Oculus software. The Rift headset needs no driver. The sensors run with Windows' own WinUSB driver, which `cv1touch sensors install` gives them (it asks for permission once); `cv1touch sensors` says whether each sensor plugged in has it, and `cv1touch sensors remove` takes it off again. No driver package of our own and no certificate is involved.
 
@@ -43,6 +43,18 @@ cargo test --lib --bins
 ```
 
 The first `vcpkg install` compiles OpenCV, which takes a long time. `build.rs` builds the engine with meson, links `openhmd`, and copies `openhmd-0.dll` and `libusb-1.0.dll` next to the executables Cargo builds.
+
+## Bundle and installer
+
+From a release build with the engine, `windows\bundle.ps1` collects what a Windows install is into `target\bundle` (it reads the vcpkg ports' licences and versions from `CV1TOUCH_DEPS`), and Inno Setup 6 packs the installer into `target\installer`:
+
+```powershell
+cargo build --locked --release --bins
+powershell -ExecutionPolicy Bypass -File windows\bundle.ps1
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.2.0 /DBundle=..\..\target\bundle windows\installer\cv1touch.iss
+```
+
+CI does both on every push and pull request (`.github\workflows\windows.yml`), installs and uninstalls the result silently on a clean runner, and attaches it to the release of a tag `v*`.
 
 ## Type-checking without the engine
 
