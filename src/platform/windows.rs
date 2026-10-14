@@ -1453,6 +1453,18 @@ pub fn end_with_this_process(_command: &mut std::process::Command) -> io::Result
     joined.map_err(io::Error::from_raw_os_error)
 }
 
+pub fn play_wav(wav: &[u8]) {
+    use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
+    // SAFETY: with SND_MEMORY the "name" is the WAV image, read until the sound ends (SND_SYNC).
+    unsafe {
+        PlaySoundW(
+            wav.as_ptr().cast(),
+            std::ptr::null_mut(),
+            SND_MEMORY | SND_SYNC | SND_NODEFAULT,
+        )
+    };
+}
+
 pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
     use windows_sys::Win32::System::Threading::{
         SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,

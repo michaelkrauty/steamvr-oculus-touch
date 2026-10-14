@@ -7,8 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::process::{self, Command as Process};
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -355,7 +354,7 @@ fn rec_summary(path: &Path, windows: &[Window]) -> i32 {
     0
 }
 
-/// Plays `count` short 880 Hz beeps through PipeWire/PulseAudio.
+/// Plays `count` short 880 Hz beeps.
 fn beeps(count: usize) {
     const RATE: u32 = 48_000;
     let mut samples: Vec<i16> = Vec::new();
@@ -383,16 +382,7 @@ fn beeps(count: usize) {
     for s in samples {
         wav.extend_from_slice(&s.to_le_bytes());
     }
-    let path = std::env::temp_dir().join(format!("cv1touch-beep-{}-{count}.wav", process::id()));
-    if std::fs::write(&path, &wav).is_ok() {
-        // a missing sound server only loses the beep; its complaints would bury the prompts
-        let _ = Process::new("paplay")
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = std::fs::remove_file(&path);
-    }
+    platform::sound::play_wav(&wav);
 }
 
 /// From now on an interrupt (Ctrl+C, closing the terminal) sets a flag instead of ending the

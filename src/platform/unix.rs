@@ -911,6 +911,29 @@ pub fn end_with_this_process(command: &mut std::process::Command) -> io::Result<
 
 pub fn without_window(_command: &mut std::process::Command) {}
 
+pub fn play_wav(wav: &[u8]) {
+    use std::io::Write;
+    static PLAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "cv1touch-sound-{}-{}.wav",
+        std::process::id(),
+        PLAYED.fetch_add(1, Ordering::Relaxed)
+    ));
+    // a new file of this user's only: a link or a file someone else put there is left alone
+    let Ok(mut file) = create_private(&path) else {
+        return;
+    };
+    if file.write_all(wav).is_ok() {
+        drop(file);
+        let _ = std::process::Command::new("paplay")
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

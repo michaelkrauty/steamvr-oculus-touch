@@ -642,6 +642,18 @@ pub mod ipc {
     }
 }
 
+pub mod sound {
+    //! Sounds the command-line tool marks timed steps with.
+    use super::os;
+
+    /// Plays `wav`, a WAV file's bytes, to its end: through PipeWire or PulseAudio (paplay) on
+    /// Linux, the default output device on Windows. A missing sound server only loses the sound,
+    /// silently: its complaints would bury the instructions on the terminal.
+    pub fn play_wav(wav: &[u8]) {
+        os::play_wav(wav)
+    }
+}
+
 pub mod process {
     //! Other programs running on this machine.
     use std::io;
