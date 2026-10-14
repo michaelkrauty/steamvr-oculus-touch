@@ -28,7 +28,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", root.join(p).display());
     }
-    if env::var_os("CARGO_FEATURE_ENGINE").is_some() {
+    println!("cargo:rerun-if-env-changed=CV1TOUCH_CHECK_ONLY");
+    // type-checking alone (`cargo check`/`clippy`, any target) links nothing: with
+    // CV1TOUCH_CHECK_ONLY=1 the native engine is not built
+    let check_only = env::var("CV1TOUCH_CHECK_ONLY").is_ok_and(|v| v == "1");
+    if env::var_os("CARGO_FEATURE_ENGINE").is_some() && !check_only {
         build_engine(&root, &out);
     }
     generate_engine(&root, &out);
