@@ -660,6 +660,135 @@ pub fn fake_hid_send(sender: &mut std::os::unix::net::UnixDatagram, report: &[u8
     assert_eq!(sender.send(report).unwrap(), report.len());
 }
 
+pub type ThreadId = libc::pid_t;
+
+pub fn current_thread() -> ThreadId {
+    // SAFETY: no arguments.
+    unsafe { libc::gettid() }
+}
+
+pub fn thread_named(name: &str) -> Option<ThreadId> {
+    std::fs::read_dir("/proc/self/task")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+            (comm.trim_end() == name)
+                .then(|| e.file_name().to_str()?.parse().ok())
+                .flatten()
+        })
+}
+
+/// rtkit's ceiling on RLIMIT_RTTIME (us): it grants real time only to a process that bounds how
+/// long a real-time thread runs without blocking. Past it the kernel kills the process.
+const RTTIME_LIMIT_US: u64 = 200_000;
+
+pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
+    // SAFETY: plain rlimit structs passed by pointer.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_RTTIME, &mut lim);
+        if lim.rlim_max > RTTIME_LIMIT_US {
+            let bounded = libc::rlimit {
+                rlim_cur: RTTIME_LIMIT_US,
+                rlim_max: RTTIME_LIMIT_US,
+            };
+            if libc::setrlimit(libc::RLIMIT_RTTIME, &bounded) != 0 {
+                return Err(format!(
+                    "bounding RLIMIT_RTTIME: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    let out = std::process::Command::new("busctl")
+        .args([
+            "call",
+            "org.freedesktop.RealtimeKit1",
+            "/org/freedesktop/RealtimeKit1",
+            "org.freedesktop.RealtimeKit1",
+            "MakeThreadRealtimeWithPID",
+            "ttu",
+        ])
+        .args([
+            std::process::id().to_string(),
+            thread.to_string(),
+            priority.to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("busctl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rtkit: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(format!("SCHED_RR {priority}"))
+}
+
+pub fn allowed_cpus(thread: ThreadId) -> io::Result<Vec<usize>> {
+    // SAFETY: valid output pointer; only queries the requested thread.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(thread, std::mem::size_of_val(&allowed), &mut allowed) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &allowed))
+            .collect())
+    }
+}
+
+pub fn set_cpus(thread: ThreadId, cpus: &[usize]) -> io::Result<()> {
+    // SAFETY: cpu_set_t's all-zero representation is the empty set.
+    let mut selected: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no CPU {cpu}"),
+            ));
+        }
+        // SAFETY: checked against CPU_SETSIZE.
+        unsafe { libc::CPU_SET(cpu, &mut selected) };
+    }
+    // SAFETY: an initialized set.
+    if unsafe { libc::sched_setaffinity(thread, std::mem::size_of_val(&selected), &selected) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn lock_memory() -> io::Result<()> {
+    // SAFETY: no pointers; only marks this process's mappings.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn voluntary_switches() -> Option<i64> {
+    // SAFETY: a zeroed rusage filled for the calling thread.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    (unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut u) } == 0).then_some(u.ru_nvcsw)
+}
+
+pub fn random_u64() -> io::Result<u64> {
+    let mut v = 0u64;
+    // SAFETY: valid buffer of 8 bytes.
+    let n = unsafe { libc::getrandom(&mut v as *mut u64 as *mut libc::c_void, 8, 0) };
+    if n == 8 {
+        Ok(v)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub fn opt_out_of_throttling() -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1304,3 +1304,206 @@ pub fn fake_hid_send(sender: &mut FakeHidSender, report: &[u8]) {
     };
     assert!(ok != 0 && wrote as usize == report.len());
 }
+
+pub type ThreadId = u32;
+
+pub fn current_thread() -> ThreadId {
+    // SAFETY: no arguments.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// A thread handle, closed when dropped.
+struct ThreadHandle(windows_sys::Win32::Foundation::HANDLE);
+
+impl ThreadHandle {
+    fn open(thread: ThreadId, access: u32) -> io::Result<ThreadHandle> {
+        // SAFETY: plain call; a null handle is the error.
+        let h = unsafe { windows_sys::Win32::System::Threading::OpenThread(access, 0, thread) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ThreadHandle(h))
+    }
+}
+
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        // SAFETY: a handle we opened.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// A thread's description (its name), as SetThreadDescription set it.
+fn thread_description(thread: ThreadId) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{
+        GetThreadDescription, THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    let h = ThreadHandle::open(thread, THREAD_QUERY_LIMITED_INFORMATION).ok()?;
+    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a live handle and an output pointer; the string is ours to free.
+    unsafe {
+        if GetThreadDescription(h.0, &mut text) < 0 || text.is_null() {
+            return None;
+        }
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let name = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        windows_sys::Win32::Foundation::LocalFree(text.cast());
+        Some(name)
+    }
+}
+
+pub fn thread_named(name: &str) -> Option<ThreadId> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    // SAFETY: a snapshot of all threads, walked with a correctly sized entry and closed after.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let process = std::process::id();
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut found = None;
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more && found.is_none() {
+            if entry.th32OwnerProcessID == process
+                && thread_description(entry.th32ThreadID).as_deref() == Some(name)
+            {
+                found = Some(entry.th32ThreadID);
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
+    use windows_sys::Win32::System::Threading::{
+        SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+        THREAD_SET_LIMITED_INFORMATION,
+    };
+    let (level, what) = if priority >= 10 {
+        (THREAD_PRIORITY_TIME_CRITICAL, "time-critical priority")
+    } else {
+        (THREAD_PRIORITY_HIGHEST, "highest priority")
+    };
+    let h =
+        ThreadHandle::open(thread, THREAD_SET_LIMITED_INFORMATION).map_err(|e| e.to_string())?;
+    // SAFETY: a live handle opened for setting information.
+    if unsafe { SetThreadPriority(h.0, level) } == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(what.into())
+}
+
+/// The thread's own affinity mask. Processor group 0 only (64 CPUs): a thread placed in another
+/// group (on a machine with more) is refused.
+pub fn allowed_cpus(thread: ThreadId) -> io::Result<Vec<usize>> {
+    use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+    use windows_sys::Win32::System::Threading::{
+        GetThreadGroupAffinity, THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    let h = ThreadHandle::open(thread, THREAD_QUERY_LIMITED_INFORMATION)?;
+    // SAFETY: a plain structure, all zeros a valid value.
+    let mut affinity: GROUP_AFFINITY = unsafe { std::mem::zeroed() };
+    // SAFETY: a live handle with query access, and a structure to fill.
+    if unsafe { GetThreadGroupAffinity(h.0, &mut affinity) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if affinity.Group != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("the thread runs in processor group {}", affinity.Group),
+        ));
+    }
+    Ok((0..usize::BITS as usize)
+        .filter(|cpu| affinity.Mask & (1 << cpu) != 0)
+        .collect())
+}
+
+pub fn set_cpus(thread: ThreadId, cpus: &[usize]) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::{
+        SetThreadAffinityMask, THREAD_QUERY_INFORMATION, THREAD_SET_INFORMATION,
+    };
+    let mut mask = 0usize;
+    for &cpu in cpus {
+        if cpu >= usize::BITS as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("CPU {cpu} is outside processor group 0"),
+            ));
+        }
+        mask |= 1 << cpu;
+    }
+    let h = ThreadHandle::open(thread, THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION)?;
+    // SAFETY: a live handle with the access the call needs; 0 is the error.
+    if unsafe { SetThreadAffinityMask(h.0, mask) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn lock_memory() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows has no counterpart to mlockall",
+    ))
+}
+
+/// Windows does not report them per thread, and has no limit on a real-time thread's run to stay
+/// under.
+pub fn voluntary_switches() -> Option<i64> {
+    None
+}
+
+pub fn random_u64() -> io::Result<u64> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut v = 0u64;
+    // SAFETY: an 8-byte buffer and the system's preferred generator (no algorithm handle).
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            &mut v as *mut u64 as *mut u8,
+            8,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "BCryptGenRandom: NTSTATUS {status:#x}"
+        )));
+    }
+    Ok(v)
+}
+
+pub fn opt_out_of_throttling() -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: this process's pseudo-handle and a correctly sized state.
+    let ok = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const PROCESS_POWER_THROTTLING_STATE as *const std::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

@@ -7,7 +7,6 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::mem;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -19,7 +18,7 @@ use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{Hand, HandConfig};
-use cv1touch::platform::{hid, ipc, shutdown};
+use cv1touch::platform::{hid, ipc, shutdown, system};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
@@ -1097,13 +1096,12 @@ fn radio_main(
     mut pipe: Pipeline,
     mut watch: Option<LandmarkWatch>,
 ) {
-    if let Err(err) = set_radio_affinity() {
+    let me = system::current_thread();
+    if let Err(err) = set_rt_affinity(me) {
         log(format!("radio thread keeps the process's CPUs ({err})"));
     }
-    match make_realtime(RADIO_RT_PRIORITY) {
-        Ok(()) => log(format!(
-            "radio thread real-time (SCHED_RR {RADIO_RT_PRIORITY})"
-        )),
+    match system::make_realtime(me, RADIO_RT_PRIORITY) {
+        Ok(how) => log(format!("radio thread real-time ({how})")),
         Err(err) => log(format!("radio thread stays normal priority ({err})")),
     }
     d.radio_on.store(true, Ordering::Release);
@@ -1336,42 +1334,37 @@ impl Drop for RadioExit<'_> {
 
 /// How long the radio thread may run without sleeping before it sleeps a moment of its own:
 /// RLIMIT_RTTIME (200 ms) kills the daemon if a real-time thread runs that long unblocked, and a
-/// poll that finds a report or a frame waiting returns without sleeping.
+/// poll that finds a report or a frame waiting returns without sleeping. Windows has no such limit
+/// (nor reports a thread's sleeps), so there it never rests.
 const RADIO_MAX_RUN_NS: u64 = 50_000_000;
 const RADIO_REST: Duration = Duration::from_micros(200);
 
 /// Tells the radio thread when it last slept (its voluntary context switches) and makes it rest
 /// if that was `RADIO_MAX_RUN_NS` ago.
 struct Rest {
-    switches: i64,
+    switches: Option<i64>,
     since: u64,
 }
 
 impl Rest {
     fn new() -> Rest {
         Rest {
-            switches: voluntary_switches(),
+            switches: system::voluntary_switches(),
             since: shm::now_ns(),
         }
     }
 
     fn if_due(&mut self, now: u64) {
-        let s = voluntary_switches();
-        if s != self.switches {
-            (self.switches, self.since) = (s, now);
+        let Some(s) = system::voluntary_switches() else {
+            return;
+        };
+        if Some(s) != self.switches {
+            (self.switches, self.since) = (Some(s), now);
         } else if now.saturating_sub(self.since) >= RADIO_MAX_RUN_NS {
             thread::sleep(RADIO_REST);
-            (self.switches, self.since) = (voluntary_switches(), shm::now_ns());
+            (self.switches, self.since) = (system::voluntary_switches(), shm::now_ns());
         }
     }
-}
-
-/// The calling thread's voluntary context switches (it blocked or slept).
-fn voluntary_switches() -> i64 {
-    // SAFETY: a zeroed rusage filled for the calling thread.
-    let mut u: libc::rusage = unsafe { mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut u) };
-    u.ru_nvcsw
 }
 
 /// What `publish_hand_state` keeps per hand from one sample to the next.
@@ -1907,6 +1900,8 @@ fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
 /// OpenHMD logs through C's stdout, which is block-buffered when it is not a terminal: under
 /// systemd its lines reached the journal in 4 KB batches, stamped with the flush time rather than
 /// when they happened. Line-buffered, each lands as it is written. Must run before anything prints.
+/// (On Windows the engine's DLL carries its own C runtime, and with it its own stdout.)
+#[cfg(unix)]
 fn line_buffer_stdout() {
     extern "C" {
         static mut stdout: *mut libc::FILE;
@@ -1914,83 +1909,14 @@ fn line_buffer_stdout() {
     unsafe { libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IOLBF, 0) };
 }
 
-/// Keeps the daemon's pages in RAM once touched: under reclaim pressure a swapped-out page costs a
-/// disk read on whichever thread touches it next, the engine thread included. Only touched pages,
-/// not the whole address space (the mapped libraries reserve far more than they use).
-fn lock_memory() -> std::io::Result<()> {
-    // SAFETY: no pointers; only marks this process's mappings.
-    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The radio thread's SCHED_RR priority: above every normal thread, below PipeWire's (20) and
-/// the compositor's (90 and up).
+/// The radio thread's real-time priority: on Linux SCHED_RR above every normal thread, below
+/// PipeWire's (20) and the compositor's (90 and up).
 const RADIO_RT_PRIORITY: u32 = 10;
-/// rtkit's ceiling on RLIMIT_RTTIME (us): it grants real time only to a process that bounds how
-/// long a real-time thread runs without blocking. Past it the kernel kills the daemon (systemd
-/// restarts it); the radio thread blocks on the radio every couple of milliseconds and runs a few
-/// percent of a core.
-const RTTIME_LIMIT_US: u64 = 200_000;
-
-/// Runs the calling thread SCHED_RR through rtkit (no privileges needed), so a radio report wakes
-/// it at once instead of queueing behind whatever normal thread shares its core. rtkit sets
-/// reset-on-fork: threads it starts afterwards stay normal.
-fn make_realtime(priority: u32) -> Result<(), String> {
-    // SAFETY: no arguments.
-    make_thread_realtime(unsafe { libc::gettid() }, priority)
-}
-
-/// `make_realtime` for any thread of the daemon's.
-fn make_thread_realtime(tid: libc::pid_t, priority: u32) -> Result<(), String> {
-    // SAFETY: plain rlimit structs passed by pointer.
-    unsafe {
-        let mut lim: libc::rlimit = mem::zeroed();
-        libc::getrlimit(libc::RLIMIT_RTTIME, &mut lim);
-        if lim.rlim_max > RTTIME_LIMIT_US {
-            let bounded = libc::rlimit {
-                rlim_cur: RTTIME_LIMIT_US,
-                rlim_max: RTTIME_LIMIT_US,
-            };
-            if libc::setrlimit(libc::RLIMIT_RTTIME, &bounded) != 0 {
-                return Err(format!(
-                    "bounding RLIMIT_RTTIME: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-    }
-    let out = std::process::Command::new("busctl")
-        .args([
-            "call",
-            "org.freedesktop.RealtimeKit1",
-            "/org/freedesktop/RealtimeKit1",
-            "org.freedesktop.RealtimeKit1",
-            "MakeThreadRealtimeWithPID",
-            "ttu",
-        ])
-        .args([
-            std::process::id().to_string(),
-            tid.to_string(),
-            priority.to_string(),
-        ])
-        .output()
-        .map_err(|e| format!("busctl: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "rtkit: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
-}
 
 /// Keep the inherited affinity unless the user explicitly chooses CPUs.
 /// CV1TOUCH_CPUS accepts comma-separated CPU IDs and inclusive ranges, e.g. "2,4-6".
-fn affinity_cpus(spec: &str, allowed: &libc::cpu_set_t) -> Result<libc::cpu_set_t, String> {
-    // SAFETY: cpu_set_t's all-zero representation is the empty set.
-    let mut selected: libc::cpu_set_t = unsafe { mem::zeroed() };
+fn affinity_cpus(spec: &str, allowed: &[usize]) -> Result<Vec<usize>, String> {
+    let mut selected = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
         let (first, last) = part.split_once('-').unwrap_or((part, part));
@@ -2000,23 +1926,25 @@ fn affinity_cpus(spec: &str, allowed: &libc::cpu_set_t) -> Result<libc::cpu_set_
         let last = last
             .parse::<usize>()
             .map_err(|_| "CV1TOUCH_CPUS: expected CPU IDs or ranges".to_string())?;
-        if first > last || last >= libc::CPU_SETSIZE as usize {
+        if first > last || last >= MAX_CPUS {
             return Err("CV1TOUCH_CPUS: invalid CPU range".into());
         }
         for cpu in first..=last {
-            // SAFETY: checked CPU_SETSIZE above; both sets are initialized.
-            unsafe {
-                if !libc::CPU_ISSET(cpu, allowed) {
-                    return Err(format!(
-                        "CV1TOUCH_CPUS: CPU {cpu} is outside the thread's allowed affinity"
-                    ));
-                }
-                libc::CPU_SET(cpu, &mut selected);
+            if !allowed.contains(&cpu) {
+                return Err(format!(
+                    "CV1TOUCH_CPUS: CPU {cpu} is outside the thread's allowed affinity"
+                ));
+            }
+            if !selected.contains(&cpu) {
+                selected.push(cpu);
             }
         }
     }
     Ok(selected)
 }
+
+/// The most CPUs Linux's affinity calls take (CPU_SETSIZE).
+const MAX_CPUS: usize = 1024;
 
 fn affinity_setting() -> Result<Option<String>, String> {
     match std::env::var("CV1TOUCH_CPUS") {
@@ -2026,49 +1954,18 @@ fn affinity_setting() -> Result<Option<String>, String> {
     }
 }
 
-fn thread_affinity(tid: libc::pid_t) -> Result<libc::cpu_set_t, String> {
-    // SAFETY: valid output pointer; only queries the requested thread.
-    unsafe {
-        let mut allowed: libc::cpu_set_t = mem::zeroed();
-        if libc::sched_getaffinity(tid, mem::size_of_val(&allowed), &mut allowed) != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(allowed)
-    }
+fn set_rt_affinity(thread: system::ThreadId) -> Result<(), String> {
+    set_rt_affinity_with(thread, affinity_setting()?.as_deref())
 }
 
-fn set_radio_affinity() -> Result<(), String> {
-    set_rt_affinity(0)
-}
-
-fn set_rt_affinity(tid: libc::pid_t) -> Result<(), String> {
-    set_rt_affinity_with(tid, affinity_setting()?.as_deref())
-}
-
-fn set_rt_affinity_with(tid: libc::pid_t, spec: Option<&str>) -> Result<(), String> {
+fn set_rt_affinity_with(thread: system::ThreadId, spec: Option<&str>) -> Result<(), String> {
     let Some(spec) = spec else { return Ok(()) };
-    let selected = affinity_cpus(spec, &thread_affinity(tid)?)?;
-    // SAFETY: initialized nonempty set containing only CPUs allowed for this thread.
-    if unsafe { libc::sched_setaffinity(tid, mem::size_of_val(&selected), &selected) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(())
+    let allowed = system::allowed_cpus(thread).map_err(|e| e.to_string())?;
+    let selected = affinity_cpus(spec, &allowed)?;
+    system::set_cpus(thread, &selected).map_err(|e| e.to_string())
 }
 
-/// The thread of ours with this name (its comm), if one is running.
-fn thread_named(name: &str) -> Option<libc::pid_t> {
-    fs::read_dir("/proc/self/task")
-        .ok()?
-        .filter_map(|e| e.ok())
-        .find_map(|e| {
-            let comm = fs::read_to_string(e.path().join("comm")).ok()?;
-            (comm.trim_end() == name)
-                .then(|| e.file_name().to_str()?.parse().ok())
-                .flatten()
-        })
-}
-
-/// OpenHMD's USB event thread's SCHED_RR priority: below the radio thread's.
+/// OpenHMD's USB event thread's real-time priority: below the radio thread's.
 const USB_RT_PRIORITY: u32 = 9;
 
 /// Makes OpenHMD's USB event thread (cv1t-usb) real-time, on our real-time CPUs. It reaps and
@@ -2080,7 +1977,7 @@ fn make_usb_thread_realtime() {
         if i > 0 {
             thread::sleep(Duration::from_millis(50));
         }
-        thread_named("cv1t-usb")
+        system::thread_named("cv1t-usb")
     });
     let Some(tid) = found else {
         log("no cv1t-usb thread: OpenHMD's USB event thread stays as it is");
@@ -2089,8 +1986,8 @@ fn make_usb_thread_realtime() {
     if let Err(err) = set_rt_affinity(tid) {
         log(format!("cv1t-usb keeps the process's CPUs ({err})"));
     }
-    match make_thread_realtime(tid, USB_RT_PRIORITY) {
-        Ok(()) => log(format!("cv1t-usb real-time (SCHED_RR {USB_RT_PRIORITY})")),
+    match system::make_realtime(tid, USB_RT_PRIORITY) {
+        Ok(how) => log(format!("cv1t-usb real-time ({how})")),
         Err(err) => log(format!("cv1t-usb stays normal priority ({err})")),
     }
 }
@@ -2210,14 +2107,10 @@ fn usage() -> ! {
 }
 
 fn random_u64() -> u64 {
-    let mut v = 0u64;
-    // SAFETY: valid buffer of 8 bytes.
-    let n = unsafe { libc::getrandom(&mut v as *mut u64 as *mut libc::c_void, 8, 0) };
-    if n == 8 && v != 0 {
-        v
-    } else {
-        shm::now_ns()
-    }
+    system::random_u64()
+        .ok()
+        .filter(|&v| v != 0)
+        .unwrap_or_else(shm::now_ns)
 }
 
 fn main() {
@@ -2238,7 +2131,9 @@ fn main() {
     }
     let affinity = affinity_setting().and_then(|spec| {
         if let Some(spec) = spec {
-            affinity_cpus(&spec, &thread_affinity(0)?)?;
+            let allowed = system::allowed_cpus(system::current_thread())
+                .map_err(|e| format!("CV1TOUCH_CPUS: {e}"))?;
+            affinity_cpus(&spec, &allowed)?;
         }
         Ok(())
     });
@@ -2246,14 +2141,19 @@ fn main() {
         eprintln!("cv1touchd: {e}");
         process::exit(2);
     }
-    // First, before any thread exists (the recorder and engine threads inherit this mask):
-    // SIGINT/SIGTERM must reach only the signalfd, never a thread whose default action kills us.
+    // First, before any thread exists: on Linux the recorder and engine threads inherit the
+    // blocked SIGINT and SIGTERM, which must reach only the shutdown requests, never a thread
+    // whose default action kills us.
     let shutdown = shutdown::Requests::take().unwrap_or_else(|e| {
-        log(format!("cannot take SIGINT/SIGTERM: {e}"));
+        log(format!("cannot take over shutdown requests: {e}"));
         process::exit(1);
     });
+    #[cfg(unix)]
     line_buffer_stdout();
-    match lock_memory() {
+    if let Err(e) = system::opt_out_of_throttling() {
+        log(format!("power throttling stays as Windows sets it ({e})"));
+    }
+    match system::lock_memory() {
         Ok(()) => log("memory locked: pages stay in RAM once touched"),
         Err(e) => log(format!(
             "memory not locked ({e}): pages can be swapped out under pressure"
@@ -2338,11 +2238,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&runtime_dir)
-    {
+    if let Err(e) = cv1touch::platform::fs::create_private_dir_all(&runtime_dir) {
         log(format!("{}: {e}", runtime_dir.display()));
         process::exit(1);
     }
@@ -3169,7 +3065,7 @@ mod tests {
             std::process::id(),
             shm::now_ns()
         ));
-        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        cv1touch::platform::fs::create_private_dir_all(&dir).unwrap();
         let path = dir.join("input.json");
         let original = input_config();
         let runtime = Mutex::new(InputRuntime {
@@ -3282,39 +3178,14 @@ mod tests {
     }
 
     #[test]
-    fn finds_a_thread_of_ours_by_its_name() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        let t = thread::Builder::new()
-            .name("cv1t-findme".into())
-            .spawn(move || {
-                // SAFETY: no arguments.
-                tx.send(unsafe { libc::gettid() }).unwrap();
-                stop_rx.recv().ok();
-            })
-            .unwrap();
-        let tid = rx.recv().unwrap();
-        assert_eq!(thread_named("cv1t-findme"), Some(tid));
-        assert_eq!(thread_named("cv1t-nobody"), None);
-        stop_tx.send(()).unwrap();
-        t.join().unwrap();
-    }
-
-    #[test]
     fn default_affinity_preserves_a_restricted_thread() {
         thread::spawn(|| {
-            let before = thread_affinity(0).unwrap();
-            let cpu = (0..libc::CPU_SETSIZE as usize)
-                .find(|&c| unsafe { libc::CPU_ISSET(c, &before) })
-                .unwrap();
-            set_rt_affinity_with(0, Some(&cpu.to_string())).unwrap();
-            set_rt_affinity_with(0, None).unwrap();
-            let after = thread_affinity(0).unwrap();
-            let got: Vec<_> = (0..libc::CPU_SETSIZE as usize)
-                .filter(|&c| unsafe { libc::CPU_ISSET(c, &after) })
-                .collect();
+            let me = system::current_thread();
+            let cpu = system::allowed_cpus(me).unwrap()[0];
+            set_rt_affinity_with(me, Some(&cpu.to_string())).unwrap();
+            set_rt_affinity_with(me, None).unwrap();
             assert_eq!(
-                got,
+                system::allowed_cpus(me).unwrap(),
                 vec![cpu],
                 "default affinity must not widen or replace the inherited mask"
             );
@@ -3325,15 +3196,11 @@ mod tests {
 
     #[test]
     fn explicit_affinity_validates_ranges_and_the_allowed_mask() {
-        let mut allowed: libc::cpu_set_t = unsafe { mem::zeroed() };
-        for cpu in [0, 2, 3, 7] {
-            unsafe { libc::CPU_SET(cpu, &mut allowed) };
-        }
-        let selected = affinity_cpus("0,2-3,7", &allowed).unwrap();
-        let got: Vec<_> = (0..8)
-            .filter(|&c| unsafe { libc::CPU_ISSET(c, &selected) })
-            .collect();
-        assert_eq!(got, vec![0, 2, 3, 7]);
+        let allowed = [0, 2, 3, 7];
+        assert_eq!(
+            affinity_cpus("0,2-3,7", &allowed).unwrap(),
+            vec![0, 2, 3, 7]
+        );
         for spec in [
             "",
             "1",
@@ -3395,11 +3262,12 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs rtkit headroom: rtkit grants a user at most 25 threads, and a running SteamVR holds 14"]
     fn realtime_request_makes_only_the_calling_thread_round_robin() {
         thread::spawn(|| {
-            make_realtime(RADIO_RT_PRIORITY).unwrap();
+            system::make_realtime(system::current_thread(), RADIO_RT_PRIORITY).unwrap();
             // SAFETY: plain queries of the calling thread (pid 0).
             let (policy, prio) = unsafe {
                 let mut p: libc::sched_param = mem::zeroed();
@@ -3424,10 +3292,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires sufficient RLIMIT_MEMLOCK or CAP_IPC_LOCK for mlockall"]
     fn locked_memory_stays_resident_once_touched() {
-        lock_memory().unwrap();
+        system::lock_memory().unwrap();
         let v = vec![1u8; 4 << 20];
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
         let locked_kb: u64 = status

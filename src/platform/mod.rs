@@ -328,6 +328,73 @@ pub mod hid {
     }
 }
 
+pub mod system {
+    //! The daemon's hold on the machine: its threads' priority and CPUs, its memory, and its
+    //! power setting. On Linux: SCHED_RR through rtkit, sched_setaffinity and mlockall. On
+    //! Windows: thread priorities and affinity masks, opting out of power throttling, and no
+    //! memory locking.
+    use std::io;
+
+    use super::os;
+
+    /// An operating system thread of this process.
+    pub type ThreadId = os::ThreadId;
+
+    /// The calling thread.
+    pub fn current_thread() -> ThreadId {
+        os::current_thread()
+    }
+
+    /// The thread of this process with this name, if one is running.
+    pub fn thread_named(name: &str) -> Option<ThreadId> {
+        os::thread_named(name)
+    }
+
+    /// Runs `thread` ahead of normal threads, so the report or transfer it waits on wakes it at
+    /// once. On Linux: SCHED_RR at `priority` through rtkit (no privileges needed; threads it
+    /// starts afterwards stay normal), ahead of every normal thread. On Windows: for `priority`
+    /// 10 and up the time-critical priority, the top of the normal range, which a normal thread
+    /// only ties during a passing boost; below, the highest normal one, which a boosted normal
+    /// thread can pass. Says what it set, for the log.
+    pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
+        os::make_realtime(thread, priority)
+    }
+
+    /// The CPUs `thread` may run on (on Windows, within processor group 0: the first 64).
+    pub fn allowed_cpus(thread: ThreadId) -> io::Result<Vec<usize>> {
+        os::allowed_cpus(thread)
+    }
+
+    /// Restricts `thread` to `cpus`, which must be among its allowed ones.
+    pub fn set_cpus(thread: ThreadId, cpus: &[usize]) -> io::Result<()> {
+        os::set_cpus(thread, cpus)
+    }
+
+    /// Keeps the process's pages in RAM once touched, where the platform can: a page swapped out
+    /// costs a disk read on whichever thread touches it next. Only touched pages, not the whole
+    /// address space (the mapped libraries reserve far more than they use).
+    pub fn lock_memory() -> io::Result<()> {
+        os::lock_memory()
+    }
+
+    /// The calling thread's voluntary context switches (it blocked or slept), where the platform
+    /// counts them.
+    pub fn voluntary_switches() -> Option<i64> {
+        os::voluntary_switches()
+    }
+
+    /// 64 random bits from the operating system.
+    pub fn random_u64() -> io::Result<u64> {
+        os::random_u64()
+    }
+
+    /// Keeps Windows from running the process in its power-saving efficiency mode, which slows
+    /// a background process's threads; nothing to do on Linux.
+    pub fn opt_out_of_throttling() -> io::Result<()> {
+        os::opt_out_of_throttling()
+    }
+}
+
 pub mod shutdown {
     //! Requests to stop the daemon: SIGINT and SIGTERM on Linux; on Windows the console's
     //! control events: Ctrl+C, Ctrl+Break, closing the console, and logoff and shutdown, which
@@ -598,6 +665,72 @@ mod tests {
 
     fn segment_name(tag: &str) -> String {
         format!("/cv1t-platform-{tag}-{}", std::process::id())
+    }
+
+    #[test]
+    fn finds_a_thread_of_ours_by_its_name() {
+        use super::system;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::Builder::new()
+            .name("cv1t-findme".into())
+            .spawn(move || {
+                tx.send(system::current_thread()).unwrap();
+                stop_rx.recv().ok();
+            })
+            .unwrap();
+        let tid = rx.recv().unwrap();
+        assert_eq!(system::thread_named("cv1t-findme"), Some(tid));
+        assert_eq!(system::thread_named("cv1t-nobody"), None);
+        stop_tx.send(()).unwrap();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_thread_keeps_to_the_cpus_it_is_given() {
+        use super::system;
+        std::thread::spawn(|| {
+            let me = system::current_thread();
+            let allowed = system::allowed_cpus(me).unwrap();
+            assert!(!allowed.is_empty());
+            system::set_cpus(me, &allowed[..1]).unwrap();
+            assert_eq!(system::allowed_cpus(me).unwrap(), allowed[..1]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn the_system_gives_random_bits() {
+        use super::system;
+        let (a, b) = (system::random_u64().unwrap(), system::random_u64().unwrap());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn power_throttling_can_be_turned_off() {
+        super::system::opt_out_of_throttling().unwrap();
+    }
+
+    /// On Windows a real-time request takes no privileges: the thread runs time-critical.
+    #[cfg(windows)]
+    #[test]
+    fn a_realtime_thread_runs_time_critical() {
+        use super::system;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        std::thread::spawn(|| {
+            let how = system::make_realtime(system::current_thread(), 10).unwrap();
+            assert_eq!(how, "time-critical priority");
+            // SAFETY: the calling thread's pseudo-handle.
+            assert_eq!(
+                unsafe { GetThreadPriority(GetCurrentThread()) },
+                THREAD_PRIORITY_TIME_CRITICAL
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
