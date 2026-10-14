@@ -28,5 +28,6 @@ pub mod summary;
 pub mod supervise;
 pub mod track;
 pub mod vr;
+pub mod zip;
 
 pub mod frame_queue;
