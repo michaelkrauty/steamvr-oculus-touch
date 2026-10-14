@@ -2,7 +2,7 @@
 
 Windows support is being built. Today the SteamVR driver, the native engine, the daemon and the `cv1touch` command build and pass their tests on Windows 11 x64. There is no installer yet, so this page is for developers.
 
-Like the Linux build, the Windows build uses no Oculus software. The Rift headset needs no driver. The sensors will need a WinUSB driver package of our own, which is not written yet.
+Like the Linux build, the Windows build uses no Oculus software. The Rift headset needs no driver. The sensors run with Windows' own WinUSB driver, which `cv1touch sensors install` gives them (it asks for permission once); `cv1touch sensors` says whether each sensor plugged in has it, and `cv1touch sensors remove` takes it off again. No driver package of our own and no certificate is involved.
 
 ## Tools
 

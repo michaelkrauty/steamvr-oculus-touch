@@ -14,9 +14,6 @@ use cv1touch::supervise;
 use cv1touch::zip::ZipWriter;
 use std::io::{Read, Seek, SeekFrom};
 
-/// The Oculus USB vendor: the headset, its sensors and the Touch controllers' dongle.
-const OCULUS: u16 = 0x2833;
-
 /// The most of one log a report keeps: its end, where the problem usually is.
 const LOG_TAIL: u64 = 4 << 20;
 

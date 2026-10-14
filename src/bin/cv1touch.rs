@@ -28,6 +28,8 @@ use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 mod guided_setup;
 #[path = "cv1touch/report.rs"]
 mod report;
+#[path = "cv1touch/sensors.rs"]
+mod sensors;
 
 fn human_color_enabled(no_color: bool, term_dumb: bool, terminal: bool, forced: bool) -> bool {
     !no_color && !term_dumb && (terminal || forced)
@@ -53,7 +55,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -130,6 +132,9 @@ fn json_status() -> i32 {
 /// A check `doctor` makes: its name, whether it passed, and what it looked at or found.
 type DoctorCheck = (&'static str, bool, String);
 
+/// The Oculus USB vendor: the headset, its sensors and the Touch controllers' dongle.
+const OCULUS: u16 = 0x2833;
+
 /// What `doctor` checks, and the daemon's status if it answered.
 fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     let runtime = steamvr::runtime_root();
@@ -187,6 +192,8 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
                 .unwrap_or_else(|| align::render_path().display().to_string()),
         ),
     ];
+    #[cfg(windows)]
+    checks.push(sensors::doctor_check());
     let daemon = status_json();
     checks.push((
         "daemon",
@@ -5277,6 +5284,9 @@ fn main() {
         ["alignment", "reload"] => send("alignment reload"),
         ["stop"] => send("stop"),
         ["report"] => report::run(None),
+        ["sensors"] => sensors::status(),
+        ["sensors", "install"] => sensors::install(),
+        ["sensors", "remove"] => sensors::remove(),
         ["report", "--out", path] => report::run(Some(PathBuf::from(path))),
         ["calibration", "capture"] => send("calibration capture"),
         ["calibration", "provisional"] => send("calibration provisional"),
