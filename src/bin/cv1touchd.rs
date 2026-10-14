@@ -18,13 +18,13 @@ use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{Hand, HandConfig};
-use cv1touch::platform::{hid, ipc, shutdown, system};
+use cv1touch::platform::{self, hid, ipc, shutdown, system};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
 use cv1touch::track::predict::{ShapeParams, VelocityShaper};
 use cv1touch::track::tracker::Stats;
-use cv1touch::{align, calib, ffi, input_calibration, modes, settings, track};
+use cv1touch::{align, calib, ffi, input_calibration, modes, settings, supervise, track};
 
 /// Disable headset tracking LEDs by default while retaining the headset radio for Touch.
 const DEFAULT_HMD_LEDS_OFF: bool = true;
@@ -434,8 +434,11 @@ impl EngineSink for Daemon {
     }
 }
 
+/// A line for the log. One that cannot be written is lost: under a supervisor that has ended,
+/// standard error is a closed pipe, and the daemon still has to stop cleanly.
 fn log(msg: impl AsRef<str>) {
-    eprintln!("cv1touchd: {}", msg.as_ref());
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "cv1touchd: {}", msg.as_ref());
 }
 
 fn publish_disconnected(d: &Daemon) {
@@ -1900,7 +1903,7 @@ fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
 /// OpenHMD logs through C's stdout, which is block-buffered when it is not a terminal: under
 /// systemd its lines reached the journal in 4 KB batches, stamped with the flush time rather than
 /// when they happened. Line-buffered, each lands as it is written. Must run before anything prints.
-/// (On Windows the engine's DLL carries its own C runtime, and with it its own stdout.)
+/// (On Windows the engine's DLL carries its own C runtime and stdout: ohmd_cv1touch_unbuffer_log.)
 #[cfg(unix)]
 fn line_buffer_stdout() {
     extern "C" {
@@ -2099,11 +2102,67 @@ fn serve_client(d: &Daemon, mut conn: ipc::Connection, one_at_a_time: &Mutex<()>
     }
 }
 
-const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
+const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --supervise [OPTIONS]   run it as a child process, restarted after a failure, its output in a log file\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
     process::exit(2);
+}
+
+/// `--supervise`: runs the daemon with the other arguments as a child process, started again
+/// after a failure, its output in a log file (supervise.rs). For Windows, where no service
+/// manager does that; on Linux systemd runs the daemon (cv1touchd.service).
+fn supervise(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--supervise") {
+        usage();
+    }
+    // the last one, as the daemon takes it
+    let runtime = args
+        .iter()
+        .rposition(|a| a == "--runtime-dir")
+        .and_then(|i| args.get(i + 1))
+        .map_or_else(control::runtime_dir, PathBuf::from);
+    if let Err(e) = platform::fs::create_private_dir_all(&runtime) {
+        eprintln!("cv1touchd: {}: {e}", runtime.display());
+        return 1;
+    }
+    // one supervisor per runtime directory, as there is one daemon
+    let lock_path = runtime.join("supervisor.lock");
+    let _lock = match ipc::lock_exclusive(&lock_path) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            println!("cv1touchd: a supervisor is already running");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("cv1touchd: {}: {e}", lock_path.display());
+            return 1;
+        }
+    };
+    let mut log = match supervise::Log::open(&supervise::log_dir()) {
+        Ok(log) => log,
+        Err(e) => {
+            eprintln!("cv1touchd: {}: {e}", supervise::log_dir().display());
+            return 1;
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("cv1touchd: cannot find its own program: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "cv1touchd: supervising the daemon, its log in {}",
+        log.path().display()
+    );
+    let daemon = || {
+        let mut daemon = std::process::Command::new(&exe);
+        daemon.args(args);
+        daemon
+    };
+    supervise::run(daemon, &mut log, supervise::POLICY)
 }
 
 fn random_u64() -> u64 {
@@ -2129,6 +2188,9 @@ fn main() {
             _ => {}
         }
     }
+    if arguments.first().map(String::as_str) == Some("--supervise") {
+        process::exit(supervise(&arguments[1..]));
+    }
     let affinity = affinity_setting().and_then(|spec| {
         if let Some(spec) = spec {
             let allowed = system::allowed_cpus(system::current_thread())
@@ -2150,6 +2212,11 @@ fn main() {
     });
     #[cfg(unix)]
     line_buffer_stdout();
+    #[cfg(windows)]
+    // SAFETY: takes nothing; nothing has printed through the engine's stdout yet.
+    unsafe {
+        ffi::ohmd_cv1touch_unbuffer_log()
+    };
     if let Err(e) = system::opt_out_of_throttling() {
         log(format!("power throttling stays as Windows sets it ({e})"));
     }

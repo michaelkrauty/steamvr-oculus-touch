@@ -138,6 +138,11 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_contex
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
 OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device *device);
+/* The engine logs to its C runtime's stdout, fully buffered when that is a pipe or a file. This
+ * turns the buffering off, so each line goes out as it is written and none is lost when the
+ * process ends abruptly. For Windows, where the library carries its own C runtime: elsewhere the
+ * process's stdout is the engine's too. */
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_unbuffer_log(void);
 
 /* A decoder for radio reports read through a second handle on the radio's hidraw node (each reader
  * gets every report), for a thread of the daemon's own: it decodes on its own copy of each

@@ -24,6 +24,7 @@ pub mod shm;
 pub mod status;
 pub mod steamvr;
 pub mod summary;
+pub mod supervise;
 pub mod track;
 pub mod vr;
 

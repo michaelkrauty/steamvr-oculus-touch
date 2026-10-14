@@ -727,6 +727,11 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_configure_sensors(ohmd_context 
     return cv1touch_sensor_config_set(&ctx->cv1touch_sensors, ignored, ignored_count, poses, pose_count);
 }
 
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_unbuffer_log(void)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+}
+
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user)
 {
 	ctx->cv1touch_frame_cb = cb;

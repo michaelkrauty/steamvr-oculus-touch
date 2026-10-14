@@ -6,6 +6,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Added
 
+- `cv1touchd --supervise` runs the daemon as a child process with each line of its output stamped with the time in `logs/cv1touchd.log` under the state directory, keeping four earlier logs. After a failure it starts the daemon again 2 s later, as the systemd unit does, unless the daemon refused its arguments or failed five times in a row within 30 s of starting. It is meant for Windows, where no service manager does this.
 - `cv1touch prediction [PERCENT]` sets how much of the tracked motion SteamVR extrapolates poses with: 100 (the default) as before, 0 none, so each pose is shown where it was measured. It applies at once and is kept for later runs in `settings.json` in the configuration directory.
 
 ### Changed

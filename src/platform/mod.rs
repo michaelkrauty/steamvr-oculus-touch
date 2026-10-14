@@ -665,6 +665,21 @@ pub mod process {
         }
         os::process_running(name)
     }
+
+    /// Makes the process `command` starts end when this one does, however it ends. On Linux it
+    /// gets SIGTERM when the thread that starts it ends: start it from the main thread. On
+    /// Windows the whole of this process joins a job object (once), and with it everything it
+    /// starts from then on; the job ends them all when this process ends, or at once when one of
+    /// them crashes, instead of after Windows Error Reporting has looked at it.
+    pub fn end_with_this_process(command: &mut std::process::Command) -> io::Result<()> {
+        os::end_with_this_process(command)
+    }
+
+    /// Starts the program `command` runs without a console window of its own (Windows); on
+    /// Linux nothing changes.
+    pub fn without_window(command: &mut std::process::Command) {
+        os::without_window(command)
+    }
 }
 
 #[cfg(test)]
@@ -1103,6 +1118,106 @@ mod tests {
         std::io::stdout()
             .write_all(b"back on the terminal\n")
             .unwrap();
+    }
+
+    /// A process that sleeps for half a minute, its output nowhere.
+    fn sleeper() -> std::process::Command {
+        use std::process::{Command, Stdio};
+        #[cfg(unix)]
+        let mut c = {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        #[cfg(windows)]
+        let mut c = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        };
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        // the state follows the name in parentheses; Z is a process that has ended
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        })
+    }
+
+    #[cfg(windows)]
+    fn alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        // SAFETY: a handle opened for waiting, closed after a wait that does not block.
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+            CloseHandle(h);
+            running
+        }
+    }
+
+    /// In a process of its own, which starts two sleepers and ends: the one started after
+    /// `end_with_this_process` ends with it, the one started before keeps running. The pids come
+    /// back through a file: a pipe would stay open while either sleeper holds it.
+    #[test]
+    fn a_process_started_to_end_with_this_one_does() {
+        use super::process;
+        const CHILD: &str = "CV1TOUCH_TEST_END_WITH";
+        let Some(pids) = std::env::var_os(CHILD) else {
+            let pids = std::env::temp_dir().join(format!("cv1t-end-with-{}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::a_process_started_to_end_with_this_one_does",
+                ])
+                .env(CHILD, &pids)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let text = std::fs::read_to_string(&pids).unwrap();
+            std::fs::remove_file(&pids).unwrap();
+            let pid = |what: &str| -> u32 {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(what)?.trim().parse().ok())
+                    .unwrap_or_else(|| panic!("no {what} in {text}"))
+            };
+            let (kept, ended) = (pid("kept"), pid("ended"));
+            let gone = within_five_seconds(|| !alive(ended));
+            let kept_alive = alive(kept);
+            #[cfg(unix)]
+            // SAFETY: signalling a process this test started.
+            unsafe {
+                libc::kill(kept as i32, libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &kept.to_string()])
+                .output();
+            assert!(gone, "the process tied to its starter outlived it");
+            assert!(kept_alive, "the untied process ended too");
+            return;
+        };
+        // this process ends before either: what happens to them then is the test
+        let kept = sleeper().spawn().unwrap().id();
+        let mut tied = sleeper();
+        process::end_with_this_process(&mut tied).unwrap();
+        let ended = tied.spawn().unwrap().id();
+        std::fs::write(pids, format!("kept {kept}\nended {ended}\n")).unwrap();
     }
 
     #[test]

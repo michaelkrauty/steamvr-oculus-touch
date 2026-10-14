@@ -890,6 +890,27 @@ pub fn process_running(name: &str) -> io::Result<bool> {
     }
 }
 
+pub fn end_with_this_process(command: &mut std::process::Command) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let starter = std::process::id() as libc::pid_t;
+    // SAFETY: prctl and getppid are async-signal-safe, as code between fork and exec must be.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // the starter may have ended before the request: then no signal would come
+            if libc::getppid() != starter {
+                return Err(io::Error::other("its starter ended"));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+pub fn without_window(_command: &mut std::process::Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

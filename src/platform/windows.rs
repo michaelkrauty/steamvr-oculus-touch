@@ -1381,6 +1381,12 @@ pub fn thread_named(name: &str) -> Option<ThreadId> {
     }
 }
 
+pub fn without_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 pub fn process_running(name: &str) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -1407,6 +1413,44 @@ pub fn process_running(name: &str) -> io::Result<bool> {
         CloseHandle(snapshot);
         Ok(found)
     }
+}
+
+pub fn end_with_this_process(_command: &mut std::process::Command) -> io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // the job's handle stays open, never closed, until this process ends; children inherit the
+    // job (Windows 8 and later nest jobs, so a job this process already runs in is no obstacle)
+    static JOB: OnceLock<Result<(), i32>> = OnceLock::new();
+    let joined = JOB.get_or_init(|| {
+        // SAFETY: a new unnamed job, given a correctly sized limit structure, then this process.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(job, GetCurrentProcess()) != 0;
+            if !ok {
+                let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                CloseHandle(job);
+                return Err(e);
+            }
+            Ok(())
+        }
+    });
+    joined.map_err(io::Error::from_raw_os_error)
 }
 
 pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {

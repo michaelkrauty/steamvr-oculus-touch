@@ -194,7 +194,13 @@ fn doctor(json: bool) -> i32 {
         for (name, ok, detail) in &checks {
             println!("{} {name}: {detail}", if *ok { "ok" } else { "FAIL" });
         }
+        #[cfg(unix)]
         println!("Wake sleeping controllers before checking tracking. USB access needs active-session udev permissions; logs: journalctl --user -u cv1touchd.");
+        #[cfg(windows)]
+        println!(
+            "Wake sleeping controllers before checking tracking. The daemon's log: {}",
+            cv1touch::supervise::log_file().display()
+        );
     }
     if checks.iter().all(|(_, ok, _)| *ok) {
         0
