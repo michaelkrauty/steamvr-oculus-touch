@@ -934,6 +934,134 @@ pub fn play_wav(wav: &[u8]) {
     let _ = std::fs::remove_file(&path);
 }
 
+pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
+    usb_devices_in(Path::new("/sys/bus/usb/devices"), vendor)
+}
+
+/// The interface classes worth naming in a report.
+fn interface_class(code: &str) -> &'static str {
+    match code {
+        "01" => "audio",
+        "03" => "HID",
+        "0e" => "video",
+        "ff" => "vendor-specific",
+        _ => "other",
+    }
+}
+
+/// The USB devices of `vendor` under `root`, laid out as /sys/bus/usb/devices is: a device's
+/// directory ("1-2") holds idVendor, idProduct, product and speed (Mb/s); an interface's
+/// ("1-2:1.0") holds bInterfaceNumber and bInterfaceClass; each links to its driver. Each device
+/// comes before its interfaces.
+pub(crate) fn usb_devices_in(
+    root: &Path,
+    vendor: u16,
+) -> io::Result<Vec<crate::platform::usb::Node>> {
+    use crate::platform::usb::Node;
+    let read = |dir: &Path, name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let hex =
+        |dir: &Path, name: &str| read(dir, name).and_then(|s| u16::from_str_radix(&s, 16).ok());
+    let driver = |dir: &Path| {
+        std::fs::read_link(dir.join("driver"))
+            .ok()?
+            .file_name()?
+            .to_str()
+            .map(String::from)
+    };
+    let names: Vec<String> = std::fs::read_dir(root)?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    let mut products = std::collections::BTreeMap::new();
+    let mut nodes = Vec::new();
+    for name in names.iter().filter(|n| !n.contains(':')) {
+        let dir = root.join(name);
+        if hex(&dir, "idVendor") != Some(vendor) {
+            continue;
+        }
+        let product = hex(&dir, "idProduct").unwrap_or(0);
+        products.insert(name.as_str(), product);
+        let product_name = read(&dir, "product").unwrap_or_default();
+        nodes.push(Node {
+            id: name.clone(),
+            product,
+            name: match read(&dir, "speed") {
+                Some(speed) => format!("{product_name} ({speed} Mb/s)"),
+                None => product_name,
+            },
+            driver: driver(&dir),
+            problem: None,
+        });
+    }
+    for name in &names {
+        let Some(product) = name
+            .split_once(':')
+            .and_then(|(device, _)| products.get(device))
+        else {
+            continue;
+        };
+        let dir = root.join(name);
+        let number = read(&dir, "bInterfaceNumber").unwrap_or_default();
+        let class = interface_class(&read(&dir, "bInterfaceClass").unwrap_or_default());
+        nodes.push(Node {
+            id: name.clone(),
+            product: *product,
+            name: format!("interface {number} ({class})"),
+            driver: driver(&dir),
+            problem: None,
+        });
+    }
+    // by device, then interface: "3-1" and its interfaces before "3-1.1", which ':' after '.'
+    // would not give
+    let key = |id: &str| {
+        let (device, interface) = id.split_once(':').unwrap_or((id, ""));
+        (device.to_string(), interface.to_string())
+    };
+    nodes.sort_by_key(|n| key(&n.id));
+    Ok(nodes)
+}
+
+pub fn system_description() -> String {
+    let release = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+                .map(|v| v.trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| "Linux".into());
+    // SAFETY: a zeroed structure the call fills in.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    let kernel = if unsafe { libc::uname(&mut uts) } == 0 {
+        // SAFETY: uname NUL-terminates its fields.
+        let field = |f: &[libc::c_char]| {
+            unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        format!(
+            "{} {} {}",
+            field(&uts.sysname),
+            field(&uts.release),
+            field(&uts.machine)
+        )
+    } else {
+        "an unknown kernel".into()
+    };
+    format!("{release}, {kernel}")
+}
+
+pub fn desktop() -> Option<std::path::PathBuf> {
+    None
+}
+
+pub fn show_file(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,5 +1118,58 @@ mod tests {
             "accepted a shared lock directory"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tree laid out as /sys/bus/usb/devices: a sensor with its video interface bound to
+    /// uvcvideo, a headset interface with no driver, and another maker's mouse.
+    #[test]
+    fn usb_devices_are_read_from_sysfs() {
+        use crate::platform::usb::Node;
+        let root = std::env::temp_dir().join(format!("cv1t-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let file = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{text}\n")).unwrap();
+        };
+        file("1-2/idVendor", "2833");
+        file("1-2/idProduct", "0211");
+        file("1-2/product", "Rift Sensor");
+        file("1-2/speed", "5000");
+        std::fs::create_dir_all(root.join("drivers/usb")).unwrap();
+        std::os::unix::fs::symlink(root.join("drivers/usb"), root.join("1-2/driver")).unwrap();
+        file("1-2:1.0/bInterfaceNumber", "00");
+        file("1-2:1.0/bInterfaceClass", "0e");
+        std::fs::create_dir_all(root.join("drivers/uvcvideo")).unwrap();
+        std::os::unix::fs::symlink(root.join("drivers/uvcvideo"), root.join("1-2:1.0/driver"))
+            .unwrap();
+        file("3-1/idVendor", "2833");
+        file("3-1/idProduct", "0031");
+        file("3-1:1.1/bInterfaceNumber", "01");
+        file("3-1:1.1/bInterfaceClass", "03");
+        // a hub's device below it sorts after the hub's own interface
+        file("3-1.2/idVendor", "2833");
+        file("3-1.2/idProduct", "0330");
+        file("1-4/idVendor", "046d");
+        file("1-4/idProduct", "c52b");
+        file("1-4:1.0/bInterfaceClass", "03");
+        let node = |id: &str, product, name: &str, driver: Option<&str>| Node {
+            id: id.into(),
+            product,
+            name: name.into(),
+            driver: driver.map(String::from),
+            problem: None,
+        };
+        assert_eq!(
+            usb_devices_in(&root, 0x2833).unwrap(),
+            [
+                node("1-2", 0x0211, "Rift Sensor (5000 Mb/s)", Some("usb")),
+                node("1-2:1.0", 0x0211, "interface 00 (video)", Some("uvcvideo")),
+                node("3-1", 0x0031, "", None),
+                node("3-1:1.1", 0x0031, "interface 01 (HID)", None),
+                node("3-1.2", 0x0330, "", None),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -262,6 +262,12 @@ pub mod dirs {
         resolve(&|name| std::env::var_os(name))
     }
 
+    /// The user's desktop, where Windows users look for a file they were asked to send; None on
+    /// Linux, which has no such convention for a command-line tool.
+    pub fn desktop() -> Option<PathBuf> {
+        super::os::desktop()
+    }
+
     /// OpenHMD's cache of sensor and controller configuration, as the engine resolves it
     /// (ohmd_get_config_dir).
     pub fn openhmd() -> PathBuf {
@@ -387,6 +393,12 @@ pub mod system {
     /// counts them.
     pub fn voluntary_switches() -> Option<i64> {
         os::voluntary_switches()
+    }
+
+    /// The operating system and its version, for a report: "Arch Linux, Linux 7.2.9-arch1-1
+    /// x86_64", "Windows 11 Professional 24H2 (build 26100.6584)".
+    pub fn description() -> String {
+        os::system_description()
     }
 
     /// 64 random bits from the operating system.
@@ -642,6 +654,37 @@ pub mod ipc {
     }
 }
 
+pub mod usb {
+    //! The USB devices of one maker, and the driver the system runs each with: whether the engine
+    //! can open the sensors depends on it.
+    use std::io;
+
+    use super::os;
+
+    /// A USB device, or one of its interfaces, as the system lists it.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct Node {
+        /// The system's name for it: the device instance ID on Windows
+        /// ("USB\VID_2833&PID_0211\..."), the sysfs name on Linux ("1-2", or "1-2:1.0" for an
+        /// interface).
+        pub id: String,
+        pub product: u16,
+        /// How the device or the system describes it.
+        pub name: String,
+        /// The driver it runs with, if any.
+        pub driver: Option<String>,
+        /// Why Windows does not run it: its Device Manager problem code (28: no driver).
+        pub problem: Option<u32>,
+    }
+
+    /// The present devices of the USB vendor `vendor`, and their interfaces (on Windows, also
+    /// the HID collections of their HID interfaces): on Linux each device before its interfaces,
+    /// on Windows by `id`.
+    pub fn devices(vendor: u16) -> io::Result<Vec<Node>> {
+        os::usb_devices(vendor)
+    }
+}
+
 pub mod sound {
     //! Sounds the command-line tool marks timed steps with.
     use super::os;
@@ -685,6 +728,12 @@ pub mod process {
     /// them crashes, instead of after Windows Error Reporting has looked at it.
     pub fn end_with_this_process(command: &mut std::process::Command) -> io::Result<()> {
         os::end_with_this_process(command)
+    }
+
+    /// Shows the file at `path` selected in a file manager window (Explorer on Windows); false
+    /// where there is none to ask (Linux, from a command-line tool).
+    pub fn show_file(path: &std::path::Path) -> bool {
+        os::show_file(path)
     }
 
     /// Starts the program `command` runs without a console window of its own (Windows); on
@@ -1270,6 +1319,50 @@ mod tests {
         use super::system;
         let (a, b) = (system::random_u64().unwrap(), system::random_u64().unwrap());
         assert_ne!(a, b);
+    }
+
+    /// The kernel's release on Linux; on Windows a build and update number read from the
+    /// registry, and the feature update's name.
+    #[test]
+    fn the_system_describes_itself() {
+        let description = super::system::description();
+        if cfg!(windows) {
+            let build = description
+                .split_once("(build ")
+                .and_then(|(_, rest)| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{description}"));
+            let (number, update) = build.split_once('.').unwrap();
+            assert!(
+                number.parse::<u32>().is_ok_and(|n| n >= 10_000),
+                "{description}"
+            );
+            assert!(update.parse::<u32>().is_ok(), "{description}");
+            assert!(!description.contains("  "), "{description}");
+        } else {
+            let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+            assert!(description.contains(release.trim()), "{description}");
+        }
+    }
+
+    /// Whatever is plugged in (none on a CI runner), the list can be read and holds only the
+    /// vendor's devices' entries: on Linux each device before its interfaces, on Windows by ID.
+    #[test]
+    fn the_usb_devices_of_a_vendor_can_be_listed() {
+        let nodes = super::usb::devices(0x2833).unwrap();
+        let key = |id: &str| {
+            if cfg!(windows) {
+                (id.to_string(), String::new())
+            } else {
+                let (device, interface) = id.split_once(':').unwrap_or((id, ""));
+                (device.to_string(), interface.to_string())
+            }
+        };
+        assert!(nodes.windows(2).all(|w| key(&w[0].id) <= key(&w[1].id)));
+        if cfg!(windows) {
+            assert!(nodes
+                .iter()
+                .all(|n| n.id.to_uppercase().contains("VID_2833")));
+        }
     }
 
     #[test]

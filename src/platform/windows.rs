@@ -1465,6 +1465,194 @@ pub fn play_wav(wav: &[u8]) {
     };
 }
 
+/// A string property of a device, as SetupAPI keeps it.
+///
+/// # Safety
+/// `set` and `data` must name a device of a live device information set.
+unsafe fn device_property(
+    set: windows_sys::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+    data: &windows_sys::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
+    property: u32,
+) -> Option<String> {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::SetupDiGetDeviceRegistryPropertyW;
+    let mut buf = [0u16; 512];
+    let mut size = 0;
+    // SAFETY: as the caller promises; a buffer of the stated size in bytes.
+    let ok = unsafe {
+        SetupDiGetDeviceRegistryPropertyW(
+            set,
+            data,
+            property,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(&buf) as u32,
+            &mut size,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len])).filter(|s| !s.is_empty())
+}
+
+pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
+    use crate::platform::usb::Node;
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Status, SetupDiEnumDeviceInfo, SetupDiGetDeviceInstanceIdW, CR_SUCCESS,
+        DIGCF_ALLCLASSES, DN_HAS_PROBLEM, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_SERVICE,
+        SP_DEVINFO_DATA,
+    };
+    let wanted = format!("VID_{vendor:04X}");
+    // SAFETY: SetupAPI calls with valid out-pointers and correctly sized structures; the device
+    // information set is destroyed once.
+    unsafe {
+        let set = SetupDiGetClassDevsW(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_ALLCLASSES | DIGCF_PRESENT,
+        );
+        if set == INVALID_HANDLE_VALUE as isize {
+            return Err(io::Error::last_os_error());
+        }
+        let mut nodes = Vec::new();
+        for index in 0.. {
+            let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
+            data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+            if SetupDiEnumDeviceInfo(set, index, &mut data) == 0 {
+                break;
+            }
+            let mut id = [0u16; 512];
+            if SetupDiGetDeviceInstanceIdW(
+                set,
+                &data,
+                id.as_mut_ptr(),
+                id.len() as u32,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+            let len = id.iter().position(|&c| c == 0).unwrap_or(id.len());
+            let id = String::from_utf16_lossy(&id[..len]);
+            let upper = id.to_uppercase();
+            if !(upper.starts_with("USB\\") || upper.starts_with("HID\\"))
+                || !upper.contains(&wanted)
+            {
+                continue;
+            }
+            let product = upper
+                .split_once("PID_")
+                .and_then(|(_, rest)| u16::from_str_radix(rest.get(..4)?, 16).ok())
+                .unwrap_or(0);
+            let (mut status, mut problem) = (0, 0);
+            let problem = (CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0)
+                == CR_SUCCESS
+                && status & DN_HAS_PROBLEM != 0)
+                .then_some(problem);
+            nodes.push(Node {
+                id,
+                product,
+                name: device_property(set, &data, SPDRP_FRIENDLYNAME)
+                    .or_else(|| device_property(set, &data, SPDRP_DEVICEDESC))
+                    .unwrap_or_default(),
+                driver: device_property(set, &data, SPDRP_SERVICE),
+                problem,
+            });
+        }
+        SetupDiDestroyDeviceInfoList(set);
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(nodes)
+    }
+}
+
+/// A string or number under HKEY_LOCAL_MACHINE.
+fn machine_value(key: &str, value: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, REG_DWORD, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    };
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = [0u16; 256];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let mut kind = 0;
+    // SAFETY: NUL-terminated names and a buffer of the stated size in bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ | RRF_RT_REG_DWORD,
+            &mut kind,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    if kind == REG_DWORD {
+        return Some((u32::from(buf[0]) | (u32::from(buf[1]) << 16)).to_string());
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+pub fn system_description() -> String {
+    let key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let build = machine_value(key, "CurrentBuild").unwrap_or_default();
+    let update = machine_value(key, "UBR").unwrap_or_default();
+    // DisplayVersion ("24H2") since 20H2, ReleaseId ("2004") before
+    let feature = machine_value(key, "DisplayVersion")
+        .or_else(|| machine_value(key, "ReleaseId"))
+        .unwrap_or_default();
+    // Windows 11 still names itself Windows 10 in ProductName; its builds start at 22000
+    let generation = if build.parse::<u32>().is_ok_and(|b| b >= 22_000) {
+        "11"
+    } else {
+        "10"
+    };
+    let edition = machine_value(key, "EditionID").unwrap_or_default();
+    let name = [format!("Windows {generation}"), edition, feature]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{name} (build {build}.{update})")
+}
+
+pub fn desktop() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath};
+    let mut path = std::ptr::null_mut();
+    // SAFETY: the known folder's ID and an out-pointer; the string is freed once.
+    unsafe {
+        let found =
+            SHGetKnownFolderPath(&FOLDERID_Desktop, 0, std::ptr::null_mut(), &mut path) >= 0;
+        let result = found.then(|| {
+            let mut len = 0;
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+                path, len,
+            )))
+        });
+        CoTaskMemFree(path.cast());
+        result
+    }
+}
+
+pub fn show_file(path: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    // Explorer takes "/select," and the path as one argument, the path in quotes
+    std::process::Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", path.display()))
+        .spawn()
+        .is_ok()
+}
+
 pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
     use windows_sys::Win32::System::Threading::{
         SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
