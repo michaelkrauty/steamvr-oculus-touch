@@ -1381,6 +1381,34 @@ pub fn thread_named(name: &str) -> Option<ThreadId> {
     }
 }
 
+pub fn process_running(name: &str) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let exe = format!("{name}.exe").to_lowercase();
+    // SAFETY: a snapshot of all processes, walked with a correctly sized entry and closed after.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more && !found {
+            let file = &entry.szExeFile;
+            let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+            found = String::from_utf16_lossy(&file[..len]).to_lowercase() == exe;
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        Ok(found)
+    }
+}
+
 pub fn make_realtime(thread: ThreadId, priority: u32) -> Result<String, String> {
     use windows_sys::Win32::System::Threading::{
         SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,

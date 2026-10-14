@@ -7,15 +7,24 @@
 
 use std::path::{Path, PathBuf};
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+#[cfg(unix)]
+fn default_steam_root() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".steam/steam")
+}
+
+/// Steam's default location; the OpenVR path registry names the real ones once SteamVR has run.
+#[cfg(windows)]
+fn default_steam_root() -> PathBuf {
+    std::env::var_os("ProgramFiles(x86)")
+        .map_or_else(|| PathBuf::from(r"C:\Program Files (x86)"), PathBuf::from)
+        .join("Steam")
 }
 
 /// Native Steam configuration root; may differ from the library containing SteamVR.
 pub fn steam_root() -> PathBuf {
     std::env::var_os("CV1TOUCH_STEAM_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".steam/steam"))
+        .unwrap_or_else(default_steam_root)
 }
 
 fn registry_path() -> PathBuf {
@@ -76,8 +85,13 @@ pub fn vrsettings_path() -> PathBuf {
         .join("steamvr.vrsettings")
 }
 
+/// SteamVR's driver registration tool.
 pub fn vrpathreg() -> PathBuf {
-    runtime_root().join("bin/vrpathreg.sh")
+    runtime_root().join(if cfg!(windows) {
+        "bin/win64/vrpathreg.exe"
+    } else {
+        "bin/vrpathreg.sh"
+    })
 }
 
 fn installed_assets(exe: &Path) -> PathBuf {
@@ -92,24 +106,26 @@ pub fn driver_assets() -> Result<(PathBuf, PathBuf), String> {
     let dir = explicit
         .clone()
         .unwrap_or_else(|| installed_assets(&std::env::current_exe().unwrap_or_default()));
-    let so = dir.join("driver_cv1touch.so");
-    let manifest = dir.join("driver.vrdrivermanifest");
+    let so = dir.join(DRIVER_LIBRARY.1);
+    let manifest = dir.join(DRIVER_MANIFEST);
     if so.is_file() && manifest.is_file() {
         return Ok((so, manifest));
     }
     if explicit.is_some() {
         return Err(format!(
-            "{}: needs driver_cv1touch.so and driver.vrdrivermanifest",
-            dir.display()
+            "{}: needs {} and {DRIVER_MANIFEST}",
+            dir.display(),
+            DRIVER_LIBRARY.1
         ));
     }
     let native = PathBuf::from(
         option_env!("CV1TOUCH_NATIVE_DIR")
             .ok_or("this build has no native driver; build with the engine feature")?,
     );
-    let so = native.join("driver/driver_cv1touch.so");
-    let manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("driver/cv1touch/driver.vrdrivermanifest");
+    let so = native.join("driver").join(DRIVER_LIBRARY.1);
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("driver/cv1touch")
+        .join(DRIVER_MANIFEST);
     if so.is_file() && manifest.is_file() {
         Ok((so, manifest))
     } else {
@@ -122,8 +138,17 @@ pub fn driver_dir() -> PathBuf {
 }
 
 const OWNERSHIP_FILE: &str = ".cv1touch-owned.json";
-const DRIVER_LIBRARY: &str = "bin/linux64/driver_cv1touch.so";
+/// The directory SteamVR loads this platform's driver library from, and the library.
+#[cfg(unix)]
+const DRIVER_LIBRARY: (&str, &str) = ("bin/linux64", "driver_cv1touch.so");
+#[cfg(windows)]
+const DRIVER_LIBRARY: (&str, &str) = ("bin/win64", "driver_cv1touch.dll");
 const DRIVER_MANIFEST: &str = "driver.vrdrivermanifest";
+
+/// The driver library's path in the driver directory, as the ownership record names it.
+fn driver_library() -> String {
+    format!("{}/{}", DRIVER_LIBRARY.0, DRIVER_LIBRARY.1)
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +169,7 @@ fn ownership(so: &Path, manifest: &Path) -> Result<DriverOwnership, String> {
         format: "cv1touch-driver-ownership".into(),
         version: 1,
         files: [
-            (DRIVER_LIBRARY.into(), fingerprint(so)?),
+            (driver_library(), fingerprint(so)?),
             (DRIVER_MANIFEST.into(), fingerprint(manifest)?),
         ]
         .into(),
@@ -171,10 +196,10 @@ pub fn check_driver(dir: &Path, legacy: Option<(&Path, &Path)>) -> Result<(), St
             let path = entry.path();
             let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
             let kind = entry.file_type().map_err(|e| e.to_string())?;
-            let directory = ["bin", "bin/linux64"]
+            let directory = ["bin", DRIVER_LIBRARY.0]
                 .iter()
                 .any(|p| relative == Path::new(p));
-            let file = [DRIVER_LIBRARY, DRIVER_MANIFEST, OWNERSHIP_FILE]
+            let file = [&driver_library(), DRIVER_MANIFEST, OWNERSHIP_FILE]
                 .iter()
                 .any(|p| relative == Path::new(p));
             if kind.is_symlink() || !(directory && kind.is_dir() || file && kind.is_file()) {
@@ -203,7 +228,7 @@ pub fn check_driver(dir: &Path, legacy: Option<(&Path, &Path)>) -> Result<(), St
         if record.format != "cv1touch-driver-ownership"
             || record.version != 1
             || record.files.len() != 2
-            || !record.files.contains_key(DRIVER_LIBRARY)
+            || !record.files.contains_key(&driver_library())
             || !record.files.contains_key(DRIVER_MANIFEST)
         {
             return Err(format!(
@@ -286,8 +311,11 @@ pub fn assemble_with_legacy(
     check_driver(dir, legacy)?;
     let stage = staging_dir(dir)?;
     let prepare = || -> Result<(), String> {
-        std::fs::create_dir_all(stage.join("bin/linux64")).map_err(|e| e.to_string())?;
-        for (source, name) in [(built_so, DRIVER_LIBRARY), (manifest, DRIVER_MANIFEST)] {
+        std::fs::create_dir_all(stage.join(DRIVER_LIBRARY.0)).map_err(|e| e.to_string())?;
+        for (source, name) in [
+            (built_so, driver_library()),
+            (manifest, DRIVER_MANIFEST.into()),
+        ] {
             let destination = stage.join(name);
             std::fs::copy(source, &destination)
                 .map_err(|e| format!("{}: {e}", source.display()))?;
@@ -300,7 +328,7 @@ pub fn assemble_with_legacy(
         )
         .map_err(|e| e.to_string())?;
         crate::platform::fs::sync_file(&metadata).map_err(|e| e.to_string())?;
-        sync_directory(&stage.join("bin/linux64"))?;
+        sync_directory(&stage.join(DRIVER_LIBRARY.0))?;
         sync_directory(&stage.join("bin"))?;
         sync_directory(&stage)?;
         check_driver(&stage, None)?;
@@ -479,10 +507,7 @@ mod tests {
         std::fs::write(d.join("driver.vrdrivermanifest"), b"{}").unwrap();
         let out = d.join("cv1touch");
         assemble(&d.join("lib.so"), &d.join("driver.vrdrivermanifest"), &out).unwrap();
-        assert_eq!(
-            std::fs::read(out.join("bin/linux64/driver_cv1touch.so")).unwrap(),
-            b"ELF"
-        );
+        assert_eq!(std::fs::read(out.join(driver_library())).unwrap(), b"ELF");
         assert_eq!(
             std::fs::read(out.join("driver.vrdrivermanifest")).unwrap(),
             b"{}"
@@ -497,7 +522,7 @@ mod tests {
     }
     #[test]
     fn modified_driver_payload_is_preserved_before_upgrade_or_remove() {
-        for name in ["bin/linux64/driver_cv1touch.so", "driver.vrdrivermanifest"] {
+        for name in [driver_library(), DRIVER_MANIFEST.into()] {
             let d = tmp(&format!("modified-{}", name.replace('/', "-")));
             let so = d.join("source.so");
             let manifest = d.join("source.json");
@@ -531,8 +556,8 @@ mod tests {
             let package = d.join("package");
             assemble(&so, &manifest, &package).unwrap();
             if symbolic {
-                std::fs::remove_file(package.join("bin/linux64/driver_cv1touch.so")).unwrap();
-                symlink(&so, package.join("bin/linux64/driver_cv1touch.so")).unwrap();
+                std::fs::remove_file(package.join(driver_library())).unwrap();
+                symlink(&so, package.join(driver_library())).unwrap();
             } else {
                 std::fs::write(package.join("personal"), b"keep").unwrap();
             }
@@ -541,7 +566,7 @@ mod tests {
             assert!(remove_owned_driver(&package).is_err());
             if !symbolic {
                 assert_eq!(
-                    std::fs::read(package.join("bin/linux64/driver_cv1touch.so")).unwrap(),
+                    std::fs::read(package.join(driver_library())).unwrap(),
                     b"old"
                 );
             }
@@ -557,14 +582,14 @@ mod tests {
         std::fs::write(&so, b"old").unwrap();
         std::fs::write(&manifest, br#"{"name":"cv1touch"}"#).unwrap();
         let package = d.join("package");
-        std::fs::create_dir_all(package.join("bin/linux64")).unwrap();
-        std::fs::copy(&so, package.join("bin/linux64/driver_cv1touch.so")).unwrap();
-        std::fs::copy(&manifest, package.join("driver.vrdrivermanifest")).unwrap();
+        std::fs::create_dir_all(package.join(DRIVER_LIBRARY.0)).unwrap();
+        std::fs::copy(&so, package.join(driver_library())).unwrap();
+        std::fs::copy(&manifest, package.join(DRIVER_MANIFEST)).unwrap();
         assert!(check_driver(&package, None).is_err());
         check_driver(&package, Some((&so, &manifest))).unwrap();
-        std::fs::write(package.join("bin/linux64/driver_cv1touch.so"), b"changed").unwrap();
+        std::fs::write(package.join(driver_library()), b"changed").unwrap();
         assert!(check_driver(&package, Some((&so, &manifest))).is_err());
-        std::fs::write(package.join("bin/linux64/driver_cv1touch.so"), b"old").unwrap();
+        std::fs::write(package.join(driver_library()), b"old").unwrap();
         assemble(&so, &manifest, &package).unwrap();
         std::fs::write(&so, b"new").unwrap();
         assemble(&so, &manifest, &package).unwrap();
@@ -583,12 +608,15 @@ mod tests {
         std::fs::write(&new, b"new").unwrap();
         std::fs::write(&manifest, br#"{"name":"cv1touch"}"#).unwrap();
         let package = d.join("package");
-        std::fs::create_dir_all(package.join("bin/linux64")).unwrap();
-        std::fs::copy(&old, package.join(DRIVER_LIBRARY)).unwrap();
+        std::fs::create_dir_all(package.join(DRIVER_LIBRARY.0)).unwrap();
+        std::fs::copy(&old, package.join(driver_library())).unwrap();
         std::fs::copy(&manifest, package.join(DRIVER_MANIFEST)).unwrap();
         assert!(assemble(&new, &manifest, &package).is_err());
         assemble_with_legacy(&new, &manifest, &package, Some((&old, &manifest))).unwrap();
-        assert_eq!(std::fs::read(package.join(DRIVER_LIBRARY)).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(package.join(driver_library())).unwrap(),
+            b"new"
+        );
         check_driver(&package, None).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }

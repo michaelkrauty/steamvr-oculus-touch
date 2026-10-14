@@ -92,6 +92,11 @@ const OPENVR_LIBRARY: (&str, &str) = ("bin/linux64/libopenvr_api.so", "libopenvr
 #[cfg(windows)]
 const OPENVR_LIBRARY: (&str, &str) = ("bin/win64/openvr_api.dll", "openvr_api.dll");
 
+/// The OpenVR client library SteamVR ships.
+pub fn runtime_library() -> std::path::PathBuf {
+    crate::steamvr::runtime_root().join(OPENVR_LIBRARY.0)
+}
+
 pub struct Client {
     // dropped after `shutdown` runs in Drop
     _lib: Library,
@@ -107,7 +112,7 @@ impl Client {
     pub fn connect() -> Result<Client, String> {
         // SAFETY: symbols looked up by NUL-terminated names have the declared C signatures.
         unsafe {
-            let bundled = crate::steamvr::runtime_root().join(OPENVR_LIBRARY.0);
+            let bundled = runtime_library();
             let Some(lib) =
                 Library::open(&bundled).or_else(|| Library::open(Path::new(OPENVR_LIBRARY.1)))
             else {

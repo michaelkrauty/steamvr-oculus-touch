@@ -866,6 +866,30 @@ impl Drop for OutputRedirect {
     }
 }
 
+/// The kernel keeps a process's name (comm) in 16 bytes, NUL included; pgrep -x matches no
+/// longer pattern.
+const PROCESS_NAME_MAX: usize = 15;
+
+/// `name` is plain (no regular expression characters): pgrep matches it as written.
+pub fn process_running(name: &str) -> io::Result<bool> {
+    let status = std::process::Command::new("pgrep")
+        .args(["-x", "--"])
+        .arg(&name[..name.len().min(PROCESS_NAME_MAX)])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => {
+                io::Error::new(e.kind(), "pgrep is not installed (it comes with procps)")
+            }
+            _ => io::Error::new(e.kind(), format!("pgrep: {e}")),
+        })?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(io::Error::other(format!("pgrep exited {status}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

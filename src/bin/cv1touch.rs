@@ -134,7 +134,7 @@ fn doctor(json: bool) -> i32 {
     let mut checks = vec![
         (
             "steamvr_runtime",
-            runtime.join("bin/vrpathreg.sh").is_file(),
+            steamvr::vrpathreg().is_file(),
             runtime.display().to_string(),
         ),
         (
@@ -144,7 +144,7 @@ fn doctor(json: bool) -> i32 {
         ),
         (
             "openvr_library",
-            runtime.join("bin/linux64/libopenvr_api.so").is_file(),
+            vr::runtime_library().is_file(),
             "SteamVR native OpenVR client library".into(),
         ),
         (
@@ -1069,18 +1069,8 @@ fn vr_pulse(index: &str, ms: &str) -> i32 {
 }
 
 fn vrserver_running() -> Result<bool, String> {
-    let status = Command::new("pgrep")
-        .args(["-x", "vrserver"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot check SteamVR processes: {e} (pgrep required)"))?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(format!(
-            "cannot check SteamVR processes: pgrep exited {status}"
-        )),
-    }
+    platform::process::running("vrserver")
+        .map_err(|e| format!("cannot check SteamVR processes: {e}"))
 }
 
 fn steamvr_check(legacy: Option<(&Path, &Path)>) -> i32 {

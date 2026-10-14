@@ -642,6 +642,31 @@ pub mod ipc {
     }
 }
 
+pub mod process {
+    //! Other programs running on this machine.
+    use std::io;
+
+    use super::os;
+
+    /// Whether a process of the program `name` runs, under any account: its executable's name
+    /// without the extension, of letters, digits, '-' and '_' ("vrserver" is vrserver.exe on
+    /// Windows, in any case). Linux asks pgrep (procps); it keeps the first 15 bytes of a
+    /// process's name, so a longer `name` is compared by those.
+    pub fn running(name: &str) -> io::Result<bool> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name:?} is not a plain program name"),
+            ));
+        }
+        os::process_running(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fs;
@@ -1123,6 +1148,23 @@ mod tests {
     #[test]
     fn power_throttling_can_be_turned_off() {
         super::system::opt_out_of_throttling().unwrap();
+    }
+
+    /// This test binary's name is longer than Linux keeps (cv1touch-<hash>), and has .exe on
+    /// Windows.
+    #[test]
+    fn a_running_program_is_found_by_name() {
+        use super::process;
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_stem().unwrap().to_str().unwrap();
+        assert!(name.len() > 15, "{name}");
+        assert!(process::running(name).unwrap());
+        assert!(process::running(&name.to_uppercase()).unwrap() == cfg!(windows));
+        assert!(!process::running("cv1touch-not-a-program").unwrap());
+        // a name, not an option to pgrep
+        assert!(!process::running("-cv1touch-not-a-program").unwrap());
+        assert!(process::running("vrserver|init").is_err());
+        assert!(process::running("").is_err());
     }
 
     /// On Windows a real-time request takes no privileges: the thread runs time-critical.
