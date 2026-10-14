@@ -81,6 +81,11 @@ pub fn runtime_root() -> PathBuf {
         })
 }
 
+/// Where SteamVR writes its logs (vrserver.txt holds the driver's lines).
+pub fn log_dir() -> PathBuf {
+    registered_path("log").unwrap_or_else(|| steam_root().join("logs"))
+}
+
 pub fn vrsettings_path() -> PathBuf {
     if std::env::var_os("CV1TOUCH_STEAM_ROOT").is_some() {
         return steam_root().join("config/steamvr.vrsettings");

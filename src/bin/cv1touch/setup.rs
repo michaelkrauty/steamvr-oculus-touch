@@ -30,7 +30,7 @@ struct Inspection {
     engine_ready: Option<bool>,
 }
 
-fn journal_path() -> PathBuf {
+pub(super) fn journal_path() -> PathBuf {
     state_dir().join("setup.json")
 }
 
@@ -291,12 +291,30 @@ fn reports(inspection: &Inspection, checkpoint: &Checkpoint) -> Vec<setup::Stage
     reports
 }
 
-fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) -> bool {
+/// Whether setup is complete, the stages, and `setup --check --json`'s report.
+fn report_json(
+    inspection: &Inspection,
+    checkpoint: &Checkpoint,
+) -> (bool, Vec<setup::StageReport>, serde_json::Value) {
     let stages = reports(inspection, checkpoint);
     let ready =
         stages.iter().all(|r| r.state == State::Ready) && inspection.checks.iter().all(|c| c.ok);
+    let json = serde_json::json!({"ready": ready, "checks": inspection.checks, "stages": stages, "note": "Saved dependency reuse does not verify physical alignment. Setup never pairs or resets controllers."});
+    (ready, stages, json)
+}
+
+/// `setup --check --json`'s report, or why there is none.
+pub(super) fn check_json() -> Result<serde_json::Value, String> {
+    let checkpoint = setup::load(&journal_path())
+        .map_err(|e| format!("setup journal: {e}"))?
+        .unwrap_or_default();
+    Ok(report_json(&inspect(&checkpoint), &checkpoint).2)
+}
+
+fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) -> bool {
+    let (ready, stages, report) = report_json(inspection, checkpoint);
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"ready": ready, "checks": inspection.checks, "stages": stages, "note": "Saved dependency reuse does not verify physical alignment. Setup never pairs or resets controllers."})).unwrap());
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         let g = glyphs();
         println!(

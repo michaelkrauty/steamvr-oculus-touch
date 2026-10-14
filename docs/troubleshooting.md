@@ -2,6 +2,8 @@
 
 Start with `cv1touch doctor`, `cv1touch status --json`, and `journalctl --user -u cv1touchd -b`. Include version, distribution, sensor count, build/test results, and the relevant error when reporting a problem. Remove serial numbers, room coordinates, personal paths, and unrelated logs before sharing.
 
+`cv1touch report` puts all of that into one zip file for someone helping you: a summary (version, system, the `doctor` checks, the Oculus USB devices and the drivers they run with, the daemon's status and setup's state), the ends of the daemon's and SteamVR's logs, and cv1touch's settings and calibration. It names the other files in cv1touch's directories without sending them. On Linux only you can read it; on Windows it takes the permissions of the folder it is saved in (the desktop's are yours alone). The calibration describes where your sensors stand in your room, and SteamVR's log also names your other VR devices, your user folder and your network addresses; look inside before sharing it more widely.
+
 | Symptom | Checks and recovery |
 | --- | --- |
 | Setup reports unknown stages | Existing camera/gravity/render/registration files lack setup-journal evidence. Visually verify the relevant tracking and deliberately adopt them, retaining the files, or recapture. File validity alone is not an accuracy check. |

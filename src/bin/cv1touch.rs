@@ -26,6 +26,8 @@ use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 
 #[path = "cv1touch/setup.rs"]
 mod guided_setup;
+#[path = "cv1touch/report.rs"]
+mod report;
 
 fn human_color_enabled(no_color: bool, term_dumb: bool, terminal: bool, forced: bool) -> bool {
     !no_color && !term_dumb && (terminal || forced)
@@ -51,7 +53,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -125,7 +127,11 @@ fn json_status() -> i32 {
     }
 }
 
-fn doctor(json: bool) -> i32 {
+/// A check `doctor` makes: its name, whether it passed, and what it looked at or found.
+type DoctorCheck = (&'static str, bool, String);
+
+/// What `doctor` checks, and the daemon's status if it answered.
+fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     let runtime = steamvr::runtime_root();
     let calibration = file::load(&file::default_path());
     let registration = align::load_registration(&align::registration_path());
@@ -187,6 +193,11 @@ fn doctor(json: bool) -> i32 {
         daemon.is_some(),
         control::socket_path().display().to_string(),
     ));
+    (checks, daemon)
+}
+
+fn doctor(json: bool) -> i32 {
+    let (checks, daemon) = doctor_checks();
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "checks": checks.iter().map(|(name, ok, detail)| serde_json::json!({"name": name, "ok": ok, "detail": detail})).collect::<Vec<_>>(), "daemon": daemon, "note": "Wake sleeping controllers before checking tracking; calibration and registration require physical capture." })).unwrap());
     } else {
@@ -200,6 +211,7 @@ fn doctor(json: bool) -> i32 {
             "Wake sleeping controllers before checking tracking. The daemon's log: {}",
             cv1touch::supervise::log_file().display()
         );
+        println!("To send someone everything they need to see what went wrong: cv1touch report");
     }
     if checks.iter().all(|(_, ok, _)| *ok) {
         0
@@ -5264,6 +5276,8 @@ fn main() {
         ["doctor", "--json"] => doctor(true),
         ["alignment", "reload"] => send("alignment reload"),
         ["stop"] => send("stop"),
+        ["report"] => report::run(None),
+        ["report", "--out", path] => report::run(Some(PathBuf::from(path))),
         ["calibration", "capture"] => send("calibration capture"),
         ["calibration", "provisional"] => send("calibration provisional"),
         ["calibration", "load", path] => {
