@@ -55,7 +55,7 @@ fn human_action(message: &str) {
 
 fn usage_code(code: i32) -> ! {
     eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor, and waits until they have ended)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
+        "usage:\n  cv1touch setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor, and waits until they have ended)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
          cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
          cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
@@ -5464,13 +5464,25 @@ fn consistency_cmd(rec: &Path, cal: &Path) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["setup"] => guided_setup::run(false, false),
+        ["setup"] => guided_setup::run(false, false, None),
+        ["setup", "--redo", stage] | ["setup", "--redo", stage, "--no-slip-check"] | ["setup", "--no-slip-check", "--redo", stage] => {
+            if args.iter().any(|a| a == "--no-slip-check") {
+                guided_setup::SLIP_CHECK.store(false, Ordering::Relaxed);
+            }
+            match cv1touch::setup::Stage::from_redo_name(stage) {
+                Some(s) => guided_setup::run(false, false, Some(s)),
+                None => {
+                    eprintln!("cv1touch: --redo takes sensors, floor, model, buttons or headset");
+                    2
+                }
+            }
+        }
         ["setup", "--no-slip-check"] => {
             guided_setup::SLIP_CHECK.store(false, Ordering::Relaxed);
-            guided_setup::run(false, false)
+            guided_setup::run(false, false, None)
         }
-        ["setup", "--check"] => guided_setup::run(true, false),
-        ["setup", "--check", "--json"] | ["setup", "--json", "--check"] => guided_setup::run(true, true),
+        ["setup", "--check"] => guided_setup::run(true, false, None),
+        ["setup", "--check", "--json"] | ["setup", "--json", "--check"] => guided_setup::run(true, true, None),
         ["status"] => status_board(shm::DEFAULT_NAME),
         ["status", "--shm", name] => status_board(name),
         ["status", "--json"] => json_status(),

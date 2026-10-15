@@ -55,6 +55,7 @@ cv1touch setup --check
 cv1touch setup --check --json
 cv1touch setup
 cv1touch setup --no-slip-check
+cv1touch setup --redo headset
 ```
 
 `setup --check` is read-only: it lists each stage as done, not done, saved but not verified, needing redoing, or waiting on something, and starts nothing. A done stage means its saved settings still fit together; it does not measure tracking accuracy. Check that in SteamVR afterwards.
@@ -63,7 +64,7 @@ Before you start: install the CLI and daemon from the same build, start the daem
 
 `cv1touch setup` shows the checks (only the failing ones are explained), the stage list, and a prompt for the next stage: Enter starts it, `q` quits. It runs only the stages that need work and remembers finished ones in `$XDG_STATE_HOME/cv1touch/setup.json` (default `~/.local/state/cv1touch/setup.json`), so rerunning it continues where you left off. Each finished stage prints one line with its headline result; solver output goes to a log next to the recordings, shown when a stage fails. A failed stage offers to try again right away; earlier stages stay done. Instructions are bold in a terminal; `NO_COLOR` or `TERM=dumb` turns that off (and a dumb terminal gets ASCII marks), and JSON reports stay plain.
 
-Settings saved before you used the guide show as saved but not verified. `k` keeps such a stage as it is: do that only if tracking already looks right (sensor coverage, level, controller models, and the controllers' position against the SteamVR headset across the play area). Keeping records your judgement; it measures nothing. When in doubt, redo the stage.
+`cv1touch setup --redo STAGE` (`sensors`, `floor`, `model`, `buttons` or `headset`) offers a finished stage again, with redo and keep, for when something the guide cannot see has changed, such as a new SteamVR room setup; the saved result stays until the stage is redone, and quitting at the prompt changes nothing. Settings saved before you used the guide show as saved but not verified. `k` keeps such a stage as it is: do that only if tracking already looks right (sensor coverage, level, controller models, and the controllers' position against the SteamVR headset across the play area). Keeping records your judgement; it measures nothing. When in doubt, redo the stage.
 
 Whenever your hands are full, A on the right controller does what Enter does, and timed steps are marked by a haptic pulse in both controllers and a beep from the speakers: one starts, two end. The stages:
 

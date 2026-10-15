@@ -1484,7 +1484,7 @@ fn run_stage(
     persist(checkpoint)
 }
 
-pub(super) fn run(check_only: bool, json: bool) -> i32 {
+pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
     if !check_only && !io::stdin().is_terminal() {
         eprintln!("cv1touch: setup needs an interactive terminal. Use setup --check [--json] for a read-only report.");
         return 2;
@@ -1511,6 +1511,13 @@ pub(super) fn run(check_only: bool, json: bool) -> i32 {
         checkpoint = setup::load(&journal_path())
             .map_err(|e| format!("setup journal: {e}"))?
             .unwrap_or_default();
+        if let Some(stage) = redo {
+            // offered again (redo, or keep): pending outranks a result that still validates, as
+            // for the buttons stage. In memory only: the journal is written when the stage starts
+            // or is kept, so quitting at the prompt changes nothing on disk.
+            checkpoint.completed.remove(&stage);
+            checkpoint.pending.insert(stage);
+        }
         let g = glyphs();
         let mut shown_checks = String::new();
         // the stage list shows at the start and again after a failure; a finished stage is one

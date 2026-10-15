@@ -15,6 +15,21 @@ pub enum Stage {
     Registration,
     Inputs,
 }
+impl Stage {
+    /// The stage `cv1touch setup --redo NAME` names: sensors, floor, model, buttons or headset
+    /// (the guide's own words for its stages).
+    pub fn from_redo_name(name: &str) -> Option<Stage> {
+        match name {
+            "sensors" => Some(Stage::Camera),
+            "floor" => Some(Stage::Gravity),
+            "model" => Some(Stage::Render),
+            "buttons" => Some(Stage::Inputs),
+            "headset" => Some(Stage::Registration),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
     Missing,
@@ -500,6 +515,17 @@ pub fn save(path: &std::path::Path, checkpoint: &Checkpoint) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--redo` names stages the guide's way; anything else is no stage.
+    #[test]
+    fn redo_names_map_to_stages() {
+        assert_eq!(Stage::from_redo_name("headset"), Some(Stage::Registration));
+        assert_eq!(Stage::from_redo_name("model"), Some(Stage::Render));
+        assert_eq!(Stage::from_redo_name("sensors"), Some(Stage::Camera));
+        assert_eq!(Stage::from_redo_name("floor"), Some(Stage::Gravity));
+        assert_eq!(Stage::from_redo_name("buttons"), Some(Stage::Inputs));
+        assert_eq!(Stage::from_redo_name("registration"), None);
+    }
     fn hash(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
     }
