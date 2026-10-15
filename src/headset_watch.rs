@@ -198,7 +198,8 @@ impl RigidWatch {
 }
 
 /// Turning (degrees, each way) and nodding/tilting (degrees of range) a capture needs: two full
-/// turns each way less some slack, and a clear nod and tilt.
+/// turns each way less some slack, and a clear nod and tilt, each at least half the range to
+/// each side of level (a nod up and a nod down; a tilt toward each shoulder).
 pub const TURN_DEG: f64 = 660.0;
 pub const NOD_DEG: f64 = 30.0;
 
@@ -212,8 +213,9 @@ pub struct TurnCoverage {
     roll: Option<(f64, f64)>,
 }
 
-fn span(range: Option<(f64, f64)>) -> f64 {
-    range.map_or(0.0, |(lo, hi)| hi - lo)
+/// Whether the range reaches half of `NOD_DEG` to each side of level: both nods, both tilts.
+fn both_ways(range: Option<(f64, f64)>) -> bool {
+    range.is_some_and(|(lo, hi)| lo <= -NOD_DEG / 2.0 && hi >= NOD_DEG / 2.0)
 }
 
 fn widen(range: &mut Option<(f64, f64)>, v: f64) {
@@ -253,7 +255,7 @@ impl TurnCoverage {
     }
 
     pub fn done(&self) -> bool {
-        self.turns_done() && span(self.pitch) >= NOD_DEG && span(self.roll) >= NOD_DEG
+        self.turns_done() && both_ways(self.pitch) && both_ways(self.roll)
     }
 }
 
@@ -360,6 +362,45 @@ mod tests {
 
     fn head_at(t: f64, speed: f64, wobble: f64) -> UnitQuaternion<f64> {
         head_with(t, speed, wobble, 20.0)
+    }
+
+    /// After the turns, nodding both ways but tilting toward one shoulder only (either shoulder),
+    /// or the other way round: the capture does not end on a one-sided motion, however far it
+    /// goes (35 degrees one way covers more range than two 15-degree sides would).
+    #[test]
+    fn one_sided_nods_or_tilts_do_not_finish_the_capture() {
+        for (one_sided_nod, sign) in [(true, 1.0), (true, -1.0), (false, 1.0), (false, -1.0)] {
+            let mut c = TurnCoverage::default();
+            let turning = 720.0 / 45.0;
+            let mut t = 0.0;
+            while t < 2.0 * turning + 20.0 {
+                let mut hmd = head_with(t, 45.0, 0.0, 0.0);
+                if t >= 2.0 * turning {
+                    let since = t - 2.0 * turning;
+                    let nod = 35.0 * (2.0 * since).sin();
+                    let tilt = 35.0 * (1.3 * since).sin();
+                    let one_way = |v: f64| sign * v.abs();
+                    let (nod, tilt) = if one_sided_nod {
+                        (one_way(nod), tilt)
+                    } else {
+                        (nod, one_way(tilt))
+                    };
+                    hmd = rot(Vector3::x(), nod) * rot(Vector3::z(), tilt);
+                }
+                c.push(hmd);
+                t += 0.01;
+            }
+            assert!(c.turns_done());
+            assert!(!c.done(), "one_sided_nod {one_sided_nod} sign {sign}");
+        }
+        // both ways each: done
+        let mut c = TurnCoverage::default();
+        let mut t = 0.0;
+        while t < 2.0 * 720.0 / 45.0 + 20.0 {
+            c.push(head_with(t, 45.0, 0.0, 20.0));
+            t += 0.01;
+        }
+        assert!(c.done());
     }
 
     /// At 45 degrees/s: turning until 32 s, then nodding and tilting.
