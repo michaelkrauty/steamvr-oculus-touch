@@ -677,6 +677,11 @@ fn status_json() -> Option<serde_json::Value> {
     serde_json::from_str(reply.strip_prefix("ok ")?).ok()
 }
 
+/// The daemon's latency adjustment from its status, ms (none from a daemon that does not say).
+fn latency_adjustment(status: Option<&serde_json::Value>) -> Option<f64> {
+    status?["latency_adjustment_ms"].as_f64()
+}
+
 /// Waits until cv1touchd reports `mode` with every sensor's frame counter advancing.
 fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
     let start = Instant::now();
@@ -1381,14 +1386,12 @@ impl Drop for StopRecordingGuard {
 
 fn eval_capture() -> i32 {
     catch_interrupts();
-    if status_json()
-        .and_then(|v| v["mode"].as_str().map(str::to_string))
-        .as_deref()
-        != Some("calibrated")
-    {
+    let status = status_json();
+    if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return 1;
     }
+    let latency_adjustment_ms = latency_adjustment(status.as_ref());
     let client = match vr::Client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -1462,6 +1465,7 @@ fn eval_capture() -> i32 {
         windows,
         samples,
         others: Vec::new(),
+        latency_adjustment_ms,
     };
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
@@ -2716,14 +2720,12 @@ fn capture_free_named_with_feedback(
     mut feedback: Option<&mut dyn CaptureFeedback>,
 ) -> Result<PathBuf, i32> {
     catch_interrupts();
-    if status_json()
-        .and_then(|v| v["mode"].as_str().map(str::to_string))
-        .as_deref()
-        != Some("calibrated")
-    {
+    let status = status_json();
+    if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return Err(1);
     }
+    let latency_adjustment_ms = latency_adjustment(status.as_ref());
     let client = match vr::Client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -2973,6 +2975,7 @@ fn capture_free_named_with_feedback(
         windows: vec![("free".into(), start, end)],
         samples,
         others,
+        latency_adjustment_ms,
     };
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
@@ -5171,7 +5174,7 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
                     Err(e) => eprintln!("cv1touch: no registration fitted: {e}"),
                 }
             }
-            eval_report_with(base, &r.hands, &registration)
+            eval_report_with(base, &r.hands, &registration, false)
         }
         Err(e) => {
             eprintln!("cv1touch: {e}");
@@ -5217,10 +5220,18 @@ fn fit_capture_registration(
 
 /// Accuracy and latency of published poses against the jig truth recorded beside them.
 fn eval_report(base: &Path, hands: &[Vec<eval::Published>; 2]) -> i32 {
-    eval_report_with(base, hands, &align::registration_path())
+    eval_report_with(base, hands, &align::registration_path(), true)
 }
 
-fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration: &Path) -> i32 {
+/// `published_by_daemon`: the poses are the daemon's own records, whose stamps carry the latency
+/// adjustment the capture recorded; a replay's stamps carry none, so its lag is the tracker's and
+/// gets no advice on the adjustment.
+fn eval_report_with(
+    base: &Path,
+    hands: &[Vec<eval::Published>; 2],
+    registration: &Path,
+    published_by_daemon: bool,
+) -> i32 {
     let truth_path = base.with_extension("truth.json");
     let tf: eval::TruthFile = match std::fs::read_to_string(&truth_path)
         .map_err(|e| e.to_string())
@@ -5290,7 +5301,7 @@ fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration
             .collect()
     };
     let (still1, still2) = (truly_still(&still1), truly_still(&still2));
-    let report = |label: &str, x: &nalgebra::Isometry3<f64>| -> f64 {
+    let report = |label: &str, x: &nalgebra::Isometry3<f64>, advise: bool| -> f64 {
         let params = eval::SegmentParams::default();
         let first = eval::Truth {
             samples: &truth,
@@ -5324,7 +5335,15 @@ fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration
             "  jig segments (offset constant within each): {}",
             segs.join(", ")
         );
-        println!("  lag: {lag:.1} ms (published pose vs truth, moving)");
+        println!(
+            "  lag: {lag:.1} ms (published pose vs truth, moving; negative: the Touch runs ahead \
+             of the reference)"
+        );
+        if let Some(advice) = eval::latency_advice(lag, tf.latency_adjustment_ms)
+            .filter(|_| advise && published_by_daemon)
+        {
+            println!("  {advice}");
+        }
         println!("  moving, as published: position median {:.1} p90 {:.1} p99 {:.1} max {:.1} mm (rms {:.1}); rotation median {:.2} p90 {:.2} deg ({} poses)", e0.pos_median_mm, e0.pos_p90_mm, e0.pos_p99_mm, e0.pos_max_mm, e0.pos_rms_mm, e0.rot_median_deg, e0.rot_p90_deg, e0.n);
         println!("  moving, lag removed:  position median {:.1} p90 {:.1} p99 {:.1} max {:.1} mm (rms {:.1}); rotation median {:.2} p90 {:.2} deg", el.pos_median_mm, el.pos_p90_mm, el.pos_p99_mm, el.pos_max_mm, el.pos_rms_mm, el.rot_median_deg, el.rot_p90_deg);
         println!(
@@ -5347,6 +5366,7 @@ fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration
     let lag = report(
         "with the installed registration (what SteamVR shows)",
         &installed,
+        true,
     );
     // best fit to this capture on its longest jig segment, the lag removed: tracking error alone
     let segs = eval::offset_segments(
@@ -5384,6 +5404,7 @@ fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration
                 report(
                     "with a best-fit registration (tracking error alone)",
                     &sol.lighthouse_from_world,
+                    false,
                 );
             }
             Err(e) => println!("(no best-fit registration: {e})"),

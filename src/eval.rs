@@ -380,6 +380,48 @@ pub struct TruthFile {
     /// Further Lighthouse-tracked controllers recorded beside the reference (free-run captures).
     #[serde(default)]
     pub others: Vec<RefTrack>,
+    /// The daemon's latency adjustment (ms) when this was captured, which the stamps of its
+    /// published poses carry (a replay's do not); none in files from before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_adjustment_ms: Option<f64>,
+}
+
+/// A lag smaller than this (ms) is within what `lag_ms` resolves: nothing to adjust.
+const LAG_WORTH_ADJUSTING_MS: f64 = 0.5;
+
+/// What to do about a measured lag of the published stamps against the truth (negative: the Touch
+/// runs ahead of the reference): the `cv1touch latency` adjustment that puts the Touch on the
+/// reference's timeline, on top of the one the capture was made with (`lag` moves the adjustment
+/// by itself: a Touch ahead is stamped later); or how to apply it when the capture did not record
+/// that adjustment. Which timeline is the true one the capture cannot tell. None when the lag is
+/// not worth it.
+pub fn latency_advice(lag_ms: f64, adjustment_at_capture_ms: Option<f64>) -> Option<String> {
+    if !lag_ms.is_finite() || lag_ms.abs() < LAG_WORTH_ADJUSTING_MS {
+        return None;
+    }
+    let max = crate::settings::MAX_LATENCY_ADJUSTMENT_MS;
+    let Some(at_capture) = adjustment_at_capture_ms else {
+        return Some(format!(
+            "to put the Touch on the reference's timeline, add {lag_ms:+.1} ms to the latency \
+             adjustment (`cv1touch latency` shows it)"
+        ));
+    };
+    let wanted = at_capture + lag_ms;
+    if wanted.abs() > max {
+        return Some(format!(
+            "a lag this large is not a stamp adjustment (+-{max:.0} ms at most): check that the \
+             Touch stayed fixed to the reference"
+        ));
+    }
+    let was = if at_capture == 0.0 {
+        "none was set".to_string()
+    } else {
+        format!("{at_capture:+.1} ms was set")
+    };
+    Some(format!(
+        "to put the Touch on the reference's timeline: cv1touch latency {wanted:+.1} ({was} when \
+         this was captured)"
+    ))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -726,5 +768,67 @@ mod tests {
             (got.translation.vector - want.translation.vector).norm() < 1e-9
                 && got.rotation.angle_to(&want.rotation) < 1e-9
         );
+    }
+
+    /// What `eval` says to do about a lag: the adjustment that puts the Touch on the reference's
+    /// timeline, on top of the one the capture was made with. A lag within the measurement's
+    /// resolution is left alone, and one beyond what an adjustment can be is not a stamp problem.
+    #[test]
+    fn advises_the_latency_adjustment_that_removes_a_lag() {
+        // the Touch 5.4 ms ahead with no adjustment: stamp it 5.4 ms later
+        assert_eq!(
+            latency_advice(-5.4, Some(0.0)).as_deref(),
+            Some(
+                "to put the Touch on the reference's timeline: cv1touch latency -5.4 (none was \
+                 set when this was captured)"
+            )
+        );
+        // on top of the one set when the capture was made
+        assert_eq!(
+            latency_advice(-5.4, Some(-5.4)).as_deref(),
+            Some(
+                "to put the Touch on the reference's timeline: cv1touch latency -10.8 (-5.4 ms \
+                 was set when this was captured)"
+            )
+        );
+        assert_eq!(
+            latency_advice(3.0, Some(-1.0)).as_deref(),
+            Some(
+                "to put the Touch on the reference's timeline: cv1touch latency +2.0 (-1.0 ms \
+                 was set when this was captured)"
+            )
+        );
+        // a capture from before the adjustment was recorded with it
+        assert_eq!(
+            latency_advice(-5.4, None).as_deref(),
+            Some(
+                "to put the Touch on the reference's timeline, add -5.4 ms to the latency \
+                 adjustment (`cv1touch latency` shows it)"
+            )
+        );
+        assert_eq!(latency_advice(0.4, Some(0.0)), None);
+        assert_eq!(latency_advice(-0.4, None), None);
+        assert_eq!(latency_advice(f64::NAN, None), None);
+        assert_eq!(
+            latency_advice(40.0, Some(0.0)).as_deref(),
+            Some(
+                "a lag this large is not a stamp adjustment (+-30 ms at most): check that the \
+                 Touch stayed fixed to the reference"
+            )
+        );
+    }
+
+    /// A truth file from before the adjustment was recorded loads with none, and none is left
+    /// out when written.
+    #[test]
+    fn a_truth_file_without_the_adjustment_loads() {
+        let tf: TruthFile = serde_json::from_str(
+            r#"{"format":"cv1touch-eval-truth","version":1,"reference":"LHR-0","universe_id":1,"windows":[],"samples":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(tf.latency_adjustment_ms, None);
+        assert!(!serde_json::to_string(&tf)
+            .unwrap()
+            .contains("latency_adjustment_ms"));
     }
 }
