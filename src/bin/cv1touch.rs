@@ -899,7 +899,8 @@ fn fit_render(rec: Option<&Path>) -> i32 {
             format!(" (fitted alone: {:.2} mm rms; this placement differs from that by {:.1} mm, {:.2} deg)", a.rms_m * 1e3, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees())
         });
         println!(
-            "{hand}: {n} LEDs, surface distance rms {:.2} mm, max {:.2} mm{moved}",
+            "{hand}: {n} LEDs, {:.1} mm under their windows; off that depth rms {:.2} mm, max {:.2} mm{moved}",
+            f.depth_m * 1e3,
             f.rms_m * 1e3,
             f.max_m * 1e3
         );

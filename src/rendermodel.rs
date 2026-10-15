@@ -3,8 +3,10 @@
 
 //! The SteamVR CV1 Touch render models against the tracked LED model: SteamVR draws
 //! `oculus_cv1_controller_left/right` at the device pose, the engine tracks the factory LED frame.
-//! The constant offset between them is measured by fitting the LEDs (positions and outward
-//! normals) onto the body mesh's surface (ICP from 24 starting orientations).
+//! The constant offset between them is measured by fitting the LEDs (positions and emission
+//! directions) to the body mesh: a coarse fit onto the surface (ICP from 24 starting
+//! orientations), then a refinement in which each LED is matched to the window its emission ray
+//! leaves the mesh through and all LEDs sit a common depth under their windows (`refine`).
 
 use std::path::PathBuf;
 
@@ -131,9 +133,143 @@ pub fn closest_point(m: &Mesh, p: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>)
 
 pub struct Fit {
     pub render_from_model: Isometry3<f64>,
-    /// LED-to-surface distances after the fit.
+    /// How far each LED's depth under its window departs from the common depth (rms, max), m.
     pub rms_m: f64,
     pub max_m: f64,
+    /// The common depth of the LEDs under the surface, m (the cover over them).
+    pub depth_m: f64,
+}
+
+/// Where the ray from `p` along `dir` leaves the mesh: the nearest triangle it crosses outward
+/// (`dir` along the triangle's outward normal) within `reach` m behind `p` or ahead of it, with the
+/// crossing point, the signed depth of `p` under it along `dir`, and the triangle's unit normal.
+/// None when the ray leaves through no face (an LED pointing out of the mesh's gaps).
+pub fn ray_exit(
+    m: &Mesh,
+    p: &Vector3<f64>,
+    dir: &Vector3<f64>,
+    reach: f64,
+) -> Option<(Vector3<f64>, f64, Vector3<f64>)> {
+    let mut best: Option<(f64, Vector3<f64>, Vector3<f64>)> = None;
+    for t in &m.tris {
+        let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
+        let n = e1.cross(&e2);
+        if n.dot(dir) <= 0.0 {
+            continue; // entering, or edge-on
+        }
+        // Möller-Trumbore
+        let h = dir.cross(&e2);
+        let a = e1.dot(&h);
+        if a.abs() < 1e-18 {
+            continue;
+        }
+        let f = 1.0 / a;
+        let s = p - t[0];
+        let u = f * s.dot(&h);
+        if !(-1e-9..=1.0 + 1e-9).contains(&u) {
+            continue;
+        }
+        let q = s.cross(&e1);
+        let v = f * dir.dot(&q);
+        if v < -1e-9 || u + v > 1.0 + 1e-9 {
+            continue;
+        }
+        let d = f * e2.dot(&q);
+        if d < -reach || d > reach {
+            continue;
+        }
+        // the nearest crossing in absolute distance: the LED's own window
+        if best.is_none_or(|b| d.abs() < b.0.abs()) {
+            best = Some((d, p + dir * d, n.normalize()));
+        }
+    }
+    best.map(|(d, q, n)| (q, d, n))
+}
+
+/// How far the LEDs' rays reach to find their windows: generous against the coarse fit's error.
+const WINDOW_REACH_M: f64 = 0.02;
+
+/// The coarse fit refined: each LED matched to the window its emission ray leaves the mesh
+/// through, and every LED a common depth under its window (the cover, fitted along).
+/// Gauss-Newton on pose and depth, point-to-plane at the window. The emission direction only
+/// chooses the window: the body meshes are faceted (neighbouring facets of the ring's tube differ
+/// by 15 to 30 degrees), so a facet's normal says too little about the window's true normal to
+/// pull the pose by. Returns the transform and the depth; the start is kept when fewer than six
+/// LEDs find a window.
+fn refine(
+    leds: &[Led],
+    m: &Mesh,
+    start: Isometry3<f64>,
+    iterations: usize,
+) -> (Isometry3<f64>, f64) {
+    let mut t = start;
+    let mut depth = 0.0;
+    for _ in 0..iterations {
+        let mut h = nalgebra::SMatrix::<f64, 7, 7>::zeros();
+        let mut g = nalgebra::SVector::<f64, 7>::zeros();
+        let mut hits = 0usize;
+        for l in leds {
+            let p = (t * Point3::from(l.pos)).coords;
+            let a = t.rotation * l.dir;
+            let Some((q, _, n)) = ray_exit(m, &p, &a, WINDOW_REACH_M) else {
+                continue;
+            };
+            hits += 1;
+            // depth: p sits `depth` under the window along its normal
+            let r = n.dot(&(p - q)) + depth;
+            let mut j = nalgebra::SVector::<f64, 7>::zeros();
+            let pxn = p.cross(&n);
+            j[0] = pxn.x;
+            j[1] = pxn.y;
+            j[2] = pxn.z;
+            j[3] = n.x;
+            j[4] = n.y;
+            j[5] = n.z;
+            j[6] = 1.0;
+            h += j * j.transpose();
+            g -= j * r;
+        }
+        if hits < 6 {
+            return (start, 0.0);
+        }
+        for k in 0..7 {
+            h[(k, k)] += 1e-9 + 1e-6 * h[(k, k)];
+        }
+        let Some(d) = h.cholesky().map(|ch| ch.solve(&g)) else {
+            break;
+        };
+        let step = Isometry3::from_parts(
+            Translation3::new(d[3], d[4], d[5]),
+            UnitQuaternion::from_scaled_axis(Vector3::new(d[0], d[1], d[2])),
+        );
+        t = step * t;
+        depth = (depth + d[6]).max(0.0);
+        if d.norm() < 1e-10 {
+            break;
+        }
+    }
+    (t, depth)
+}
+
+/// The fit's figures for `leds` placed by `render_from_model` with the LEDs `depth` under their
+/// windows: depth deviation rms and max (m). An LED whose ray leaves through no face is measured
+/// against the nearest surface point instead.
+fn measure(leds: &[Led], m: &Mesh, render_from_model: &Isometry3<f64>, depth: f64) -> (f64, f64) {
+    let (mut d2, mut dmax, mut n) = (0.0, 0.0, 0usize);
+    for l in leds {
+        let p = (render_from_model * Point3::from(l.pos)).coords;
+        let a = render_from_model.rotation * l.dir;
+        let (q, nn) = match ray_exit(m, &p, &a, WINDOW_REACH_M) {
+            Some((q, _, nn)) => (q, nn),
+            None => closest_point(m, &p),
+        };
+        let dev = nn.dot(&(p - q)) + depth;
+        d2 += dev * dev;
+        dmax = f64::max(dmax, dev.abs());
+        n += 1;
+    }
+    let n = n.max(1) as f64;
+    ((d2 / n).sqrt(), dmax)
 }
 
 /// One ICP run from `start`: Gauss-Newton on point-to-plane distances (an LED may slide along the
@@ -227,36 +363,20 @@ pub fn fit(leds: &[Led], m: &Mesh) -> Fit {
             (best, best_cost) = (t, c);
         }
     }
-    let (t, _) = icp(leds, m, best, 200);
-    let d: Vec<f64> = leds
-        .iter()
-        .map(|l| {
-            (closest_point(m, &(t * nalgebra::Point3::from(l.pos)).coords).0
-                - (t * nalgebra::Point3::from(l.pos)).coords)
-                .norm()
-        })
-        .collect();
-    Fit {
-        render_from_model: t,
-        rms_m: (d.iter().map(|x| x * x).sum::<f64>() / d.len().max(1) as f64).sqrt(),
-        max_m: d.iter().copied().fold(0.0, f64::max),
-    }
+    let (coarse, _) = icp(leds, m, best, 200);
+    let (t, depth) = refine(leds, m, coarse, 60);
+    placed(leds, m, t, depth)
 }
 
-/// LED-to-surface distances of `leds` placed by `render_from_model` (rms, max).
-fn surface_distances(leds: &[Led], m: &Mesh, render_from_model: &Isometry3<f64>) -> (f64, f64) {
-    let d: Vec<f64> = leds
-        .iter()
-        .map(|l| {
-            (closest_point(m, &(render_from_model * Point3::from(l.pos)).coords).0
-                - (render_from_model * Point3::from(l.pos)).coords)
-                .norm()
-        })
-        .collect();
-    (
-        (d.iter().map(|x| x * x).sum::<f64>() / d.len().max(1) as f64).sqrt(),
-        d.iter().copied().fold(0.0, f64::max),
-    )
+/// The fit of `leds` placed by `render_from_model` with the LEDs `depth` under their windows.
+fn placed(leds: &[Led], m: &Mesh, render_from_model: Isometry3<f64>, depth: f64) -> Fit {
+    let (rms_m, max_m) = measure(leds, m, &render_from_model, depth);
+    Fit {
+        render_from_model,
+        rms_m,
+        max_m,
+        depth_m: depth,
+    }
 }
 
 /// The rigid move best taking `a` onto `b` (same order).
@@ -328,7 +448,8 @@ pub fn fit_mirrored(
             dir: s.rotation * mx(&l.dir),
         }))
         .collect();
-    let right_from = fit(&both, right_mesh).render_from_model;
+    let right_fit = fit(&both, right_mesh);
+    let right_from = right_fit.render_from_model;
     // a left LED p: in the right model frame s(M p), in the right render frame right_from(s(M p)),
     // and in the left render frame (the mirror of the right one) M of that
     let t = right_from * s;
@@ -338,17 +459,9 @@ pub fn fit_mirrored(
         Translation3::from(mx(&t.translation.vector)),
         UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r)),
     );
-    let placed = |leds: &[Led], m: &Mesh, t: Isometry3<f64>| {
-        let (rms_m, max_m) = surface_distances(leds, m, &t);
-        Fit {
-            render_from_model: t,
-            rms_m,
-            max_m,
-        }
-    };
     (
-        placed(left, left_mesh, left_from),
-        placed(right, right_mesh, right_from),
+        placed(left, left_mesh, left_from, right_fit.depth_m),
+        placed(right, right_mesh, right_from, right_fit.depth_m),
     )
 }
 
@@ -506,6 +619,50 @@ mod tests {
             );
             assert!(f.rms_m < 1e-4, "{hand}: {}", f.rms_m);
         }
+    }
+
+    /// A ray from inside the box leaves through the face it points at, at the right depth.
+    #[test]
+    fn a_ray_leaves_the_mesh_through_the_face_it_points_at() {
+        let m = body();
+        let p = Vector3::new(0.0, -0.05, 0.019);
+        let (q, depth, n) = ray_exit(&m, &p, &Vector3::z(), 0.01).unwrap();
+        assert!((q - Vector3::new(0.0, -0.05, 0.02)).norm() < 1e-9, "{q:?}");
+        assert!((depth - 0.001).abs() < 1e-9, "{depth}");
+        assert!((n - Vector3::z()).norm() < 1e-9, "{n:?}");
+        // pointing along the face, it leaves through nothing within reach
+        assert!(ray_exit(&m, &p, &Vector3::x(), 0.01).is_none());
+    }
+
+    /// LEDs under a cover: 1.5 mm inside the surface, each shining along its window's normal. The
+    /// fit finds the pose and the depth; a fit of the LEDs onto the surface itself would tilt the
+    /// asymmetric ring to bring them up.
+    #[test]
+    fn recovers_a_known_offset_with_recessed_leds() {
+        let m = body();
+        let truth = Isometry3::from_parts(
+            Translation3::new(0.004, -0.012, 0.007),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.9, -2.1, 0.4)),
+        );
+        let model: Vec<Led> = leds()
+            .iter()
+            .map(|l| Led {
+                pos: truth
+                    .inverse_transform_point(&(l.pos - l.dir * 0.0015).into())
+                    .coords,
+                dir: truth.rotation.inverse() * l.dir,
+            })
+            .collect();
+        let f = fit(&model, &m);
+        let err = f.render_from_model * truth.inverse();
+        assert!(
+            err.translation.vector.norm() < 3e-4 && err.rotation.angle() < 0.2f64.to_radians(),
+            "{:?} {}",
+            err.translation.vector,
+            err.rotation.angle().to_degrees()
+        );
+        assert!((f.depth_m - 0.0015).abs() < 3e-4, "{}", f.depth_m);
+        assert!(f.rms_m < 3e-4, "{}", f.rms_m);
     }
 
     #[test]
