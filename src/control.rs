@@ -325,11 +325,18 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["alignment", "reload"] => Ok(Command::AlignmentReload),
         ["latency"] => Ok(Command::Latency(None)),
         ["latency", ms] => {
-            let v = number(ms)?;
-            if v.abs() > 30.0 {
-                return Err("latency adjustment must be within +-30 ms".into());
+            let v = ms
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| "latency adjustment must be a finite number of ms".to_string())?;
+            if v.abs() > crate::settings::MAX_LATENCY_ADJUSTMENT_MS {
+                return Err(format!(
+                    "latency adjustment must be within +-{} ms",
+                    crate::settings::MAX_LATENCY_ADJUSTMENT_MS
+                ));
             }
-            Ok(Command::Latency(Some(v as f64)))
+            Ok(Command::Latency(Some(v)))
         }
         ["alignment", ..] => Err("usage: alignment reload".into()),
         [verb, ..] => Err(format!("unknown command '{verb}'")),
@@ -556,7 +563,14 @@ mod tests {
         assert_eq!(parse("alignment reload"), Ok(Command::AlignmentReload));
         assert_eq!(parse("latency"), Ok(Command::Latency(None)));
         assert_eq!(parse("latency -2.5"), Ok(Command::Latency(Some(-2.5))));
-        assert!(parse("latency 40").is_err());
+        assert_eq!(
+            parse("latency 40"),
+            Err("latency adjustment must be within +-30 ms".into())
+        );
+        assert_eq!(
+            parse("latency abc"),
+            Err("latency adjustment must be a finite number of ms".into())
+        );
         assert!(parse("alignment").is_err());
     }
 

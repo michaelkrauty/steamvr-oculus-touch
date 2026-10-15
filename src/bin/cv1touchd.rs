@@ -191,7 +191,8 @@ struct Daemon {
     settings_path: PathBuf,
     /// The current recording keeps the sensors' pixels (RAW_FRAME records).
     record_frames: AtomicBool,
-    /// Extra stamp shift of published poses, ns (`latency` command; 0 by default).
+    /// Extra stamp shift of published poses, ns (`latency` command); saved in `settings_path`
+    /// on every change and read from it at start.
     extra_latency_ns: std::sync::atomic::AtomicI64,
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
@@ -577,6 +578,54 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
 /// The prediction percents a daemon starts with: (positions, orientations).
 fn start_prediction(settings: &settings::Settings) -> (u32, u32) {
     (settings.prediction_percent, settings.rotation_percent())
+}
+
+/// The saved latency adjustment as the stamp shift it is, ns.
+fn start_latency_ns(settings: &settings::Settings) -> i64 {
+    (settings.latency_ms() * 1e6).round() as i64
+}
+
+/// The settings as they are now: what every change saves, so that none drops another.
+fn current_settings(d: &Daemon) -> settings::Settings {
+    let extra_ns = d.extra_latency_ns.load(Ordering::Acquire);
+    settings::Settings {
+        prediction_percent: d.position_prediction.load(Ordering::Acquire),
+        rotation_prediction_percent: Some(d.rotation_prediction.load(Ordering::Acquire)),
+        latency_adjustment_ms: (extra_ns != 0).then(|| extra_ns as f64 / 1e6),
+        ..settings::Settings::default()
+    }
+}
+
+/// Saves the settings as they are now; the reply's note when that fails.
+fn save_settings(d: &Daemon) -> String {
+    match settings::save(&d.settings_path, &current_settings(d)) {
+        Ok(()) => String::new(),
+        Err(e) => format!(" (not saved: {e})"),
+    }
+}
+
+/// How published poses are stamped off their IMU samples' arrival time (the `latency` reply and
+/// the start-up note): the pipeline's measured offset and the adjustment on top of it.
+fn latency_text(extra_ns: i64) -> String {
+    let total_ms = (pipeline::DEFAULT_EXPOSURE_OFFSET_NS + extra_ns) as f64 / 1e6;
+    let adjustment = if extra_ns == 0 {
+        "no adjustment".to_string()
+    } else {
+        format!("{:+.1} ms adjustment", extra_ns as f64 / 1e6)
+    };
+    let measured = pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 / 1e6;
+    if total_ms.abs() < 0.05 {
+        return format!(
+            "published poses stamped at their IMU samples' arrival time ({measured:.1} ms \
+             measured, {adjustment})"
+        );
+    }
+    format!(
+        "published poses stamped {:.1} ms {} than their IMU samples' arrival time ({measured:.1} \
+         ms measured, {adjustment})",
+        total_ms.abs(),
+        if total_ms < 0.0 { "later" } else { "earlier" },
+    )
 }
 
 /// `alignment` carrying the prediction percents (positions, orientations) the driver applies.
@@ -2352,11 +2401,12 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         d.mode.lock().unwrap(),
+        d.extra_latency_ns.load(Ordering::Relaxed) as f64 / 1e6,
         engine_ready,
         d.inputs.lock().unwrap().status(),
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
@@ -2525,16 +2575,7 @@ fn handle(d: &Daemon, line: &str) -> String {
                 if let Some(p) = rotation {
                     d.rotation_prediction.store(p, Ordering::Release);
                 }
-                let s = settings::Settings {
-                    prediction_percent: d.position_prediction.load(Ordering::Acquire),
-                    rotation_prediction_percent: Some(
-                        d.rotation_prediction.load(Ordering::Acquire),
-                    ),
-                    ..settings::Settings::default()
-                };
-                if let Err(e) = settings::save(&d.settings_path, &s) {
-                    unsaved = format!(" (not saved: {e})");
-                }
+                unsaved = save_settings(d);
                 republish_prediction(d);
             }
             // the driver applies the percents to whatever is published, OpenHMD's poses too
@@ -2570,15 +2611,15 @@ fn handle(d: &Daemon, line: &str) -> String {
             )
         }
         Ok(Command::Latency(v)) => {
+            let mut unsaved = String::new();
             if let Some(ms) = v {
                 d.extra_latency_ns
-                    .store((ms * 1e6) as i64, Ordering::Release);
+                    .store((ms * 1e6).round() as i64, Ordering::Release);
+                unsaved = save_settings(d);
             }
             format!(
-                "ok latency: published poses stamped {:.1} ms earlier than their IMU samples' arrival time ({:.1} ms measured + {:+.1} ms adjustment)",
-                (pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 + d.extra_latency_ns.load(Ordering::Acquire) as f64) * 1e-6,
-                pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 * 1e-6,
-                d.extra_latency_ns.load(Ordering::Acquire) as f64 * 1e-6
+                "ok latency: {}{unsaved}",
+                latency_text(d.extra_latency_ns.load(Ordering::Acquire))
             )
         }
         Ok(Command::AlignmentReload) => {
@@ -3078,6 +3119,13 @@ fn main() {
             settings_path.display()
         ));
     }
+    if start_latency_ns(&settings) != 0 {
+        log(format!(
+            "latency: {} ({})",
+            latency_text(start_latency_ns(&settings)),
+            settings_path.display()
+        ));
+    }
     let (alignment, notes) = align::load_default();
     for n in notes {
         log(n);
@@ -3138,7 +3186,7 @@ fn main() {
         alignment_publish: Mutex::new(()),
         settings_path,
         record_frames: AtomicBool::new(false),
-        extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
+        extra_latency_ns: std::sync::atomic::AtomicI64::new(start_latency_ns(&settings)),
         battery: [
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
@@ -3334,6 +3382,58 @@ mod tests {
             (published.prediction_position, published.prediction_rotation),
             (0, 0)
         );
+        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// `latency` is saved as it is set, for the next daemon to start from, and `prediction`,
+    /// saved beside it, keeps it; the status says it, and the reply says which way the stamps
+    /// move. Showing it saves nothing, and none is left out of the file.
+    #[test]
+    fn the_latency_adjustment_is_saved_as_it_is_set() {
+        let d = status_daemon();
+        assert_eq!(
+            handle(&d, "latency"),
+            "ok latency: published poses stamped 4.0 ms earlier than their IMU samples' arrival \
+             time (4.0 ms measured, no adjustment)"
+        );
+        assert!(!d.settings_path.exists());
+        assert_eq!(
+            handle(&d, "latency -5.4"),
+            "ok latency: published poses stamped 1.4 ms later than their IMU samples' arrival \
+             time (4.0 ms measured, -5.4 ms adjustment)"
+        );
+        assert_eq!(d.extra_latency_ns.load(Ordering::Acquire), -5_400_000);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| s.latency_ms()),
+            Ok(-5.4)
+        );
+        handle(&d, "prediction 0");
+        let s = settings::load(&d.settings_path).unwrap();
+        assert_eq!((s.prediction_percent, s.latency_ms()), (0, -5.4));
+        assert_eq!(start_latency_ns(&s), -5_400_000);
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(status["latency_adjustment_ms"], -5.4);
+        assert_eq!(
+            handle(&d, "latency 2"),
+            "ok latency: published poses stamped 6.0 ms earlier than their IMU samples' arrival \
+             time (4.0 ms measured, +2.0 ms adjustment)"
+        );
+        assert_eq!(
+            handle(&d, "latency -4"),
+            "ok latency: published poses stamped at their IMU samples' arrival time (4.0 ms \
+             measured, -4.0 ms adjustment)"
+        );
+        handle(&d, "latency 0");
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| s.latency_adjustment_ms),
+            Ok(None)
+        );
+        assert_eq!(
+            handle(&d, "latency 40"),
+            "err latency adjustment must be within +-30 ms"
+        );
+        assert_eq!(d.extra_latency_ns.load(Ordering::Acquire), 0);
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
 

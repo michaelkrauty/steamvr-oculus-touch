@@ -2,9 +2,9 @@
 // Copyright 2026 michaelkrauty
 
 //! Settings changed while the daemon runs that outlast it: how much of the tracked motion SteamVR
-//! extrapolates positions and orientations with (`cv1touch prediction`). The daemon saves them on
-//! every change and reads them when it starts; without a usable file it goes on with the
-//! defaults.
+//! extrapolates positions and orientations with (`cv1touch prediction`), and the stamp adjustment
+//! of published poses (`cv1touch latency`). The daemon saves them on every change and reads them
+//! when it starts; without a usable file it goes on with the defaults.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,13 +25,26 @@ pub struct Settings {
     /// for positions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotation_prediction_percent: Option<u32>,
+    /// How much earlier than measured published poses are stamped, ms, on top of the pipeline's
+    /// own estimate (`cv1touch latency`; `cv1touch eval` measures what is left). Within
+    /// +-`MAX_LATENCY_ADJUSTMENT_MS`; left out when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_adjustment_ms: Option<f64>,
 }
+
+/// The largest latency adjustment accepted, ms, either way.
+pub const MAX_LATENCY_ADJUSTMENT_MS: f64 = 30.0;
 
 impl Settings {
     /// The percent for orientations.
     pub fn rotation_percent(&self) -> u32 {
         self.rotation_prediction_percent
             .unwrap_or(self.prediction_percent)
+    }
+
+    /// The latency adjustment, ms (0 when none).
+    pub fn latency_ms(&self) -> f64 {
+        self.latency_adjustment_ms.unwrap_or(0.0)
     }
 }
 
@@ -42,6 +55,7 @@ impl Default for Settings {
             version: 1,
             prediction_percent: 100,
             rotation_prediction_percent: None,
+            latency_adjustment_ms: None,
         }
     }
 }
@@ -68,6 +82,12 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     }
     if s.prediction_percent > 100 || s.rotation_percent() > 100 {
         return Err(format!("{}: a prediction percent over 100", path.display()));
+    }
+    if !s.latency_ms().is_finite() || s.latency_ms().abs() > MAX_LATENCY_ADJUSTMENT_MS {
+        return Err(format!(
+            "{}: a latency adjustment outside +-{MAX_LATENCY_ADJUSTMENT_MS} ms",
+            path.display()
+        ));
     }
     Ok(s)
 }
@@ -146,10 +166,39 @@ mod tests {
             r#"{"format":"cv1touch-settings","version":1,"prediction_percent":101}"#,
             r#"{"format":"cv1touch-settings","version":1,"prediction_percent":0,"rotation_prediction_percent":101}"#,
             r#"{"format":"something-else","version":1,"prediction_percent":0}"#,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100,"latency_adjustment_ms":31}"#,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100,"latency_adjustment_ms":-30.5}"#,
         ] {
             std::fs::write(&path, text).unwrap();
             assert!(load(&path).is_err(), "{text}");
         }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The latency adjustment (`cv1touch latency`) is kept with its sign; a file from before it
+    /// had one, and one that leaves it out, mean none.
+    #[test]
+    fn the_latency_adjustment_is_kept_and_none_by_default() {
+        let path = temp("latency");
+        let s = Settings {
+            latency_adjustment_ms: Some(-5.4),
+            ..Settings::default()
+        };
+        save(&path, &s).unwrap();
+        assert_eq!(load(&path), Ok(s));
+        assert_eq!(load(&path).unwrap().latency_ms(), -5.4);
+        std::fs::write(
+            &path,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap().latency_ms(), 0.0);
+        assert_eq!(Settings::default().latency_ms(), 0.0);
+        // none is left out of the file, not written as 0
+        save(&path, &Settings::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("latency_adjustment_ms"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
