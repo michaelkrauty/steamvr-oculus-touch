@@ -7,6 +7,9 @@
 
 #include "pose.h"
 
+#include <string>
+#include <vector>
+
 using cv1t::make_pose;
 
 static bool approx(double a, double b, double eps = 1e-6) { return std::fabs(a - b) < eps; }
@@ -119,6 +122,22 @@ static void alignment_is_applied_per_hand()
 	assert(right.qDriverFromHeadRotation.w == 1 && right.vecDriverFromHeadTranslation[2] == 0); // no right offset
 }
 
+static void age_report_splits_the_hand_off()
+{
+	// ages 0.1..10 ms, of which 0.01..1 ms passed after the daemon published; pushed newest-first,
+	// so the percentiles come out right only once sorted
+	std::vector<uint64_t> ages, handoffs;
+	for (uint64_t k = 100; k >= 1; k--) {
+		ages.push_back(k * 100'000);
+		handoffs.push_back(k * 10'000);
+	}
+	assert(cv1t::age_report("CV1T-LEFT", ages, handoffs) ==
+	       "cv1touch: CV1T-LEFT pose age at submission over 100 poses: p50 5.00 ms p99 9.90 ms max 10.00 ms; of it after the daemon published: p50 0.50 ms p99 0.99 ms max 1.00 ms");
+	// an older daemon stamps no publish time: the split is left out
+	std::vector<uint64_t> one{2'000'000}, none;
+	assert(cv1t::age_report("CV1T-RIGHT", one, none) == "cv1touch: CV1T-RIGHT pose age at submission over 1 poses: p50 2.00 ms p99 2.00 ms max 2.00 ms");
+}
+
 /* A sample stamped slightly after "now" (clocks read on two threads) is not a future pose. */
 static void never_a_positive_time_offset()
 {
@@ -148,6 +167,7 @@ int main()
 	coasting_then_out_of_range();
 	a_lost_position_is_not_extrapolated();
 	alignment_is_applied_per_hand();
+	age_report_splits_the_hand_off();
 	never_a_positive_time_offset();
 	stale_sample_stops_then_disconnects();
 	printf("test_pose ok\n");

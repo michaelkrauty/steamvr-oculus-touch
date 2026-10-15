@@ -3,7 +3,6 @@
 
 #include "touch_device.h"
 
-#include <algorithm>
 
 #include "log.h"
 #include "pose.h"
@@ -93,17 +92,18 @@ void TouchDevice::send_inputs(const InputValues &v, double time_offset)
 	inputs_sent_ = true;
 }
 
-void TouchDevice::record_age(uint64_t age_ns, uint64_t now_ns)
+void TouchDevice::record_age(uint64_t age_ns, uint64_t handoff_ns, uint64_t now_ns)
 {
 	if (ages_since_ns_ == 0)
 		ages_since_ns_ = now_ns;
 	ages_.push_back(age_ns);
-	if (now_ns - ages_since_ns_ < 10'000'000'000ull || ages_.empty())
+	if (handoff_ns != UINT64_MAX)
+		handoffs_.push_back(handoff_ns);
+	if (now_ns - ages_since_ns_ < 10'000'000'000ull)
 		return;
-	std::sort(ages_.begin(), ages_.end());
-	const auto at = [&](double q) { return ages_[static_cast<size_t>(q * (ages_.size() - 1))] * 1e-6; };
-	cv1t_log("cv1touch: %s pose age at submission over %zu poses: p50 %.2f ms p99 %.2f ms max %.2f ms", serial(), ages_.size(), at(0.5), at(0.99), at(1.0));
+	cv1t_log("%s", age_report(serial(), ages_, handoffs_).c_str());
 	ages_.clear();
+	handoffs_.clear();
 	ages_since_ns_ = now_ns;
 }
 
@@ -127,8 +127,13 @@ void TouchDevice::update(const cv1t_controller_state *st, const cv1t_alignment *
 	if (sample == last_sample_ns_ && connected == last_connected_ && now_ns - last_submit_ns_ < 100'000'000)
 		return;
 	vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id, pose, sizeof pose);
-	if (connected && sample != last_sample_ns_ && now_ns >= sample)
-		record_age(now_ns - sample, now_ns);
+	if (connected && sample != last_sample_ns_ && now_ns >= sample) {
+		// the part of the age that passed after the daemon published: the hand-off to here (a
+		// publish stamped just after this pass's "now" is a hand-off of nothing, not no hand-off)
+		const uint64_t published = st->publish_host_ns;
+		const uint64_t handoff = published == 0 ? UINT64_MAX : now_ns >= published ? now_ns - published : 0;
+		record_age(now_ns - sample, handoff, now_ns);
+	}
 	if (connected != last_connected_)
 		cv1t_log("cv1touch: %s %s", serial(), connected ? "connected" : "disconnected (standby, out of range or no daemon)");
 	last_sample_ns_ = sample;

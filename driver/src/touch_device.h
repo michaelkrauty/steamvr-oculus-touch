@@ -40,7 +40,7 @@ private:
 			trigger_touch, grip, grip_touch, thumbrest_touch;
 	};
 	void send_inputs(const InputValues &v, double time_offset);
-	void record_age(uint64_t age_ns, uint64_t now_ns);
+	void record_age(uint64_t age_ns, uint64_t handoff_ns, uint64_t now_ns);
 
 	int hand_;
 	std::atomic<uint32_t> object_id_{vr::k_unTrackedDeviceIndexInvalid};
@@ -54,7 +54,7 @@ private:
 	uint64_t last_sample_ns_ = 0, last_submit_ns_ = 0, universe_ = 0;
 	bool last_connected_ = false;
 	int battery_ = -1;
-	std::vector<uint64_t> ages_;
+	std::vector<uint64_t> ages_, handoffs_;
 	uint64_t ages_since_ns_ = 0;
 };
 

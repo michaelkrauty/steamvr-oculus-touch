@@ -16,6 +16,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- The SteamVR driver's log line on the age of the poses it submits (every 10 s in SteamVR's `vrserver.txt`) now also says how much of that age passed after the daemon published the pose, which separates the driver's own wake-up from everything before it (the radio link and the daemon).
 - Controllers are tracked again sooner after waking up or losing their position. The tracker also starts from OpenHMD poses rated good, not only strong, and after a loss it searches for the controller's position itself with the orientation the gyro kept. A track started either way is shown only once a second sensor, or a strong OpenHMD pose that agrees with it, confirms it. Replaying recordings from 2026-10-08, wake-ups that had taken 6.6 s and 2.9 s took 0.24 s and 1.5 s and the other three 43-63% less time, with no new wrong locks. `cv1touch status --json` counts these acquisitions (`good`, `searched`, `unconfirmed`).
 - `cv1touchd` no longer runs OpenHMD's brute-force pose search for a controller its own tracker fitted within the last 100 ms, or one asleep, except on a sensor that has no pose yet. That search took most of the daemon's CPU time during play. The per-sensor OpenHMD fix counts in `cv1touch status` are lower for tracked controllers as a result.
 

@@ -3,9 +3,26 @@
 
 #include "pose.h"
 
+#include <algorithm>
+#include <cstdio>
+
 namespace cv1t {
 
 static vr::HmdQuaternion_t quat(const float q[4]) { return {q[3], q[0], q[1], q[2]}; }
+
+std::string age_report(const char *serial, std::vector<uint64_t> &ages, std::vector<uint64_t> &handoffs)
+{
+	std::sort(ages.begin(), ages.end());
+	std::sort(handoffs.begin(), handoffs.end());
+	const auto at = [](const std::vector<uint64_t> &v, double q) { return v[static_cast<size_t>(q * (v.size() - 1))] * 1e-6; };
+	char buf[320];
+	int n = snprintf(buf, sizeof buf, "cv1touch: %s pose age at submission over %zu poses: p50 %.2f ms p99 %.2f ms max %.2f ms", serial,
+			 ages.size(), at(ages, 0.5), at(ages, 0.99), at(ages, 1.0));
+	if (!handoffs.empty() && n > 0 && static_cast<size_t>(n) < sizeof buf)
+		snprintf(buf + n, sizeof buf - n, "; of it after the daemon published: p50 %.2f ms p99 %.2f ms max %.2f ms", at(handoffs, 0.5),
+			 at(handoffs, 0.99), at(handoffs, 1.0));
+	return buf;
+}
 
 vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment *al, int hand, uint64_t now_ns)
 {
