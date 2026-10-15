@@ -3578,9 +3578,40 @@ fn engine_published(rec: &Path) -> Result<[Vec<eval::Published>; 2], String> {
     Ok(hands)
 }
 
+/// Both Touches over a capture, for a registration: the poses the daemon published, when the
+/// calibration has not been written since the capture ended (they are in the world frame the
+/// calibration still has, and a daemon tracking throughout records no engine poses for a replay
+/// to start from); otherwise the recording replayed under the installed calibration
+/// (`replayed_now`), whose world frame the published poses may have turned away from.
+fn capture_poses(base: &Path) -> Result<[Vec<eval::Published>; 2], String> {
+    let rec = base.with_extension("rec");
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let (Some(captured), Some(calibrated)) = (modified(&rec), modified(&file::default_path()))
+    else {
+        return replayed_now(base);
+    };
+    if !published_in_current_frame(captured, calibrated) {
+        println!(
+            "the calibration was written after this capture: replaying it under the installed one"
+        );
+        return replayed_now(base);
+    }
+    engine_published(&rec)
+}
+
+/// Whether the poses the daemon published during a capture (last written at `captured`) are in
+/// the world frame of the calibration (last written at `calibrated`): yes unless the calibration
+/// was written after the capture ended.
+fn published_in_current_frame(
+    captured: std::time::SystemTime,
+    calibrated: std::time::SystemTime,
+) -> bool {
+    calibrated <= captured
+}
+
 /// Both Touches as the tracker follows them now: the recording replayed under the installed
-/// calibration. A registration has to come from these, not from what the daemon published at the
-/// time, which may be in a world frame the calibration has since turned away from.
+/// calibration (for a capture from before the calibration last changed, whose published poses
+/// are in a world frame the calibration has since turned away from).
 fn replayed_now(base: &Path) -> Result<[Vec<eval::Published>; 2], String> {
     let cal = file::load(&file::default_path())?;
     let dir = track::factory::openhmd_config_dir();
@@ -3889,9 +3920,11 @@ fn initial_registration(universe_id: u64) -> align::Registration {
 
 fn register_headset() -> i32 {
     let base = match capture_free(150,
-        "Headset registration: press each Touch firmly to a side of the headset, away from its tracking surface.\n\
-         Turn two slow circles each way, then nod and tilt your head repeatedly. Keep the Touches attached\n\
-         for the entire motion; press Enter after releasing them. No reference controller is needed.") {
+        "Headset registration: the recording runs from now, for up to 150 s; the fit keeps only the stretch in\n\
+         which both Touches moved rigidly with the headset, so take your time. Press each Touch firmly to a side\n\
+         of the headset, away from its tracking surface. Turn two slow circles each way, then nod and tilt your\n\
+         head repeatedly. Keep the Touches attached for the entire motion; release them, then press Enter.\n\
+         No reference controller is needed (cv1touch setup paces the same thing with haptic pulses).") {
         Ok(base) => base,
         Err(code) => return code,
     };
@@ -3944,7 +3977,7 @@ fn register_from_capture_with(
         let (ref_serial, ref_samples) = truth_track(&tf, reference)?;
         println!("reference {ref_serial}");
         let holds = calib::rig::holds(&ref_samples, 1_500_000_000);
-        let published = replayed_now(base)?;
+        let published = capture_poses(base)?;
         // the registration as the daemon applied it during the capture: followed through any
         // re-solve of the universe since it was made
         let stations: Vec<(String, nalgebra::Isometry3<f64>)> = tf
@@ -6452,6 +6485,21 @@ mod tests {
         assert!(!input_delivery_ok(true, false));
         assert!(!input_delivery_ok(false, true));
         assert!(input_delivery_ok(true, true));
+    }
+
+    #[test]
+    fn published_poses_count_unless_the_calibration_is_newer() {
+        use std::time::{Duration, SystemTime};
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(published_in_current_frame(
+            captured,
+            captured - Duration::from_secs(1)
+        ));
+        assert!(published_in_current_frame(captured, captured));
+        assert!(!published_in_current_frame(
+            captured,
+            captured + Duration::from_secs(1)
+        ));
     }
 
     #[test]
