@@ -3,8 +3,9 @@
 
 //! Settings changed while the daemon runs that outlast it: how much of the tracked motion SteamVR
 //! extrapolates positions and orientations with (`cv1touch prediction`), and the stamp adjustment
-//! of published poses (`cv1touch latency`). The daemon saves them on every change and reads them
-//! when it starts; without a usable file it goes on with the defaults.
+//! of published poses (`cv1touch latency`), and the pitch the controllers are shown with
+//! (`cv1touch tilt`). The daemon saves them on every change and reads them when it starts;
+//! without a usable file it goes on with the defaults.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,10 +31,17 @@ pub struct Settings {
     /// +-`MAX_LATENCY_ADJUSTMENT_MS`; left out when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_adjustment_ms: Option<f64>,
+    /// How far the controllers are shown pitched from their tracked pose, degrees, positive with
+    /// the forward end up (`cv1touch tilt`; for applications that place a tool in the hand at a
+    /// fixed angle). Within +-`MAX_TILT_DEG`; left out when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt_deg: Option<f64>,
 }
 
 /// The largest latency adjustment accepted, ms, either way.
 pub const MAX_LATENCY_ADJUSTMENT_MS: f64 = 30.0;
+/// The largest tilt accepted, degrees, either way.
+pub const MAX_TILT_DEG: f64 = 45.0;
 
 impl Settings {
     /// The percent for orientations.
@@ -46,6 +54,11 @@ impl Settings {
     pub fn latency_ms(&self) -> f64 {
         self.latency_adjustment_ms.unwrap_or(0.0)
     }
+
+    /// The tilt, degrees (0 when none).
+    pub fn tilt_deg(&self) -> f64 {
+        self.tilt_deg.unwrap_or(0.0)
+    }
 }
 
 impl Default for Settings {
@@ -56,6 +69,7 @@ impl Default for Settings {
             prediction_percent: 100,
             rotation_prediction_percent: None,
             latency_adjustment_ms: None,
+            tilt_deg: None,
         }
     }
 }
@@ -86,6 +100,12 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if !s.latency_ms().is_finite() || s.latency_ms().abs() > MAX_LATENCY_ADJUSTMENT_MS {
         return Err(format!(
             "{}: a latency adjustment outside +-{MAX_LATENCY_ADJUSTMENT_MS} ms",
+            path.display()
+        ));
+    }
+    if !s.tilt_deg().is_finite() || s.tilt_deg().abs() > MAX_TILT_DEG {
+        return Err(format!(
+            "{}: a tilt outside +-{MAX_TILT_DEG} degrees",
             path.display()
         ));
     }
@@ -168,10 +188,28 @@ mod tests {
             r#"{"format":"something-else","version":1,"prediction_percent":0}"#,
             r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100,"latency_adjustment_ms":31}"#,
             r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100,"latency_adjustment_ms":-30.5}"#,
+            r#"{"format":"cv1touch-settings","version":1,"prediction_percent":100,"tilt_deg":46}"#,
         ] {
             std::fs::write(&path, text).unwrap();
             assert!(load(&path).is_err(), "{text}");
         }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The tilt (`cv1touch tilt`) is kept with its sign and left out when none.
+    #[test]
+    fn the_tilt_is_kept_and_none_by_default() {
+        let path = temp("tilt");
+        let s = Settings {
+            tilt_deg: Some(-7.5),
+            ..Settings::default()
+        };
+        save(&path, &s).unwrap();
+        assert_eq!(load(&path), Ok(s));
+        assert_eq!(load(&path).unwrap().tilt_deg(), -7.5);
+        assert_eq!(Settings::default().tilt_deg(), 0.0);
+        save(&path, &Settings::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("tilt_deg"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

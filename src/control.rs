@@ -55,6 +55,9 @@ pub enum Command {
         position: Option<u32>,
         rotation: Option<u32>,
     },
+    /// Degrees the controllers are shown pitched from their tracked pose, positive with the
+    /// forward end up (None shows it).
+    Tilt(Option<f64>),
     /// Arm or disarm input injection for automated tests (None shows it). Armed, it disarms
     /// itself after a while.
     TestInject(Option<bool>),
@@ -278,6 +281,19 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 _ => Err("usage: prediction [PERCENT] | prediction position|rotation PERCENT".into()),
             }
         }
+        ["tilt"] => Ok(Command::Tilt(None)),
+        ["tilt", deg] => deg
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && v.abs() <= crate::settings::MAX_TILT_DEG)
+            .map(|v| Command::Tilt(Some(v)))
+            .ok_or_else(|| {
+                format!(
+                    "tilt must be a number of degrees within +-{}",
+                    crate::settings::MAX_TILT_DEG
+                )
+            }),
+        ["tilt", ..] => Err("usage: tilt [DEGREES]".into()),
         ["universe-watch"] => Ok(Command::UniverseWatch(None)),
         ["universe-watch", "on"] => Ok(Command::UniverseWatch(Some(true))),
         ["universe-watch", "off"] => Ok(Command::UniverseWatch(Some(false))),
@@ -570,6 +586,17 @@ mod tests {
         assert_eq!(
             parse("latency abc"),
             Err("latency adjustment must be a finite number of ms".into())
+        );
+        assert_eq!(parse("tilt"), Ok(Command::Tilt(None)));
+        assert_eq!(parse("tilt 10"), Ok(Command::Tilt(Some(10.0))));
+        assert_eq!(parse("tilt -7.5"), Ok(Command::Tilt(Some(-7.5))));
+        assert_eq!(
+            parse("tilt 50"),
+            Err("tilt must be a number of degrees within +-45".into())
+        );
+        assert_eq!(
+            parse("tilt up"),
+            Err("tilt must be a number of degrees within +-45".into())
         );
         assert!(parse("alignment").is_err());
     }

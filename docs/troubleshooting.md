@@ -6,6 +6,7 @@ Start with `cv1touch doctor`, `cv1touch status --json`, and `journalctl --user -
 
 | Symptom | Checks and recovery |
 | --- | --- |
+| A game holds its gun or tool at the wrong angle for your grip and has no setting for it | `cv1touch tilt DEGREES` pitches the controllers' pose as applications see it (positive: forward end up), applied at once and kept across restarts; `cv1touch tilt 0` shows them as tracked again. Tracking itself is unchanged. |
 | Setup reports unknown stages | Existing camera/gravity/render/registration files lack setup-journal evidence. Visually verify the relevant tracking and deliberately adopt them, retaining the files, or recapture. File validity alone is not an accuracy check. |
 | Setup reports stale or blocked stages | Run `cv1touch setup --check` for the reason. Resolve device/daemon/SteamVR prerequisites or repeat the affected calibration. Full camera-world replacement invalidates dependent gravity and registration evidence; unrelated valid input settings remain reusable. |
 | Setup cannot capture from a script | Captures require an interactive terminal. Use `cv1touch setup --check --json` for read-only automation and run captures interactively. |

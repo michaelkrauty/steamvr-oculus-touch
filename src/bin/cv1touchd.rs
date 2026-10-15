@@ -194,6 +194,13 @@ struct Daemon {
     /// Extra stamp shift of published poses, ns (`latency` command); saved in `settings_path`
     /// on every change and read from it at start.
     extra_latency_ns: std::sync::atomic::AtomicI64,
+    /// How far the controllers are shown pitched from their tracked pose, thousandths of a degree
+    /// (`tilt` command), turned into the render offsets published; saved and read like the
+    /// above.
+    tilt_mdeg: std::sync::atomic::AtomicI32,
+    /// The render offsets as fitted (per hand, xyzw), before the tilt: what `tilt` turns, so that
+    /// a republish does not turn them again.
+    fitted_render_orient: Mutex<[[f32; 4]; 2]>,
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
     /// Wakes the radio thread: new camera frames or bodies, or time to stop. It lives as long as
@@ -585,13 +592,25 @@ fn start_latency_ns(settings: &settings::Settings) -> i64 {
     (settings.latency_ms() * 1e6).round() as i64
 }
 
+/// The saved tilt in thousandths of a degree.
+fn start_tilt_mdeg(settings: &settings::Settings) -> i32 {
+    (settings.tilt_deg() * 1000.0).round() as i32
+}
+
+/// The daemon's tilt, degrees.
+fn tilt_deg(d: &Daemon) -> f64 {
+    d.tilt_mdeg.load(Ordering::Acquire) as f64 / 1000.0
+}
+
 /// The settings as they are now: what every change saves, so that none drops another.
 fn current_settings(d: &Daemon) -> settings::Settings {
     let extra_ns = d.extra_latency_ns.load(Ordering::Acquire);
+    let tilt_mdeg = d.tilt_mdeg.load(Ordering::Acquire);
     settings::Settings {
         prediction_percent: d.position_prediction.load(Ordering::Acquire),
         rotation_prediction_percent: Some(d.rotation_prediction.load(Ordering::Acquire)),
         latency_adjustment_ms: (extra_ns != 0).then(|| extra_ns as f64 / 1e6),
+        tilt_deg: (tilt_mdeg != 0).then(|| tilt_mdeg as f64 / 1000.0),
         ..settings::Settings::default()
     }
 }
@@ -639,6 +658,72 @@ fn with_prediction(
     alignment
 }
 
+/// `alignment` with the controllers shown pitched `tilt_deg` from their tracked pose, positive
+/// with the forward end up: each hand's render offset as fitted (`fitted`, LED model <- render
+/// frame) turned by that pitch about the render frame's own lateral axis, so that the pose
+/// SteamVR hands applications, and the render model with it, pitch together. 0 gives the fitted
+/// offsets back exactly, and so does a hand without a fitted offset (its render bit unset).
+fn with_tilt(
+    mut alignment: shm::Alignment,
+    fitted: &[[f32; 4]; 2],
+    tilt_deg: f64,
+) -> shm::Alignment {
+    if tilt_deg == 0.0 {
+        alignment.render_orient = *fitted;
+        return alignment;
+    }
+    let pitch = nalgebra::UnitQuaternion::from_axis_angle(
+        &nalgebra::Vector3::x_axis(),
+        tilt_deg.to_radians(),
+    );
+    for (hand, q) in fitted.iter().enumerate() {
+        let bit = if hand == HAND_LEFT {
+            ffi::CV1T_ALIGN_RENDER_LEFT
+        } else {
+            ffi::CV1T_ALIGN_RENDER_RIGHT
+        };
+        if alignment.valid & bit == 0 {
+            // no fitted offset for this hand (nothing the driver applies): nothing to turn
+            alignment.render_orient[hand] = *q;
+            continue;
+        }
+        let fitted = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+            q[3] as f64,
+            q[0] as f64,
+            q[1] as f64,
+            q[2] as f64,
+        ));
+        let turned = fitted * pitch;
+        alignment.render_orient[hand] = [
+            turned.i as f32,
+            turned.j as f32,
+            turned.k as f32,
+            turned.w as f32,
+        ];
+    }
+    alignment
+}
+
+/// `alignment` with the daemon's tilt applied to the fitted render offsets.
+fn with_daemon_tilt(d: &Daemon, alignment: shm::Alignment) -> shm::Alignment {
+    let fitted = *d.fitted_render_orient.lock().unwrap();
+    with_tilt(alignment, &fitted, tilt_deg(d))
+}
+
+/// How the controllers are shown, in words.
+fn tilt_text(deg: f64) -> String {
+    if deg == 0.0 {
+        "the controllers are shown as tracked (no tilt)".to_string()
+    } else {
+        format!(
+            "the controllers are shown with the forward end pitched {:.1} deg {} from the tracked \
+             pose",
+            deg.abs(),
+            if deg > 0.0 { "up" } else { "down" },
+        )
+    }
+}
+
 /// The daemon's prediction percents.
 fn prediction_percents(d: &Daemon) -> (u32, u32) {
     (
@@ -652,18 +737,24 @@ fn prediction_percents(d: &Daemon) -> (u32, u32) {
 /// request has just changed.
 fn publish_alignment(d: &Daemon, alignment: shm::Alignment) {
     let _one = d.alignment_publish.lock().unwrap();
-    d.shm
-        .publish_alignment(&with_prediction(alignment, prediction_percents(d)));
+    // `alignment` carries the render offsets as fitted: what the tilt turns from now on
+    *d.fitted_render_orient.lock().unwrap() = alignment.render_orient;
+    d.shm.publish_alignment(&with_prediction(
+        with_daemon_tilt(d, alignment),
+        prediction_percents(d),
+    ));
 }
 
-/// Publishes the alignment in place with the daemon's prediction percents. Read while holding
-/// the publishers' lock, it is the newest: a registration the universe watch has just moved is
-/// not put back.
-fn republish_prediction(d: &Daemon) {
+/// Publishes the alignment in place with the daemon's settings (the tilt on the fitted render
+/// offsets, the prediction percents). Read while holding the publishers' lock, it is the newest:
+/// a registration the universe watch has just moved is not put back.
+fn republish_settings(d: &Daemon) {
     let _one = d.alignment_publish.lock().unwrap();
     if let Some(alignment) = d.shm.alignment() {
-        d.shm
-            .publish_alignment(&with_prediction(alignment, prediction_percents(d)));
+        d.shm.publish_alignment(&with_prediction(
+            with_daemon_tilt(d, alignment),
+            prediction_percents(d),
+        ));
     }
 }
 
@@ -2401,12 +2492,13 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         d.mode.lock().unwrap(),
         d.extra_latency_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        tilt_deg(d),
         engine_ready,
         d.inputs.lock().unwrap().status(),
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
@@ -2576,7 +2668,7 @@ fn handle(d: &Daemon, line: &str) -> String {
                     d.rotation_prediction.store(p, Ordering::Release);
                 }
                 unsaved = save_settings(d);
-                republish_prediction(d);
+                republish_settings(d);
             }
             // the driver applies the percents to whatever is published, OpenHMD's poses too
             format!(
@@ -2609,6 +2701,16 @@ fn handle(d: &Daemon, line: &str) -> String {
                     "off"
                 }
             )
+        }
+        Ok(Command::Tilt(v)) => {
+            let mut unsaved = String::new();
+            if let Some(deg) = v {
+                d.tilt_mdeg
+                    .store((deg * 1000.0).round() as i32, Ordering::Release);
+                unsaved = save_settings(d);
+                republish_settings(d);
+            }
+            format!("ok tilt: {}{unsaved}", tilt_text(tilt_deg(d)))
         }
         Ok(Command::Latency(v)) => {
             let mut unsaved = String::new();
@@ -3126,11 +3228,23 @@ fn main() {
             settings_path.display()
         ));
     }
+    let start_tilt_deg = start_tilt_mdeg(&settings) as f64 / 1000.0;
+    if start_tilt_deg != 0.0 {
+        log(format!(
+            "tilt: {} ({})",
+            tilt_text(start_tilt_deg),
+            settings_path.display()
+        ));
+    }
     let (alignment, notes) = align::load_default();
     for n in notes {
         log(n);
     }
-    shm.publish_alignment(&with_prediction(alignment, start_prediction(&settings)));
+    let fitted_render_orient = alignment.render_orient;
+    shm.publish_alignment(&with_prediction(
+        with_tilt(alignment, &fitted_render_orient, start_tilt_deg),
+        start_prediction(&settings),
+    ));
     let rec = Recorder::new(RECORDER_RING_BYTES);
     if let Some(path) = &record {
         if let Err(e) = rec.start(path, shm::now_ns()) {
@@ -3187,6 +3301,8 @@ fn main() {
         settings_path,
         record_frames: AtomicBool::new(false),
         extra_latency_ns: std::sync::atomic::AtomicI64::new(start_latency_ns(&settings)),
+        tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
+        fitted_render_orient: Mutex::new(fitted_render_orient),
         battery: [
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
@@ -3300,6 +3416,8 @@ mod tests {
                 .join("settings.json"),
             record_frames: AtomicBool::new(false),
             extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
+            tilt_mdeg: std::sync::atomic::AtomicI32::new(0),
+            fitted_render_orient: Mutex::new([[0.0, 0.0, 0.0, 1.0]; 2]),
             battery: [
                 std::sync::atomic::AtomicI32::new(-1),
                 std::sync::atomic::AtomicI32::new(-1),
@@ -3434,6 +3552,92 @@ mod tests {
             "err latency adjustment must be within +-30 ms"
         );
         assert_eq!(d.extra_latency_ns.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// `tilt` pitches the pose SteamVR and its applications see, through the render offset:
+    /// applied once to the offsets as fitted (a republish for another setting does not add it
+    /// again), saved as it is set, shown in the status, and 0 gives the fitted offsets back
+    /// exactly.
+    #[test]
+    fn the_tilt_turns_the_render_offset_once_and_is_saved() {
+        let d = status_daemon();
+        // a fit like the real one, about all three axes: the pitch must be applied in the render
+        // frame (fitted * pitch), which this tells apart from the LED-model frame (pitch * fitted)
+        let axis_angle = |axis: nalgebra::Unit<nalgebra::Vector3<f64>>, deg: f64| {
+            nalgebra::UnitQuaternion::from_axis_angle(&axis, deg.to_radians())
+        };
+        let fitted = axis_angle(nalgebra::Vector3::x_axis(), 42.5)
+            * axis_angle(nalgebra::Vector3::y_axis(), 3.5)
+            * axis_angle(nalgebra::Vector3::z_axis(), 2.0);
+        let xyzw =
+            |q: nalgebra::UnitQuaternion<f64>| [q.i as f32, q.j as f32, q.k as f32, q.w as f32];
+        let unit = |q: [f32; 4]| {
+            nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                q[3] as f64,
+                q[0] as f64,
+                q[1] as f64,
+                q[2] as f64,
+            ))
+        };
+        // the right hand has no fitted offset (its bit unset; all zeros, as the alignment comes
+        // without a fit): left alone, not turned into NaN
+        let a = shm::Alignment {
+            render_orient: [xyzw(fitted), [0.0; 4]],
+            valid: ffi::CV1T_ALIGN_RENDER_LEFT,
+            ..shm::Alignment::default()
+        };
+        publish_alignment(&d, a);
+        assert_eq!(
+            handle(&d, "tilt"),
+            "ok tilt: the controllers are shown as tracked (no tilt)"
+        );
+        assert_eq!(d.shm.alignment().unwrap().render_orient, a.render_orient);
+        assert!(!d.settings_path.exists());
+        assert_eq!(
+            handle(&d, "tilt 10"),
+            "ok tilt: the controllers are shown with the forward end pitched 10.0 deg up from the \
+             tracked pose"
+        );
+        // what was applied, in the render frame: fitted^-1 * published
+        let applied =
+            |hand: usize| fitted.inverse() * unit(d.shm.alignment().unwrap().render_orient[hand]);
+        let published = d.shm.alignment().unwrap();
+        assert!(
+            applied(0).angle_to(&axis_angle(nalgebra::Vector3::x_axis(), 10.0)) < 1e-4,
+            "{:?}",
+            applied(0).axis_angle()
+        );
+        assert_eq!(published.render_orient[1], [0.0; 4]);
+        // another setting republishes: the tilt is not added again
+        handle(&d, "prediction 0");
+        assert_eq!(
+            d.shm.alignment().unwrap().render_orient,
+            published.render_orient
+        );
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| (s.tilt_deg(), s.prediction_percent)),
+            Ok((10.0, 0))
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(status["tilt_deg"], 10.0);
+        assert_eq!(
+            handle(&d, "tilt -2.5"),
+            "ok tilt: the controllers are shown with the forward end pitched 2.5 deg down from \
+             the tracked pose"
+        );
+        assert!(applied(0).angle_to(&axis_angle(nalgebra::Vector3::x_axis(), -2.5)) < 1e-4);
+        assert_eq!(
+            handle(&d, "tilt 50"),
+            "err tilt must be a number of degrees within +-45"
+        );
+        handle(&d, "tilt 0");
+        assert_eq!(d.shm.alignment().unwrap().render_orient, a.render_orient);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| s.tilt_deg),
+            Ok(None)
+        );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
 
