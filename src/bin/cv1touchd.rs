@@ -5,6 +5,7 @@
 //! publishes both Touch controllers' state to shared memory.
 
 use std::fs;
+use std::io;
 use std::io::{Read, Write};
 use std::mem;
 use std::path::PathBuf;
@@ -23,8 +24,9 @@ use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
 use cv1touch::track::predict::{ShapeParams, VelocityShaper};
+use cv1touch::track::repose;
 use cv1touch::track::tracker::Stats;
-use cv1touch::{align, calib, ffi, input_calibration, modes, settings, supervise, track};
+use cv1touch::{align, calib, ffi, input_calibration, modes, settings, setup, supervise, track};
 
 /// Disable headset tracking LEDs by default while retaining the headset radio for Touch.
 const DEFAULT_HMD_LEDS_OFF: bool = true;
@@ -154,6 +156,17 @@ struct Daemon {
     pending_frames_dropped: std::sync::atomic::AtomicU64,
     /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
     landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
+    /// Per sensor serial: where it stands with the pose watch (`repose`), for `status`.
+    sensor_poses: Mutex<std::collections::BTreeMap<String, PoseNote>>,
+    /// Per sensor serial: its agreement with the others, as of the last tick (`status`).
+    sensor_agreement: Mutex<std::collections::BTreeMap<String, track::tracker::CameraAgreement>>,
+    /// Fewer than two sensors agree with each other (see `repose::Change::Unsure`).
+    sensors_unsure: AtomicBool,
+    /// The calibration file the poses came from, which a sensor placed again is written to, and
+    /// its fingerprint as loaded or last written: a file changed since is not written over.
+    calibration: Mutex<Option<LoadedCalibration>>,
+    /// The backups the daemon's own writes made, oldest first (see `thin_own_backups`).
+    own_backups: Mutex<Vec<PathBuf>>,
     /// How the Lighthouse universe moved since the registration (see `universe_watch`), with
     /// the registration it was measured against (its `created_unix_s`).
     universe_shift: Mutex<Option<(u64, nalgebra::Isometry3<f64>)>>,
@@ -324,6 +337,16 @@ impl LandmarkWatch {
         }
     }
 
+    /// Stops watching the sensor `serial`: its landmarks were learned where it stood.
+    fn forget(&mut self, d: &Daemon, serial: &str) {
+        self.monitor.forget(serial);
+        self.sensors.remove(serial);
+        self.alerted.remove(serial);
+        self.missing.remove(serial);
+        self.over.remove(serial);
+        d.landmark_shifts.lock().unwrap().remove(serial);
+    }
+
     fn frame(&mut self, d: &Daemon, info: &engine::FrameInfo, blobs: &[Blob]) {
         let serial = engine::cstr_field(&info.serial);
         let unlabelled: Vec<nalgebra::Vector2<f64>> = blobs
@@ -475,10 +498,17 @@ fn publish_sensor_snapshot(d: &Daemon, sensors: &[SensorStatus]) {
     d.shm.publish_sensors(sensors);
 }
 
-fn sensor_status(s: &engine::Sensor) -> SensorStatus {
+fn sensor_status(d: &Daemon, s: &engine::Sensor) -> SensorStatus {
     let mut out = SensorStatus::default();
-    shm::set_serial(&mut out, &engine::sensor_serial(s));
-    out.placed = s.have_camera_pose as u32;
+    let serial = engine::sensor_serial(s);
+    shm::set_serial(&mut out, &serial);
+    // a sensor being placed again has no pose in the engine for the while, but a calibrated one
+    // in ours: it counts as placed
+    let placing = matches!(
+        d.sensor_poses.lock().unwrap().get(&serial),
+        Some(PoseNote::Moved { .. })
+    );
+    out.placed = (s.have_camera_pose || placing) as u32;
     out.frames = s.frames;
     out.pose_fixes[HAND_LEFT] = s.pose_fixes[2]; // OpenHMD device id 2 = left
     out.pose_fixes[HAND_RIGHT] = s.pose_fixes[1]; // OpenHMD device id 1 = right
@@ -793,6 +823,9 @@ fn engine_main(d: Arc<Daemon>) {
         d.engine_applied.store(revision, Ordering::Release);
         last_err.clear();
         d.session.lock().unwrap().reset(); // sensors may differ after a reopen
+        d.sensor_poses.lock().unwrap().clear();
+        d.sensor_agreement.lock().unwrap().clear();
+        d.sensors_unsure.store(false, Ordering::Relaxed);
         log(format!(
             "engine running with {} sensor(s)",
             e.sensors().len()
@@ -935,6 +968,600 @@ struct RadioLink {
     bodies: Mutex<Vec<NewBody>>,
     /// The bias file's new contents from the radio thread, for the engine thread to write.
     biases: Mutex<Option<track::biases::BiasFile>>,
+    /// Sensor pose changes from the radio thread, for the engine thread to give the engine (and
+    /// a sensor placed again to write into the calibration).
+    reposed: Mutex<Vec<PoseChange>>,
+}
+
+/// The calibration file the daemon's sensor poses came from.
+#[derive(Clone)]
+struct LoadedCalibration {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl LoadedCalibration {
+    /// The file at `path`, fingerprinted; a file that cannot be read is remembered without one,
+    /// so that it is never written over.
+    fn at(path: PathBuf) -> LoadedCalibration {
+        let sha256 = setup::fingerprint(&path).unwrap_or_default();
+        LoadedCalibration { path, sha256 }
+    }
+}
+
+/// How many `.bak-*` copies of the calibration file are kept beside it, newest first.
+const KEPT_BACKUPS: usize = 10;
+/// A probed sensor that gathers no labelled sighting of a controller in this long is let go: it
+/// was not it that moved, or nothing was in its view.
+const PROBATION_NS: u64 = 30_000_000_000;
+/// A sensor placed again this many times in `PLACEMENTS_WINDOW_NS` is given up on.
+const MAX_PLACEMENTS: usize = 3;
+const PLACEMENTS_WINDOW_NS: u64 = 1_800_000_000_000;
+/// Releases of a sensor more than this far apart do not count as a run.
+const RELEASE_RUN_NS: u64 = 3_600_000_000_000;
+
+/// What the radio thread decided about a sensor's pose in the engine.
+enum PoseChange {
+    /// The sensor moved: the engine should label its blobs by the long search while it is being
+    /// placed, which a sensor without a pose does.
+    Cleared(String),
+    /// The sensor's pose, placed again from the others (or given back, as calibrated, when it
+    /// could not be placed: the engine stops its search then).
+    Set(Reposed),
+}
+
+/// A sensor placed again from the others (`repose`): its new pose, and how far it is from the
+/// calibrated one; `write` is false for a pose given back as it was.
+struct Reposed {
+    serial: String,
+    orient_xyzw: [f32; 4],
+    pos: [f32; 3],
+    median_px: f64,
+    matches: usize,
+    moved_mm: f64,
+    turned_deg: f64,
+    write: bool,
+}
+
+/// Where a sensor stands with the pose watch, for `status`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum PoseNote {
+    /// It moved: its frames are probed, not tracked with, until it is placed again.
+    Moved { since_ns: u64, attempts: u32 },
+    Placed {
+        at_ns: u64,
+        moved_mm: f64,
+        turned_deg: f64,
+        median_px: f64,
+        matches: usize,
+    },
+    /// No pose could be found for it from the others: it stays out of tracking.
+    GivenUp {
+        since_ns: u64,
+        attempts: u32,
+        reason: String,
+    },
+    /// Judged moved, then let go: a false alarm (its pose was placed where it was calibrated),
+    /// or no pose came in time; tracked with again, as calibrated.
+    Released { at_ns: u64, why: String },
+}
+
+/// How often the radio thread judges the sensors' agreement and tends the placing.
+const REPOSE_TICK_NS: u64 = 1_000_000_000;
+/// "Unsure" is logged at most this often.
+const UNSURE_LOG_NS: u64 = 60_000_000_000;
+
+/// A batch for the solver thread: the probes, the sensor's camera model and the controllers' LEDs.
+struct SolveJob {
+    job: repose::Job,
+    model: calib::camera::CameraModel,
+    bodies: [Option<Vec<calib::capture::Led>>; 2],
+}
+
+/// The radio thread's side of placing moved sensors again: judges the agreement every
+/// `REPOSE_TICK_NS`, probes a sensor judged moved, gathers its probes and hands batches to a
+/// solver thread, and when a pose is confirmed tracks with it at once and tells the engine thread.
+struct Reposing {
+    monitor: repose::Monitor,
+    reposer: repose::Reposer,
+    to_solver: std::sync::mpsc::Sender<SolveJob>,
+    from_solver: std::sync::mpsc::Receiver<(repose::Job, Result<repose::Solved, String>)>,
+    next_tick: u64,
+    unsure_until: u64,
+    unsure_logged: u64,
+    /// When each probed sensor was handed over (tick clock).
+    probed_since: std::collections::BTreeMap<String, u64>,
+    /// When each sensor was placed again (tick clock), newest last.
+    placements: std::collections::BTreeMap<String, Vec<u64>>,
+    /// Per sensor: releases in a row (false alarms, timeouts) and when the last was; each one
+    /// doubles the cooldown, a placement or a quiet hour ends the run.
+    releases: std::collections::BTreeMap<String, (u32, u64)>,
+}
+
+impl Reposing {
+    fn start() -> Reposing {
+        let (to_solver, jobs) = std::sync::mpsc::channel::<SolveJob>();
+        let (results, from_solver) = std::sync::mpsc::channel();
+        // the solver runs for up to seconds at a time (the placing searches 2000 six-point fits),
+        // off the real-time thread; it ends with the radio thread, which holds the only sender
+        let spawned = std::thread::Builder::new()
+            .name("cv1t-repose".into())
+            .spawn(move || {
+                for w in jobs {
+                    let bodies = [w.bodies[0].as_deref(), w.bodies[1].as_deref()];
+                    let result = repose::solve(&w.model, bodies, &w.job);
+                    if results.send((w.job, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            log(format!("no solver thread for moved sensors ({e})"));
+        }
+        Reposing {
+            monitor: repose::Monitor::new(repose::WINDOW_NS),
+            reposer: repose::Reposer::default(),
+            to_solver,
+            from_solver,
+            next_tick: 0,
+            unsure_until: 0,
+            unsure_logged: 0,
+            probed_since: Default::default(),
+            placements: Default::default(),
+            releases: Default::default(),
+        }
+    }
+
+    /// Lets a probed sensor go, tracked with again as calibrated: the engine gets its pose back,
+    /// the monitor leaves it alone for a while, and `status` says `why`.
+    fn release(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        serial: &str,
+        now: u64,
+        why: &str,
+    ) {
+        if let Some(camera) = pipe.camera_id(serial) {
+            self.reposer.forget(camera);
+        }
+        pipe.probe(serial, false);
+        pipe.reset_agreement(serial);
+        self.probed_since.remove(serial);
+        let run = self.releases.entry(serial.to_string()).or_insert((0, now));
+        if now.saturating_sub(run.1) > RELEASE_RUN_NS {
+            run.0 = 0;
+        }
+        run.0 += 1;
+        run.1 = now;
+        let cooldown = repose::COOLDOWN_NS << (run.0 - 1).min(4);
+        self.monitor.released_until(serial, now + cooldown);
+        if let Some(cam) = pipe.camera(serial) {
+            let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
+            link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+                serial: serial.to_string(),
+                orient_xyzw,
+                pos,
+                median_px: 0.0,
+                matches: 0,
+                moved_mm: 0.0,
+                turned_deg: 0.0,
+                write: false,
+            }));
+        }
+        d.sensor_poses.lock().unwrap().insert(
+            serial.to_string(),
+            PoseNote::Released {
+                at_ns: now,
+                why: why.to_string(),
+            },
+        );
+        log(format!(
+            "sensor {serial}: {why}; tracking with it again as calibrated"
+        ));
+    }
+
+    fn tick(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        watch: &mut Option<LandmarkWatch>,
+        now: u64,
+    ) {
+        if now < self.next_tick {
+            return;
+        }
+        self.next_tick = now + REPOSE_TICK_NS;
+        while let Ok((job, result)) = self.from_solver.try_recv() {
+            let camera = job.camera;
+            let Some(serial) = pipe.serial_of(camera).map(str::to_string) else {
+                continue;
+            };
+            match self.reposer.solved(job, result) {
+                repose::Outcome::Nothing => {
+                    if let Some(PoseNote::Moved { attempts, .. }) =
+                        d.sensor_poses.lock().unwrap().get_mut(&serial)
+                    {
+                        *attempts += 1;
+                    }
+                }
+                repose::Outcome::Placed { fit, .. } => {
+                    let Some(cam) = pipe.camera(&serial).copied() else {
+                        continue;
+                    };
+                    if repose::false_alarm(&cam.world_from_cam, &fit.world_from_cam) {
+                        self.release(
+                            d,
+                            link,
+                            pipe,
+                            &serial,
+                            now,
+                            "a false alarm: placed again, it stands where it was calibrated",
+                        );
+                        continue;
+                    }
+                    let delta = cam.world_from_cam.inverse() * fit.world_from_cam;
+                    let moved_mm = delta.translation.vector.norm() * 1e3;
+                    let turned_deg = delta.rotation.angle().to_degrees();
+                    self.placements.entry(serial.clone()).or_default().push(now);
+                    self.releases.remove(&serial);
+                    pipe.sensor(&serial, cam.model, fit.world_from_cam);
+                    pipe.probe(&serial, false);
+                    pipe.reset_agreement(&serial);
+                    self.reposer.forget(camera);
+                    self.probed_since.remove(&serial);
+                    self.monitor.released(&serial);
+                    if let Some(w) = watch.as_mut() {
+                        w.forget(d, &serial);
+                    }
+                    let (orient_xyzw, pos) = calib::iso_to_xyzw(&fit.world_from_cam);
+                    link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+                        serial: serial.clone(),
+                        orient_xyzw,
+                        pos,
+                        median_px: fit.median_px,
+                        matches: fit.pairs,
+                        moved_mm,
+                        turned_deg,
+                        write: true,
+                    }));
+                    d.sensor_poses.lock().unwrap().insert(
+                        serial.clone(),
+                        PoseNote::Placed {
+                            at_ns: now,
+                            moved_mm,
+                            turned_deg,
+                            median_px: fit.median_px,
+                            matches: fit.pairs,
+                        },
+                    );
+                    log(format!(
+                        "sensor {serial}: placed again from the other sensors, {moved_mm:.0} mm and {turned_deg:.1} degrees from its calibrated pose ({:.2} px median over {} LED matches in {} frames); tracking with it again",
+                        fit.median_px, fit.pairs, fit.frames
+                    ));
+                }
+                repose::Outcome::GaveUp {
+                    attempts, reason, ..
+                } => {
+                    // the engine gets its calibrated pose back, so that it stops searching every
+                    // frame; our tracker keeps the sensor out, and its frames are dropped
+                    pipe.ignore(&serial, true);
+                    self.probed_since.remove(&serial);
+                    if let Some(cam) = pipe.camera(&serial) {
+                        let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
+                        link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+                            serial: serial.clone(),
+                            orient_xyzw,
+                            pos,
+                            median_px: 0.0,
+                            matches: 0,
+                            moved_mm: 0.0,
+                            turned_deg: 0.0,
+                            write: false,
+                        }));
+                    }
+                    d.sensor_poses.lock().unwrap().insert(
+                        serial.clone(),
+                        PoseNote::GivenUp {
+                            since_ns: now,
+                            attempts,
+                            reason: reason.clone(),
+                        },
+                    );
+                    log(format!(
+                        "sensor {serial}: no pose for it from the other sensors after {attempts} tries ({reason}); it stays out of tracking until cv1touch setup or a restart"
+                    ));
+                }
+            }
+        }
+        let agreement = pipe.camera_agreement();
+        for change in self.monitor.update(now, &agreement) {
+            match change {
+                repose::Change::Moved(serial) => {
+                    let Some(camera) = pipe.camera_id(&serial) else {
+                        continue;
+                    };
+                    let recent = self.placements.get(&serial).map_or(0, |p| {
+                        p.iter()
+                            .filter(|t| now.saturating_sub(**t) <= PLACEMENTS_WINDOW_NS)
+                            .count()
+                    });
+                    if recent >= MAX_PLACEMENTS {
+                        // it keeps moving, or something else is wrong: not again and again
+                        pipe.probe(&serial, true);
+                        pipe.ignore(&serial, true);
+                        d.sensor_poses.lock().unwrap().insert(
+                            serial.clone(),
+                            PoseNote::GivenUp {
+                                since_ns: now,
+                                attempts: 0,
+                                reason: format!("placed again {recent} times in half an hour"),
+                            },
+                        );
+                        log(format!(
+                            "sensor {serial}: judged moved again, after {recent} placements in half an hour: it stays out of tracking until cv1touch setup or a restart"
+                        ));
+                        continue;
+                    }
+                    pipe.probe(&serial, true);
+                    self.reposer.watch(camera);
+                    self.probed_since.insert(serial.clone(), now);
+                    link.reposed
+                        .lock()
+                        .unwrap()
+                        .push(PoseChange::Cleared(serial.clone()));
+                    d.sensor_poses.lock().unwrap().insert(
+                        serial.clone(),
+                        PoseNote::Moved {
+                            since_ns: now,
+                            attempts: 0,
+                        },
+                    );
+                    let a = agreement
+                        .iter()
+                        .find(|(s, _)| *s == serial)
+                        .map(|(_, a)| *a)
+                        .unwrap_or_default();
+                    let matched = if a.samples == 0 {
+                        "no LED matched".to_string()
+                    } else {
+                        format!(
+                            "residual {:.2} px, offset {:.2} px",
+                            a.median_px,
+                            a.bias_px.norm()
+                        )
+                    };
+                    log(format!(
+                        "sensor {serial}: disagrees with the other sensors (missed {} of {} checks; {matched}): it moved; placing it again from them while the controllers are in its view",
+                        a.misses, a.checks
+                    ));
+                }
+                repose::Change::Unsure => {
+                    self.unsure_until = now + 2 * repose::WINDOW_NS;
+                    if now.saturating_sub(self.unsure_logged) >= UNSURE_LOG_NS {
+                        self.unsure_logged = now;
+                        log("fewer than two sensors agree with each other: sensors moved, but which cannot be told from here; if tracking is off, run cv1touch setup");
+                    }
+                }
+            }
+        }
+        d.sensors_unsure
+            .store(now < self.unsure_until, Ordering::Relaxed);
+        *d.sensor_agreement.lock().unwrap() = agreement.into_iter().collect();
+        // a probed sensor that gathers no labelled sighting in `PROBATION_NS`, or whose probes
+        // bring no pose in `PATIENCE_NS`, is let go, so that the engine's search on it ends
+        let waited_out: Vec<(String, &str)> = self
+            .probed_since
+            .iter()
+            .filter_map(|(serial, since)| {
+                let waited = now.saturating_sub(*since);
+                let gathered = pipe
+                    .camera_id(serial)
+                    .is_some_and(|c| self.reposer.gathered(c) > 0);
+                if !gathered && waited >= PROBATION_NS {
+                    Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it was not it that moved, or nothing was in its view"))
+                } else if waited >= repose::PATIENCE_NS {
+                    Some((serial.clone(), "no pose for it in 3 minutes (too little controller motion in its view, or no pose fits)"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (serial, why) in waited_out {
+            self.release(d, link, pipe, &serial, now, why);
+        }
+        for probe in std::mem::take(&mut pipe.probes) {
+            self.reposer.add(probe);
+        }
+        if let Some(job) = self.reposer.batch() {
+            let model = pipe
+                .serial_of(job.camera)
+                .and_then(|serial| pipe.camera(serial))
+                .map(|c| c.model);
+            let Some(model) = model else {
+                return;
+            };
+            let bodies =
+                [HAND_LEFT, HAND_RIGHT].map(|h| pipe.tracker(h).map(|t| t.body.leds.clone()));
+            if self
+                .to_solver
+                .send(SolveJob { job, model, bodies })
+                .is_err()
+            {
+                log("the solver thread for moved sensors is gone");
+            }
+        }
+    }
+}
+
+/// The engine thread's side: the engine tracks with the new pose, the options keep it for a
+/// reopen, the calibration file records it (with a backup of the old), and the sensor's
+/// landmarks, learned where it stood, are dropped.
+fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
+    if let Err(err) = e.set_sensor_pose(
+        &r.serial,
+        r.orient_xyzw.map(f64::from),
+        r.pos.map(f64::from),
+    ) {
+        log(format!(
+            "sensor {}: the engine did not take the pose ({err}); it has what it had",
+            r.serial
+        ));
+    }
+    if !r.write {
+        return;
+    }
+    {
+        let mut opts = d.opts.lock().unwrap();
+        if let Some(p) = opts.fixed_poses.iter_mut().find(|p| p.serial == r.serial) {
+            p.orient = r.orient_xyzw;
+            p.pos = r.pos;
+        }
+    }
+    let loaded = d.calibration.lock().unwrap().clone();
+    let written = match loaded {
+        Some(loaded) => match write_reposed(&loaded, r) {
+            Ok((backup, sha256)) => {
+                log(format!(
+                    "sensor {}: wrote its new pose to {}{}",
+                    r.serial,
+                    loaded.path.display(),
+                    backup
+                        .as_ref()
+                        .map_or(String::new(), |b| format!(" (previous: {})", b.display()))
+                ));
+                if let Some(c) = d.calibration.lock().unwrap().as_mut() {
+                    c.sha256 = sha256;
+                }
+                if let Some(backup) = backup {
+                    thin_own_backups(&mut d.own_backups.lock().unwrap(), backup);
+                }
+                true
+            }
+            Err(err) => {
+                log(format!("sensor {}: new pose not written: {err}", r.serial));
+                false
+            }
+        },
+        None => {
+            log(format!(
+                "sensor {}: new pose not written: no calibration file is loaded",
+                r.serial
+            ));
+            false
+        }
+    };
+    if !written {
+        // the old pose comes back at the next start: its landmarks stay with it
+        return;
+    }
+    let landmarks = track::landmarks::default_path();
+    match track::landmarks::forget_in_file(&landmarks, &r.serial) {
+        Ok(0) => {}
+        Ok(n) => log(format!(
+            "sensor {}: dropped its {n} landmark(s) from {}, learned where it stood; cv1touch setup learns new ones",
+            r.serial,
+            landmarks.display()
+        )),
+        Err(err) => log(format!("sensor {}: {err}", r.serial)),
+    }
+}
+
+/// Writes the sensor's new pose into the loaded calibration file: the backup of the old file and
+/// the new file's fingerprint. Not while `cv1touch setup` runs, and not over a file changed
+/// since the daemon loaded it. Setup's stages bound to the old file are bound to the new one, so
+/// that they stay as they were, and old backups are thinned to `KEPT_BACKUPS`.
+fn write_reposed(
+    loaded: &LoadedCalibration,
+    r: &Reposed,
+) -> Result<(Option<PathBuf>, String), String> {
+    let path = &loaded.path;
+    let state = platform::dirs::get().state;
+    // held until the journal is written too, so that setup cannot start in between
+    let _setup_kept_out = match control::lock_single_instance(&state.join("setup.lock")) {
+        Ok(lock) => Some(lock),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            return Err("cv1touch setup is running: it will write its own calibration".into());
+        }
+        Err(_) => None,
+    };
+    let current = setup::fingerprint(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if current != loaded.sha256 {
+        return Err(format!(
+            "{} changed since the daemon loaded it: restart cv1touchd, or run `cv1touch calibration load`, to use it as it is",
+            path.display()
+        ));
+    }
+    let mut cal = calib::file::load(path)?;
+    let entry = cal
+        .sensors
+        .iter_mut()
+        .find(|s| s.serial == r.serial)
+        .ok_or_else(|| format!("{} has no sensor {}", path.display(), r.serial))?;
+    entry.orient_xyzw = r.orient_xyzw;
+    entry.pos = r.pos;
+    entry.rms_px = r.median_px;
+    entry.observations = r.matches;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    cal.source = note_in_source(
+        &cal.source,
+        &format!(
+            "{} placed again by cv1touchd from the other sensors ({:.0} mm, {:.1} deg) at unix {now}",
+            r.serial, r.moved_mm, r.turned_deg
+        ),
+    );
+    let (backup, sha256) = calib::file::save_with_fingerprint(path, &cal)?;
+    let journal = state.join("setup.json");
+    if let Ok(Some(mut checkpoint)) = setup::load(&journal) {
+        if setup::carry_camera_fingerprint(&mut checkpoint, &loaded.sha256, &sha256) {
+            match setup::save(&journal, &checkpoint) {
+                Ok(()) => log("setup's stages stay as they were: they are bound to the new file"),
+                Err(e) => log(format!("{}: {e}", journal.display())),
+            }
+        }
+    }
+    Ok((backup, sha256))
+}
+
+/// `source` with `note` appended; a source grown past a page keeps its beginning and its end.
+fn note_in_source(source: &str, note: &str) -> String {
+    const KEEP: usize = 1500;
+    let joined = format!("{source}; {note}");
+    if joined.len() <= KEEP {
+        return joined;
+    }
+    let head: String = joined.chars().take(300).collect();
+    let tail: String = joined
+        .chars()
+        .rev()
+        .take(KEEP - 300 - 7)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head} [...] {tail}")
+}
+
+/// Remembers a backup the daemon's own write made, and removes the daemon's oldest ones beyond
+/// `KEPT_BACKUPS`; backups other tools made (setup, calibrate) are never touched.
+fn thin_own_backups(own: &mut Vec<PathBuf>, backup: PathBuf) {
+    own.push(backup);
+    while own.len() > KEPT_BACKUPS {
+        let oldest = own.remove(0);
+        match std::fs::remove_file(&oldest) {
+            Ok(()) => log(format!(
+                "removed the daemon's oldest backup {}, keeping {KEPT_BACKUPS}",
+                oldest.display()
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => log(format!("{}: {e}", oldest.display())),
+        }
+    }
 }
 
 struct NewBody {
@@ -1070,6 +1697,17 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         if let Some(f) = link.biases.lock().unwrap().take() {
             save_biases(&f);
         }
+        for change in std::mem::take(&mut *link.reposed.lock().unwrap()) {
+            match change {
+                PoseChange::Cleared(serial) => match e.clear_sensor_pose(&serial) {
+                    Ok(()) => log(format!(
+                        "sensor {serial}: the engine labels its blobs by the long search while it is placed"
+                    )),
+                    Err(err) => log(format!("sensor {serial}: {err}")),
+                },
+                PoseChange::Set(r) => apply_reposed(d, e, &r),
+            }
+        }
         if radio {
             if bodies.find(e, link) {
                 d.wake_radio();
@@ -1079,7 +1717,8 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
             d.track_in.lock().unwrap().clear();
         }
         if now >= next_sensors {
-            let sensors: Vec<SensorStatus> = e.sensors().iter().map(sensor_status).collect();
+            let sensors: Vec<SensorStatus> =
+                e.sensors().iter().map(|s| sensor_status(d, s)).collect();
             publish_sensor_snapshot(d, &sensors);
             next_sensors = now + SENSOR_PUBLISH_NS;
             if d.rec.active() {
@@ -1173,6 +1812,7 @@ fn radio_main(
     d.radio_on.store(true, Ordering::Release);
     let _exit = RadioExit { d, link };
     let mut biases = BiasMemory::load();
+    let mut reposing = Reposing::start();
     let mut hands = [
         Hand::new(HAND_LEFT, HandConfig::default()),
         Hand::new(HAND_RIGHT, HandConfig::default()),
@@ -1328,6 +1968,7 @@ fn radio_main(
         if let Some(f) = biases.update(&pipe, now) {
             *link.biases.lock().unwrap() = Some(f);
         }
+        reposing.tick(d, link, &mut pipe, &mut watch, now);
         rest.if_due(now);
         if now >= next_stats {
             d.pending_frames_dropped
@@ -1682,6 +2323,8 @@ fn status_json(d: &Daemon) -> String {
         })
         .collect();
     let shifts = d.landmark_shifts.lock().unwrap();
+    let poses = d.sensor_poses.lock().unwrap();
+    let agreements = d.sensor_agreement.lock().unwrap();
     let sensors_json: Vec<serde_json::Value> = sensors
         .iter()
         .map(|s| {
@@ -1689,17 +2332,26 @@ fn status_json(d: &Daemon) -> String {
             let shift = shifts
                 .get(&serial)
                 .map(|(x, y, n)| serde_json::json!({"dx": x, "dy": y, "landmarks": n}));
+            let pose = poses
+                .get(&serial)
+                .map(|note| serde_json::to_value(note).unwrap_or_default());
+            let agreement = agreements.get(&serial).map(|a| {
+                serde_json::json!({"median_px": a.median_px, "bias_px": a.bias_px.norm(),
+                "samples": a.samples, "checks": a.checks, "misses": a.misses})
+            });
             serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
             "fixes": s.pose_fixes, "camera_orient": s.camera_orient, "camera_pos": s.camera_pos,
-            "landmark_shift": shift})
+            "landmark_shift": shift, "pose": pose, "agreement": agreement})
         })
         .collect();
+    drop(agreements);
+    drop(poses);
     drop(shifts);
     let mut queue = serde_json::to_value(d.track_in.lock().unwrap().stats()).unwrap();
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -1716,6 +2368,7 @@ fn status_json(d: &Daemon) -> String {
         st.write_errors,
         hands_json.join(","),
         serde_json::to_string(&sensors_json).unwrap(),
+        d.sensors_unsure.load(Ordering::Relaxed),
         sensors.len(),
         sensors.len().min(shm::MAX_SENSORS),
         sensors.len() > shm::MAX_SENSORS,
@@ -1791,13 +2444,16 @@ fn handle(d: &Daemon, line: &str) -> String {
             }
         }
         Ok(Command::CalibrationCapture) => {
+            *d.calibration.lock().unwrap() = None;
             switch_mode(d, modes::capture(&current_opts(d)), "capture")
         }
         Ok(Command::CalibrationProvisional) => {
+            *d.calibration.lock().unwrap() = None;
             switch_mode(d, modes::provisional(&current_opts(d)), "provisional")
         }
         Ok(Command::CalibrationLoad(path)) => match modes::calibrated(&current_opts(d), &path) {
             Ok((opts, n)) => {
+                *d.calibration.lock().unwrap() = Some(LoadedCalibration::at(path.clone()));
                 switch_mode(d, opts, "calibrated");
                 format!("ok calibrated: {n} sensor poses from {}", path.display())
             }
@@ -2361,8 +3017,8 @@ fn main() {
         }
     }
 
-    let (opts, mode) = if provisional {
-        (modes::provisional(&opts), "provisional".to_string())
+    let (opts, mode, calibration_path) = if provisional {
+        (modes::provisional(&opts), "provisional".to_string(), None)
     } else {
         let path = calibration
             .clone()
@@ -2374,7 +3030,7 @@ fn main() {
                         "calibrated: {n} sensor poses from {}",
                         path.display()
                     ));
-                    (o, "calibrated".to_string())
+                    (o, "calibrated".to_string(), Some(path))
                 }
                 Err(e) => {
                     log(format!(
@@ -2385,10 +3041,10 @@ fn main() {
             }
         } else {
             log(format!(
-                "no calibration at {}: provisional placement (run `cv1touch calibrate`)",
+                "no calibration at {}: provisional placement (run `cv1touch setup`)",
                 path.display()
             ));
-            (modes::provisional(&opts), "provisional".to_string())
+            (modes::provisional(&opts), "provisional".to_string(), None)
         }
     };
 
@@ -2466,6 +3122,11 @@ fn main() {
         track_stats: Mutex::new([(Stats::default(), false); 2]),
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
+        sensor_poses: Mutex::new(Default::default()),
+        sensor_agreement: Mutex::new(Default::default()),
+        sensors_unsure: AtomicBool::new(false),
+        calibration: Mutex::new(calibration_path.map(LoadedCalibration::at)),
+        own_backups: Mutex::new(Vec::new()),
         universe_shift: Mutex::new(None),
         universe_recheck: AtomicBool::new(false),
         driver_stations: Mutex::new(None),
@@ -2569,6 +3230,11 @@ mod tests {
             track_stats: Mutex::new([(Stats::default(), false); 2]),
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
+            sensor_poses: Mutex::new(Default::default()),
+            sensor_agreement: Mutex::new(Default::default()),
+            sensors_unsure: AtomicBool::new(false),
+            calibration: Mutex::new(None),
+            own_backups: Mutex::new(Vec::new()),
             universe_shift: Mutex::new(None),
             universe_recheck: AtomicBool::new(false),
             driver_stations: Mutex::new(None),
@@ -2668,6 +3334,101 @@ mod tests {
             (0, 0)
         );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// A source note stays within a page: the beginning and the end are kept.
+    #[test]
+    fn a_source_note_is_kept_to_a_page() {
+        assert_eq!(note_in_source("a", "b"), "a; b");
+        let long = "x".repeat(2000);
+        let kept = note_in_source(&long, "placed again");
+        assert!(
+            kept.len() <= 1500 && kept.starts_with("xxx") && kept.ends_with("placed again"),
+            "{}",
+            kept.len()
+        );
+        assert!(kept.contains("[...]"));
+    }
+
+    /// The daemon thins only the backups its own writes made, oldest first.
+    #[test]
+    fn only_the_daemons_own_backups_are_thinned() {
+        let dir = std::env::temp_dir().join(format!("cv1t-own-backups-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let theirs = dir.join("calibration.json.bak-1");
+        std::fs::write(&theirs, "setup's").unwrap();
+        let mut own = Vec::new();
+        for k in 0..KEPT_BACKUPS + 2 {
+            let b = dir.join(format!("calibration.json.bak-{}", 100 + k));
+            std::fs::write(&b, "ours").unwrap();
+            thin_own_backups(&mut own, b);
+        }
+        assert_eq!(own.len(), KEPT_BACKUPS);
+        assert!(theirs.exists(), "another tool's backup stays");
+        assert!(
+            !dir.join("calibration.json.bak-100").exists()
+                && !dir.join("calibration.json.bak-101").exists()
+        );
+        assert!(dir.join("calibration.json.bak-102").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sensor's new pose is written into the loaded file only while it is still that file.
+    #[test]
+    fn a_new_pose_is_written_only_into_the_file_that_was_loaded() {
+        let dir = std::env::temp_dir().join(format!("cv1t-reposed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        let cal = calib::file::CalibrationFile {
+            format: calib::file::FORMAT.into(),
+            version: calib::file::VERSION,
+            created_unix_s: 1,
+            world: "gravity".into(),
+            source: "a test".into(),
+            sensors: vec![calib::file::SensorEntry {
+                serial: "WMTD000000001".into(),
+                orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                pos: [0.0, 2.0, 1.0],
+                rms_px: 0.3,
+                observations: 100,
+            }],
+            stats: calib::file::Stats {
+                reference: "test".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 100,
+                rejected_views: 0,
+            },
+        };
+        calib::file::save(&path, &cal).unwrap();
+        let loaded = LoadedCalibration::at(path.clone());
+        let r = Reposed {
+            serial: "WMTD000000001".into(),
+            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.1, 2.0, 1.0],
+            median_px: 0.25,
+            matches: 4000,
+            moved_mm: 100.0,
+            turned_deg: 0.0,
+            write: true,
+        };
+        // changed since it was loaded: refused
+        let mut other = cal.clone();
+        other.source = "someone else's".into();
+        calib::file::save(&path, &other).unwrap();
+        let err = write_reposed(&loaded, &r).unwrap_err();
+        assert!(err.contains("changed since"), "{err}");
+        // as loaded: written, with the pose, a note, and a backup
+        let loaded = LoadedCalibration::at(path.clone());
+        let (backup, sha) = write_reposed(&loaded, &r).unwrap();
+        assert!(backup.is_some_and(|b| b.exists()));
+        let written = calib::file::load(&path).unwrap();
+        assert_eq!(written.sensors[0].pos, [0.1, 2.0, 1.0]);
+        assert_eq!(written.sensors[0].observations, 4000);
+        assert!(written.source.contains("placed again by cv1touchd"));
+        assert_eq!(setup::fingerprint(&path).unwrap(), sha);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A connected controller the tracker has no state for (it woke, or a wrong lock was dropped)

@@ -39,6 +39,31 @@ pub fn default_path() -> PathBuf {
     crate::align::registration_path().with_file_name("landmarks.json")
 }
 
+/// Writes `f` to `path`, replacing it whole: written beside it first, then renamed over it.
+pub fn save(path: &Path, f: &LandmarkFile) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text + "\n").map_err(|e| format!("{}: {e}", tmp.display()))?;
+    crate::platform::fs::rename_replacing(&tmp, path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Drops the landmarks of the sensor `serial` from the file at `path`, which was learned where
+/// the sensor stood: how many went (0 when the file does not exist).
+pub fn forget_in_file(path: &Path, serial: &str) -> Result<usize, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut f = load(path)?;
+    let before = f.landmarks.len();
+    f.landmarks.retain(|l| l.serial != serial);
+    let gone = before - f.landmarks.len();
+    if gone > 0 {
+        save(path, &f)?;
+    }
+    Ok(gone)
+}
+
 pub fn load(path: &Path) -> Result<LandmarkFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let f: LandmarkFile =
@@ -203,6 +228,16 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Stops watching the sensor `serial`'s landmarks: they were learned where it stood.
+    pub fn forget(&mut self, serial: &str) {
+        let keep: Vec<bool> = self.refs.iter().map(|l| l.serial != serial).collect();
+        let mut k = keep.iter();
+        self.refs.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        self.seen.retain(|_| *k.next().unwrap());
+        self.latest.remove(serial);
+    }
+
     pub fn new(refs: Vec<Landmark>, window_ns: u64) -> Monitor {
         let n = refs.len();
         Monitor {

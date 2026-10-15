@@ -324,6 +324,25 @@ pub fn preserve_camera_update(
     Ok(())
 }
 
+/// The camera calibration was rewritten in place (a sensor placed again by the daemon): every
+/// stage bound to its old fingerprint `old`, as its own artifact (the camera and gravity stages)
+/// or as a dependency, is bound to `new` instead, so that it stays as it was, Ready or not.
+/// Whether anything was bound to `old`.
+pub fn carry_camera_fingerprint(checkpoint: &mut Checkpoint, old: &str, new: &str) -> bool {
+    let mut carried = false;
+    for binding in checkpoint.completed.values_mut() {
+        if binding.artifact_sha256 == old {
+            binding.artifact_sha256 = new.to_string();
+            carried = true;
+        }
+        if binding.camera_sha256.as_deref() == Some(old) {
+            binding.camera_sha256 = Some(new.to_string());
+            carried = true;
+        }
+    }
+    carried
+}
+
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 fn is_hash(hash: &str) -> bool {
     hash.len() == 64
@@ -885,6 +904,63 @@ mod tests {
         assert!(save(&fifo, &Checkpoint::default()).is_err());
         assert!(load(&temp.0).is_err());
     }
+    #[test]
+    fn a_rewritten_camera_file_keeps_its_stages() {
+        let (old, new) = ("a".repeat(64), "b".repeat(64));
+        let mut c = Checkpoint::default();
+        c.completed.insert(
+            Stage::Camera,
+            Binding {
+                artifact_sha256: old.clone(),
+                ..Default::default()
+            },
+        );
+        // gravity's own artifact is the camera file too; registration depends on it
+        c.completed.insert(
+            Stage::Gravity,
+            Binding {
+                artifact_sha256: old.clone(),
+                camera_sha256: Some(old.clone()),
+                ..Default::default()
+            },
+        );
+        c.completed.insert(
+            Stage::Registration,
+            Binding {
+                artifact_sha256: "c".repeat(64),
+                camera_sha256: Some(old.clone()),
+                ..Default::default()
+            },
+        );
+        c.completed.insert(
+            Stage::Inputs,
+            Binding {
+                artifact_sha256: "d".repeat(64),
+                ..Default::default()
+            },
+        );
+        assert!(carry_camera_fingerprint(&mut c, &old, &new));
+        assert_eq!(c.completed[&Stage::Camera].artifact_sha256, new);
+        assert_eq!(c.completed[&Stage::Gravity].artifact_sha256, new);
+        assert_eq!(
+            c.completed[&Stage::Gravity].camera_sha256.as_deref(),
+            Some(new.as_str())
+        );
+        assert_eq!(
+            c.completed[&Stage::Registration].artifact_sha256,
+            "c".repeat(64)
+        );
+        assert_eq!(
+            c.completed[&Stage::Registration].camera_sha256.as_deref(),
+            Some(new.as_str())
+        );
+        assert_eq!(c.completed[&Stage::Inputs].artifact_sha256, "d".repeat(64));
+        assert!(
+            !carry_camera_fingerprint(&mut c, &old, &new),
+            "nothing bound to the old one"
+        );
+    }
+
     #[test]
     fn sha256_matches_known_content() {
         let temp = Temp::new();

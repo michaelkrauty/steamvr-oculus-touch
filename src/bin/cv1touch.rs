@@ -273,7 +273,71 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
         daemon.is_some(),
         control::socket_path().display().to_string(),
     ));
+    if let Some(d) = &daemon {
+        let (ok, detail) = sensor_poses_check(d);
+        checks.push(("sensor_poses", ok, detail));
+    }
     (checks, daemon)
+}
+
+/// Whether the sensors stand where the calibration says (the daemon's pose watch, `status`):
+/// one that moved is being placed again from the others, one that could not be is waiting for
+/// `setup`, and with fewer than two sensors agreeing nothing can be told.
+fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
+    let sensors = status["sensors"].as_array().cloned().unwrap_or_default();
+    let mut moved = Vec::new();
+    let mut given_up = Vec::new();
+    let mut placed = Vec::new();
+    let mut released = Vec::new();
+    for s in &sensors {
+        let serial = s["serial"].as_str().unwrap_or("?");
+        match s["pose"]["state"].as_str() {
+            Some("moved") => moved.push(serial),
+            Some("given_up") => given_up.push(serial),
+            Some("placed") => placed.push(serial),
+            Some("released") => released.push(serial),
+            _ => {}
+        }
+    }
+    if status["sensors_unsure"].as_bool() == Some(true) {
+        return (
+            false,
+            "fewer than two sensors agree with each other: run cv1touch setup".to_string(),
+        );
+    }
+    if !given_up.is_empty() {
+        return (
+            false,
+            format!(
+                "{} could not be placed from the other sensors: run cv1touch setup",
+                given_up.join(", ")
+            ),
+        );
+    }
+    if !moved.is_empty() {
+        return (
+            false,
+            format!(
+                "{} moved and is being placed again: move the controllers where it sees them",
+                moved.join(", ")
+            ),
+        );
+    }
+    let mut detail = format!("{} sensor(s) stand where calibrated", sensors.len());
+    if !placed.is_empty() {
+        detail = format!(
+            "{} sensor(s); {} placed again since the daemon started",
+            sensors.len(),
+            placed.join(", ")
+        );
+    }
+    if !released.is_empty() {
+        detail.push_str(&format!(
+            "; {} judged moved by mistake and let go",
+            released.join(", ")
+        ));
+    }
+    (true, detail)
 }
 
 fn doctor(json: bool) -> i32 {
@@ -5525,6 +5589,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `doctor`'s sensor_poses check reads the daemon's pose watch: moved beats placed, given up
+    /// beats moved, and unsure beats all.
+    #[test]
+    fn doctor_tells_what_the_pose_watch_found() {
+        let status = |unsure: bool, states: &[Option<&str>]| {
+            serde_json::json!({
+                "sensors_unsure": unsure,
+                "sensors": states.iter().enumerate().map(|(i, st)| {
+                    serde_json::json!({"serial": format!("S{i}"), "pose": st.map(|s| serde_json::json!({"state": s}))})
+                }).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            sensor_poses_check(&status(false, &[None, None])),
+            (true, "2 sensor(s) stand where calibrated".to_string())
+        );
+        let (ok, detail) = sensor_poses_check(&status(false, &[None, Some("placed")]));
+        assert!(ok && detail.contains("S1 placed again"), "{detail}");
+        let (ok, detail) = sensor_poses_check(&status(false, &[Some("released"), None]));
+        assert!(
+            ok && detail.contains("S0 judged moved by mistake"),
+            "{detail}"
+        );
+        let (ok, detail) = sensor_poses_check(&status(false, &[Some("placed"), Some("moved")]));
+        assert!(!ok && detail.starts_with("S1 moved"), "{detail}");
+        let (ok, detail) = sensor_poses_check(&status(false, &[Some("moved"), Some("given_up")]));
+        assert!(!ok && detail.starts_with("S1 could not"), "{detail}");
+        let (ok, detail) = sensor_poses_check(&status(true, &[Some("given_up")]));
+        assert!(!ok && detail.starts_with("fewer than two"), "{detail}");
+    }
 
     /// `stop` waits for the daemon to end: true once it has, false when the time is up while it
     /// still runs. The first look comes before any sleep, so a zero timeout still looks once.
