@@ -41,7 +41,7 @@ pub struct Replay {
     pub events: Vec<FrameEvent>,
     pub probes: Vec<Probe>,
     /// Each sensor's agreement with the others at the end (see `Pipeline::camera_agreement`).
-    pub agreement: Vec<(String, f64, f64, u64)>,
+    pub agreement: Vec<(String, super::tracker::CameraAgreement)>,
 }
 
 /// `imu_position` finds a controller's IMU position from its LED model (see `factory`).
@@ -68,7 +68,7 @@ pub fn replay(
                 let serial = cstr_field(&s.serial);
                 if let Some(w) = poses.get(&serial) {
                     p.sensor(&serial, CameraModel::from_sensor(&s), *w);
-                } else if o.probe_sensor.as_deref() == Some(serial.as_str()) {
+                } else if o.probe_sensors.contains(&serial) {
                     // a sensor being placed has no pose yet; probing needs only its frames
                     p.sensor(&serial, CameraModel::from_sensor(&s), Isometry3::identity());
                 }

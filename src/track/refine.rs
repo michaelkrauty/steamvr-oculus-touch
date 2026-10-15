@@ -431,6 +431,7 @@ mod tests {
                     })
                     .collect();
                 Probe {
+                    camera: 0,
                     hand: 1,
                     device_id: 1,
                     world_from_model: w,
@@ -488,6 +489,7 @@ mod tests {
                     });
                 }
                 Probe {
+                    camera: 0,
                     hand: 1,
                     device_id: 1,
                     world_from_model: w,

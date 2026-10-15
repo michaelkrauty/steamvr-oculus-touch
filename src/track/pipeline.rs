@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use nalgebra::{Isometry3, Vector2, Vector3};
 
 use super::clock::{LinearClock, Unwrap32};
-use super::tracker::{EnginePose, ImuSample, Outcome, Output, Params, Stats, Tracker};
+use super::tracker::{
+    CameraAgreement, EnginePose, ImuSample, Outcome, Output, Params, Stats, Tracker,
+};
 use super::vision::{Blob, Body, Camera};
 use crate::calib::camera::CameraModel;
 use crate::calib::capture::{Led, MATCH_GOOD, MATCH_STRONG};
@@ -36,6 +38,9 @@ pub const DEFAULT_EXPOSURE_OFFSET_NS: i64 = 4_000_000;
 /// Wait this long past an exposure before probing it, so frames of it (and of the next exposure)
 /// from the tracked sensors are in.
 pub const PROBE_DELAY_NS: u64 = 80_000_000;
+/// Probed frames waiting for the track to pass their exposure, per hand at most: about a second
+/// of one sensor; a controller asleep drains none.
+pub const PROBING_CAP: usize = 64;
 
 /// The headset clock (microseconds) of one of its IMU reports.
 pub fn hmd_report_timestamp(d: &[u8]) -> Option<u32> {
@@ -58,9 +63,10 @@ pub struct Options {
     pub exposure_offset_ns: i64,
     /// Keep every frame's outcome in `Pipeline::events` and the trackers' miss diagnostics.
     pub trace: bool,
-    /// This sensor's frames are not tracked with: each is kept in `Pipeline::probes` with the
+    /// These sensors' frames are not tracked with: each is kept in `Pipeline::probes` with the
     /// controller's pose at its exposure, once the other sensors' frames up to then are applied.
-    pub probe_sensor: Option<String>,
+    /// A sensor being placed, or one that moved and is being re-placed (`Pipeline::probe`).
+    pub probe_sensors: Vec<String>,
     /// Replay only: also keep each output's pose this long before, as the filter holds it once
     /// the frames that arrive in the meantime are in (`Replay::delayed`).
     pub delayed_ns: Option<u64>,
@@ -75,7 +81,7 @@ impl Default for Options {
             params: Params::default(),
             exposure_offset_ns: DEFAULT_EXPOSURE_OFFSET_NS,
             trace: false,
-            probe_sensor: None,
+            probe_sensors: Vec::new(),
             delayed_ns: None,
             seed_biases: [None, None],
         }
@@ -102,6 +108,8 @@ pub struct FrameEvent {
 /// A probed sensor's frame with the tracked pose of one controller at its exposure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Probe {
+    /// The sensor's registration id (`Pipeline::serial_of`).
+    pub camera: usize,
     pub hand: usize,
     /// The engine device id of that hand's controller, which its blob labels carry.
     pub device_id: i32,
@@ -148,10 +156,17 @@ pub struct Pipeline {
     clocks: [LinearClock; 2],
     trackers: [Option<Tracker>; 2],
     cams: BTreeMap<String, RegisteredCamera>,
+    /// Registration ids of the sensors whose frames are probed, not tracked with.
+    probed: std::collections::BTreeSet<usize>,
+    /// Registration ids of the sensors whose frames are dropped (given up on).
+    ignored: std::collections::BTreeSet<usize>,
     pending: [Vec<Pending>; 2],
-    probing: [Vec<(u64, Vec<Blob>)>; 2],
+    /// Per hand: a probed sensor's frames (exposure, camera, blobs) waiting for the track to
+    /// pass their exposure.
+    probing: [Vec<(u64, usize, Vec<Blob>)>; 2],
     latest: [Option<Stamped>; 2],
-    /// Frames before the headset clock had a fit, or from sensors without a pose.
+    /// Frames before the headset clock had a fit, from sensors without a pose, or from sensors
+    /// given up on (`ignore`).
     pub frames_skipped: u64,
     /// Pending frames evicted by the per-camera two-frame limit, summed across hands.
     pub frames_dropped: u64,
@@ -168,6 +183,8 @@ impl Pipeline {
             clocks: [LinearClock::default(), LinearClock::default()],
             trackers: [None, None],
             cams: BTreeMap::new(),
+            probed: Default::default(),
+            ignored: Default::default(),
             pending: [Vec::new(), Vec::new()],
             probing: [Vec::new(), Vec::new()],
             latest: [None, None],
@@ -192,9 +209,90 @@ impl Pipeline {
         let id = self.cams.len();
         self.cams
             .insert(serial.to_string(), RegisteredCamera { id, camera });
+        if self.opts.probe_sensors.contains(&serial.to_string()) {
+            self.probed.insert(id);
+        }
         for tracker in self.trackers.iter_mut().flatten() {
             tracker.register_camera();
         }
+    }
+
+    /// Probes the sensor `serial` from now on (`on`), or tracks with it again: false when no
+    /// such sensor is registered. Frames of it already queued for tracking are dropped.
+    pub fn probe(&mut self, serial: &str, on: bool) -> bool {
+        let Some(registered) = self.cams.get(serial) else {
+            return false;
+        };
+        let id = registered.id;
+        if on {
+            self.probed.insert(id);
+            for pending in &mut self.pending {
+                pending.retain(|p| p.camera != id);
+            }
+        } else {
+            self.probed.remove(&id);
+            for probing in &mut self.probing {
+                probing.retain(|p| p.1 != id);
+            }
+        }
+        true
+    }
+
+    /// Drops the sensor `serial`'s frames from now on (`on`), neither tracked with nor probed, or
+    /// takes them again: false when no such sensor is registered.
+    pub fn ignore(&mut self, serial: &str, on: bool) -> bool {
+        let Some(id) = self.cams.get(serial).map(|c| c.id) else {
+            return false;
+        };
+        if on {
+            self.ignored.insert(id);
+            for probing in &mut self.probing {
+                probing.retain(|p| p.1 != id);
+            }
+            for pending in &mut self.pending {
+                pending.retain(|p| p.camera != id);
+            }
+        } else {
+            self.ignored.remove(&id);
+        }
+        true
+    }
+
+    /// Forgets how the sensor `serial` agreed with the others, as when it was placed again.
+    pub fn reset_agreement(&mut self, serial: &str) {
+        let Some(id) = self.cams.get(serial).map(|c| c.id) else {
+            return;
+        };
+        for tr in self.trackers.iter_mut().flatten() {
+            if let Some(a) = tr.agreement.get_mut(id) {
+                *a = CameraAgreement::default();
+            }
+        }
+    }
+
+    /// Whether the sensor `serial`'s frames are probed rather than tracked with.
+    pub fn is_probed(&self, serial: &str) -> bool {
+        self.cams
+            .get(serial)
+            .is_some_and(|c| self.probed.contains(&c.id))
+    }
+
+    /// The registration id of the sensor `serial`.
+    pub fn camera_id(&self, serial: &str) -> Option<usize> {
+        self.cams.get(serial).map(|c| c.id)
+    }
+
+    /// The serial of the sensor registered with id `camera`.
+    pub fn serial_of(&self, camera: usize) -> Option<&str> {
+        self.cams
+            .iter()
+            .find(|(_, c)| c.id == camera)
+            .map(|(serial, _)| serial.as_str())
+    }
+
+    /// The sensor `serial`'s camera model and the pose it is tracked with.
+    pub fn camera(&self, serial: &str) -> Option<&Camera> {
+        self.cams.get(serial).map(|c| &c.camera)
     }
 
     pub fn has_body(&self, hand: usize) -> bool {
@@ -243,21 +341,29 @@ impl Pipeline {
     }
 
     /// Each sensor (by serial) with its agreement with the others, both controllers' samples
-    /// combined: (serial, median residual px, |bias| px, samples).
-    pub fn camera_agreement(&self) -> Vec<(String, f64, f64, u64)> {
+    /// combined: the residual and bias weighted by samples, the counts summed.
+    pub fn camera_agreement(&self) -> Vec<(String, CameraAgreement)> {
         self.cams
             .iter()
             .map(|(serial, camera)| {
-                let (mut sum, mut bias, mut n) = (0.0, Vector2::zeros(), 0u64);
+                let mut all = CameraAgreement::default();
                 for tr in self.trackers.iter().flatten() {
                     if let Some(a) = tr.agreement.get(camera.id) {
-                        sum += a.median_px * a.samples as f64;
-                        bias += a.bias_px * a.samples as f64;
-                        n += a.samples;
+                        all.median_px += a.median_px * a.samples as f64;
+                        all.bias_px += a.bias_px * a.samples as f64;
+                        all.samples += a.samples;
+                        all.checks += a.checks;
+                        all.misses += a.misses;
                     }
                 }
-                let k = if n > 0 { 1.0 / n as f64 } else { f64::NAN };
-                (serial.clone(), sum * k, (bias * k).norm(), n)
+                let k = if all.samples > 0 {
+                    1.0 / all.samples as f64
+                } else {
+                    f64::NAN
+                };
+                all.median_px *= k;
+                all.bias_px *= k;
+                (serial.clone(), all)
             })
             .collect()
     }
@@ -312,13 +418,14 @@ impl Pipeline {
             .first()
             .is_some_and(|p| p.0 + PROBE_DELAY_NS <= device_ns)
         {
-            let (t_e, blobs) = self.probing[hand].remove(0);
+            let (t_e, camera, blobs) = self.probing[hand].remove(0);
             if let Some(f) = tr.filter_at(t_e) {
                 let pos_sd = (0..3)
                     .map(|i| f.cov[(3 + i, 3 + i)])
                     .fold(0.0, f64::max)
                     .sqrt();
                 self.probes.push(Probe {
+                    camera,
                     hand,
                     device_id: tr.device_id,
                     world_from_model: tr.body.world_from_model(&f.x),
@@ -378,6 +485,10 @@ impl Pipeline {
             self.frames_skipped += 1;
             return;
         };
+        if self.ignored.contains(&registered.id) {
+            self.frames_skipped += 1;
+            return;
+        }
         let camera = registered.id;
         let cam = registered.camera;
         let list: Vec<Blob> = blobs
@@ -387,7 +498,7 @@ impl Pipeline {
                 led_id: b.led_id,
             })
             .collect();
-        let probe = self.opts.probe_sensor.as_deref() == Some(serial.as_str());
+        let probe = self.probed.contains(&camera);
         for hand in 0..2 {
             let Some(tr) = self.trackers[hand].as_mut() else {
                 continue;
@@ -397,7 +508,10 @@ impl Pipeline {
             };
             let t_e = (t as i64 + self.opts.exposure_offset_ns).max(0) as u64;
             if probe {
-                self.probing[hand].push((t_e, list.clone()));
+                if self.probing[hand].len() >= PROBING_CAP {
+                    self.probing[hand].remove(0);
+                }
+                self.probing[hand].push((t_e, camera, list.clone()));
                 continue;
             }
             let engine = info.devices[..(info.n_devices as usize).min(info.devices.len())]
@@ -890,6 +1004,42 @@ mod tests {
             after.iter().copied().fold(0.0, f64::max)
         );
     }
+    /// A sensor is probed when the options name it, or from the moment `probe` says so, and
+    /// tracked with again when it says not; its frames queued the other way are dropped.
+    #[test]
+    fn probing_is_switched_live_per_sensor() {
+        let mut p = Pipeline::new(Options {
+            probe_sensors: vec!["B".to_string()],
+            ..Options::default()
+        });
+        p.sensor("A", synth::camera_model(), Isometry3::identity());
+        p.sensor("B", synth::camera_model(), Isometry3::identity());
+        assert!(!p.is_probed("A") && p.is_probed("B"));
+        assert_eq!(
+            (p.serial_of(0), p.serial_of(1), p.serial_of(2)),
+            (Some("A"), Some("B"), None)
+        );
+        assert!(p.probe("A", true) && p.probe("B", false));
+        assert!(p.is_probed("A") && !p.is_probed("B"));
+        assert!(!p.probe("X", true));
+        p.probing[0].push((1, 1, Vec::new()));
+        p.probing[0].push((2, 0, Vec::new()));
+        assert!(p.probe("A", false));
+        assert_eq!(p.probing[0].iter().map(|p| p.1).collect::<Vec<_>>(), [1]);
+        assert!(p.camera("B").is_some() && p.camera("X").is_none());
+        // ignored: its queued probes go, and its agreement can be forgotten
+        p.body(DEVICE_RIGHT, synth::touch_leds(), Vector3::zeros());
+        p.trackers[HAND_RIGHT].as_mut().unwrap().agreement[1].misses = 9;
+        assert!(p.ignore("B", true) && !p.ignore("X", true));
+        assert!(p.probing[0].is_empty());
+        p.reset_agreement("B");
+        assert_eq!(
+            p.trackers[HAND_RIGHT].as_ref().unwrap().agreement[1].misses,
+            0
+        );
+        assert!(p.ignore("B", false));
+    }
+
     #[test]
     fn dynamic_sensors_registration_keeps_existing_identity() {
         let mut p = Pipeline::new(Options::default());
@@ -902,7 +1052,8 @@ mod tests {
                 .into_iter()
                 .find(|a| a.0 == "Z")
                 .unwrap()
-                .3,
+                .1
+                .samples,
             7
         );
         p.sensor(

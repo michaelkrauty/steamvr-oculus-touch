@@ -243,7 +243,10 @@ pub enum Outcome {
 
 /// How well one sensor agrees with the others: an exponentially weighted mean of the median
 /// pixel residual of its matched LEDs under a prior the other sensors set (another sensor updated
-/// the track within `CROSS_CHECK_NS`). A sensor that moved since calibration stands out.
+/// the track within `CROSS_CHECK_NS`). A sensor that moved since calibration stands out: a little,
+/// and its residual and bias grow; a lot, and it matches nothing under that prior although the
+/// controller is in its frame (by the engine's labels, or by a frame full of blobs where the
+/// track puts it), which `checks` and `misses` count.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CameraAgreement {
     pub median_px: f64,
@@ -251,10 +254,20 @@ pub struct CameraAgreement {
     /// sensor's consistent offset does not.
     pub bias_px: Vector2<f64>,
     pub samples: u64,
+    /// Frames in which the controller was in the sensor's frame while the other sensors had just
+    /// set the prior, and of those, the frames that matched nothing under it.
+    pub checks: u64,
+    pub misses: u64,
 }
 
 pub const CROSS_CHECK_NS: u64 = 25_000_000;
 const AGREEMENT_WEIGHT: f64 = 1.0 / 500.0;
+/// A frame with this many blobs, where the track puts this many LEDs in view, holds the
+/// controller even without the engine's labels.
+const CHECK_MIN_BLOBS: usize = 5;
+/// A controller nearer the sensor than this (metres) is no check of its pose: that close, blobs
+/// merge and a millimetre of the prior is pixels.
+const CHECK_MIN_DEPTH_M: f64 = 0.6;
 
 /// A measurement applied within the history, kept so that it can be applied again when an older
 /// frame arrives after it.
@@ -821,10 +834,36 @@ impl Tracker {
             } else {
                 &labelled
             };
+            // the controller is in this frame, by the engine's labels or by a frame full of blobs
+            // where the track puts it, and the others have just said where it is (a track they
+            // have confirmed): whatever happens next checks this sensor's pose. The engine
+            // searches no further for a controller our tracker holds, so a sensor that moved a
+            // lot gets no labels.
+            let depth = || {
+                (cam.world_from_cam.inverse() * self.body.world_from_model(&prior.x))
+                    .translation
+                    .vector
+                    .z
+            };
+            let checked = camera < self.camera_last.len()
+                && self.provisional.is_none()
+                && self.others_set_prior(camera, t_e)
+                && ((engine.is_some() && labelled.len() >= self.params.acquire_min_leds)
+                    || (blobs.len() >= CHECK_MIN_BLOBS
+                        && vision::visible_leds(
+                            cam,
+                            &self.body,
+                            &prior.x,
+                            &self.params.fit.assoc,
+                        ) >= CHECK_MIN_BLOBS))
+                && depth() >= CHECK_MIN_DEPTH_M;
             match vision::fit_frame(cam, &self.body, &prior, blobs, hints, &self.params.fit) {
                 Ok(fit) => {
                     if self.debug {
                         self.fits.push((fit.pairs.len(), fit.unexplained));
+                    }
+                    if checked {
+                        self.check_camera(camera, false);
                     }
                     self.cross_check(t_e, camera, cam, blobs, &fit.pairs, &prior);
                     if self.applied.back().is_some_and(|a| a.t > t_e) {
@@ -876,6 +915,9 @@ impl Tracker {
                     return Outcome::NotVisible;
                 }
                 Err(miss) => {
+                    if checked {
+                        self.check_camera(camera, true);
+                    }
                     if self.debug {
                         let (v, n, a) = vision::association_report(
                             cam,
@@ -1186,12 +1228,7 @@ impl Tracker {
         if camera >= self.camera_last.len() {
             return;
         }
-        let others = (0..self.camera_last.len()).any(|c| {
-            c != camera
-                && self.camera_last[c] != 0
-                && t_e.saturating_sub(self.camera_last[c]) <= CROSS_CHECK_NS
-                && self.camera_last[c] <= t_e
-        });
+        let others = self.others_set_prior(camera, t_e);
         self.camera_last[camera] = self.camera_last[camera].max(t_e);
         if !others || pairs.len() < 4 {
             return;
@@ -1210,6 +1247,26 @@ impl Tracker {
         a.median_px += w * (median - a.median_px);
         a.bias_px += (mean - a.bias_px) * w;
         a.samples += 1;
+    }
+
+    /// Whether another sensor updated the track within `CROSS_CHECK_NS` before `t_e`: the prior
+    /// at `t_e` is then the other sensors' word, which this one can agree with or not.
+    fn others_set_prior(&self, camera: usize, t_e: u64) -> bool {
+        (0..self.camera_last.len()).any(|c| {
+            c != camera
+                && self.camera_last[c] != 0
+                && t_e.saturating_sub(self.camera_last[c]) <= CROSS_CHECK_NS
+                && self.camera_last[c] <= t_e
+        })
+    }
+
+    /// A frame in which the engine saw this controller in the sensor while the other sensors had
+    /// just set the prior: a check of the sensor's pose, `missed` when nothing matched under it.
+    fn check_camera(&mut self, camera: usize, missed: bool) {
+        if let Some(a) = self.agreement.get_mut(camera) {
+            a.checks += 1;
+            a.misses += u64::from(missed);
+        }
     }
 
     /// Gravity's direction in the controller at controller time `t`, less the bias `ba`, when the
@@ -1284,7 +1341,7 @@ impl Tracker {
 mod tests {
     use super::*;
     use crate::calib::synth::{self, Motion, Rng};
-    use nalgebra::{Point3, UnitQuaternion, Vector2};
+    use nalgebra::{Point3, Translation3, UnitQuaternion, Vector2};
 
     const G: f64 = 9.80665;
 
@@ -2569,6 +2626,161 @@ mod tests {
             );
         }
         assert!(tr.last_confirmed > 0);
+    }
+
+    /// Frames of three sensors at 52 Hz over `seconds` of motion, the third sensor's blobs seen
+    /// from `truly` while the tracker is told its calibrated pose: how each sensor agrees.
+    fn agreement_with_third_sensor_at(truly: &Camera, seconds: f64) -> Vec<CameraAgreement> {
+        agreement_with_third_sensor(truly, seconds, true)
+    }
+
+    /// As `agreement_with_third_sensor_at`; `labelled`: whether the engine labels the third
+    /// sensor's blobs and rates a pose from it (it does not, for a controller our tracker holds
+    /// that it cannot match itself).
+    fn agreement_with_third_sensor(
+        truly: &Camera,
+        seconds: f64,
+        labelled: bool,
+    ) -> Vec<CameraAgreement> {
+        let w = world(11);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 3);
+        let mut rng = Rng::new(5);
+        for tick in 1..(seconds * 500.0) as usize {
+            let t = tick as f64 * 0.002;
+            tr.imu(imu(&w, t));
+            if tick % 10 == 0 {
+                for camera in 0..3 {
+                    let seen_from = if camera == 2 { truly } else { &w.cams[camera] };
+                    let mut blobs = sight(&w, seen_from, t, &mut rng, 0.1);
+                    let mut engine = Some(EnginePose::strong(w.motion.pose(t)));
+                    if camera == 2 && !labelled {
+                        for b in &mut blobs {
+                            b.led_id = -1;
+                        }
+                        engine = None;
+                    }
+                    tr.frame(
+                        (1e9 + t * 1e9) as u64,
+                        camera,
+                        &w.cams[camera],
+                        &blobs,
+                        engine,
+                        &[],
+                    );
+                }
+            }
+        }
+        tr.agreement.clone()
+    }
+
+    /// A sensor moved a little since calibration still matches its LEDs, with a residual and a
+    /// bias the sensors that stayed do not have.
+    #[test]
+    fn a_sensor_moved_a_little_shows_in_its_residual() {
+        let w = world(11);
+        let nudged = Camera {
+            world_from_cam: Translation3::new(0.01, 0.0, 0.0) * w.cams[2].world_from_cam,
+            ..w.cams[2]
+        };
+        let a = agreement_with_third_sensor_at(&nudged, 6.0);
+        assert!(a[2].samples > 20, "{:?}", a[2]);
+        assert!(
+            a[2].median_px > 0.6 && a[2].bias_px.norm() > 0.5,
+            "{:?}",
+            a[2]
+        );
+        // the moved sensor pulls the track a little its way, so the others show some of it too,
+        // but it stands out from them
+        for stayed in &a[..2] {
+            assert!(stayed.samples > 20, "{stayed:?}");
+            assert!(
+                a[2].median_px > 1.3 * stayed.median_px
+                    && a[2].bias_px.norm() > 1.5 * stayed.bias_px.norm(),
+                "{:?} vs {stayed:?}",
+                a[2]
+            );
+        }
+    }
+
+    /// A sensor moved a lot sees the controller (the engine labels its LEDs) where the track,
+    /// set by the other sensors, projects nothing near: no matches, so its residual stays silent,
+    /// but every such frame is a check it missed.
+    #[test]
+    fn a_sensor_moved_a_lot_misses_while_the_engine_sees_the_controller() {
+        let w = world(11);
+        let moved = Camera {
+            world_from_cam: Translation3::new(0.4, 0.0, 0.0) * w.cams[2].world_from_cam,
+            ..w.cams[2]
+        };
+        let a = agreement_with_third_sensor_at(&moved, 6.0);
+        assert!(a[2].checks > 20, "{:?}", a[2]);
+        assert!(a[2].misses as f64 >= 0.8 * a[2].checks as f64, "{:?}", a[2]);
+        for stayed in &a[..2] {
+            assert!(stayed.checks > 20, "{stayed:?}");
+            assert!(
+                (stayed.misses as f64) < 0.1 * stayed.checks as f64,
+                "{stayed:?}"
+            );
+        }
+    }
+
+    /// A controller held right at a sensor is no check of that sensor: its frames count neither
+    /// as checks nor as misses, whatever the fit does, while the far sensors are checked as usual;
+    /// a sensor a metre away is checked.
+    #[test]
+    fn a_controller_right_at_the_sensor_is_no_check() {
+        let checks_with_third_sensor_at = |distance: f64| {
+            let mut w = world(11);
+            w.motion = Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.3, -0.5, 0.2]);
+            w.cams[2] = Camera {
+                world_from_cam: synth::look_at(
+                    Vector3::new(0.0, 1.0, distance),
+                    Vector3::new(0.0, 1.0, 0.0),
+                    false,
+                ),
+                ..w.cams[2]
+            };
+            let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 3);
+            let mut rng = Rng::new(5);
+            for tick in 1..3000 {
+                let t = tick as f64 * 0.002;
+                tr.imu(imu(&w, t));
+                if tick % 10 == 0 {
+                    for camera in 0..3 {
+                        let blobs = sight(&w, &w.cams[camera], t, &mut rng, 0.1);
+                        tr.frame(
+                            (1e9 + t * 1e9) as u64,
+                            camera,
+                            &w.cams[camera],
+                            &blobs,
+                            Some(EnginePose::strong(w.motion.pose(t))),
+                            &[],
+                        );
+                    }
+                }
+            }
+            (tr.agreement[2].checks, tr.agreement[0].checks)
+        };
+        let (near, far) = checks_with_third_sensor_at(0.4);
+        assert_eq!(near, 0, "a sensor 0.4 m away");
+        assert!(far > 20, "{far}");
+        let (metre, _) = checks_with_third_sensor_at(1.0);
+        assert!(metre > 20, "a sensor a metre away: {metre}");
+    }
+
+    /// The engine labels nothing in a sensor that moved a lot (it searches no further for a
+    /// controller our tracker holds): a frame full of blobs where the track puts the controller
+    /// is a check all the same, and it misses.
+    #[test]
+    fn a_sensor_moved_a_lot_misses_without_the_engines_labels() {
+        let w = world(11);
+        let moved = Camera {
+            world_from_cam: Translation3::new(0.4, 0.0, 0.0) * w.cams[2].world_from_cam,
+            ..w.cams[2]
+        };
+        let a = agreement_with_third_sensor(&moved, 6.0, false);
+        assert!(a[2].checks > 20, "{:?}", a[2]);
+        assert!(a[2].misses as f64 >= 0.8 * a[2].checks as f64, "{:?}", a[2]);
     }
 
     #[test]

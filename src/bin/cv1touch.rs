@@ -4553,7 +4553,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
                     continue;
                 };
                 let o = track::replay::Options {
-                    probe_sensor: Some(entry.serial.clone()),
+                    probe_sensors: vec![entry.serial.clone()],
                     ..Default::default()
                 };
                 let r = track::replay::replay(rec, &cal, &imu, &o)?;
@@ -4707,7 +4707,7 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
         let mut without = cal.clone();
         without.sensors.retain(|e| e.serial != serial);
         let o = track::replay::Options {
-            probe_sensor: Some(serial.to_string()),
+            probe_sensors: vec![serial.to_string()],
             ..Default::default()
         };
         let r = track::replay::replay(rec, &without, &imu, &o)?;
@@ -5085,8 +5085,15 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
                     );
                 }
             }
-            for (serial, px, bias, n) in &r.agreement {
-                println!("sensor {serial}: agrees with the others to {px:.2} px median, offset {bias:.2} px ({n} cross-checks)");
+            for (serial, a) in &r.agreement {
+                println!(
+                    "sensor {serial}: agrees with the others to {:.2} px median, offset {:.2} px ({} cross-checks); missed {} of {} checks",
+                    a.median_px,
+                    a.bias_px.norm(),
+                    a.samples,
+                    a.misses,
+                    a.checks
+                );
             }
             let mut registration = args
                 .iter()
