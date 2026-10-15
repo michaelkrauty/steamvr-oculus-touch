@@ -1199,3 +1199,21 @@ int rift_tracker_get_sensor_info(rift_tracker_ctx *ctx, int index, ohmd_cv1touch
 	rift_sensor_get_cv1touch_info(ctx->sensors[index], out);
 	return 0;
 }
+
+int rift_tracker_set_sensor_pose(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_pose *pose)
+{
+	for (int i = 0; i < ctx->n_sensors; i++) {
+		if (rift_sensor_set_cv1touch_pose(ctx->sensors[i], pose))
+			return 0;
+	}
+	return -1;
+}
+
+int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (int i = 0; i < ctx->n_sensors; i++) {
+		if (rift_sensor_clear_cv1touch_pose(ctx->sensors[i], serial))
+			return 0;
+	}
+	return -1;
+}

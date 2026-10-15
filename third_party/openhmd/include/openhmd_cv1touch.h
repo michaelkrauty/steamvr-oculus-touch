@@ -171,6 +171,15 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *dev
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *device, ohmd_cv1touch_led *out, int max);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_count(ohmd_device *device);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device, int index, ohmd_cv1touch_sensor *out);
+/* Gives the sensor pose->serial names the camera -> world pose it tracks with from now on, as its
+ * fixed pose at start did; applied by the sensor's own analysis thread before its next frame.
+ * Returns 0, or -1 when no such sensor is open. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_set_sensor_pose(ohmd_device *device, const ohmd_cv1touch_sensor_pose *pose);
+/* Takes the open sensor serial's camera -> world pose away: it then labels the blobs of every
+ * device in every frame (the long search, as a sensor with no pose yet does) and tracks with
+ * nothing, until ohmd_cv1touch_set_sensor_pose gives it a pose again. Returns 0, or -1 when no
+ * such sensor is open. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_clear_sensor_pose(ohmd_device *device, const char *serial);
 
 #ifdef __cplusplus
 }

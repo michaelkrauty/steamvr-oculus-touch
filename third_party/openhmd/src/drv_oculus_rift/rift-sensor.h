@@ -80,6 +80,10 @@ void rift_sensor_retry(rift_sensor_ctx *sensor_ctx, uint64_t now_ns);
 void rift_sensor_free (rift_sensor_ctx *sensor_ctx);
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor);
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out);
+/* True when pose->serial is this sensor: it tracks with that camera -> world pose from its next frame on. */
+bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_pose *pose);
+/* True when serial is this sensor: from its next frame on it has no pose, and labels blobs by the long search. */
+bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial);
 bool rift_sensor_add_device (rift_sensor_ctx *ctx, rift_tracked_device *device);
 bool rift_sensor_start(rift_sensor_ctx *sensor);
 

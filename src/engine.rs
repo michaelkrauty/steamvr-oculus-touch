@@ -87,16 +87,18 @@ struct SensorConfig {
 }
 
 // used by the engine, and by tests on any build
+/// A sensor serial as the engine takes it: 1 to 31 ASCII letters or digits, NUL-terminated.
+fn serial(s: &str) -> Result<[c_char; 32], String> {
+    if s.is_empty() || s.len() > 31 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err("sensor serials must contain 1 to 31 ASCII letters or digits".into());
+    }
+    let mut out = [0; 32];
+    copy_cstr(&mut out, s);
+    Ok(out)
+}
+
 #[cfg_attr(not(feature = "engine"), allow(dead_code))]
 fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
-    fn serial(s: &str) -> Result<[c_char; 32], String> {
-        if s.is_empty() || s.len() > 31 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err("sensor serials must contain 1 to 31 ASCII letters or digits".into());
-        }
-        let mut out = [0; 32];
-        copy_cstr(&mut out, s);
-        Ok(out)
-    }
     if opts.ignore_sensors.len() > c_int::MAX as usize
         || opts.fixed_poses.len() > c_int::MAX as usize
     {
@@ -342,6 +344,45 @@ impl Engine {
                         .then_some(s)
                 })
                 .collect()
+        }
+    }
+
+    /// Gives the open sensor `serial` the camera -> world pose it tracks with from its next frame
+    /// on (its calibrated pose at start, until then). Err when no such sensor is open.
+    pub fn set_sensor_pose(
+        &self,
+        serial: &str,
+        orient_xyzw: [f64; 4],
+        pos: [f64; 3],
+    ) -> Result<(), String> {
+        let pose = ffi::ohmd_cv1touch_sensor_pose {
+            serial: self::serial(serial)?,
+            orient: orient_xyzw.map(|v| v as f32),
+            pos: pos.map(|v| v as f32),
+        };
+        // SAFETY: valid device and a complete, NUL-terminated pose structure.
+        if unsafe { ffi::ohmd_cv1touch_set_sensor_pose(self.hands[HAND_RIGHT], &pose) } == 0 {
+            Ok(())
+        } else {
+            Err(format!("the engine has no open sensor {serial}"))
+        }
+    }
+
+    /// Takes the open sensor `serial`'s pose away: it then labels blobs in every frame by the long
+    /// search, as a sensor with no pose yet does, and tracks with nothing, until
+    /// `set_sensor_pose` gives it one. Err when no such sensor is open.
+    pub fn clear_sensor_pose(&self, serial: &str) -> Result<(), String> {
+        let serial_c = self::serial(serial)?;
+        // SAFETY: valid device and a NUL-terminated serial.
+        if unsafe {
+            ffi::ohmd_cv1touch_clear_sensor_pose(self.hands[HAND_RIGHT], serial_c.as_ptr())
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "the engine has no open sensor {serial}, or it may place itself (provisional mode)"
+            ))
         }
     }
 

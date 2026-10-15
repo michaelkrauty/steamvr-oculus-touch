@@ -94,6 +94,12 @@ struct rift_sensor_ctx_s
 
 	bool long_analysis_busy;
 
+	/* cv1touch: a camera pose given (or taken away: pending_clear) at runtime, applied by the
+	 * fast analysis thread */
+	bool have_pending_pose;
+	bool pending_clear;
+	posef pending_pose;
+
 	/* End protected by sensor_lock */
 
 	ohmd_thread* fast_analysis_thread;
@@ -656,6 +662,19 @@ static unsigned int fast_analysis_thread(void *arg)
 	rift_sensor_analysis_frame *frame = POP_QUEUE(&sensor->fast_analysis_q);
 	while (!sensor->shutdown) {
 			if (frame != NULL) {
+				/* cv1touch: a pose given at runtime, taken between frames while the long
+				 * analysis is not reading the pose finder */
+				if ((sensor->have_pending_pose || sensor->pending_clear) && !sensor->long_analysis_busy) {
+					if (sensor->pending_clear) {
+						sensor->pf.have_camera_pose = false;
+						LOGI("Sensor %d (%s) has no pose for now: it labels blobs only", sensor->id, sensor->serial_no);
+					} else {
+						rift_pose_finder_set_camera_pose(&sensor->pf, &sensor->pending_pose);
+						LOGI("Sensor %d (%s) uses a new pose", sensor->id, sensor->serial_no);
+					}
+					sensor->have_pending_pose = false;
+					sensor->pending_clear = false;
+				}
 				ohmd_unlock_mutex (sensor->sensor_lock);
 				if (init_frame_analyse(sensor, frame))
 					analyse_frame_fast(sensor, frame);
@@ -732,6 +751,34 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor)
 {
 	return sensor->serial_no;
+}
+
+bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_pose *pose)
+{
+	posef fixed;
+
+	if (!cv1touch_fixed_pose_lookup_list(pose, 1, sensor->serial_no, &fixed))
+		return false;
+	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->pending_pose = fixed;
+	sensor->have_pending_pose = true;
+	sensor->pending_clear = false;
+	ohmd_unlock_mutex(sensor->sensor_lock);
+	return true;
+}
+
+bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial)
+{
+	if (strcmp(sensor->serial_no, serial) != 0)
+		return false;
+	/* a sensor that may place itself would do so from its own fusion at once: not for it */
+	if (sensor->pf.cv1touch_allow_placement)
+		return false;
+	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->pending_clear = true;
+	sensor->have_pending_pose = false;
+	ohmd_unlock_mutex(sensor->sensor_lock);
+	return true;
 }
 
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out)

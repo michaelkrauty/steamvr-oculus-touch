@@ -1737,3 +1737,23 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device,
 		return -1;
 	return rift_tracker_get_sensor_info(hmd->tracker_ctx, index, out);
 }
+
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_set_sensor_pose(ohmd_device *device, const ohmd_cv1touch_sensor_pose *pose)
+{
+	if (device == NULL || device->getf != getf || pose == NULL)
+		return -1;
+	rift_hmd_t *hmd = rift_device_priv_get(device)->hmd;
+	if (hmd->tracker_ctx == NULL)
+		return -1;
+	return rift_tracker_set_sensor_pose(hmd->tracker_ctx, pose);
+}
+
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_clear_sensor_pose(ohmd_device *device, const char *serial)
+{
+	if (device == NULL || device->getf != getf || serial == NULL)
+		return -1;
+	rift_hmd_t *hmd = rift_device_priv_get(device)->hmd;
+	if (hmd->tracker_ctx == NULL)
+		return -1;
+	return rift_tracker_clear_sensor_pose(hmd->tracker_ctx, serial);
+}
