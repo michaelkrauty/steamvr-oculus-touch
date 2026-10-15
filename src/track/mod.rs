@@ -14,6 +14,7 @@ pub mod pipeline;
 pub mod predict;
 pub mod refine;
 pub mod replay;
+pub mod repose;
 pub mod search;
 pub mod tracker;
 pub mod vision;
