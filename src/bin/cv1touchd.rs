@@ -660,7 +660,8 @@ fn apply_tracked(
     };
     let v = v.unwrap_or(s.output.vel);
     state.lin_vel = [v.x as f32, v.y as f32, v.z as f32];
-    // the driver takes orient * (ang_vel - gyro_bias) as the world rate: the shaped one, in the body
+    // the driver gives SteamVR ang_vel - gyro_bias as the body rate it integrates in: the shaped
+    // world rate, turned into the body
     let body = q.inverse() * w + s.gyro_bias;
     state.ang_vel = [body.x as f32, body.y as f32, body.z as f32];
     state.gyro_bias = [
@@ -2152,7 +2153,7 @@ fn hold_unfixed(state: &mut ControllerState, last_seen: Option<[f32; 3]>) {
         state.pos = pos;
     }
     state.lin_vel = [0.0; 3];
-    // the driver extrapolates the turn orient * (ang_vel - gyro_bias)
+    // a zero body rate for the driver (ang_vel - gyro_bias = 0): no turn to extrapolate
     state.ang_vel = state.gyro_bias;
     state.flags &= !ffi::CV1T_FLAG_POSITION;
     state.last_position_fix_host_ns = 0;
@@ -3568,7 +3569,8 @@ mod tests {
         let mut st = ControllerState::default();
         let mut shaper = VelocityShaper::new(ShapeParams::default());
         apply_tracked(&mut st, &s, 0, &mut shaper, false);
-        // what the driver turns into SteamVR's world rate, and the linear velocity
+        // the body rate the driver hands SteamVR (the shaped world rate, in the body), and the
+        // linear velocity
         assert!((q * (v3(st.ang_vel) - v3(st.gyro_bias)) - rate).norm() < 1e-5);
         assert!((v3(st.lin_vel) - s.output.vel).norm() < 1e-6);
         let mut shaped = ControllerState::default();

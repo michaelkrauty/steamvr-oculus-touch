@@ -7,16 +7,6 @@ namespace cv1t {
 
 static vr::HmdQuaternion_t quat(const float q[4]) { return {q[3], q[0], q[1], q[2]}; }
 
-/* v rotated by unit quaternion (x y z w). */
-static void rotate(const float q[4], const double v[3], double out[3])
-{
-	const double x = q[0], y = q[1], z = q[2], w = q[3];
-	const double tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
-	out[0] = v[0] + w * tx + (y * tz - z * ty);
-	out[1] = v[1] + w * ty + (z * tx - x * tz);
-	out[2] = v[2] + w * tz + (x * ty - y * tx);
-}
-
 vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment *al, int hand, uint64_t now_ns)
 {
 	vr::DriverPose_t p{};
@@ -48,12 +38,14 @@ vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment
 	const bool set = al && (al->valid & CV1T_ALIGN_PREDICTION);
 	const double position_share = set ? al->prediction_position / 100.0 : 1.0;
 	const double rotation_share = set ? al->prediction_rotation / 100.0 : 1.0;
-	const double w_body[3] = {(double)st->ang_vel[0] - st->gyro_bias[0], (double)st->ang_vel[1] - st->gyro_bias[1], (double)st->ang_vel[2] - st->gyro_bias[2]};
-	rotate(st->orient, w_body, p.vecAngularVelocity);
+	// SteamVR integrates the angular velocity in the frame of qRotation (measured with a synthetic
+	// pose; its documentation says driver world space), and neither the alignment nor the render
+	// offset changes that frame: it gets the body rate with the bias removed. The linear velocity
+	// is in driver world space, as documented.
 	for (int i = 0; i < 3; i++) {
 		p.vecPosition[i] = st->pos[i];
 		p.vecVelocity[i] = st->lin_vel[i] * position_share;
-		p.vecAngularVelocity[i] *= rotation_share;
+		p.vecAngularVelocity[i] = ((double)st->ang_vel[i] - st->gyro_bias[i]) * rotation_share;
 	}
 	p.poseTimeOffset = age > 0 ? -static_cast<double>(age) * 1e-9 : 0.0;
 	const bool fixed = st->last_position_fix_host_ns != 0 &&

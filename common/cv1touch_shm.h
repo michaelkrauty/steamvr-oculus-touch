@@ -87,6 +87,7 @@ typedef struct cv1t_controller_state {
 	float raw_pos[3];
 	float lin_vel[3];                   /* m/s world, as tracked (and shaped for SteamVR's prediction) */
 	float ang_vel[3];                   /* the world rate w as body (q^-1 w) + gyro_bias, so that
+	                                     * ang_vel - gyro_bias is the body rate SteamVR integrates and
 	                                     * q (ang_vel - gyro_bias) = w; as tracked (and shaped) */
 	float lin_acc[3];
 	float gyro_raw[3];                  /* rad/s IMU frame, bias not removed */

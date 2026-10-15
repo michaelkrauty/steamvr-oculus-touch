@@ -21,7 +21,8 @@ static cv1t_controller_state state()
 	s.orient[0] = h; s.orient[3] = h; // 90 degrees about +X
 	s.pos[0] = 0.1f; s.pos[1] = 1.2f; s.pos[2] = -0.3f;
 	s.lin_vel[0] = 0.5f;
-	s.ang_vel[2] = 1.0f; s.gyro_bias[2] = 0.25f; // body +Z at 0.75 rad/s
+	s.gyro_bias[0] = 0.1f; s.gyro_bias[1] = -0.2f; s.gyro_bias[2] = 0.25f;
+	s.ang_vel[0] = 0.1f; s.ang_vel[1] = -0.2f; s.ang_vel[2] = 1.0f; // body +Z at 0.75 rad/s once the bias is off
 	return s;
 }
 
@@ -43,8 +44,9 @@ static void connected_pose_and_timing()
 	assert(approx(p.poseTimeOffset, -0.002));
 	assert(approx(p.qRotation.w, std::sqrt(0.5)) && approx(p.qRotation.x, std::sqrt(0.5)) && approx(p.qRotation.y, 0));
 	assert(approx(p.vecPosition[1], 1.2f) && approx(p.vecVelocity[0], 0.5f));
-	// body +Z rotated 90 degrees about +X is world -Y
-	assert(approx(p.vecAngularVelocity[0], 0, 1e-6) && approx(p.vecAngularVelocity[1], -0.75, 1e-6) && approx(p.vecAngularVelocity[2], 0, 1e-6));
+	// SteamVR integrates the angular velocity in the device's own frame (measured; its documentation
+	// says the world's), so it gets the body rate with the bias removed: +Z at 0.75 rad/s, unrotated
+	assert(approx(p.vecAngularVelocity[0], 0, 1e-6) && approx(p.vecAngularVelocity[1], 0, 1e-6) && approx(p.vecAngularVelocity[2], 0.75, 1e-6));
 	assert(p.qWorldFromDriverRotation.w == 1 && p.qDriverFromHeadRotation.w == 1);
 }
 
@@ -54,20 +56,20 @@ static void prediction_shares_scale_the_velocities()
 	cv1t_alignment al{};
 	// an alignment without the percents (from before they were published) gives all the motion
 	const auto all = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(approx(all.vecVelocity[0], 0.5) && approx(all.vecAngularVelocity[1], -0.75));
+	assert(approx(all.vecVelocity[0], 0.5) && approx(all.vecAngularVelocity[2], 0.75));
 	al.valid = CV1T_ALIGN_PREDICTION;
 	al.prediction_position = 100;
 	al.prediction_rotation = 0;
 	const auto moves = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(approx(moves.vecVelocity[0], 0.5) && moves.vecAngularVelocity[1] == 0);
+	assert(approx(moves.vecVelocity[0], 0.5) && moves.vecAngularVelocity[2] == 0);
 	al.prediction_position = 0;
 	al.prediction_rotation = 100;
 	const auto turns = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(turns.vecVelocity[0] == 0 && approx(turns.vecAngularVelocity[1], -0.75));
+	assert(turns.vecVelocity[0] == 0 && approx(turns.vecAngularVelocity[2], 0.75));
 	al.prediction_position = 50;
 	al.prediction_rotation = 50;
 	const auto half = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(approx(half.vecVelocity[0], 0.25) && approx(half.vecAngularVelocity[1], -0.375));
+	assert(approx(half.vecVelocity[0], 0.25) && approx(half.vecAngularVelocity[2], 0.375));
 	// the pose itself does not move with the shares
 	assert(half.vecPosition[1] == moves.vecPosition[1] && half.qRotation.w == moves.qRotation.w);
 }
@@ -96,7 +98,7 @@ static void a_lost_position_is_not_extrapolated()
 	s.flags &= ~CV1T_FLAG_POSITION;
 	const auto p = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'001'000'000);
 	assert(p.poseIsValid && p.vecVelocity[0] == 0 && p.vecVelocity[1] == 0 && p.vecVelocity[2] == 0);
-	assert(approx(p.vecAngularVelocity[1], -0.75, 1e-6));
+	assert(approx(p.vecAngularVelocity[2], 0.75, 1e-6));
 }
 
 static void alignment_is_applied_per_hand()
@@ -111,6 +113,8 @@ static void alignment_is_applied_per_hand()
 	const auto left = make_pose(&s, &al, CV1T_HAND_LEFT, 10'001'000'000);
 	assert(left.qWorldFromDriverRotation.w == 0 && left.qWorldFromDriverRotation.y == 1 && left.vecWorldFromDriverTranslation[0] == 2.0);
 	assert(approx(left.vecDriverFromHeadTranslation[2], 0.04f));
+	// neither the alignment nor the render offset touches the velocities handed over: SteamVR applies them itself
+	assert(approx(left.vecVelocity[0], 0.5f) && approx(left.vecAngularVelocity[0], 0, 1e-6) && approx(left.vecAngularVelocity[2], 0.75, 1e-6));
 	const auto right = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'001'000'000);
 	assert(right.qDriverFromHeadRotation.w == 1 && right.vecDriverFromHeadTranslation[2] == 0); // no right offset
 }
@@ -129,7 +133,7 @@ static void stale_sample_stops_then_disconnects()
 	const cv1t_controller_state s = state(); // sample at 10.000 s, moving
 	const auto aging = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'150'000'000);
 	assert(aging.deviceIsConnected && aging.poseIsValid);
-	assert(aging.vecVelocity[0] == 0 && aging.vecAngularVelocity[1] == 0);
+	assert(aging.vecVelocity[0] == 0 && aging.vecAngularVelocity[2] == 0);
 	assert(aging.result == vr::TrackingResult_Running_OutOfRange);
 	const auto dead = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 11'500'000'000);
 	assert(!dead.deviceIsConnected && !dead.poseIsValid);
