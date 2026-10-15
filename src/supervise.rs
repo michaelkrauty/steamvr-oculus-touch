@@ -601,11 +601,28 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    /// A stop request once the log at `path` holds `text`, however long the daemon took to end.
+    fn stop_once_logged(path: PathBuf, text: &'static str) -> Stopping<'static> {
+        let mut sent = false;
+        Stopping {
+            requested: Box::new(move || {
+                (!sent && read(&path).contains(text)).then(|| {
+                    sent = true;
+                    "Ctrl+C".to_string()
+                })
+            }),
+            ask: Box::new(|| Ok(())),
+            within: Duration::from_secs(10),
+        }
+    }
+
     #[test]
     fn a_stop_while_waiting_to_start_the_daemon_again_ends_the_supervisor() {
         let d = dir("waiting");
         let mut log = Log::open(&d).unwrap();
-        let mut stopping = stop_after(Duration::from_millis(300), || {}, Duration::from_secs(10));
+        // the stop comes once the supervisor waits to start the daemon again: a stop after a
+        // fixed time came while the daemon still ran on a loaded machine, which stops it instead
+        let mut stopping = stop_once_logged(log.path(), "starting it again in");
         let started = Instant::now();
         let code = run(
             || shell("exit 1"),
