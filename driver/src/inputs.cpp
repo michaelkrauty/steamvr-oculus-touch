@@ -9,8 +9,7 @@ namespace cv1t {
 InputValues map_inputs(const cv1t_controller_state *st, int hand, uint64_t now_ns)
 {
 	InputValues v;
-	if (!st || !(st->flags & CV1T_FLAG_CONNECTED) ||
-	    (now_ns > st->sample_host_ns && now_ns - st->sample_host_ns > kDeadSampleNs))
+	if (!st || !(st->flags & CV1T_FLAG_CONNECTED) || sample_dead(*st, now_ns))
 		return v;
 	const bool left = hand == CV1T_HAND_LEFT;
 	const uint32_t a_btn = left ? CV1T_BTN_X : CV1T_BTN_A, b_btn = left ? CV1T_BTN_Y : CV1T_BTN_B;

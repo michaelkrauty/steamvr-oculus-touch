@@ -502,7 +502,7 @@ fn rec_summary(path: &Path, windows: &[Window]) -> i32 {
     for (hand, name) in [(HAND_LEFT, "left"), (HAND_RIGHT, "right")] {
         for (t, delay) in summary::disconnect_delays(&states, hand) {
             println!(
-                "{name}: disconnected at {t} ns, {:.1} ms after its last radio report",
+                "{name}: silent from {t} ns (a radio gap or standby), {:.1} ms after its last radio report",
                 delay as f64 / 1e6
             );
         }
@@ -2863,7 +2863,7 @@ fn capture_free_named_with_feedback(
                     let touch = [HAND_LEFT, HAND_RIGHT].map(|hand| {
                         reader
                             .hand(hand)
-                            .filter(|st| st.flags & cv1touch::hand::FLAG_CONNECTED != 0)
+                            .filter(|st| cv1touch::hand::reporting(st.flags))
                             .map(|st| register::extrapolate(&st, now).rotation)
                     });
                     let _ = out.send(PoseFrame {

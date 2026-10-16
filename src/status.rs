@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 use crate::hand::{
     BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, FLAG_CALIBRATED, FLAG_CONNECTED,
-    FLAG_POSITION, TOUCH_A, TOUCH_B, TOUCH_STICK, TOUCH_THUMBREST, TOUCH_TRIGGER, TOUCH_X, TOUCH_Y,
+    FLAG_POSITION, FLAG_RADIO_GAP, TOUCH_A, TOUCH_B, TOUCH_STICK, TOUCH_THUMBREST, TOUCH_TRIGGER,
+    TOUCH_X, TOUCH_Y,
 };
 use crate::shm::{serial_str, ControllerState, SensorStatus};
 
@@ -71,6 +72,8 @@ fn state_text(s: &ControllerState) -> &'static str {
         "not paired / never seen"
     } else if s.flags & FLAG_CONNECTED == 0 {
         "STANDBY / out of range"
+    } else if s.flags & FLAG_RADIO_GAP != 0 {
+        "radio silent: held as it was"
     } else if s.flags & FLAG_POSITION != 0 {
         "6DoF"
     } else {
@@ -247,6 +250,23 @@ mod tests {
         assert!(text.contains("+100.0") && text.contains("-200.0"));
         assert!(text.contains("buttons A") && text.contains("touch trigger"));
         assert!(text.contains("WMTD000000001: placed") && text.contains("R  48.5"));
+    }
+
+    #[test]
+    fn render_radio_gap() {
+        let text = render(
+            &[
+                state(FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_RADIO_GAP),
+                state(FLAG_CALIBRATED | FLAG_CONNECTED),
+            ],
+            &[],
+            &HashMap::new(),
+            0.004,
+            0x2A,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].contains("left") && lines[2].contains("radio silent: held as it was"));
+        assert!(lines[3].contains("right") && lines[3].contains("rotation only"));
     }
 
     /// Sensor counters are published every 250 ms but the board samples every 200 ms; rates must

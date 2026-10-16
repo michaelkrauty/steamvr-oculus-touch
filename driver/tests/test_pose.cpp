@@ -159,6 +159,27 @@ static void stale_sample_stops_then_disconnects()
 	assert(make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'050'000'000).vecVelocity[0] == 0.5); // still fresh
 }
 
+/* A radio gap (the daemon holds the controller as it was): connected and valid, out of range and
+ * still, for as long as the daemon says so; past kGapSampleNs (a daemon that stopped publishing
+ * during one) disconnected. */
+static void a_radio_gap_is_held_connected()
+{
+	cv1t_controller_state s = state(); // sample at 10.000 s, moving
+	s.flags = CV1T_FLAG_CALIBRATED | CV1T_FLAG_CONNECTED | CV1T_FLAG_RADIO_GAP;
+	s.last_position_fix_host_ns = 10'000'000'000;
+	const auto held = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 17'000'000'000);
+	assert(held.deviceIsConnected && held.poseIsValid);
+	assert(held.result == vr::TrackingResult_Running_OutOfRange);
+	assert(approx(held.vecPosition[1], 1.2f) && approx(held.qRotation.w, std::sqrt(0.5)));
+	assert(held.vecVelocity[0] == 0 && held.vecAngularVelocity[2] == 0);
+	assert(held.poseTimeOffset == 0); // held, not placed 7 s in the past
+	// out of range from the start of the gap, before the sample is stale or the fix coasted out
+	assert(make_pose(&s, nullptr, CV1T_HAND_RIGHT, 10'001'000'000).result == vr::TrackingResult_Running_OutOfRange);
+	const auto boundary = s.sample_host_ns + cv1t::kGapSampleNs;
+	assert(make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary).deviceIsConnected);
+	assert(!make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary + 1).deviceIsConnected);
+}
+
 int main()
 {
 	no_data_is_disconnected();
@@ -170,6 +191,7 @@ int main()
 	age_report_splits_the_hand_off();
 	never_a_positive_time_offset();
 	stale_sample_stops_then_disconnects();
+	a_radio_gap_is_held_connected();
 	printf("test_pose ok\n");
 	return 0;
 }

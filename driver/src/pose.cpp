@@ -34,7 +34,7 @@ vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment
 	if (!st || !(st->flags & CV1T_FLAG_CONNECTED))
 		return p; // not connected, not valid
 	const int64_t age = static_cast<int64_t>(now_ns - st->sample_host_ns);
-	if (age > static_cast<int64_t>(kDeadSampleNs))
+	if (sample_dead(*st, now_ns))
 		return p; // the daemon stopped publishing: no frozen poses
 	p.deviceIsConnected = true;
 	p.poseIsValid = true;
@@ -64,11 +64,14 @@ vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment
 		p.vecVelocity[i] = st->lin_vel[i] * position_share;
 		p.vecAngularVelocity[i] = ((double)st->ang_vel[i] - st->gyro_bias[i]) * rotation_share;
 	}
-	p.poseTimeOffset = age > 0 ? -static_cast<double>(age) * 1e-9 : 0.0;
+	// a radio gap's pose is held, not placed in time: its sample can be seconds old
+	const bool gap = st->flags & CV1T_FLAG_RADIO_GAP;
+	p.poseTimeOffset = age > 0 && !gap ? -static_cast<double>(age) * 1e-9 : 0.0;
 	const bool fixed = st->last_position_fix_host_ns != 0 &&
 			   static_cast<int64_t>(now_ns - st->last_position_fix_host_ns) <= static_cast<int64_t>(kCoastNs);
 	const bool stale = age > static_cast<int64_t>(kStaleSampleNs);
-	p.result = fixed && !stale ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
+	// a radio gap: the controller as it was, where the game keeps it (the daemon sends no position)
+	p.result = fixed && !stale && !gap ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
 	if (stale) {
 		for (int i = 0; i < 3; i++)
 			p.vecVelocity[i] = p.vecAngularVelocity[i] = 0; // hold still rather than extrapolate an old motion

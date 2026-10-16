@@ -2,8 +2,8 @@
 // Copyright 2026 michaelkrauty
 
 //! Converts one engine controller snapshot into the published shared-memory state: connection and
-//! standby detection, position-hold window, per-hand button mapping, capacitive touch hysteresis
-//! and device→host time mapping.
+//! standby detection, radio gaps, position-hold window, per-hand button mapping, capacitive touch
+//! hysteresis and device→host time mapping.
 
 use crate::clock_map::ClockMap;
 use crate::ffi;
@@ -12,6 +12,7 @@ use crate::shm::{ControllerState, HAND_LEFT, HAND_RIGHT};
 pub const FLAG_CALIBRATED: u32 = ffi::CV1T_FLAG_CALIBRATED;
 pub const FLAG_CONNECTED: u32 = ffi::CV1T_FLAG_CONNECTED;
 pub const FLAG_POSITION: u32 = ffi::CV1T_FLAG_POSITION;
+pub const FLAG_RADIO_GAP: u32 = ffi::CV1T_FLAG_RADIO_GAP;
 pub const BTN_A: u32 = ffi::CV1T_BTN_A;
 pub const BTN_B: u32 = ffi::CV1T_BTN_B;
 pub const BTN_X: u32 = ffi::CV1T_BTN_X;
@@ -51,10 +52,19 @@ pub fn battery_from_radio(d: &[u8]) -> Vec<(usize, i32)> {
         .collect()
 }
 
+/// Whether a published state is of a controller whose samples are arriving: connected and not in
+/// a radio gap.
+pub fn reporting(flags: u32) -> bool {
+    flags & FLAG_CONNECTED != 0 && flags & FLAG_RADIO_GAP == 0
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HandConfig {
-    /// No new IMU sample for this long means standby / out of range.
+    /// No new IMU sample for this long means the controller's samples stopped.
     pub connect_timeout_ns: u64,
+    /// A controller whose samples stop stays connected this long after its last sample, as it
+    /// was then, inputs held (a radio gap); past it, it is in standby or out of range.
+    pub ride_through_ns: u64,
     /// Position stays valid this long after the last optical fix (engine POSE_LOST_THRESHOLD).
     pub position_hold_ns: u64,
     /// Capacitive hysteresis thresholds on the normalized values.
@@ -66,11 +76,43 @@ impl Default for HandConfig {
     fn default() -> Self {
         Self {
             connect_timeout_ns: 100_000_000,
+            ride_through_ns: 10_000_000_000,
             position_hold_ns: 500_000_000,
             touch_on: 0.6,
             touch_off: 0.4,
         }
     }
+}
+
+/// A controller that turned faster than this within `MOTION_WINDOW_NS` of its last sample was in
+/// use when its samples stopped, rad/s: a controller put down has been still for longer.
+const MOTION_RAD_S: f32 = 0.5;
+const MOTION_WINDOW_NS: u64 = 3_000_000_000;
+
+/// A change in a controller's radio gap (see `HandConfig::ride_through_ns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapEvent {
+    /// Its samples stopped: no sample since `last_sample_host_ns`. `moving`: it turned within a
+    /// few seconds before.
+    Began {
+        last_sample_host_ns: u64,
+        moving: bool,
+    },
+    /// Its samples came back after `silent_ns` without.
+    Ended { silent_ns: u64 },
+    /// No sample for the whole ride-through: published as in standby from now.
+    Expired { silent_ns: u64 },
+}
+
+/// The inputs a controller last reported while its samples arrived, held through a radio gap.
+#[derive(Debug, Clone, Copy, Default)]
+struct HeldInputs {
+    trigger: f32,
+    grip: f32,
+    stick: [f32; 2],
+    cap: [f32; 5],
+    buttons: u32,
+    touches: u32,
 }
 
 pub struct Hand {
@@ -80,6 +122,12 @@ pub struct Hand {
     last_device_ns: u64,
     last_advance_host_ns: u64,
     touches: u32,
+    held: HeldInputs,
+    /// Published live since its samples last stopped for good: what a radio gap holds.
+    seen_live: bool,
+    in_gap: bool,
+    last_motion_host_ns: u64,
+    event: Option<GapEvent>,
 }
 
 fn hysteresis(cur: u32, bit: u32, value: f32, on: f32, off: f32) -> u32 {
@@ -102,7 +150,17 @@ impl Hand {
             last_device_ns: 0,
             last_advance_host_ns: 0,
             touches: 0,
+            held: HeldInputs::default(),
+            seen_live: false,
+            in_gap: false,
+            last_motion_host_ns: 0,
+            event: None,
         }
+    }
+
+    /// The radio-gap change the last `update` found, if any (taken once).
+    pub fn take_event(&mut self) -> Option<GapEvent> {
+        self.event.take()
     }
 
     fn map_buttons(&self, b: u8) -> u32 {
@@ -159,13 +217,47 @@ impl Hand {
         out.flags |= FLAG_CALIBRATED;
 
         if c.device_time_ns != self.last_device_ns {
+            if self.in_gap {
+                self.in_gap = false;
+                self.event = Some(GapEvent::Ended {
+                    silent_ns: c.received_host_ns.saturating_sub(self.last_advance_host_ns),
+                });
+            }
             self.last_device_ns = c.device_time_ns;
             self.last_advance_host_ns = c.received_host_ns;
             self.clock.observe(c.device_time_ns, c.received_host_ns);
+            let g = c.imu_gyro;
+            if g[0] * g[0] + g[1] * g[1] + g[2] * g[2] > MOTION_RAD_S * MOTION_RAD_S {
+                self.last_motion_host_ns = c.received_host_ns;
+            }
         }
-        let connected = self.last_advance_host_ns != 0
-            && now_ns.saturating_sub(self.last_advance_host_ns) < self.cfg.connect_timeout_ns;
-        if connected {
+        let silent_ns = now_ns.saturating_sub(self.last_advance_host_ns);
+        let connected = self.last_advance_host_ns != 0 && silent_ns < self.cfg.connect_timeout_ns;
+        // a controller whose samples stopped stays as it was for the ride-through: a radio that
+        // drops it for a moment, or for the seconds it takes to find it again, takes nothing from
+        // the hand holding it. Only one published live since: there is nothing else to hold.
+        self.seen_live |= connected;
+        let gap = self.seen_live && !connected && silent_ns < self.cfg.ride_through_ns;
+        if gap && !self.in_gap {
+            self.in_gap = true;
+            self.event = Some(GapEvent::Began {
+                last_sample_host_ns: self.last_advance_host_ns,
+                moving: self.last_motion_host_ns != 0
+                    && self
+                        .last_advance_host_ns
+                        .saturating_sub(self.last_motion_host_ns)
+                        <= MOTION_WINDOW_NS,
+            });
+        } else if !gap && !connected {
+            self.seen_live = false;
+            if self.in_gap {
+                self.in_gap = false;
+                self.event = Some(GapEvent::Expired { silent_ns });
+            }
+        }
+        if gap {
+            out.flags |= FLAG_CONNECTED | FLAG_RADIO_GAP;
+        } else if connected {
             out.flags |= FLAG_CONNECTED;
             if c.last_pose_fix_device_ns != 0
                 && c.device_time_ns.saturating_sub(c.last_pose_fix_device_ns)
@@ -193,14 +285,26 @@ impl Hand {
         out.pos_stddev = c.pos_stddev;
         out.rot_stddev = c.rot_stddev;
         self.update_touches(&c.cap);
-        // The engine keeps the last report after a dropout; publish released inputs instead.
         if connected {
-            out.trigger = c.trigger;
-            out.grip = c.grip;
-            out.stick = c.stick;
-            out.cap = c.cap;
-            out.buttons = self.map_buttons(c.buttons);
-            out.touches = self.touches;
+            self.held = HeldInputs {
+                trigger: c.trigger,
+                grip: c.grip,
+                stick: c.stick,
+                cap: c.cap,
+                buttons: self.map_buttons(c.buttons),
+                touches: self.touches,
+            };
+        }
+        // Through a radio gap the inputs stay as the controller last reported them, whatever the
+        // engine keeps; in standby they are released (the engine keeps the last report).
+        if connected || gap {
+            let h = self.held;
+            out.trigger = h.trigger;
+            out.grip = h.grip;
+            out.stick = h.stick;
+            out.cap = h.cap;
+            out.buttons = h.buttons;
+            out.touches = h.touches;
         }
         out
     }
@@ -245,10 +349,16 @@ mod tests {
         assert!(out.flags & FLAG_CONNECTED != 0 && out.flags & FLAG_POSITION != 0);
         assert!(out.touches & TOUCH_THUMBREST != 0);
 
-        // Samples stop (standby); the engine keeps returning the frozen pose.
+        // Samples stop (standby); the engine keeps returning the frozen pose. A radio gap first,
+        // then standby once the ride-through is over.
         let out = h.update(&c, host + 150_000_000);
+        assert_eq!(out.flags & (FLAG_RADIO_GAP | FLAG_POSITION), FLAG_RADIO_GAP);
+        let out = h.update(&c, host + 10_000_000_000);
         assert!(out.flags & FLAG_CALIBRATED != 0);
-        assert_eq!(out.flags & (FLAG_CONNECTED | FLAG_POSITION), 0);
+        assert_eq!(
+            out.flags & (FLAG_CONNECTED | FLAG_POSITION | FLAG_RADIO_GAP),
+            0
+        );
         assert_eq!(out.touches, 0);
 
         // Wake: samples resume; position needs a new optical fix.
@@ -261,8 +371,8 @@ mod tests {
         assert_eq!(out.flags & FLAG_POSITION, 0);
     }
 
-    /// A controller that drops out (standby, out of radio range) must not keep publishing held
-    /// inputs: a trigger held at the moment of disconnect would otherwise stay held forever.
+    /// A controller that drops out for good (standby, out of radio range) must not keep publishing
+    /// held inputs: a trigger held at the moment of disconnect would otherwise stay held forever.
     #[test]
     fn inputs_released_when_disconnected() {
         let mut h = Hand::new(HAND_RIGHT, HandConfig::default());
@@ -276,13 +386,163 @@ mod tests {
         c.cap = [1.0; 5];
         let live = h.update(&c, 1_000_000_000);
         assert!(live.flags & FLAG_CONNECTED != 0 && live.buttons != 0 && live.trigger > 0.5);
-        let gone = h.update(&c, 1_000_000_000 + 150_000_000);
+        let gone = h.update(&c, 1_000_000_000 + 10_000_000_000);
         assert_eq!(gone.flags & FLAG_CONNECTED, 0);
         assert_eq!((gone.buttons, gone.touches), (0, 0));
         assert_eq!(
             (gone.trigger, gone.grip, gone.stick, gone.cap),
             (0.0, 0.0, [0.0; 2], [0.0; 5])
         );
+    }
+
+    /// One live sample at `host` with these inputs, the device clock a step on.
+    fn live_sample(
+        h: &mut Hand,
+        c: &mut ffi::ohmd_cv1touch_controller,
+        host: u64,
+    ) -> ControllerState {
+        c.device_time_ns += 2_000_000;
+        c.received_host_ns = host;
+        h.update(c, host)
+    }
+
+    /// Through a radio gap the controller stays connected with every input as it last reported
+    /// it, whatever the engine keeps or a sleeping controller's beacon says, and without a
+    /// position; the gap is reported as it begins and as it ends.
+    #[test]
+    fn radio_gap_holds_the_inputs_as_they_were() {
+        let mut h = Hand::new(HAND_RIGHT, HandConfig::default());
+        let mut c = input();
+        c.device_time_ns = 10_000_000;
+        c.buttons = 0x1 | 0x8;
+        c.trigger = 0.9;
+        c.grip = 0.8;
+        c.stick = [0.5, -0.5];
+        c.cap = [1.0; 5];
+        c.imu_gyro = [0.0, 2.0, 0.0];
+        let host = 1_000_000_000;
+        let live = live_sample(&mut h, &mut c, host);
+        assert!(reporting(live.flags));
+        assert_eq!(h.take_event(), None);
+
+        // the samples stop; the engine's copy of the inputs changes all the same
+        c.buttons = 0;
+        c.trigger = 0.0;
+        c.grip = 0.0;
+        c.stick = [0.0; 2];
+        c.cap = [0.0; 5];
+        let held = h.update(&c, host + 150_000_000);
+        assert_eq!(
+            held.flags,
+            FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_RADIO_GAP
+        );
+        assert!(!reporting(held.flags));
+        assert_eq!(held.buttons, BTN_A | BTN_STICK);
+        assert_eq!(
+            (held.trigger, held.grip, held.stick, held.cap),
+            (0.9, 0.8, [0.5, -0.5], [1.0; 5])
+        );
+        assert_eq!(held.touches, live.touches);
+        assert_ne!(held.touches, 0);
+        assert_eq!(
+            h.take_event(),
+            Some(GapEvent::Began {
+                last_sample_host_ns: host,
+                moving: true
+            })
+        );
+        // reported once
+        let still = h.update(&c, host + 9_000_000_000);
+        assert_eq!(still.flags & FLAG_RADIO_GAP, FLAG_RADIO_GAP);
+        assert_eq!(still.buttons, BTN_A | BTN_STICK);
+        assert_eq!(h.take_event(), None);
+
+        // back: the inputs are the controller's again
+        let back = live_sample(&mut h, &mut c, host + 9_500_000_000);
+        assert!(reporting(back.flags));
+        assert_eq!((back.buttons, back.trigger), (0, 0.0));
+        assert_eq!(
+            h.take_event(),
+            Some(GapEvent::Ended {
+                silent_ns: 9_500_000_000
+            })
+        );
+    }
+
+    /// A gap longer than the ride-through ends in standby, reported once, inputs released.
+    #[test]
+    fn radio_gap_expires_into_standby() {
+        let mut h = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut c = input();
+        c.trigger = 1.0;
+        let host = 5_000_000_000;
+        live_sample(&mut h, &mut c, host);
+        h.update(&c, host + 200_000_000);
+        assert!(matches!(
+            h.take_event(),
+            Some(GapEvent::Began { moving: false, .. })
+        ));
+        let held = h.update(&c, host + 9_999_000_000);
+        assert_eq!(held.trigger, 1.0);
+        let gone = h.update(&c, host + 10_001_000_000);
+        assert_eq!(gone.flags, FLAG_CALIBRATED);
+        assert_eq!(gone.trigger, 0.0);
+        assert_eq!(
+            h.take_event(),
+            Some(GapEvent::Expired {
+                silent_ns: 10_001_000_000
+            })
+        );
+        h.update(&c, host + 12_000_000_000);
+        assert_eq!(h.take_event(), None);
+        // a sample seen only once it is old is no gap of a controller published live long before
+        c.device_time_ns += 2_000_000;
+        c.received_host_ns = host + 20_000_000_000;
+        assert_eq!(h.update(&c, host + 20_150_000_000).flags, FLAG_CALIBRATED);
+        assert_eq!(h.take_event(), None);
+        // waking long after is no gap's end
+        live_sample(&mut h, &mut c, host + 30_000_000_000);
+        assert_eq!(h.take_event(), None);
+    }
+
+    /// A gap holds what was published live: a controller never published live since its samples
+    /// stopped (a publisher that first sees it late) is in standby, with nothing held.
+    #[test]
+    fn no_radio_gap_without_a_live_state_to_hold() {
+        let mut h = Hand::new(HAND_RIGHT, HandConfig::default());
+        let mut c = input();
+        c.device_time_ns = 10_000_000;
+        c.received_host_ns = 1_000_000_000;
+        c.buttons = 0x1;
+        let late = h.update(&c, 1_150_000_000);
+        assert_eq!(late.flags, FLAG_CALIBRATED);
+        assert_eq!(late.buttons, 0);
+        assert_eq!(h.take_event(), None);
+    }
+
+    /// `moving` says whether the controller turned within a few seconds of its last sample: one
+    /// put down and left still has not.
+    #[test]
+    fn radio_gap_says_whether_the_controller_was_in_use() {
+        let gap_after = |still_for_ns: u64| {
+            let mut h = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut c = input();
+            c.imu_gyro = [0.6, 0.0, 0.0];
+            live_sample(&mut h, &mut c, 1_000_000_000);
+            c.imu_gyro = [0.01, 0.0, 0.02];
+            let mut t = 1_000_000_000;
+            while t < 1_000_000_000 + still_for_ns {
+                t += 2_000_000;
+                live_sample(&mut h, &mut c, t);
+            }
+            h.update(&c, t + 150_000_000);
+            match h.take_event() {
+                Some(GapEvent::Began { moving, .. }) => moving,
+                e => panic!("{e:?}"),
+            }
+        };
+        assert!(gap_after(2_900_000_000));
+        assert!(!gap_after(3_100_000_000));
     }
 
     #[test]

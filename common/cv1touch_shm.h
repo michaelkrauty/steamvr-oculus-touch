@@ -48,8 +48,12 @@ enum { CV1T_HAND_LEFT = 0, CV1T_HAND_RIGHT = 1, CV1T_HAND_COUNT = 2 };
 
 /* cv1t_controller_state.flags */
 #define CV1T_FLAG_CALIBRATED (1u << 0) /* factory calibration read: controller paired and seen */
-#define CV1T_FLAG_CONNECTED (1u << 1)  /* IMU samples arriving: awake and in radio range */
+#define CV1T_FLAG_CONNECTED (1u << 1)  /* IMU samples arriving, or a radio gap (below): awake and in range */
 #define CV1T_FLAG_POSITION (1u << 2)   /* optical position fix within the hold window */
+/* With CONNECTED: no IMU sample for over 100 ms, for at most 10 s (a radio gap). The state is the
+ * controller as it was at its last sample, inputs held, not moving, without a position: keep it
+ * in the application as it was. Readers that do not know this flag see an old sample. */
+#define CV1T_FLAG_RADIO_GAP (1u << 3)
 
 #define CV1T_BTN_A (1u << 0)
 #define CV1T_BTN_B (1u << 1)

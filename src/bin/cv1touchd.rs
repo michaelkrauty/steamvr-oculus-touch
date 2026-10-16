@@ -18,7 +18,7 @@ use std::time::Duration;
 use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::frame_queue::FrameQueue;
-use cv1touch::hand::{Hand, HandConfig};
+use cv1touch::hand::{GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
@@ -97,7 +97,7 @@ impl InputRuntime {
 
     fn apply(&mut self, hand: usize, state: &mut ControllerState) {
         let raw = &mut self.latest[hand];
-        raw.connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
+        raw.connected = cv1touch::hand::reporting(state.flags);
         raw.received_host_ns = state.received_host_ns;
         raw.buttons = state.buttons;
         raw.trigger = state.trigger;
@@ -2306,6 +2306,8 @@ struct HandMemory {
     unfixed_since: Option<u64>,
     /// Where the tracker last had the controller (see `hold_unfixed`).
     last_seen: Option<[f32; 3]>,
+    /// The state last published while the controller's samples arrived: what a radio gap holds.
+    last_live: Option<ControllerState>,
 }
 
 impl HandMemory {
@@ -2359,6 +2361,41 @@ fn apply_tracker(
         }
         None if connected => hold_unfixed(state, memory.last_seen),
         _ => state.flags &= !ffi::CV1T_FLAG_POSITION,
+    }
+}
+
+/// Logs a change in a controller's radio gap.
+fn note_gap(h: usize, event: GapEvent) {
+    let name = ["left", "right"][h];
+    let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
+    log(match event {
+        GapEvent::Began { moving, .. } => format!(
+            "{name}: radio silent ({}): holding it as it was, inputs included, for up to {ride_s:.0} s",
+            if moving { "in use" } else { "still" }
+        ),
+        GapEvent::Ended { silent_ns } => {
+            format!("{name}: radio back after {:.2} s", silent_ns as f64 * 1e-9)
+        }
+        GapEvent::Expired { silent_ns } => format!(
+            "{name}: radio silent for {:.0} s: standby, inputs released",
+            silent_ns as f64 * 1e-9
+        ),
+    });
+}
+
+/// What a controller in a radio gap is published as: the state last published while its samples
+/// arrived (its pose, and the inputs then held, input calibration applied), neither moving nor
+/// turning, without a position. The game keeps the hand where it was and whatever it held.
+fn held_through_gap(last: &ControllerState, now: u64) -> ControllerState {
+    ControllerState {
+        flags: (last.flags & ffi::CV1T_FLAG_CALIBRATED)
+            | ffi::CV1T_FLAG_CONNECTED
+            | ffi::CV1T_FLAG_RADIO_GAP,
+        lin_vel: [0.0; 3],
+        // a zero body rate for the driver (ang_vel - gyro_bias = 0)
+        ang_vel: last.gyro_bias,
+        publish_host_ns: now,
+        ..*last
     }
 }
 
@@ -2442,6 +2479,16 @@ fn publish_hand_state(
     }
     d.inputs.lock().unwrap().apply(h, &mut state);
     d.inject.apply(h, now, &mut state);
+    if state.flags & ffi::CV1T_FLAG_RADIO_GAP != 0 {
+        if let Some(last) = &memory.last_live {
+            state = held_through_gap(last, now);
+        }
+    } else {
+        memory.last_live = (state.flags & ffi::CV1T_FLAG_CONNECTED != 0).then_some(state);
+    }
+    if let Some(event) = hand.take_event() {
+        note_gap(h, event);
+    }
     d.shm.publish_hand(h, &state);
     if d.rec.active() {
         d.rec.write(
@@ -3892,6 +3939,76 @@ mod tests {
             &mut memory,
         );
         assert_eq!(d.shm.hand(HAND_LEFT).unwrap().pos, c.view_pos);
+    }
+
+    /// Through a radio gap a controller is published as it last was while its samples arrived:
+    /// its pose and its inputs (input calibration applied) as they were, connected, in the gap,
+    /// without a position or motion; it is published live again when its samples come back.
+    #[test]
+    fn a_radio_gap_publishes_the_controller_as_it_was() {
+        let d = status_daemon();
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        let mut memory = HandMemory::default();
+        let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+        let now = shm::now_ns();
+        let mut c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: now,
+            last_pose_fix_device_ns: 1_000_000,
+            view_pos: [3.0, 0.5, 4.0],
+            view_orient: [0.0, 0.6, 0.0, 0.8],
+            view_lin_vel: [1.0, 0.0, 0.0],
+            view_ang_vel: [0.0, 2.0, 0.0],
+            gyro_bias: [0.01, 0.0, 0.0],
+            trigger: 0.9,
+            grip: 1.0,
+            buttons: 0x1,
+            ..Default::default()
+        };
+        let mut publish = |c: &engine::Controller, at: u64| {
+            publish_hand_state(
+                &d,
+                HAND_RIGHT,
+                c,
+                at,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            );
+            d.shm.hand(HAND_RIGHT).unwrap()
+        };
+        let live = publish(&c, now);
+        assert_eq!(
+            live.flags & (ffi::CV1T_FLAG_POSITION | ffi::CV1T_FLAG_RADIO_GAP),
+            ffi::CV1T_FLAG_POSITION
+        );
+        // the samples stop, and the engine's copy moves on regardless
+        c.view_pos = [9.0; 3];
+        c.trigger = 0.0;
+        c.buttons = 0;
+        let held = publish(&c, now + 500_000_000);
+        assert_eq!(
+            held.flags,
+            ffi::CV1T_FLAG_CALIBRATED | ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP
+        );
+        assert_eq!((held.pos, held.orient), (live.pos, live.orient));
+        assert_eq!(
+            (held.trigger, held.grip, held.buttons),
+            (live.trigger, live.grip, live.buttons)
+        );
+        assert_ne!(held.buttons, 0);
+        assert_eq!(held.sample_host_ns, live.sample_host_ns);
+        assert_eq!(held.publish_host_ns, now + 500_000_000);
+        assert_eq!(held.lin_vel, [0.0; 3]);
+        assert_eq!(held.ang_vel, held.gyro_bias);
+        // back
+        c.device_time_ns += 600_000_000;
+        c.received_host_ns = now + 600_000_000;
+        let back = publish(&c, now + 600_000_000);
+        assert_eq!(back.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        assert_eq!((back.pos, back.buttons), ([9.0; 3], 0));
     }
 
     /// The log names each loss of a connected controller's position and, when it comes back, how

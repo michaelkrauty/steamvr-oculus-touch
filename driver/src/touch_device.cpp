@@ -122,9 +122,11 @@ void TouchDevice::update(const cv1t_controller_state *st, const cv1t_alignment *
 		vr::VRProperties()->SetUint64Property(container_, vr::Prop_CurrentUniverseId_Uint64, universe_);
 	}
 	const bool connected = pose.deviceIsConnected;
+	const bool gap = connected && (st->flags & CV1T_FLAG_RADIO_GAP);
 	const uint64_t sample = st ? st->sample_host_ns : 0;
-	// a new sample, a connection change, or a 100 ms keep-alive
-	if (sample == last_sample_ns_ && connected == last_connected_ && now_ns - last_submit_ns_ < 100'000'000)
+	// a new sample, a connection change, a radio gap's start or end, or a 100 ms keep-alive
+	if (sample == last_sample_ns_ && connected == last_connected_ && gap == last_gap_ &&
+	    now_ns - last_submit_ns_ < 100'000'000)
 		return;
 	vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id, pose, sizeof pose);
 	if (connected && sample != last_sample_ns_ && now_ns >= sample) {
@@ -136,8 +138,13 @@ void TouchDevice::update(const cv1t_controller_state *st, const cv1t_alignment *
 	}
 	if (connected != last_connected_)
 		cv1t_log("cv1touch: %s %s", serial(), connected ? "connected" : "disconnected (standby, out of range or no daemon)");
+	if (gap && !last_gap_)
+		cv1t_log("cv1touch: %s radio silent: held as it was", serial());
+	else if (!gap && last_gap_ && connected)
+		cv1t_log("cv1touch: %s radio back", serial());
 	last_sample_ns_ = sample;
 	last_connected_ = connected;
+	last_gap_ = gap;
 	last_submit_ns_ = now_ns;
 	send_inputs(map_inputs(st, hand_, now_ns), pose.poseTimeOffset);
 	if (st && connected && st->battery_percent >= 0 && st->battery_percent != battery_) {

@@ -78,12 +78,29 @@ static void a_dead_sample_releases_everything()
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary + 1) == cv1t::InputValues{});
 }
 
+// Through a radio gap the daemon publishes the inputs as they were held when it began: they stay
+// held for as long as the gap lasts, the trigger and buttons included.
+static void a_radio_gap_keeps_the_inputs_held()
+{
+    auto s = awake();
+    s.flags |= CV1T_FLAG_RADIO_GAP;
+    s.sample_host_ns = 1'000'000'000;
+    s.buttons = CV1T_BTN_A;
+    s.trigger = s.grip = 1;
+    const auto boundary = s.sample_host_ns + cv1t::kGapSampleNs;
+    const auto held = map_inputs(&s, CV1T_HAND_RIGHT, s.sample_host_ns + 9'000'000'000);
+    assert(held.a_click && held.trigger == 1 && held.grip == 1 && held.grip_touch);
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).a_click);
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary + 1) == cv1t::InputValues{});
+}
+
 int main()
 {
 	right_hand_bits();
 	left_hand_uses_x_and_y();
 	asleep_or_missing_releases_everything();
 	a_dead_sample_releases_everything();
+	a_radio_gap_keeps_the_inputs_held();
 	printf("test_inputs ok\n");
 	return 0;
 }

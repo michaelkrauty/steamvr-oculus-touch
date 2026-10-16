@@ -52,7 +52,7 @@ private:
 	InputValues last_inputs_{};
 	bool inputs_sent_ = false;
 	uint64_t last_sample_ns_ = 0, last_submit_ns_ = 0, universe_ = 0;
-	bool last_connected_ = false;
+	bool last_connected_ = false, last_gap_ = false;
 	int battery_ = -1;
 	std::vector<uint64_t> ages_, handoffs_;
 	uint64_t ages_since_ns_ = 0;

@@ -2,10 +2,10 @@
 // Copyright 2026 michaelkrauty
 
 //! Recording analysis for live verification: per-window connection/position fractions,
-//! receive→publish latency, and standby (connected→disconnected) detection delays.
+//! receive→publish latency, and how soon a controller's silence is noticed (reporting→silent).
+//! A controller held through a radio gap is not reporting.
 
-use crate::hand::FLAG_CONNECTED;
-use crate::hand::FLAG_POSITION;
+use crate::hand::{reporting, FLAG_POSITION};
 use crate::shm::ControllerState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,11 +55,11 @@ pub fn window_stats(
         .map(|(_, _, s)| s)
         .collect();
     let n = sel.len();
-    let frac = |flag: u32| {
+    let frac = |has: &dyn Fn(u32) -> bool| {
         if n == 0 {
             0.0
         } else {
-            sel.iter().filter(|s| s.flags & flag != 0).count() as f64 / n as f64
+            sel.iter().filter(|s| has(s.flags)).count() as f64 / n as f64
         }
     };
     // Only fresh samples measure receive->publish latency: the daemon republishes both hands on
@@ -72,7 +72,7 @@ pub fn window_stats(
         }
         let fresh = last_device_ns != Some(s.device_time_ns);
         last_device_ns = Some(s.device_time_ns);
-        if fresh && *t >= w.start_ns && *t <= w.end_ns && s.flags & FLAG_CONNECTED != 0 {
+        if fresh && *t >= w.start_ns && *t <= w.end_ns && reporting(s.flags) {
             lat.push(s.publish_host_ns.saturating_sub(s.received_host_ns));
         }
     }
@@ -81,14 +81,15 @@ pub fn window_stats(
         |p: f64| (!lat.is_empty()).then(|| lat[((lat.len() - 1) as f64 * p).round() as usize]);
     HandWindowStats {
         n,
-        connected: frac(FLAG_CONNECTED),
-        position: frac(FLAG_POSITION),
+        connected: frac(&reporting),
+        position: frac(&|f| f & FLAG_POSITION != 0),
         latency_p50_ns: pct(0.5),
         latency_p99_ns: pct(0.99),
     }
 }
 
-/// For each connected→disconnected flip: (host time of the flip, time since the last received report).
+/// For each flip from reporting to silent (a radio gap or standby): (host time of the flip, time
+/// since the last received report).
 pub fn disconnect_delays(states: &[(u64, usize, ControllerState)], hand: usize) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut prev_connected = false;
@@ -97,7 +98,7 @@ pub fn disconnect_delays(states: &[(u64, usize, ControllerState)], hand: usize) 
         if *h != hand {
             continue;
         }
-        let connected = s.flags & FLAG_CONNECTED != 0;
+        let connected = reporting(s.flags);
         if prev_connected && !connected {
             out.push((*t, t.saturating_sub(last_received)));
         }
@@ -196,5 +197,28 @@ mod tests {
             vec![(last_rx + 100_000_000, 100_000_000)]
         );
         assert_eq!(window_stats(&states, 1, &w).n, 0);
+    }
+
+    /// A controller held through a radio gap is published connected, but is silent.
+    #[test]
+    fn a_radio_gap_is_silence() {
+        let live = FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_POSITION;
+        let held = FLAG_CALIBRATED | FLAG_CONNECTED | crate::hand::FLAG_RADIO_GAP;
+        let states = vec![
+            (1_000_000_000, 1usize, st(1_000_000_000, 999_000_000, live)),
+            (1_101_000_000, 1, st(1_101_000_000, 999_000_000, held)),
+            (1_200_000_000, 1, st(1_200_000_000, 999_000_000, held)),
+            (1_300_000_000, 1, st(1_300_000_000, 1_299_000_000, live)),
+        ];
+        let w = Window {
+            name: "all".into(),
+            start_ns: 0,
+            end_ns: u64::MAX,
+        };
+        assert!((window_stats(&states, 1, &w).connected - 0.5).abs() < 1e-9);
+        assert_eq!(
+            disconnect_delays(&states, 1),
+            vec![(1_101_000_000, 102_000_000)]
+        );
     }
 }
