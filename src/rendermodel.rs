@@ -6,7 +6,9 @@
 //! The constant offset between them is measured by fitting the LEDs (positions and emission
 //! directions) to the body mesh: a coarse fit onto the surface (ICP from 24 starting
 //! orientations), then a refinement in which each LED is matched to the window its emission ray
-//! leaves the mesh through and all LEDs sit a common depth under their windows (`refine`).
+//! leaves the mesh through and all LEDs sit a common depth under their windows (`refine`). An LED
+//! whose ray leaves through a face that does not face it is under no window the mesh models and
+//! is left out (`WINDOW_FACING_DEG`).
 
 use std::path::PathBuf;
 
@@ -138,6 +140,11 @@ pub struct Fit {
     pub max_m: f64,
     /// The common depth of the LEDs under the surface, m (the cover over them).
     pub depth_m: f64,
+    /// LEDs under windows the mesh models: the fit and its figures are over these.
+    pub used: usize,
+    /// LEDs left out because their rays leave the mesh through no face once the others sit under
+    /// their windows: they point out of the mesh's gaps.
+    pub gaps: usize,
 }
 
 /// Where the ray from `p` along `dir` leaves the mesh: the nearest triangle it crosses outward
@@ -189,15 +196,79 @@ pub fn ray_exit(
 /// How far the LEDs' rays reach to find their windows: generous against the coarse fit's error.
 const WINDOW_REACH_M: f64 = 0.02;
 
+/// An LED's window faces the LED: a face further off its emission direction than this is not its
+/// window, and the LED is under no window the mesh models. The Touch's ring LEDs leave the body
+/// mesh within 13 degrees of their windows' normals; its two handle LEDs leave it through faces
+/// 34 to 50 degrees off, 3 to 5 mm in front of them (the mesh has no cover over them that the
+/// factory positions sit under), and matched to those faces they pulled the fit 4.5 degrees off
+/// the ring.
+const WINDOW_FACING_DEG: f64 = 30.0;
+
+/// What the mesh offers an LED at `p` shining along `a`.
+enum Window {
+    /// The window its ray leaves through: the exit point and the window's normal.
+    Found(Vector3<f64>, Vector3<f64>),
+    /// Its ray leaves through no face (the pose has it off its window): the nearest surface point
+    /// and that face's normal, to pull it back.
+    Nearest(Vector3<f64>, Vector3<f64>),
+    /// Its ray leaves through a face that does not face it: no window the mesh models.
+    None,
+}
+
+fn window(m: &Mesh, p: &Vector3<f64>, a: &Vector3<f64>) -> Window {
+    let a = a.normalize();
+    match ray_exit(m, p, &a, WINDOW_REACH_M) {
+        Some((q, _, n)) if a.dot(&n) >= WINDOW_FACING_DEG.to_radians().cos() => Window::Found(q, n),
+        Some(_) => Window::None,
+        None => {
+            let (q, n) = closest_point(m, p);
+            Window::Nearest(q, n)
+        }
+    }
+}
+
 /// The coarse fit refined: each LED matched to the window its emission ray leaves the mesh
 /// through, and every LED a common depth under its window (the cover, fitted along).
-/// Gauss-Newton on pose and depth, point-to-plane at the window. The emission direction only
-/// chooses the window: the body meshes are faceted (neighbouring facets of the ring's tube differ
-/// by 15 to 30 degrees), so a facet's normal says too little about the window's true normal to
-/// pull the pose by. Returns the transform and the depth; the start is kept when fewer than six
-/// LEDs find a window.
+/// Gauss-Newton on pose and depth, point-to-plane at the window. The emission direction chooses
+/// the window and rules out faces that do not face the LED (`window`); it does not pull the pose:
+/// the body meshes are faceted (neighbouring facets of the ring's tube differ by 15 to 30
+/// degrees), so a facet's normal says too little about the window's true normal for that. An LED
+/// whose ray leaves through no face is held the common depth under the nearest surface instead,
+/// which brings it back under its window as the pose improves; one still without a window once
+/// the others sit under theirs points out of a gap in the mesh and is left out: after each pass
+/// every LED is classified at the pose found, and `refine_pass` runs again over those with a
+/// window (at most three passes; an LED dropped by a pass that was still pulled off is taken back
+/// once it finds its window). Returns the transform, the depth and which LEDs the last pass
+/// fitted; the start is kept when fewer than six LEDs have a window or a surface to hold to.
 fn refine(
     leds: &[Led],
+    m: &Mesh,
+    start: Isometry3<f64>,
+    iterations: usize,
+) -> (Isometry3<f64>, f64, Vec<bool>) {
+    let mut keep = vec![true; leds.len()];
+    let (mut t, mut depth) = (start, 0.0);
+    for pass in 0..3 {
+        (t, depth) = refine_pass(leds, &keep, m, t, iterations);
+        let now: Vec<bool> = leds
+            .iter()
+            .map(|l| {
+                let p = (t * Point3::from(l.pos)).coords;
+                !matches!(window(m, &p, &(t.rotation * l.dir)), Window::Nearest(..))
+            })
+            .collect();
+        if now == keep || pass == 2 {
+            break;
+        }
+        keep = now;
+    }
+    (t, depth, keep)
+}
+
+/// One run of the refinement over the LEDs `keep` marks.
+fn refine_pass(
+    leds: &[Led],
+    keep: &[bool],
     m: &Mesh,
     start: Isometry3<f64>,
     iterations: usize,
@@ -208,11 +279,12 @@ fn refine(
         let mut h = nalgebra::SMatrix::<f64, 7, 7>::zeros();
         let mut g = nalgebra::SVector::<f64, 7>::zeros();
         let mut hits = 0usize;
-        for l in leds {
+        for (l, _) in leds.iter().zip(keep).filter(|(_, k)| **k) {
             let p = (t * Point3::from(l.pos)).coords;
             let a = t.rotation * l.dir;
-            let Some((q, _, n)) = ray_exit(m, &p, &a, WINDOW_REACH_M) else {
-                continue;
+            let (q, n) = match window(m, &p, &a) {
+                Window::Found(q, n) | Window::Nearest(q, n) => (q, n),
+                Window::None => continue,
             };
             hits += 1;
             // depth: p sits `depth` under the window along its normal
@@ -251,25 +323,36 @@ fn refine(
     (t, depth)
 }
 
-/// The fit's figures for `leds` placed by `render_from_model` with the LEDs `depth` under their
-/// windows: depth deviation rms and max (m). An LED whose ray leaves through no face is measured
-/// against the nearest surface point instead.
-fn measure(leds: &[Led], m: &Mesh, render_from_model: &Isometry3<f64>, depth: f64) -> (f64, f64) {
-    let (mut d2, mut dmax, mut n) = (0.0, 0.0, 0usize);
-    for l in leds {
+/// The fit's figures for the LEDs `keep` marks, placed by `render_from_model` with the LEDs
+/// `depth` under their windows: depth deviation rms and max (m), and how many LEDs are under a
+/// window. An LED whose ray leaves through no face is measured against the nearest surface point
+/// but not counted as under a window; one whose ray leaves through a face that does not face it
+/// is left out, as in the fit.
+fn measure(
+    leds: &[Led],
+    keep: &[bool],
+    m: &Mesh,
+    render_from_model: &Isometry3<f64>,
+    depth: f64,
+) -> (f64, f64, usize) {
+    let (mut d2, mut dmax, mut n, mut used) = (0.0, 0.0, 0usize, 0usize);
+    for (l, _) in leds.iter().zip(keep).filter(|(_, k)| **k) {
         let p = (render_from_model * Point3::from(l.pos)).coords;
         let a = render_from_model.rotation * l.dir;
-        let (q, nn) = match ray_exit(m, &p, &a, WINDOW_REACH_M) {
-            Some((q, _, nn)) => (q, nn),
-            None => closest_point(m, &p),
+        let (q, nn) = match window(m, &p, &a) {
+            Window::Found(q, nn) => {
+                used += 1;
+                (q, nn)
+            }
+            Window::Nearest(q, nn) => (q, nn),
+            Window::None => continue,
         };
         let dev = nn.dot(&(p - q)) + depth;
         d2 += dev * dev;
         dmax = f64::max(dmax, dev.abs());
         n += 1;
     }
-    let n = n.max(1) as f64;
-    ((d2 / n).sqrt(), dmax)
+    ((d2 / n.max(1) as f64).sqrt(), dmax, used)
 }
 
 /// One ICP run from `start`: Gauss-Newton on point-to-plane distances (an LED may slide along the
@@ -325,6 +408,11 @@ fn icp(leds: &[Led], m: &Mesh, start: Isometry3<f64>, iterations: usize) -> (Iso
 }
 
 pub fn fit(leds: &[Led], m: &Mesh) -> Fit {
+    fit_kept(leds, m).0
+}
+
+/// `fit`, with which LEDs the fit kept (the rest point out of the mesh's gaps).
+fn fit_kept(leds: &[Led], m: &Mesh) -> (Fit, Vec<bool>) {
     let centroid = |pts: &mut dyn Iterator<Item = Vector3<f64>>| {
         let (s, n) = pts.fold((Vector3::zeros(), 0usize), |(s, n), p| (s + p, n + 1));
         s / n.max(1) as f64
@@ -364,18 +452,27 @@ pub fn fit(leds: &[Led], m: &Mesh) -> Fit {
         }
     }
     let (coarse, _) = icp(leds, m, best, 200);
-    let (t, depth) = refine(leds, m, coarse, 60);
-    placed(leds, m, t, depth)
+    let (t, depth, keep) = refine(leds, m, coarse, 60);
+    (placed(leds, &keep, m, t, depth), keep)
 }
 
-/// The fit of `leds` placed by `render_from_model` with the LEDs `depth` under their windows.
-fn placed(leds: &[Led], m: &Mesh, render_from_model: Isometry3<f64>, depth: f64) -> Fit {
-    let (rms_m, max_m) = measure(leds, m, &render_from_model, depth);
+/// The fit of the LEDs `keep` marks, placed by `render_from_model` with the LEDs `depth` under
+/// their windows.
+fn placed(
+    leds: &[Led],
+    keep: &[bool],
+    m: &Mesh,
+    render_from_model: Isometry3<f64>,
+    depth: f64,
+) -> Fit {
+    let (rms_m, max_m, used) = measure(leds, keep, m, &render_from_model, depth);
     Fit {
         render_from_model,
         rms_m,
         max_m,
         depth_m: depth,
+        used,
+        gaps: keep.iter().filter(|k| !**k).count(),
     }
 }
 
@@ -448,7 +545,7 @@ pub fn fit_mirrored(
             dir: s.rotation * mx(&l.dir),
         }))
         .collect();
-    let right_fit = fit(&both, right_mesh);
+    let (right_fit, keep) = fit_kept(&both, right_mesh);
     let right_from = right_fit.render_from_model;
     // a left LED p: in the right model frame s(M p), in the right render frame right_from(s(M p)),
     // and in the left render frame (the mirror of the right one) M of that
@@ -459,9 +556,10 @@ pub fn fit_mirrored(
         Translation3::from(mx(&t.translation.vector)),
         UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r)),
     );
+    let (keep_right, keep_left) = keep.split_at(right.len());
     (
-        placed(left, left_mesh, left_from, right_fit.depth_m),
-        placed(right, right_mesh, right_from, right_fit.depth_m),
+        placed(left, keep_left, left_mesh, left_from, right_fit.depth_m),
+        placed(right, keep_right, right_mesh, right_from, right_fit.depth_m),
     )
 }
 
@@ -663,6 +761,130 @@ mod tests {
         );
         assert!((f.depth_m - 0.0015).abs() < 3e-4, "{}", f.depth_m);
         assert!(f.rms_m < 3e-4, "{}", f.rms_m);
+    }
+
+    /// Two LEDs 3 mm in front of a face that does not face them, their rays leaving the mesh 40
+    /// degrees off its normal (the Touch's handle LEDs are like this against the body mesh: 3 to
+    /// 5 mm in front of faces 34 to 50 degrees off). They are under no window the mesh models;
+    /// matched to that face they pull the ring's fit 4.7 degrees and 2.4 mm off.
+    #[test]
+    fn leds_in_front_of_a_face_that_does_not_face_them_are_left_out() {
+        let m = body();
+        let truth = Isometry3::from_parts(
+            Translation3::new(0.004, -0.012, 0.007),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.9, -2.1, 0.4)),
+        );
+        let (s, c) = 40f64.to_radians().sin_cos();
+        let strays = [
+            (Vector3::new(0.005, -0.05, 0.023), Vector3::new(s, 0.0, c)),
+            (Vector3::new(-0.005, -0.08, 0.023), Vector3::new(s, 0.0, c)),
+        ];
+        let model: Vec<Led> = leds()
+            .iter()
+            .map(|l| (l.pos - l.dir * 0.0015, l.dir))
+            .chain(strays)
+            .map(|(pos, dir)| Led {
+                pos: truth.inverse_transform_point(&pos.into()).coords,
+                dir: truth.rotation.inverse() * dir,
+            })
+            .collect();
+        let f = fit(&model, &m);
+        let err = f.render_from_model * truth.inverse();
+        assert!(
+            err.translation.vector.norm() < 3e-4 && err.rotation.angle() < 0.2f64.to_radians(),
+            "{:?} {}",
+            err.translation.vector,
+            err.rotation.angle().to_degrees()
+        );
+        assert!((f.depth_m - 0.0015).abs() < 3e-4, "{}", f.depth_m);
+        assert!(f.rms_m < 3e-4, "{}", f.rms_m);
+        assert_eq!(f.used, 20);
+    }
+
+    /// LEDs whose rays leave through no face at the start (the pose has the ring lifted off its
+    /// windows, as the coarse fit can leave the Touch's front ring LEDs) are held under the
+    /// nearest surface and come back under their windows; dropped, they would leave the rest to
+    /// settle the pose, which they cannot.
+    #[test]
+    fn leds_off_their_windows_are_brought_back_under_them() {
+        let m = body();
+        let truth = Isometry3::from_parts(
+            Translation3::new(0.004, -0.012, 0.007),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.9, -2.1, 0.4)),
+        );
+        let model: Vec<Led> = leds()
+            .iter()
+            .map(|l| Led {
+                pos: truth
+                    .inverse_transform_point(&(l.pos - l.dir * 0.0015).into())
+                    .coords,
+                dir: truth.rotation.inverse() * l.dir,
+            })
+            .collect();
+        let start = Translation3::new(0.0, 0.012, 0.0) * truth;
+        let off = model
+            .iter()
+            .filter(|l| {
+                let p = (start * Point3::from(l.pos)).coords;
+                ray_exit(&m, &p, &(start.rotation * l.dir), WINDOW_REACH_M).is_none()
+            })
+            .count();
+        assert!(off >= 6, "{off} LEDs off their windows at the start");
+        let (t, depth, keep) = refine(&model, &m, start, 200);
+        assert!(keep.iter().all(|&k| k), "{keep:?}");
+        let err = t * truth.inverse();
+        assert!(
+            err.translation.vector.norm() < 1e-4 && err.rotation.angle() < 0.1f64.to_radians(),
+            "{:?} {} (depth {})",
+            err.translation.vector,
+            err.rotation.angle().to_degrees(),
+            depth
+        );
+        assert!((depth - 0.0015).abs() < 1e-4, "{depth}");
+    }
+
+    /// An LED pointing out through a gap in the mesh (here the box's +z face is missing) finds no
+    /// window at any pose. Held under the nearest surface for good it would pull the fit toward
+    /// the box's side; once the other LEDs sit under their windows it is left out instead.
+    #[test]
+    fn an_led_pointing_out_of_a_gap_in_the_mesh_is_left_out() {
+        let full = body();
+        let m = Mesh {
+            tris: full
+                .tris
+                .into_iter()
+                .filter(|t| !t.iter().all(|v| (v.z - 0.02).abs() < 1e-9 && v.y <= 1e-9))
+                .collect(),
+        };
+        assert_eq!(m.tris.len(), full_tris() - 2);
+        let truth = Isometry3::from_parts(
+            Translation3::new(0.004, -0.012, 0.007),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.9, -2.1, 0.4)),
+        );
+        let gap = (Vector3::new(0.0, -0.05, 0.0185), Vector3::z());
+        let model: Vec<Led> = leds()
+            .iter()
+            .map(|l| (l.pos - l.dir * 0.0015, l.dir))
+            .chain([gap])
+            .map(|(pos, dir)| Led {
+                pos: truth.inverse_transform_point(&pos.into()).coords,
+                dir: truth.rotation.inverse() * dir,
+            })
+            .collect();
+        let f = fit(&model, &m);
+        let err = f.render_from_model * truth.inverse();
+        assert!(
+            err.translation.vector.norm() < 3e-4 && err.rotation.angle() < 0.2f64.to_radians(),
+            "{:?} {}",
+            err.translation.vector,
+            err.rotation.angle().to_degrees()
+        );
+        assert_eq!((f.used, f.gaps), (20, 1));
+        assert!(f.rms_m < 3e-4, "{}", f.rms_m);
+    }
+
+    fn full_tris() -> usize {
+        body().tris.len()
     }
 
     #[test]

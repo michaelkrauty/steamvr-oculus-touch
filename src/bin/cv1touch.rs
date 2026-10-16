@@ -896,19 +896,39 @@ fn fit_render(rec: Option<&Path>) -> i32 {
     for (hand, n, f, alone) in fits {
         let moved = alone.map_or(String::new(), |a| {
             let d = a.render_from_model.inverse() * f.render_from_model;
-            format!(" (fitted alone: {:.2} mm rms; this placement differs from that by {:.1} mm, {:.2} deg)", a.rms_m * 1e3, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees())
+            format!(" (fitted alone over {} LEDs: {:.2} mm rms; this placement differs from that by {:.1} mm, {:.2} deg)", a.used, a.rms_m * 1e3, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees())
         });
+        let mut left_out = Vec::new();
+        if n - f.used - f.gaps > 0 {
+            left_out.push(format!(
+                "{} under no window the mesh models (faces that do not face them)",
+                n - f.used - f.gaps
+            ));
+        }
+        if f.gaps > 0 {
+            left_out.push(format!("{} through no face (a gap in the mesh)", f.gaps));
+        }
+        let left_out = if left_out.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} left out: {})", n - f.used, left_out.join(", "))
+        };
         println!(
-            "{hand}: {n} LEDs, {:.1} mm under their windows; off that depth rms {:.2} mm, max {:.2} mm{moved}",
+            "{hand}: {} of {n} LEDs under windows the mesh models, {:.1} mm under them; off that depth rms {:.2} mm, max {:.2} mm{moved}{left_out}",
+            f.used,
             f.depth_m * 1e3,
             f.rms_m * 1e3,
             f.max_m * 1e3
         );
+        if f.used < 6 {
+            eprintln!("cv1touch: too few of the {hand} LEDs sit under windows the mesh models to place it; nothing installed");
+            return 1;
+        }
         hands.push(align::RenderOffset {
             hand: hand.into(),
             model_from_render: align::PoseEntry::from_iso(&f.render_from_model.inverse()),
             rms_mm: f.rms_m * 1e3,
-            leds: n,
+            leds: f.used,
         });
     }
     for (leds, hand) in [(ll, "left"), (lr, "right")] {

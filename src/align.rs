@@ -228,6 +228,7 @@ pub struct RenderOffset {
     /// LED model frame <- SteamVR render model frame.
     pub model_from_render: PoseEntry,
     pub rms_mm: f64,
+    /// LEDs the fit used (under windows the mesh models).
     pub leds: usize,
 }
 
