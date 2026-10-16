@@ -6,7 +6,8 @@
 //! Record: u16 type, u16 flags = 0, u32 payload_len, u64 host_ns, payload.
 //! CONTROLLER_STATE = u32 hand, u32 0, cv1t_controller_state; RAW_REPORT = u32 source, bytes;
 //! FRAME_OBS = ohmd_cv1touch_frame_info, n x ohmd_cv1touch_blob; SENSOR_INFO = ohmd_cv1touch_sensor;
-//! LED_MODEL = u32 device_id, u32 n, n x ohmd_cv1touch_led.
+//! LED_MODEL = u32 device_id, u32 n, n x ohmd_cv1touch_led; HAPTIC = u32 hand, f32 duration_s,
+//! f32 frequency_hz, f32 amplitude (a haptic command as the daemon got it; amplitude 0 is off).
 //! Tracking threads only copy into a ring under a mutex (no I/O); a writer thread does the file I/O.
 
 use std::fs::{File, OpenOptions};
@@ -33,6 +34,17 @@ pub const SENSOR_INFO: u16 = 5;
 pub const LED_MODEL: u16 = 6;
 /// A sensor frame's pixels (see `encode_frame`), recorded with `record start PATH --frames`.
 pub const RAW_FRAME: u16 = 7;
+pub const HAPTIC: u16 = 8;
+
+/// A HAPTIC record's payload.
+pub fn haptic_payload(hand: usize, duration_s: f32, frequency_hz: f32, amplitude: f32) -> [u8; 16] {
+    let mut p = [0u8; 16];
+    p[..4].copy_from_slice(&(hand as u32).to_le_bytes());
+    p[4..8].copy_from_slice(&duration_s.to_le_bytes());
+    p[8..12].copy_from_slice(&frequency_hz.to_le_bytes());
+    p[12..].copy_from_slice(&amplitude.to_le_bytes());
+    p
+}
 const FILE_HEADER_LEN: usize = 32;
 const RECORD_HEADER_LEN: usize = 16;
 const CHUNK: usize = 256 * 1024;

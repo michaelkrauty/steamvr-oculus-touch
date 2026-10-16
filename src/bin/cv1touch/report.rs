@@ -4,9 +4,10 @@
 //! `cv1touch report`: one zip file with what it takes to see what went wrong on someone else's
 //! computer. A summary (version, system, `doctor`'s checks, the Oculus USB devices and the
 //! drivers they run with, which programs run, the daemon's status, setup's state), the daemon's
-//! and SteamVR's logs (their ends), and cv1touch's settings and calibration. Nothing else: no
-//! recordings, nothing outside cv1touch's and SteamVR's files (SteamVR's log names the other VR
-//! devices, the user's folder and the network addresses: `CONTENTS` says so).
+//! and SteamVR's logs (their ends), cv1touch's settings and calibration, and the radio's traffic
+//! around the controllers' last dropouts (`cv1touch::flight`). Nothing else: no other recordings,
+//! nothing outside cv1touch's and SteamVR's files (SteamVR's log names the other VR devices, the
+//! user's folder and the network addresses: `CONTENTS` says so).
 
 use super::*;
 use cv1touch::calendar::Utc;
@@ -16,6 +17,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// The most of one log a report keeps: its end, where the problem usually is.
 const LOG_TAIL: u64 = 4 << 20;
+/// How many of the newest dropout recordings a report sends.
+const DROPOUTS: usize = 3;
 
 /// At most the last `max` bytes of `data`, from the start of a line, with a note saying how much
 /// was left out; `before` bytes came before `data` (left out already).
@@ -86,6 +89,17 @@ impl Report {
             Err(e) => self
                 .missing
                 .push(format!("{name}: {} ({e})", from.display())),
+        }
+    }
+
+    /// A recording sent whole (a dropout's is under 3 MB); a larger one is left out, and said so.
+    fn recording(&mut self, name: &str, from: &Path) {
+        match std::fs::metadata(from) {
+            Ok(m) if m.len() <= LOG_TAIL => self.log(name, from, false),
+            Ok(m) => self
+                .missing
+                .push(format!("{name}: {} bytes, too large to send", m.len())),
+            Err(_) => {}
         }
     }
 
@@ -288,6 +302,15 @@ fn collect() -> Report {
         report.log(&name, &path, false);
     }
     let dirs = platform::dirs::get();
+    // what the radio did around the controllers' last dropouts: radio reports and haptic
+    // commands, no camera images
+    for path in cv1touch::flight::recordings(&dirs.state)
+        .into_iter()
+        .take(DROPOUTS)
+    {
+        let name = format!("state/{}", path.file_name().unwrap().to_string_lossy());
+        report.recording(&name, &path);
+    }
     report.listing(&dirs.config);
     report.listing(&dirs.state);
     report
@@ -344,8 +367,9 @@ const CONTENTS: &str = concat!(
     "stand in your room);\n",
     "- SteamVR's log, which also names your other VR devices, your user folder and your ",
     "network addresses;\n",
-    "- the Oculus devices plugged in, and your system's version.\n",
-    "Nothing else: no recordings, and no other files."
+    "- the Oculus devices plugged in, and your system's version;\n",
+    "- what the controllers' radio sent around their last dropouts (no camera images).\n",
+    "Nothing else: no other recordings, and no other files."
 );
 
 pub(super) fn run(out: Option<PathBuf>) -> i32 {

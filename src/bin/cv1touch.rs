@@ -471,7 +471,7 @@ fn rec_summary(path: &Path, windows: &[Window]) -> i32 {
         eprintln!("cv1touch: {error}");
         return 1;
     }
-    println!("records by type (1 state, 2 raw report, 4 frame obs, 5 sensor info, 6 LED model): {by_type:?}");
+    println!("records by type (1 state, 2 raw report, 4 frame obs, 5 sensor info, 6 LED model, 7 raw frame, 8 haptic): {by_type:?}");
     for (serial, (n, first, last, poses)) in &frames {
         let span = (*last - *first) as f64 / 1e9;
         println!(

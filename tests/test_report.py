@@ -39,6 +39,8 @@ class ReportTests(unittest.TestCase):
         (self.config / "calibration.json.bak-1").write_text("an old calibration\n")
         (self.state / "imu-biases.json").write_text("{}\n")
         (self.state / "capture.rec").write_bytes(b"\0" * 1000)
+        for t in (1000, 1001, 1002, 1003):
+            (self.state / f"dropout-{t}-right.rec").write_bytes(b"CV1TREC\0" + bytes([t % 256]) * 100)
         (self.state / "logs/cv1touchd.log").write_text("2026-10-14T17:05:03.123Z cv1touchd: started\n")
         (self.state / "logs/cv1touchd.1.log").write_text("an earlier run\n")
         (self.root / "steam/logs/vrserver.txt").write_text("driver_cv1touch: connected\n")
@@ -53,8 +55,11 @@ class ReportTests(unittest.TestCase):
             for name in ("report.txt", "config/settings.json", "state/imu-biases.json",
                          "logs/cv1touchd.log", "logs/cv1touchd.1.log", "steamvr/vrserver.txt"):
                 self.assertIn(name, names)
-            # backups and recordings are listed, not sent
-            self.assertFalse(any("bak" in n or n.endswith(".rec") for n in names), names)
+            # backups and recordings are listed, not sent: but for the newest three dropouts'
+            dropouts = {f"state/dropout-{t}-right.rec" for t in (1001, 1002, 1003)}
+            self.assertTrue(dropouts <= names, names)
+            self.assertEqual(archive.read("state/dropout-1003-right.rec"), b"CV1TREC\0" + bytes([1003 % 256]) * 100)
+            self.assertFalse(any("bak" in n or (n.endswith(".rec") and n not in dropouts) for n in names), names)
             self.assertEqual(archive.read("config/settings.json"), b'{"prediction_percent": 0}\n')
             self.assertEqual(archive.read("steamvr/vrserver.txt"), b"driver_cv1touch: connected\n")
             summary = archive.read("report.txt").decode()

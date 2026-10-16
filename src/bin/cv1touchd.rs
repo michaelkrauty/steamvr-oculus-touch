@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
+use cv1touch::flight::{self, FlightRecorder};
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
@@ -136,6 +137,8 @@ fn reload_inputs(runtime: &Mutex<InputRuntime>, path: &std::path::Path) -> Resul
 struct Daemon {
     shm: ShmWriter,
     rec: Recorder,
+    /// The radio's recent traffic, recorded around a controller's dropout.
+    flight: FlightRecorder,
     quit: AtomicBool,
     /// A client asked the daemon to stop (control `stop`).
     stop_requested: AtomicBool,
@@ -442,12 +445,17 @@ impl EngineSink for Daemon {
 
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
         // the radio thread records its own copy of the radio's reports, stamped as they land
-        if self.rec.active() && !(source == 1 && self.radio_on.load(Ordering::Acquire)) {
+        let radio_thread = source == 1 && self.radio_on.load(Ordering::Acquire);
+        if self.rec.active() && !radio_thread {
             self.rec.write(
                 recorder::RAW_REPORT,
                 ts,
                 &[&(source as u32).to_le_bytes(), data],
             );
+        }
+        if source == 1 && !radio_thread {
+            self.flight
+                .note(recorder::RAW_REPORT, ts, &[&1u32.to_le_bytes(), data]);
         }
         if source == 1 {
             for (hand, pct) in cv1touch::hand::battery_from_radio(data) {
@@ -2080,6 +2088,8 @@ fn radio_main(
                 d.rec
                     .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
             }
+            d.flight
+                .note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
             let (samples, k) = dec.decode(report, at);
             for s in &samples[..k] {
                 let Some(h) = pipeline::device_hand(s.device_id) else {
@@ -2364,16 +2374,34 @@ fn apply_tracker(
     }
 }
 
-/// Logs a change in a controller's radio gap.
-fn note_gap(h: usize, event: GapEvent) {
+/// Logs a change in a controller's radio gap. The radio's traffic around a gap of at least
+/// `flight::SHORTEST_NS` is recorded (`FlightRecorder`) when it began while the controller was in
+/// use, or when it ended (a controller held still does not turn, but one asleep does not come
+/// back either); a shorter one that ends is a blip, not recorded.
+fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
     let name = ["left", "right"][h];
     let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
+    match event {
+        GapEvent::Began {
+            last_sample_host_ns,
+            moving: true,
+        } => d.flight.dropout(h, last_sample_host_ns),
+        GapEvent::Ended {
+            last_sample_host_ns,
+            silent_ns,
+        } if silent_ns >= flight::SHORTEST_NS => d.flight.dropout(h, last_sample_host_ns),
+        GapEvent::Ended {
+            last_sample_host_ns,
+            ..
+        } => d.flight.cancel(h, last_sample_host_ns),
+        _ => {}
+    }
     log(match event {
         GapEvent::Began { moving, .. } => format!(
             "{name}: radio silent ({}): holding it as it was, inputs included, for up to {ride_s:.0} s",
             if moving { "in use" } else { "still" }
         ),
-        GapEvent::Ended { silent_ns } => {
+        GapEvent::Ended { silent_ns, .. } => {
             format!("{name}: radio back after {:.2} s", silent_ns as f64 * 1e-9)
         }
         GapEvent::Expired { silent_ns } => format!(
@@ -2381,6 +2409,38 @@ fn note_gap(h: usize, event: GapEvent) {
             silent_ns as f64 * 1e-9
         ),
     });
+}
+
+/// Saves the dropout recordings that are due (`FlightRecorder::due`) in the state directory, on
+/// a thread of their own: a slow disk must not hold up the daemon's heartbeat.
+fn save_dropouts(d: &Daemon) {
+    let due = d.flight.due(shm::now_ns());
+    if due.is_empty() {
+        return;
+    }
+    let dir = platform::dirs::get().state;
+    let unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.as_secs());
+    let spawned = thread::Builder::new()
+        .name("cv1t-dropout".into())
+        .spawn(move || {
+            for dropout in due {
+                let name = ["left", "right"][dropout.hand];
+                match flight::save(&dir, &dropout, unix_s) {
+                    Ok(path) => log(format!(
+                        "{name}: recorded the radio from {} s before its dropout to {} s after: {}",
+                        flight::BEFORE_NS / 1_000_000_000,
+                        flight::AFTER_NS / 1_000_000_000,
+                        path.display()
+                    )),
+                    Err(e) => log(format!("{name}: could not record its dropout: {e}")),
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log(format!("could not record a dropout: {e}"));
+    }
 }
 
 /// What a controller in a radio gap is published as: the state last published while its samples
@@ -2487,7 +2547,7 @@ fn publish_hand_state(
         memory.last_live = (state.flags & ffi::CV1T_FLAG_CONNECTED != 0).then_some(state);
     }
     if let Some(event) = hand.take_event() {
-        note_gap(h, event);
+        note_gap(d, h, event);
     }
     d.shm.publish_hand(h, &state);
     if d.rec.active() {
@@ -2659,6 +2719,10 @@ fn handle(d: &Daemon, line: &str) -> String {
             frequency_hz,
             amplitude,
         }) => {
+            let payload = recorder::haptic_payload(hand, duration_s, frequency_hz, amplitude);
+            let now = shm::now_ns();
+            d.rec.write(recorder::HAPTIC, now, &[&payload]);
+            d.flight.note(recorder::HAPTIC, now, &[&payload]);
             d.haptics.lock().unwrap()[hand] = Some(Haptic {
                 duration_s,
                 frequency_hz,
@@ -3403,6 +3467,7 @@ fn main() {
     let d = Arc::new(Daemon {
         shm,
         rec,
+        flight: FlightRecorder::new(),
         quit: AtomicBool::new(false),
         stop_requested: AtomicBool::new(false),
         haptics: Mutex::new([None; 2]),
@@ -3478,6 +3543,7 @@ fn main() {
         // engine thread for seconds, which must not read as a dead daemon; stale poses are the
         // driver's own concern (sample age)
         d.shm.heartbeat(shm::now_ns());
+        save_dropouts(&d);
         if let Some(why) = shutdown.wait(Duration::from_millis(200)) {
             log(format!("{why}: shutting down"));
             break;
@@ -3514,6 +3580,7 @@ mod tests {
         Daemon {
             shm: ShmWriter::create(&name, 1).unwrap(),
             rec: Recorder::new(4096),
+            flight: FlightRecorder::new(),
             quit: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             haptics: Mutex::new([None; 2]),
@@ -3939,6 +4006,126 @@ mod tests {
             &mut memory,
         );
         assert_eq!(d.shm.hand(HAND_LEFT).unwrap().pos, c.view_pos);
+    }
+
+    /// A controller that goes silent while in use has the radio's traffic around its dropout
+    /// recorded, the haptic commands sent meanwhile included; one that goes silent lying still
+    /// (put down, asleep) has not.
+    #[test]
+    fn a_dropout_in_use_is_recorded() {
+        for (gyro, recorded) in [([0.0, 1.0, 0.0], true), ([0.0, 0.01, 0.0], false)] {
+            let d = status_daemon();
+            let mut shaper = VelocityShaper::new(ShapeParams::default());
+            let mut memory = HandMemory::default();
+            let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+            let now = shm::now_ns();
+            let c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 1_000_000,
+                received_host_ns: now,
+                imu_gyro: gyro,
+                ..Default::default()
+            };
+            // a radio report the engine read (no radio thread)
+            d.report(1, now, &[0x0c; 64]);
+            for at in [now, now + 200_000_000] {
+                publish_hand_state(
+                    &d,
+                    HAND_RIGHT,
+                    &c,
+                    at,
+                    &mut hand,
+                    None,
+                    &mut shaper,
+                    &mut memory,
+                );
+            }
+            assert_eq!(handle(&d, "haptic right 0.5 320 1"), "ok");
+            let due = d.flight.due(now + flight::AFTER_NS);
+            assert_eq!(due.len(), recorded as usize);
+            if recorded {
+                assert_eq!((due[0].hand, due[0].last_report_ns), (HAND_RIGHT, now));
+                let types: Vec<u16> = due[0].records.iter().map(|r| r.0).collect();
+                assert_eq!(types, [recorder::RAW_REPORT, recorder::HAPTIC]);
+                assert_eq!(
+                    due[0].records[1].2,
+                    recorder::haptic_payload(HAND_RIGHT, 0.5, 320.0, 1.0)
+                );
+            }
+        }
+    }
+
+    /// A gap that ends is recorded too, however still the controller was: held steady (aiming)
+    /// it does not turn, but asleep it would not have come back.
+    #[test]
+    fn a_gap_that_ends_is_recorded() {
+        let d = status_daemon();
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        let mut memory = HandMemory::default();
+        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+        let now = shm::now_ns();
+        let mut c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: now,
+            ..Default::default()
+        };
+        let mut publish = |c: &engine::Controller, at: u64| {
+            publish_hand_state(
+                &d,
+                HAND_LEFT,
+                c,
+                at,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            )
+        };
+        publish(&c, now);
+        publish(&c, now + 300_000_000);
+        assert!(d.flight.due(now + flight::AFTER_NS).is_empty(), "still");
+        c.device_time_ns += 2_000_000;
+        c.received_host_ns = now + 2_000_000_000;
+        publish(&c, now + 2_000_000_000);
+        let due = d.flight.due(now + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].hand, due[0].last_report_ns), (HAND_LEFT, now));
+    }
+
+    /// A gap shorter than half a second that ends is a blip: not recorded, even in use.
+    #[test]
+    fn a_blip_is_not_recorded() {
+        let d = status_daemon();
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        let mut memory = HandMemory::default();
+        let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+        let now = shm::now_ns();
+        let mut c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: now,
+            imu_gyro: [2.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let mut publish = |c: &engine::Controller, at: u64| {
+            publish_hand_state(
+                &d,
+                HAND_RIGHT,
+                c,
+                at,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            )
+        };
+        publish(&c, now);
+        publish(&c, now + 150_000_000);
+        c.device_time_ns += 2_000_000;
+        c.received_host_ns = now + 450_000_000;
+        publish(&c, now + 450_000_000);
+        assert!(d.flight.due(now + flight::AFTER_NS).is_empty());
     }
 
     /// Through a radio gap a controller is published as it last was while its samples arrived:

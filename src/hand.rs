@@ -98,8 +98,11 @@ pub enum GapEvent {
         last_sample_host_ns: u64,
         moving: bool,
     },
-    /// Its samples came back after `silent_ns` without.
-    Ended { silent_ns: u64 },
+    /// Its samples came back after `silent_ns` without, the last before at `last_sample_host_ns`.
+    Ended {
+        last_sample_host_ns: u64,
+        silent_ns: u64,
+    },
     /// No sample for the whole ride-through: published as in standby from now.
     Expired { silent_ns: u64 },
 }
@@ -220,6 +223,7 @@ impl Hand {
             if self.in_gap {
                 self.in_gap = false;
                 self.event = Some(GapEvent::Ended {
+                    last_sample_host_ns: self.last_advance_host_ns,
                     silent_ns: c.received_host_ns.saturating_sub(self.last_advance_host_ns),
                 });
             }
@@ -464,6 +468,7 @@ mod tests {
         assert_eq!(
             h.take_event(),
             Some(GapEvent::Ended {
+                last_sample_host_ns: host,
                 silent_ns: 9_500_000_000
             })
         );
