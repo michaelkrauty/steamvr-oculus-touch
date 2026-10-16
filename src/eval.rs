@@ -384,6 +384,11 @@ pub struct TruthFile {
     /// published poses carry (a replay's do not); none in files from before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_adjustment_ms: Option<f64>,
+    /// The base station SteamVR tracked each Lighthouse device from throughout the capture, by
+    /// device serial (`steamvr_log::Span`); a device whose tracking restarted meanwhile, or every
+    /// device when SteamVR's log could not be read, is not in it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tracking_bases: std::collections::BTreeMap<String, String>,
 }
 
 /// A lag smaller than this (ms) is within what `lag_ms` resolves: nothing to adjust.
@@ -451,6 +456,19 @@ pub fn truth_samples(rows: &[[f64; 8]]) -> Vec<TruthSample> {
         .collect()
 }
 
+/// How far a track strays from its middle sample (m, radians, the farthest of each): a base
+/// station's track stays at zero unless SteamVR moved the station during the capture.
+pub fn spread(track: &[TruthSample]) -> Option<(f64, f64)> {
+    let mid = track.get(track.len() / 2)?.pose;
+    Some(track.iter().fold((0.0f64, 0.0f64), |(m, r), s| {
+        let d = mid.inverse() * s.pose;
+        (
+            m.max(d.translation.vector.norm()),
+            r.max(d.rotation.angle()),
+        )
+    }))
+}
+
 impl TruthFile {
     pub fn truth(&self) -> Vec<TruthSample> {
         truth_samples(&self.samples)
@@ -503,6 +521,33 @@ pub fn pick_hand(hands: [&[Published]; 2], truth: &[TruthSample]) -> Option<(usi
         }
     }
     best
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::*;
+
+    #[test]
+    fn a_track_strays_by_its_farthest_sample_from_the_middle() {
+        let at = |t: u64, x: f64, a: f64| TruthSample {
+            t_ns: t,
+            pose: Isometry3::from_parts(
+                Translation3::new(x, 1.0, -2.0),
+                UnitQuaternion::from_scaled_axis(Vector3::new(0.0, a, 0.0)),
+            ),
+        };
+        assert_eq!(spread(&[]), None);
+        let still = [at(0, 0.5, 0.2), at(1, 0.5, 0.2), at(2, 0.5, 0.2)];
+        assert_eq!(spread(&still), Some((0.0, 0.0)));
+        // moved once, late: 3 mm and 0.5 degrees from where it sat halfway through
+        let moved = [
+            at(0, 0.5, 0.2),
+            at(1, 0.5, 0.2),
+            at(2, 0.503, 0.2 + 0.5f64.to_radians()),
+        ];
+        let (m, r) = spread(&moved).unwrap();
+        assert!((m - 0.003).abs() < 1e-9 && (r.to_degrees() - 0.5).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]

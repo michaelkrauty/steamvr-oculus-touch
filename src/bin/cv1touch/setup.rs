@@ -1432,7 +1432,7 @@ fn run_stage(
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
             log.quiet(|| {
-                let code = register_from_capture_with(&base, true, Some("hmd"), true, false);
+                let code = register_from_capture_with(&base, true, Some("hmd"), true, false, None);
                 if code == 0 {
                     send_quiet("alignment reload")
                 } else {

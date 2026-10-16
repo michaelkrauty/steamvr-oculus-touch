@@ -65,7 +65,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch fit-render [REC]\n  cv1touch steamvr install|check [--legacy-assets SO MANIFEST] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
          cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
          cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
-         cv1touch register --follow BASE --reference SERIAL|hmd [--write] | register --stations REC [--write | --out PATH]\n  \
+         cv1touch register --follow BASE --reference SERIAL|hmd [--tracking-base LHB-SERIAL] [--write] | register --stations REC [--write | --out PATH]\n  \
          cv1touch eval-capture [--free [SECONDS]]\n  cv1touch eval BASE | eval-rig BASE [--replay] | eval-holds BASE\n  \
          cv1touch track BASE [--calibration PATH] [--registration PATH] [--offset-ms MS] [--set KEY=VALUE]...\n  \
          cv1touch landmarks learn REC [--write] | landmarks check REC\n  cv1touch input-test"
@@ -1445,6 +1445,7 @@ fn eval_capture() -> i32 {
         return 1;
     }
     let mut guard = StopRecordingGuard(true);
+    let bases = cv1touch::steamvr_log::Span::begin(&cv1touch::steamvr_log::server_log());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
         let stop = stop.clone();
@@ -1468,6 +1469,7 @@ fn eval_capture() -> i32 {
     ]);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let samples = sampler.join().unwrap_or_default();
+    let tracking_bases = bases.finish();
     guard.0 = false;
     send("record stop");
     let windows = match paced {
@@ -1489,6 +1491,7 @@ fn eval_capture() -> i32 {
         samples,
         others: Vec::new(),
         latency_adjustment_ms,
+        tracking_bases,
     };
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
@@ -2804,6 +2807,7 @@ fn capture_free_named_with_feedback(
         None
     };
     let mut guard = StopRecordingGuard(scoped_guard.is_none());
+    let bases = cv1touch::steamvr_log::Span::begin(&cv1touch::steamvr_log::server_log());
     let start = shm::now_ns();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -2921,6 +2925,7 @@ fn capture_free_named_with_feedback(
     let end = shm::now_ns();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let (tracks, kinds) = sampler.join().unwrap_or_default();
+    let tracking_bases = bases.finish();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
     let stop_command = scoped_guard
@@ -2999,6 +3004,7 @@ fn capture_free_named_with_feedback(
         samples,
         others,
         latency_adjustment_ms,
+        tracking_bases,
     };
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
@@ -3973,6 +3979,102 @@ fn held_by_heading(
         .collect()
 }
 
+/// The history holds this many of a universe's layouts before a registration stops looking for
+/// more in earlier captures.
+const LAYOUTS_FROM_CAPTURES_BELOW: usize = 8;
+
+/// The base station layouts earlier captures in the state directory saw in universe `universe`
+/// (each capture's stations halfway through it), with when each was made, oldest first. Only the
+/// base stations' tracks are read; the rest of each file is passed over.
+fn capture_layouts(universe: u64) -> Vec<(u64, align::Stations)> {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+    /// A track of the truth file's `others`: its samples kept only for a base station, whose
+    /// serial the file writes before them.
+    struct Track {
+        serial: String,
+        kind: String,
+        samples: Option<Vec<[f64; 8]>>,
+    }
+    impl<'de> serde::Deserialize<'de> for Track {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Track, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Track;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a track")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Track, A::Error> {
+                    let mut t = Track {
+                        serial: String::new(),
+                        kind: String::new(),
+                        samples: None,
+                    };
+                    while let Some(k) = m.next_key::<String>()? {
+                        match k.as_str() {
+                            "serial" => t.serial = m.next_value()?,
+                            "kind" => t.kind = m.next_value()?,
+                            "samples" if t.serial.starts_with("LHB-") => {
+                                t.samples = Some(m.next_value()?)
+                            }
+                            _ => {
+                                m.next_value::<IgnoredAny>()?;
+                            }
+                        }
+                    }
+                    Ok(t)
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct Capture {
+        universe_id: u64,
+        #[serde(default)]
+        others: Vec<Track>,
+    }
+    let Ok(dir) = std::fs::read_dir(state_dir()) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut v: Vec<(u64, align::Stations)> = dir
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".truth.json"))
+        // a capture linked under another name is read once
+        .filter(|e| seen.insert(std::fs::canonicalize(e.path()).unwrap_or_else(|_| e.path())))
+        .filter_map(|e| {
+            let path = e.path();
+            let at = std::fs::metadata(&path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            let c: Capture =
+                serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&path).ok()?))
+                    .ok()?;
+            let stations: align::Stations = c
+                .others
+                .iter()
+                .filter(|t| t.kind == "base")
+                .filter_map(|t| {
+                    let s = eval::truth_samples(t.samples.as_ref()?);
+                    Some((t.serial.clone(), s.get(s.len() / 2)?.pose))
+                })
+                .collect();
+            (c.universe_id == universe && stations.len() >= 2).then_some((at, stations))
+        })
+        .collect();
+    v.sort_by_key(|(at, _)| *at);
+    v
+}
+
+/// A base station a capture's registration measures stays within this of where it was halfway
+/// through the capture (SteamVR reports a station it has not moved to well under it).
+const STATION_STILL_M: f64 = 0.0005;
+const STATION_STILL_DEG: f64 = 0.05;
+
 /// Registration from a capture in which the Touches moved rigidly with the reference (pressed to
 /// the headset while the wearer turns, looks up and down and tilts): every 20 ms a pair.
 fn initial_registration(universe_id: u64) -> align::Registration {
@@ -4004,7 +4106,7 @@ fn register_headset() -> i32 {
         Ok(base) => base,
         Err(code) => return code,
     };
-    let code = register_follow(&base, true, Some("hmd"));
+    let code = register_follow(&base, true, Some("hmd"), None);
     if code == 0 {
         send("alignment reload")
     } else {
@@ -4012,12 +4114,17 @@ fn register_headset() -> i32 {
     }
 }
 
-fn register_follow(base: &Path, write: bool, reference: Option<&str>) -> i32 {
-    register_from_capture(base, write, reference, true)
+fn register_follow(
+    base: &Path,
+    write: bool,
+    reference: Option<&str>,
+    tracking_base: Option<&str>,
+) -> i32 {
+    register_from_capture_with(base, write, reference, true, true, tracking_base)
 }
 
 fn register_from_capture(base: &Path, write: bool, reference: Option<&str>, follow: bool) -> i32 {
-    register_from_capture_with(base, write, reference, follow, true)
+    register_from_capture_with(base, write, reference, follow, true, None)
 }
 
 fn registration_seed(
@@ -4034,12 +4141,15 @@ fn registration_seed(
     Ok((had_registration, reg))
 }
 
+/// `tracking_base` names the base station SteamVR tracked the reference from throughout the
+/// capture, for a capture whose truth does not record it (made before captures recorded it).
 fn register_from_capture_with(
     base: &Path,
     write: bool,
     reference: Option<&str>,
     follow: bool,
     reuse: bool,
+    tracking_base: Option<&str>,
 ) -> i32 {
     let run = || -> Result<(), String> {
         let truth_path = base.with_extension("truth.json");
@@ -4052,6 +4162,9 @@ fn register_from_capture_with(
         let (had_registration, mut reg) = registration_seed(&reg_path, tf.universe_id, reuse)?;
         let (ref_serial, ref_samples) = truth_track(&tf, reference)?;
         println!("reference {ref_serial}");
+        let tracking_base = tracking_base
+            .map(str::to_string)
+            .or_else(|| tf.tracking_bases.get(&ref_serial).cloned());
         let holds = calib::rig::holds(&ref_samples, 1_500_000_000);
         let published = capture_poses(base)?;
         // the registration as the daemon applied it during the capture: followed through any
@@ -4065,14 +4178,37 @@ fn register_from_capture_with(
                 Some((o.serial.clone(), s.get(s.len() / 2)?.pose))
             })
             .collect();
-        let x0 = match reg.follow(&stations) {
-            Some(shift) => {
+        // SteamVR's layouts so far, with those earlier captures and this one saw: they place the
+        // stations no registration measured
+        let mut history = align::load_layouts(&align::layouts_path());
+        let earlier = if history.of(tf.universe_id).len() < LAYOUTS_FROM_CAPTURES_BELOW {
+            capture_layouts(tf.universe_id)
+        } else {
+            Vec::new()
+        };
+        let captured_at = std::fs::metadata(&truth_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(unix_now, |d| d.as_secs());
+        let added = earlier
+            .iter()
+            .filter(|(at, l)| history.record(tf.universe_id, *at, l))
+            .count()
+            + usize::from(history.record(tf.universe_id, captured_at, &stations));
+        let layouts = history.of(tf.universe_id);
+        let by_base = tracking_base
+            .as_deref()
+            .and_then(|b| reg.follow_base(b, &stations, &reg.station_map(&layouts)));
+        let x0 = match (by_base, reg.follow(&stations)) {
+            (Some(f), _) => f.now_from_then * reg.lighthouse_from_world.iso(),
+            (None, Some(shift)) => {
                 let s = shift.now_from_then;
                 let play = reg.play_area_point();
                 println!("the universe had moved {:.1} mm, {:.2} deg in the play area since the installed registration (stations disagreeing there by {:.1} mm rms)", (s * play - play).norm() * 1e3, s.rotation.angle().to_degrees(), shift.residual_m * 1e3);
                 s * reg.lighthouse_from_world.iso()
             }
-            None => reg.lighthouse_from_world.iso(),
+            (None, None) => reg.lighthouse_from_world.iso(),
         };
         let mut fits = Vec::new();
         let mut held_pairs = Vec::new();
@@ -4244,6 +4380,80 @@ fn register_from_capture_with(
         } else {
             first.0
         };
+        // SteamVR tracked the reference in its tracking base's frame: the fit put that station
+        // where it is in the world, if SteamVR left the station where it was throughout (it moves
+        // its tracking base too when it re-solves the layout)
+        let calibration_unix_s = file::load(&file::default_path())?.created_unix_s;
+        let spread = |serial: &str| {
+            let o = tf
+                .others
+                .iter()
+                .find(|o| o.kind == "base" && o.serial == serial)?;
+            eval::spread(&eval::truth_samples(&o.samples))
+        };
+        let measured_now = match &tracking_base {
+            Some(b) => match (stations.iter().find(|(s, _)| s == b), spread(b)) {
+                (Some((_, p)), Some((m, r)))
+                    if m <= STATION_STILL_M && r <= STATION_STILL_DEG.to_radians() =>
+                {
+                    println!("SteamVR tracked {ref_serial} from base station {b} throughout: the registration measures where that station is");
+                    Some(align::MeasuredStation::from_fit(
+                        b,
+                        &x,
+                        p,
+                        unix_now(),
+                        calibration_unix_s,
+                    ))
+                }
+                (Some(_), Some((m, r))) => {
+                    println!("SteamVR moved base station {b}, which it tracked {ref_serial} from, by up to {:.1} mm, {:.2} deg during the capture: no station measured", m * 1e3, r.to_degrees());
+                    None
+                }
+                _ => {
+                    println!("base station {b} is not among the stations this capture recorded: no station measured");
+                    None
+                }
+            },
+            None => {
+                println!("SteamVR's log does not say which base station tracked {ref_serial} throughout the capture: no station measured");
+                None
+            }
+        };
+        let previous = align::load_registration(&reg_path)
+            .map(|r| r.measured)
+            .unwrap_or_default();
+        let measured = align::merge_measured(&previous, measured_now.clone(), calibration_unix_s);
+        for m in &previous {
+            let when = cv1touch::calendar::Utc::of(
+                std::time::UNIX_EPOCH + Duration::from_secs(m.registered_unix_s),
+            )
+            .iso();
+            match &measured_now {
+                _ if measured.contains(m) => println!(
+                    "  keeps the measurement of {} from the registration of {when}",
+                    m.serial
+                ),
+                None => println!("  drops the measurement of {} from the registration of {when}: a registration that measures no station follows its own fit", m.serial),
+                Some(n) if n.serial == m.serial => {
+                    let d = m.world_from_station.iso().inverse() * n.world_from_station.iso();
+                    println!("  replaces the measurement of {} from the registration of {when} ({:.1} mm, {:.2} deg from it)", m.serial, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees());
+                }
+                Some(_) => println!("  drops the measurement of {} from the registration of {when}: it was against another calibration", m.serial),
+            }
+        }
+        let mut preview = reg.clone();
+        preview.lighthouse_from_world = align::PoseEntry::from_iso(&x);
+        preview.measured = measured.clone();
+        preview.stations = stations
+            .iter()
+            .map(|(serial, p)| align::StationPose {
+                serial: serial.clone(),
+                pose: align::PoseEntry::from_iso(p),
+            })
+            .collect();
+        for (serial, w) in preview.station_map(&layouts) {
+            println!("  {serial}: {}", w.placement);
+        }
         if !write {
             println!("(not written: run with --write)");
             return Ok(());
@@ -4275,6 +4485,28 @@ fn register_from_capture_with(
                 })
             })
             .collect();
+        reg.tracking_base = measured_now.map(|m| m.serial);
+        reg.measured = measured;
+        if added > 0 {
+            // what the daemon added meanwhile stays; a file that cannot be read is left alone
+            let path = align::layouts_path();
+            let kept = align::read_layouts(&path).and_then(|mut on_file| {
+                for u in &history.universes {
+                    for l in &u.layouts {
+                        let stations: align::Stations = l
+                            .stations
+                            .iter()
+                            .map(|s| (s.serial.clone(), s.pose.iso()))
+                            .collect();
+                        on_file.record(u.universe_id, l.seen_unix_s, &stations);
+                    }
+                }
+                align::save_layouts(&path, &on_file)
+            });
+            if let Err(e) = kept {
+                println!("  ({e}: the layouts found are not kept)");
+            }
+        }
         reg.pairs = fits.iter().map(|f| f.3).sum();
         reg.pos_rms_mm = fits.iter().map(|f| f.1).sum::<f64>() / fits.len() as f64 * 1e3;
         reg.rot_rms_deg = fits.iter().map(|f| f.2).sum::<f64>() / fits.len() as f64;
@@ -4435,6 +4667,9 @@ fn register_stations(rec: &Path, write: bool, out: Option<&Path>) -> i32 {
         reg.lighthouse_from_world = align::PoseEntry::from_iso(&best.lighthouse_from_world);
         reg.created_unix_s = unix_now();
         reg.touch = "base stations".into();
+        // measured stations would be followed instead of this fit
+        reg.measured.clear();
+        reg.tracking_base = None;
         reg.pairs = spots.len();
         reg.pos_rms_mm = 0.0;
         reg.rot_rms_deg = 0.0;
@@ -4674,6 +4909,9 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
         reg.lighthouse_from_world = align::PoseEntry::from_iso(&full.state.lighthouse_from_world);
         reg.created_unix_s = unix_now();
         reg.touch = format!("rig ({})", names.join("+"));
+        // measured stations would be followed instead of this fit
+        reg.measured.clear();
+        reg.tracking_base = None;
         reg.pairs = full.sightings.len();
         // how far the tracked Touches sit from where the fitted rig puts them, over the holds
         let (mut se_t, mut se_r, mut n) = (0.0, 0.0, 0usize);
@@ -5246,6 +5484,11 @@ fn calibrate_gravity_with(
             let turn = nalgebra::Isometry3::from_parts(nalgebra::Translation3::identity(), total);
             reg.lighthouse_from_world =
                 align::PoseEntry::from_iso(&(reg.lighthouse_from_world.iso() * turn.inverse()));
+            // the stations a registration measured, in the levelled world
+            for m in &mut reg.measured {
+                m.world_from_station =
+                    align::PoseEntry::from_iso(&(turn * m.world_from_station.iso()));
+            }
             Some(serde_json::to_vec_pretty(&reg).map_err(|e| e.to_string())?)
         } else {
             None
@@ -5378,6 +5621,8 @@ fn fit_capture_registration(
     )?;
     let mut reg = align::load_registration(template)?;
     reg.lighthouse_from_world = align::PoseEntry::from_iso(&sol.lighthouse_from_world);
+    reg.measured.clear();
+    reg.tracking_base = None;
     let out = std::env::temp_dir().join(format!(
         "cv1touch-fitted-registration-{}.json",
         std::process::id()
@@ -5738,8 +5983,10 @@ fn main() {
         ["register", "--holds", base, "--write"] => register_holds(Path::new(base), true, None),
         ["register", "--holds", base, "--reference", r] => register_holds(Path::new(base), false, Some(r)),
         ["register", "--holds", base, "--reference", r, "--write"] => register_holds(Path::new(base), true, Some(r)),
-        ["register", "--follow", base, "--reference", r] => register_follow(Path::new(base), false, Some(r)),
-        ["register", "--follow", base, "--reference", r, "--write"] => register_follow(Path::new(base), true, Some(r)),
+        ["register", "--follow", base, "--reference", r] => register_follow(Path::new(base), false, Some(r), None),
+        ["register", "--follow", base, "--reference", r, "--write"] => register_follow(Path::new(base), true, Some(r), None),
+        ["register", "--follow", base, "--reference", r, "--tracking-base", t] => register_follow(Path::new(base), false, Some(r), Some(t)),
+        ["register", "--follow", base, "--reference", r, "--tracking-base", t, "--write"] => register_follow(Path::new(base), true, Some(r), Some(t)),
         ["register", "--stations", rec] => register_stations(Path::new(rec), false, None),
         ["register", "--stations", rec, "--write"] => register_stations(Path::new(rec), true, None),
         ["register", "--stations", rec, "--out", out] => register_stations(Path::new(rec), true, Some(Path::new(out))),
