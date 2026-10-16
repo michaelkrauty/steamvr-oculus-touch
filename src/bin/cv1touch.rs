@@ -1209,6 +1209,8 @@ fn register_solve(
             })
             .collect(),
         play_area: mean_position(pairs.iter().map(|p| &p.0)),
+        tracking_base: None,
+        measured: Vec::new(),
     };
     match align::save(&align::registration_path(), &file) {
         Ok(backup) => {
@@ -3936,6 +3938,8 @@ fn initial_registration(universe_id: u64) -> align::Registration {
         rot_rms_deg: 0.0,
         stations: Vec::new(),
         play_area: None,
+        tracking_base: None,
+        measured: Vec::new(),
     }
 }
 
@@ -4755,8 +4759,9 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
     })
 }
 
-/// How the Lighthouse universe moved since the installed registration was fitted, station by
-/// station (what cv1touchd's universe watch follows).
+/// How the installed registration applies now: the base station SteamVR tracks the headset from
+/// (its log), where each station is in the world and how, and how SteamVR has each since the
+/// registration (what cv1touchd's universe watch follows).
 fn universe_cmd() -> i32 {
     let run = || -> Result<(), String> {
         let reg = align::load_registration(&align::registration_path())?;
@@ -4766,11 +4771,6 @@ fn universe_cmd() -> i32 {
         let client = vr::Client::connect()?;
         let now = client.stations();
         drop(client);
-        let then: Vec<(String, nalgebra::Isometry3<f64>)> = reg
-            .stations
-            .iter()
-            .map(|s| (s.serial.clone(), s.pose.iso()))
-            .collect();
         let play = reg.play_area_point();
         println!(
             "play area (raw, when fitted): ({:+.2}, {:+.2}, {:+.2}){}",
@@ -4783,18 +4783,81 @@ fn universe_cmd() -> i32 {
                 ""
             }
         );
-        for (serial, t) in &then {
+        let mut log = cv1touch::steamvr_log::Watch::new(&cv1touch::steamvr_log::server_log());
+        if let Err(e) = log.poll() {
+            println!("SteamVR's log {}: {e}", log.path().display());
+        }
+        // as the daemon follows it: the station SteamVR tracks the headset from, or last did
+        let base = log
+            .bases
+            .last_of_headset(&reg.reference)
+            .map(str::to_string);
+        let tracked = log
+            .bases
+            .headset
+            .as_deref()
+            .map_or_else(|| log.bases.of(&reg.reference), |h| log.bases.of(h));
+        match (&base, tracked) {
+            (Some(b), Some(_)) => {
+                println!("SteamVR tracks the headset from base station {b} (its log says)")
+            }
+            (Some(b), None) => println!(
+                "SteamVR has lost the headset's tracking; it last tracked it from base station {b}"
+            ),
+            (None, _) => {
+                println!("SteamVR's log names no base station it has tracked the headset from")
+            }
+        }
+        let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
+        let map = reg.station_map(&layouts);
+        let followed = base
+            .as_deref()
+            .and_then(|b| Some((b, reg.follow_base(b, &now, &map)?)));
+        // the world <- raw transform the follow puts the headset's frame at
+        let lh_now = followed
+            .as_ref()
+            .map(|(_, f)| f.now_from_then * reg.lighthouse_from_world.iso());
+        let then = reg.fit_layout();
+        let serials: std::collections::BTreeSet<&String> =
+            map.keys().chain(then.iter().map(|(s, _)| s)).collect();
+        for serial in serials {
+            let placed = map
+                .get(serial)
+                .map_or("not placed".to_string(), |w| w.placement.to_string());
             match now.iter().find(|(s, _)| s == serial) {
                 Some((_, n)) => {
-                    let d = n * t.inverse();
-                    println!("{serial}: believed pose moved {:.2} mm, {:.3} deg; moves what it tracks in the play area by {:.1} mm", d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees(), (d * play - play).norm() * 1e3);
+                    let moved = then.iter().find(|(s, _)| s == serial).map_or(
+                        "; not in the layout the registration was fitted in".to_string(),
+                        |(_, t)| {
+                            let d = n * t.inverse();
+                            format!("; believed pose moved {:.2} mm, {:.3} deg since the registration, which moves what it tracks in the play area by {:.1} mm", d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees(), (d * play - play).norm() * 1e3)
+                        },
+                    );
+                    let off = match (lh_now, map.get(serial)) {
+                        (Some(l), Some(w)) => {
+                            let e = n * (l * w.world_from_station).inverse();
+                            format!("; SteamVR's layout puts what it alone tracks {:.1} mm from where the headset's frame has it", (e * play - play).norm() * 1e3)
+                        }
+                        _ => String::new(),
+                    };
+                    println!("{serial}: {placed}{moved}{off}");
                 }
-                None => println!("{serial}: not tracked now"),
+                None => println!("{serial}: {placed}; not tracked now"),
             }
+        }
+        if let Some((b, f)) = &followed {
+            let s = f.now_from_then;
+            println!(
+                "registration follows {b} ({}): {:.1} mm, {:.2} deg in the play area since it was fitted",
+                f.placement,
+                (s * play - play).norm() * 1e3,
+                s.rotation.angle().to_degrees()
+            );
         }
         match reg.follow(&now) {
             Some(s) => println!(
-                "universe moved {:.1} mm, {:.2} deg in the play area since the registration ({} stations, disagreeing there by {:.1} mm rms)",
+                "{}universe moved {:.1} mm, {:.2} deg in the play area since the registration, as the stations agree on it ({} stations, disagreeing there by {:.1} mm rms)",
+                if followed.is_some() { "(not followed) " } else { "" },
                 (s.now_from_then * play - play).norm() * 1e3,
                 s.now_from_then.rotation.angle().to_degrees(),
                 s.stations,

@@ -177,6 +177,8 @@ struct Daemon {
     driver_stations: Mutex<Option<TimedStationPoses>>,
     /// `universe-watch off` stops the watch (the registration stays as last followed).
     universe_watch_on: AtomicBool,
+    /// What the watch follows the registration through now, for `universe-watch`.
+    universe_following: Mutex<String>,
     /// `shaping off` publishes the tracked velocities as they are (see `track::predict`).
     shaping_on: AtomicBool,
     /// Percent of the tracked linear velocity SteamVR extrapolates positions with
@@ -824,40 +826,76 @@ fn apply_tracked(
 }
 
 const UNIVERSE_CHECK_MS: u64 = 60_000;
-/// How often the watch looks at the stations the driver reports (cheap: no SteamVR connection).
-const UNIVERSE_DRIVER_CHECK_MS: u64 = 5_000;
+/// How often the watch reads SteamVR's log and looks at the stations the driver reports (cheap:
+/// no SteamVR connection; the driver reports every 2 s).
+const UNIVERSE_TICK_MS: u64 = 1_000;
 /// The driver's report counts as current this long; past it, the watch connects to SteamVR itself
 /// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS`.
 const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
 
-/// Keeps the registration on the Lighthouse universe it was fitted in. A SteamVR restart can
-/// re-bootstrap the universe from another base station and move it by centimetres (24 mm and 0.7
-/// deg on 2026-10-08); the stations themselves do not move, so their raw poses, against those the
-/// registration recorded, measure the move. Checked once a minute with a short-lived background
-/// OpenVR connection (one that never keeps SteamVR from quitting).
+/// Keeps the registration on the headset as SteamVR tracks it. SteamVR tracks the headset in the
+/// frame of the base station it bootstrapped from, and re-solves the stations' poses relative to
+/// each other by centimetres and differently each session (one station by 110 and then 120 mm
+/// within a minute on 2026-10-15); the stations themselves do not move. So the registration
+/// follows that station alone, from where it is in the world (`align::Registration::station_map`)
+/// and where SteamVR has it now; SteamVR's log names it (`steamvr_log`). Through a dropout the
+/// watch keeps to the last station named; with none named yet, it follows the stations' moves
+/// together. The stations' poses come from the driver every 2 s, or a short-lived background
+/// OpenVR connection once a minute (one that never keeps SteamVR from quitting); each layout
+/// SteamVR settles on is kept (`align::Layouts`), to place the stations no registration measured.
 fn universe_watch(d: Arc<Daemon>) {
     let mut first = true;
     let mut warned_disagree = false;
+    let mut warned_log = false;
+    let mut warned_layouts = false;
     let mut last_connect: Option<std::time::Instant> = None;
+    let mut steamvr_log = cv1touch::steamvr_log::Watch::new(&cv1touch::steamvr_log::server_log());
+    let layouts_path = align::layouts_path();
+    let modified = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut layouts_at = modified(&layouts_path);
+    let mut layouts = align::load_layouts(&layouts_path);
+    let mut settling = align::Settling::default();
+    let mut following: Option<align::Follow> = None;
+    // since when the base station is placed but SteamVR does not report it, and whether it was said
+    let mut held: Option<(std::time::Instant, bool)> = None;
+    let say = |text: String| *d.universe_following.lock().unwrap() = text;
     while !d.quit.load(Ordering::Acquire) {
-        sleep_until(
-            &d,
-            if first {
-                5_000
-            } else {
-                UNIVERSE_DRIVER_CHECK_MS
-            },
-            || d.universe_recheck.swap(false, Ordering::AcqRel),
-        );
+        sleep_until(&d, if first { 5_000 } else { UNIVERSE_TICK_MS }, || {
+            d.universe_recheck.swap(false, Ordering::AcqRel)
+        });
         first = false;
         if !d.universe_watch_on.load(Ordering::Acquire) {
+            say(String::new());
             continue;
+        }
+        match steamvr_log.poll() {
+            Ok(_) => warned_log = false,
+            Err(e) => {
+                if !warned_log {
+                    warned_log = true;
+                    log(format!(
+                        "universe watch: SteamVR's log {}: {e}",
+                        steamvr_log.path().display()
+                    ));
+                }
+            }
         }
         let Ok(reg) = align::load_registration(&align::registration_path()) else {
             continue;
         };
-        if reg.stations.len() < 2 {
+        if reg.stations.is_empty() {
             continue;
+        }
+        // the station SteamVR tracks the headset from, or last tracked it from in this session
+        let base = steamvr_log
+            .bases
+            .last_of_headset(&reg.reference)
+            .map(str::to_string);
+        // what a registration (or another daemon) added to the layouts
+        let at = modified(&layouts_path);
+        if at != layouts_at {
+            layouts_at = at;
+            layouts = align::load_layouts(&layouts_path);
         }
         // the stations as the driver sees them inside SteamVR; else (an older driver) a short
         // SteamVR connection of our own, once a minute: each one costs vrserver an app connect
@@ -877,6 +915,7 @@ fn universe_watch(d: Arc<Daemon>) {
                 }
                 last_connect = Some(std::time::Instant::now());
                 let Ok(client) = cv1touch::vr::Client::connect() else {
+                    say(String::new());
                     continue;
                 };
                 let v = client.stations();
@@ -884,18 +923,56 @@ fn universe_watch(d: Arc<Daemon>) {
                 v
             }
         };
-        if now.len() < 2 {
+        if now.is_empty() {
             continue;
         }
-        let Some(shift) = reg.follow(&now) else {
-            if !warned_disagree {
-                warned_disagree = true;
-                log("universe watch: the base stations disagree on how the universe moved (one bumped?); registration left as it is");
+        let seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Some(settled) = settling.see(&now, seen) {
+            match align::record_layout(&layouts_path, reg.universe_id, seen, &settled) {
+                Ok((_, on_file)) => {
+                    warned_layouts = false;
+                    layouts = on_file;
+                    layouts_at = modified(&layouts_path);
+                }
+                Err(e) if !warned_layouts => {
+                    warned_layouts = true;
+                    log(format!("universe watch: {e} (the layout is not kept)"));
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(how) = reg.follow_now(base.as_deref(), &now, &layouts.of(reg.universe_id)) else {
+            match &base {
+                // the base has no place in the registration and the stations do not agree
+                Some(b) if now.iter().any(|(s, _)| s == b) => {
+                    if !warned_disagree {
+                        warned_disagree = true;
+                        log(format!("universe watch: SteamVR tracks the headset from base station {b}, which the registration has no place for, and the base stations disagree on how the universe moved; registration left as it is"));
+                    }
+                }
+                // a base SteamVR does not report for a moment: left as it is
+                Some(b) => {
+                    let (since, said) = held.get_or_insert((std::time::Instant::now(), false));
+                    if !*said && since.elapsed() > Duration::from_secs(10) {
+                        *said = true;
+                        log(format!("universe watch: SteamVR has not reported base station {b}, which it tracks the headset from, for 10 s; registration left as it is"));
+                    }
+                }
+                None if !warned_disagree => {
+                    warned_disagree = true;
+                    log("universe watch: the base stations disagree on how the universe moved (one bumped?), and SteamVR's log names no station it tracks the headset from; registration left as it is");
+                }
+                None => {}
             }
             continue;
         };
+        if held.take().is_some_and(|(_, said)| said) {
+            log("universe watch: SteamVR reports the base station again");
+        }
         warned_disagree = false;
-        let s = shift.now_from_then;
+        let s = how.now_from_then();
         let s = if s.translation.vector.norm() < 5e-4 && s.rotation.angle() < 0.01f64.to_radians() {
             nalgebra::Isometry3::identity()
         } else {
@@ -911,22 +988,25 @@ fn universe_watch(d: Arc<Daemon>) {
             (p.inverse() * s).translation.vector.norm() > 3e-4
                 || (p.inverse() * s).rotation.angle() > 0.01f64.to_radians()
         });
+        let changed_how = following.as_ref().is_none_or(|f| !f.same_way(&how));
+        say(how.to_string());
         if moved {
             *d.universe_shift.lock().unwrap() = Some((reg.created_unix_s, s));
             let (alignment, _) = align::load_with(Some(&s));
             publish_alignment(&d, alignment);
-            if s != nalgebra::Isometry3::identity()
-                || prev.is_some_and(|p| p != nalgebra::Isometry3::identity())
-            {
-                log(format!(
-                    "universe watch: the Lighthouse universe moved {:.1} mm, {:.2} deg in the play area since the registration ({} stations, disagreeing there by {:.1} mm rms); registration follows",
-                    (s * reg.play_area_point() - reg.play_area_point()).norm() * 1e3,
-                    s.rotation.angle().to_degrees(),
-                    shift.stations,
-                    shift.residual_m * 1e3
-                ));
-            }
         }
+        if (moved
+            && (s != nalgebra::Isometry3::identity()
+                || prev.is_some_and(|p| p != nalgebra::Isometry3::identity())))
+            || changed_how
+        {
+            log(format!(
+                "universe watch: registration follows {how}: {:.1} mm, {:.2} deg in the play area since it was fitted",
+                (s * reg.play_area_point() - reg.play_area_point()).norm() * 1e3,
+                s.rotation.angle().to_degrees(),
+            ));
+        }
+        following = Some(how);
     }
 }
 
@@ -2693,12 +2773,18 @@ fn handle(d: &Daemon, line: &str) -> String {
                 }
                 _ => "no recent driver report: connecting to SteamVR once a minute".into(),
             };
+            let following = d.universe_following.lock().unwrap().clone();
             format!(
-                "ok universe watch {} ({src})",
+                "ok universe watch {} ({src}){}",
                 if d.universe_watch_on.load(Ordering::Acquire) {
                     "on"
                 } else {
                     "off"
+                },
+                if following.is_empty() {
+                    String::new()
+                } else {
+                    format!("; registration follows {following}")
                 }
             )
         }
@@ -3294,6 +3380,7 @@ fn main() {
         universe_recheck: AtomicBool::new(false),
         driver_stations: Mutex::new(None),
         universe_watch_on: AtomicBool::new(true),
+        universe_following: Mutex::new(String::new()),
         shaping_on: AtomicBool::new(true),
         position_prediction: AtomicU32::new(start_prediction(&settings).0),
         rotation_prediction: AtomicU32::new(start_prediction(&settings).1),
@@ -3404,6 +3491,7 @@ mod tests {
             universe_recheck: AtomicBool::new(false),
             driver_stations: Mutex::new(None),
             universe_watch_on: AtomicBool::new(true),
+            universe_following: Mutex::new(String::new()),
             shaping_on: AtomicBool::new(true),
             position_prediction: AtomicU32::new(100),
             rotation_prediction: AtomicU32::new(100),
