@@ -181,6 +181,160 @@ pub fn missing_from(previous: &CalibrationFile, serials: &[String]) -> Vec<Strin
         .collect()
 }
 
+/// The sensors' poses (world <- camera) of a calibration, by serial.
+pub fn sensor_poses(f: &CalibrationFile) -> Vec<(String, nalgebra::Isometry3<f64>)> {
+    f.sensors
+        .iter()
+        .map(|s| (s.serial.clone(), super::iso_from_xyzw(s.orient_xyzw, s.pos)))
+        .collect()
+}
+
+/// The sensors' poses (world <- camera) a recording was made under, as the daemon recorded them.
+pub fn recording_sensor_poses(
+    rec: &Path,
+) -> Result<Vec<(String, nalgebra::Isometry3<f64>)>, String> {
+    use crate::recorder::{self, Reader};
+    let mut v: Vec<(String, nalgebra::Isometry3<f64>)> = Vec::new();
+    for r in Reader::open(rec)? {
+        if r.rtype != recorder::SENSOR_INFO {
+            continue;
+        }
+        let Some(s) = recorder::decode_sensor_info(&r.payload) else {
+            continue;
+        };
+        let serial = crate::engine::cstr_field(&s.serial);
+        if s.have_camera_pose && !v.iter().any(|(t, _)| *t == serial) {
+            v.push((serial, super::iso_from_xyzw(s.camera_orient, s.camera_pos)));
+        }
+    }
+    Ok(v)
+}
+
+/// Sensors a recalibration may leave this far from where a rigid change of world frame carries
+/// them (m, and radians) for the change to stand for both calibrations' frames: recalibrations
+/// of sensors that stayed put leave them within 7 mm and 0.2 degrees.
+pub const SENSOR_TOLERANCE_M: f64 = 0.010;
+pub const SENSOR_TOLERANCE_RAD: f64 = 1.0 * std::f64::consts::PI / 180.0;
+
+/// A change of world frame between two calibrations (`world_change`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldChange {
+    /// world_now <- world_then.
+    pub change: nalgebra::Isometry3<f64>,
+    /// The farthest it leaves a sensor's position, and its orientation, from where the newer
+    /// calibration has them (m, radians), over the sensors it is fitted to.
+    pub worst_m: f64,
+    pub worst_rad: f64,
+    /// A sensor left out because the newer calibration moved it against the others.
+    pub left_out: Option<String>,
+}
+
+impl WorldChange {
+    pub fn within_tolerance(&self) -> bool {
+        self.worst_m <= SENSOR_TOLERANCE_M && self.worst_rad <= SENSOR_TOLERANCE_RAD
+    }
+}
+
+/// The rigid fit of the sensors' poses in `then` to those in `now` (their positions, and points
+/// half a metre along their axes), with how far it leaves them.
+fn fit_change(
+    pairs: &[(&nalgebra::Isometry3<f64>, &nalgebra::Isometry3<f64>)],
+) -> Option<(nalgebra::Isometry3<f64>, f64, f64)> {
+    use nalgebra::{Matrix3, Point3, Vector3};
+    let points = |p: &nalgebra::Isometry3<f64>| -> Vec<Vector3<f64>> {
+        [
+            Vector3::zeros(),
+            Vector3::x() * 0.5,
+            Vector3::y() * 0.5,
+            Vector3::z() * 0.5,
+        ]
+        .iter()
+        .map(|v| (p * Point3::from(*v)).coords)
+        .collect()
+    };
+    let src: Vec<Vector3<f64>> = pairs.iter().flat_map(|(a, _)| points(a)).collect();
+    let dst: Vec<Vector3<f64>> = pairs.iter().flat_map(|(_, b)| points(b)).collect();
+    let k = src.len() as f64;
+    let (ca, cb) = (
+        src.iter().sum::<Vector3<f64>>() / k,
+        dst.iter().sum::<Vector3<f64>>() / k,
+    );
+    let h: Matrix3<f64> = src
+        .iter()
+        .zip(&dst)
+        .map(|(a, b)| (b - cb) * (a - ca).transpose())
+        .sum();
+    let svd = h.svd(true, true);
+    let (u, vt) = (svd.u?, svd.v_t?);
+    let d = if (u * vt).determinant() < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let r = u * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * vt;
+    let t = cb - r * ca;
+    let change =
+        nalgebra::Isometry3::from_parts(t.into(), nalgebra::UnitQuaternion::from_matrix(&r));
+    let (mut worst_m, mut worst_rad) = (0.0f64, 0.0f64);
+    for (a, b) in pairs {
+        let e = (change * **a).inverse() * **b;
+        worst_m = worst_m.max(e.translation.vector.norm());
+        worst_rad = worst_rad.max(e.rotation.angle());
+    }
+    Some((change, worst_m, worst_rad))
+}
+
+/// How one calibration's world frame sits against another's, by the sensors both place (they
+/// stay where they are mounted): the rigid fit of the sensors' poses in `then` to those in `now`.
+/// When that leaves a sensor beyond tolerance and three or more others remain, the one whose
+/// leaving out fits the rest best is left out (a sensor the newer calibration re-placed after it
+/// was bumped). None with fewer than two sensors in common.
+pub fn world_change(
+    then: &[(String, nalgebra::Isometry3<f64>)],
+    now: &[(String, nalgebra::Isometry3<f64>)],
+) -> Option<WorldChange> {
+    let pairs: Vec<(
+        &String,
+        &nalgebra::Isometry3<f64>,
+        &nalgebra::Isometry3<f64>,
+    )> = then
+        .iter()
+        .filter_map(|(s, a)| now.iter().find(|(t, _)| t == s).map(|(_, b)| (s, a, b)))
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    let fit = |skip: Option<usize>| {
+        let v: Vec<_> = pairs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != skip)
+            .map(|(_, (_, a, b))| (*a, *b))
+            .collect();
+        fit_change(&v).map(|(change, worst_m, worst_rad)| WorldChange {
+            change,
+            worst_m,
+            worst_rad,
+            left_out: skip.map(|i| pairs[i].0.clone()),
+        })
+    };
+    let all = fit(None)?;
+    if all.within_tolerance() || pairs.len() < 4 {
+        return Some(all);
+    }
+    (0..pairs.len())
+        .filter_map(|i| fit(Some(i)))
+        .min_by(|a, b| {
+            (a.worst_m / SENSOR_TOLERANCE_M)
+                .max(a.worst_rad / SENSOR_TOLERANCE_RAD)
+                .total_cmp(
+                    &(b.worst_m / SENSOR_TOLERANCE_M).max(b.worst_rad / SENSOR_TOLERANCE_RAD),
+                )
+        })
+        .filter(WorldChange::within_tolerance)
+        .or(Some(all))
+}
+
 /// calibration.json in cv1touch's configuration directory (platform::dirs).
 pub fn default_path() -> PathBuf {
     crate::platform::dirs::get().config.join("calibration.json")
@@ -274,6 +428,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("calibration.json")
+    }
+
+    /// A recalibration that keeps the sensors where they are but turns and shifts the world:
+    /// the change comes back exactly. One that also re-placed a bumped sensor: with three others
+    /// that sensor is left out; with two, the change says how far off it leaves it. A sensor
+    /// turned in place is caught as well as one moved.
+    #[test]
+    fn the_world_change_between_calibrations_comes_from_the_sensors() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+        let sensors: Vec<(String, Isometry3<f64>)> = [
+            ((1.2, 0.5, -2.2), (0.2, 3.0, 0.0)),
+            ((-1.4, 0.6, -2.1), (0.3, -2.8, 0.1)),
+            ((0.1, 2.3, 1.9), (-0.9, 0.2, 0.0)),
+            ((2.0, 0.4, 1.0), (0.1, 1.5, 0.0)),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, &((x, y, z), (a, b, c)))| {
+            (
+                format!("WMTD{i}"),
+                Isometry3::from_parts(
+                    Translation3::new(x, y, z),
+                    UnitQuaternion::from_scaled_axis(Vector3::new(a, b, c)),
+                ),
+            )
+        })
+        .collect();
+        let change = Isometry3::from_parts(
+            Translation3::new(0.004, -0.002, 0.01),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.0, 0.02, 0.001)),
+        );
+        let now: Vec<_> = sensors
+            .iter()
+            .map(|(s, p)| (s.clone(), change * p))
+            .collect();
+        let w = world_change(&sensors, &now).unwrap();
+        let d = w.change.inverse() * change;
+        assert!(d.translation.vector.norm() < 1e-9 && d.rotation.angle() < 1e-9);
+        assert!(w.worst_m < 1e-9 && w.within_tolerance() && w.left_out.is_none());
+        let mut bumped = now.clone();
+        bumped[2].1 = Isometry3::translation(0.06, 0.0, 0.0) * bumped[2].1;
+        let w = world_change(&sensors, &bumped).unwrap();
+        assert_eq!(w.left_out.as_deref(), Some("WMTD2"));
+        let d = w.change.inverse() * change;
+        assert!(d.translation.vector.norm() < 1e-9 && w.within_tolerance());
+        let w = world_change(&sensors[..3], &bumped[..3]).unwrap();
+        assert!(w.left_out.is_none() && !w.within_tolerance(), "{w:?}");
+        let mut turned = now.clone();
+        turned[1].1 *= UnitQuaternion::from_scaled_axis(Vector3::new(0.0, 0.0, 0.05));
+        let w = world_change(&sensors[..3], &turned[..3]).unwrap();
+        assert!(!w.within_tolerance(), "{w:?}");
+        assert!(world_change(&sensors[..1], &now).is_none());
     }
 
     #[test]

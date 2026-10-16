@@ -3617,9 +3617,60 @@ fn capture_poses(base: &Path) -> Result<[Vec<eval::Published>; 2], String> {
         println!(
             "the calibration was written after this capture: replaying it under the installed one"
         );
-        return replayed_now(base);
+        // a replay that tracks the controllers through most of what the daemon published; else
+        // what it published, carried into the new calibration's world
+        let replayed = replayed_now(base)?;
+        let published = engine_published(&rec)?;
+        let tracked = |h: usize| replayed[h].len() * 2 >= published[h].len();
+        if replayed.iter().any(|h| !h.is_empty()) && (0..2).all(tracked) {
+            return Ok(replayed);
+        }
+        return carried_now(&rec, published);
     }
     engine_published(&rec)
+}
+
+/// The poses the daemon published during a capture, carried into the installed calibration's
+/// world frame: for a capture the replay cannot track (the daemon tracked throughout, so it
+/// recorded no engine poses to start from), made under a calibration since replaced. The sensors
+/// stay where they are mounted, so where each calibration puts them gives the change of frame.
+/// `hands` are the poses the daemon published (`engine_published`).
+fn carried_now(
+    rec: &Path,
+    mut hands: [Vec<eval::Published>; 2],
+) -> Result<[Vec<eval::Published>; 2], String> {
+    let then = file::recording_sensor_poses(rec)?;
+    let now = file::sensor_poses(&file::load(&file::default_path())?);
+    let w = file::world_change(&then, &now).ok_or_else(|| {
+        format!(
+            "{}: the replay found too little to track and the recording does not place two of the installed calibration's sensors",
+            rec.display()
+        )
+    })?;
+    if !w.within_tolerance() {
+        return Err(format!(
+            "the replay found too little to track, and the installed calibration has moved the sensors against each other since this capture (by up to {:.1} mm, {:.2} deg): capture again",
+            w.worst_m * 1e3,
+            w.worst_rad.to_degrees()
+        ));
+    }
+    let change = w.change;
+    println!(
+        "the replay found too little to track (the daemon tracked throughout): carrying the poses it published into the installed calibration's world ({:.1} mm, {:.2} deg; sensors within {:.1} mm, {:.2} deg{})",
+        change.translation.vector.norm() * 1e3,
+        change.rotation.angle().to_degrees(),
+        w.worst_m * 1e3,
+        w.worst_rad.to_degrees(),
+        w.left_out
+            .as_ref()
+            .map_or(String::new(), |s| format!("; {s}, which the calibration has moved, left out"))
+    );
+    for p in hands.iter_mut().flatten() {
+        p.pose = change * p.pose;
+        p.vel = change.rotation * p.vel;
+        p.ang_vel_world = change.rotation * p.ang_vel_world;
+    }
+    Ok(hands)
 }
 
 /// Whether the poses the daemon published during a capture (last written at `captured`) are in
