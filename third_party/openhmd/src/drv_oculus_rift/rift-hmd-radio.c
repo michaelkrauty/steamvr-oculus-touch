@@ -599,11 +599,9 @@ int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
 		/* Store the freshly read config block.
 		 * We don't need to free on this branch - our json block is in the radio read store */
 		LOGD("Storing touch controller calibration cache file %s", config_block_key);
-		ret = ohmd_set_config(ctx, config_block_key, json, length);
-		if (ret < 0) {
-			state->failure = (rift_touch_calibration_info){ .field = "cache write" };
-			goto out;
-		}
+		/* The cache writer reports failures. Keep the valid calibration for this session
+		 * even if it cannot be saved for the next one. */
+		(void)ohmd_set_config(ctx, config_block_key, json, length);
 	}
 
 	unsigned int defaults = state->failure.defaults & ~state->defaults_warned;

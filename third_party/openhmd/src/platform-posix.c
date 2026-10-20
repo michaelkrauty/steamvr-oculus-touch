@@ -14,17 +14,18 @@
 #define CLOCK_MONOTONIC (clockid_t)4
 #endif
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
 #include <errno.h>
-#include "ohmd-assert.h"
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -294,67 +295,120 @@ out:
 	return ret;
 }
 
+/* Another process starting up can create the directory first. That is fine if it made one. */
+static int ohmd_make_directory(const char *path)
+{
+	struct stat sb;
+	if (mkdir(path, 0777) == 0)
+		return 0;
+	int error = errno ? errno : EIO;
+	if (error == EEXIST) {
+		if (stat(path, &sb) == 0)
+			return S_ISDIR(sb.st_mode) ? 0 : -ENOTDIR;
+		error = errno ? errno : EIO;
+	}
+	return -error;
+}
+
 int ohmd_ensure_path(const char* pathname)
 {
 	int ret;
 	struct stat sb;
 	char pathbuf[OHMD_STR_SIZE+1];
 	char *separator, *cur;
+	size_t length = strlen(pathname);
 
-	/* Path must be at least 2 chars */
-	OHMD_ASSERT(strlen(pathname) > 1);
+	if (length < 2 || length > OHMD_STR_SIZE)
+		return -EINVAL;
 
 	/* Check if the path exists */
 	ret = stat(pathname, &sb);
 	if (ret < 0 && errno != ENOENT)
-		return errno;
-	if (ret == 0) {
-		if (!S_ISDIR(sb.st_mode)) {
-			return errno;
-		}
-		return 0; /* Success. It already exists and is a dir */
-	}
+		return -(errno ? errno : EIO);
+	if (ret == 0)
+		return S_ISDIR(sb.st_mode) ? 0 : -ENOTDIR;
 
 	/* Recursively create all components of a path name */
-	strncpy(pathbuf, pathname, OHMD_STR_SIZE);
+	strcpy(pathbuf, pathname);
 	cur = pathbuf + 1;
 	while ((separator = strstr(cur, "/")) != NULL) {
 		*separator = '\0'; /* Shorten the string to just the path so far */
 
-		/* Check if the path exists */
 		ret = stat(pathbuf, &sb);
 		if (ret != 0) {
 			if (errno != ENOENT)
-				return errno;
-			/* This path doesn't exist, create it */
-			if ((ret = mkdir(pathbuf, 0777)) != 0)
+				return -(errno ? errno : EIO);
+			if ((ret = ohmd_make_directory(pathbuf)) != 0)
 				return ret;
 		} else if (!S_ISDIR(sb.st_mode)) {
-			return ENOTDIR;
+			return -ENOTDIR;
 		}
 
-		/* Replace the separator and advance to the next */
 		*separator = '/';
 		cur = separator + 1;
 	}
 
-	/* Create the final path component */
-	return mkdir(pathname, 0777);
+	return ohmd_make_directory(pathname);
 }
 
+/* Publish only a completely written cache: a reader sees the old file or the whole new one.
+ * The temporary file is a sibling, so rename cannot cross filesystems or expose a partially
+ * written final name. There is no sync: this runs on the engine thread, and waiting for the disk
+ * can stall tracking for tens of milliseconds or more. A cache torn by a power cut fails to parse
+ * and is read from the controller again. O_EXCL makes the name unique without touching an existing
+ * file, and the kernel applies the umask as fopen("w") did. */
 int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len)
 {
-	FILE* f = fopen(filename, "w");
-
-	if (f == NULL)
-		return errno;
-
-	if (fwrite(buf, 1, buf_len, f) != 1) {
-		if (ferror(f))
-			return errno;
+	static unsigned int sequence;
+	const size_t size = strlen(filename) + 48;
+	char *temporary = malloc(size);
+	FILE *f = NULL;
+	int fd = -1, ret = 0;
+	bool created = false;
+	if (!temporary)
+		return -ENOMEM;
+	for (int attempt = 0;; attempt++) {
+		int n = snprintf(temporary, size, "%s.tmp-%ld-%u", filename, (long)getpid(),
+			__atomic_add_fetch(&sequence, 1, __ATOMIC_RELAXED));
+		if (n < 0 || (size_t)n >= size) {
+			ret = -ENAMETOOLONG;
+			goto out;
+		}
+		fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+		if (fd >= 0)
+			break;
+		if (errno != EEXIST || attempt >= 99) {
+			ret = -(errno ? errno : EIO);
+			goto out;
+		}
 	}
-
-	return fclose(f);
+	created = true;
+	f = fdopen(fd, "wb");
+	if (!f) {
+		ret = -(errno ? errno : EIO);
+		goto out;
+	}
+	fd = -1; /* the stream now owns it */
+	errno = 0;
+	if (fwrite(buf, 1, buf_len, f) != buf_len)
+		ret = -(errno ? errno : EIO);
+	errno = 0;
+	if (ret == 0 && fflush(f) != 0)
+		ret = -(errno ? errno : EIO);
+	errno = 0;
+	if (fclose(f) != 0 && ret == 0)
+		ret = -(errno ? errno : EIO);
+	f = NULL;
+	if (ret == 0 && rename(temporary, filename) != 0)
+		ret = -(errno ? errno : EIO);
+	if (ret == 0)
+		created = false;
+out:
+	if (fd >= 0 && close(fd) != 0 && ret == 0)
+		ret = -(errno ? errno : EIO);
+	if (created) unlink(temporary);
+	free(temporary);
+	return ret;
 }
 
 /* cv1touch: the XDG rule cv1touch resolves this directory with (src/platform/mod.rs,

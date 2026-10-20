@@ -1309,16 +1309,17 @@ static void a_failed_drain_is_reported_as_itself(void)
 	CHECK(strstr(diagnostics, "Right controller radio calibration: previous radio command") && !strstr(diagnostics, "5 s"));
 	clear_retry_fixture(&hmd);
 }
-/* The calibration was read and parsed; what failed is saving it. Say so, not the parser's last field. */
-static void a_failed_cache_save_is_reported_as_the_save(void)
+/* Saving the cache is optional: when it fails, the calibration just read stays in use and is not read again. */
+static void a_failed_cache_save_keeps_the_calibration(void)
 {
 	ohmd_context ctx = {0}; rift_hmd_t hmd; retry_fixture(&hmd, &ctx);
 	radio_json = valid_json; set_config_error = -ENOSPC;
 	report_frame(&hmd, 0, 1000000000);
-	CHECK(!hmd.touch_dev[0].have_calibration && cache_writes == 1);
-	CHECK(hmd.touch_dev[0].calibration_state.error == -ENOSPC);
-	report_frame(&hmd, 0, 2000000000);
-	CHECK(strstr(diagnostics, "cache write") && !strstr(diagnostics, "ModelPoints") && !strstr(diagnostics, "LED"));
+	CHECK(hmd.touch_dev[0].have_calibration && cache_writes == 1 && tracker_creations == 1);
+	CHECK(hmd.touch_dev[0].calibration_state.error == 0 && warning_logs == 1); /* only the rejected cache */
+	CHECK(hash_reads == 1 && flash_headers == 1);
+	report_frame(&hmd, 0, 1002000000);
+	CHECK(hash_reads == 1 && flash_headers == 1 && cache_writes == 1 && imu_updates == 2);
 	clear_retry_fixture(&hmd);
 }
 /* Exercise the shared drain through both calibration and haptics, at report rate. */
@@ -1507,7 +1508,7 @@ int main(int argc, char **argv)
 	if (argc == 1 || strcmp(argv[1], "optional") == 0) optional_factory_fields_keep_the_upstream_defaults();
 	if (argc == 1 || strcmp(argv[1], "diagnostics") == 0) {
 		failure_diagnostics_name_the_hand_source_field_and_next_step();
-		a_failed_cache_save_is_reported_as_the_save();
+		a_failed_cache_save_keeps_the_calibration();
 	}
 	CHECK(argc == 1 || strcmp(argv[1], "leds") == 0 || strcmp(argv[1], "parser") == 0 ||
 	      strcmp(argv[1], "cache") == 0 || strcmp(argv[1], "radio") == 0 ||

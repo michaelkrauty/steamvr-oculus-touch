@@ -61,6 +61,13 @@ test_config_dir = executable('test_config_dir', 'test_config_dir.c',
   dependencies: [threads_dep, rt_dep])
 test('config_dir', test_config_dir)
 
+# Pure Windows path/error logic runs on both hosts, without a share or Win32 API calls.
+test_win32_cache = executable('test_win32_cache', 'test_win32_cache.c',
+  c_args: ['-I' + (rift_dir / 'src')])
+test('win32_cache_paths', test_win32_cache, args: ['paths'])
+test('win32_cache_errors', test_win32_cache, args: ['errors'])
+test('win32_cache_separators', test_win32_cache, args: ['separators'])
+
 # Below: a POSIX hardware probe, and harnesses that stub libusb or hidapi inside unity builds of the
 # engine (GNU ld drops what they leave unresolved) or use POSIX threads and clocks. Linux only.
 if windows
@@ -205,3 +212,12 @@ test('touch_calibration_drain_slow', test_touch_calibration, args: ['drain_slow'
 test('touch_calibration_drain_notice', test_touch_calibration, args: ['drain_notice'])
 test('touch_calibration_wake', test_touch_calibration, args: ['wake'])
 test('touch_calibration_wake_reason', test_touch_calibration, args: ['wake_reason'])
+
+# Cache I/O failures reach the caller without making valid controller calibration unusable.
+test_config_write = executable('test_config_write', 'test_config_write.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections', '-Wno-unused-parameter'],
+  dependencies: [threads_dep, rt_dep, dependency('hidapi-hidraw')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('config_write_api', test_config_write, args: ['api'])
+test('config_write_radio', test_config_write, args: ['radio'])
+test('config_write_fresh', test_config_write, args: ['fresh'])
+test('config_write_mode', test_config_write, args: ['mode'])

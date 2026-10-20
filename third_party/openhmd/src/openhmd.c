@@ -10,6 +10,7 @@
 
 #include "openhmdi.h"
 #include "shaders.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -636,6 +637,16 @@ int ohmd_get_config(ohmd_context *ctx, const char *key, char **out_buf, unsigned
   return ohmd_read_file (filename, out_buf, out_len);
 }
 
+/* The only thing saved here is the controllers' factory calibration. A failed save costs nothing
+ * now: the calibration is in use, and is read from the controller again the next time. */
+static void ohmd_warn_config_not_saved(ohmd_context *ctx, const char *what, const char *path, int error)
+{
+	const char *reason = strerror(error);
+	snprintf(ctx->error_msg, OHMD_STR_SIZE, "Could not %s %s: %s", what, path, reason);
+	LOGW("Could not %s %s: %s. The calibration is still in use and will be read from the controller again next time.",
+		what, path, reason);
+}
+
 int ohmd_set_config(ohmd_context *ctx, const char *key, char *buf, unsigned long buf_len)
 {
 	char filename[OHMD_STR_SIZE];
@@ -644,18 +655,19 @@ int ohmd_set_config(ohmd_context *ctx, const char *key, char *buf, unsigned long
 
 	/* Make sure the config path exists first */
 	if ((ret = ohmd_ensure_path(config_path)) < 0) {
-		ohmd_set_error (ctx, "Could not create config directory");
+		ohmd_warn_config_not_saved(ctx, "create the folder", config_path, -ret);
 		return ret;
 	}
 
 	/* TODO: Check that the key is a valid filename */
-	if (snprintf (filename, OHMD_STR_SIZE, "%s/%s", config_path, key) >= OHMD_STR_SIZE) {
-		ohmd_set_error (ctx, "Could not read config file");
-		return -1;
+	ret = snprintf (filename, OHMD_STR_SIZE, "%s/%s", config_path, key);
+	if (ret < 0 || ret >= OHMD_STR_SIZE) {
+		ohmd_warn_config_not_saved(ctx, "save the calibration to", key, ENAMETOOLONG);
+		return -ENAMETOOLONG;
 	}
 
 	if ((ret = ohmd_write_file (filename, buf, buf_len)) < 0) {
-		ohmd_set_error (ctx, "Could not create config directory");
+		ohmd_warn_config_not_saved(ctx, "save the calibration to", filename, -ret);
 		return ret;
 	}
 

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wctype.h>
+#include "platform-win32-cache.h"
 
 #include "platform.h"
 #include "openhmdi.h"
@@ -237,23 +238,29 @@ void ohmd_toggle_ovr_service(int state)
 static wchar_t *widen(const char *utf8)
 {
 	const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, NULL, 0);
-	if (n <= 0)
+	if (n <= 0) {
+		errno = EINVAL;
 		return NULL;
-	wchar_t *wide = malloc((size_t)n * sizeof *wide);
-	if (wide && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, n) != n) {
-		free(wide);
-		wide = NULL;
 	}
+	wchar_t *wide = malloc((size_t)n * sizeof *wide);
+	if (!wide) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, n) != n) {
+		free(wide);
+		errno = EINVAL;
+		return NULL;
+	}
+	ohmd_win32_path_separators(wide);
 	return wide;
 }
 
 static FILE *open_utf8(const char *filename, const wchar_t *mode)
 {
 	wchar_t *wide = widen(filename);
-	if (!wide) {
-		errno = EINVAL;
-		return NULL;
-	}
+	if (!wide)
+		return NULL; /* widen() has set errno: EINVAL for bad UTF-8, ENOMEM */
 	FILE *f = _wfopen(wide, mode);
 	free(wide);
 	return f;
@@ -263,7 +270,7 @@ int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len)
 {
 	FILE* f = open_utf8(filename, L"rb");
 	if (f == NULL)
-		return errno;
+		return errno ? errno : EIO;
 	int ret = 0;
 	char *buffer = NULL;
 	long file_len;
@@ -291,50 +298,103 @@ fail:
 	return ret;
 }
 
-/* Creates every missing directory of pathname ("/" or "\" separated). */
+/* Creates missing components after the drive/UNC root, preserving Win32 errors. */
 int ohmd_ensure_path(const char* pathname)
 {
 	char pathbuf[OHMD_STR_SIZE + 1];
 	if (strlen(pathname) < 2 || strlen(pathname) > OHMD_STR_SIZE)
-		return EINVAL;
+		return -EINVAL;
 	strcpy(pathbuf, pathname);
-	for (char *cur = pathbuf + 1;; cur++) {
+	int start = ohmd_win32_path_start(pathbuf);
+	if (start < 0) return -EINVAL;
+	if (!pathbuf[start]) return 0;
+	for (char *cur = pathbuf + start;; cur++) {
 		const char c = *cur;
-		if (c != '/' && c != '\\' && c != 0)
+		if (!ohmd_win32_separator(c) && c != 0)
 			continue;
-		*cur = 0;
-		/* "C:" alone is a drive, not a directory to create */
-		if (!(cur - pathbuf == 2 && pathbuf[1] == ':')) {
+		if (cur > pathbuf + start && !ohmd_win32_separator(cur[-1])) {
+			*cur = 0;
 			wchar_t *wide = widen(pathbuf);
 			if (!wide)
-				return EINVAL;
-			const DWORD attributes = GetFileAttributesW(wide);
+				return -(errno ? errno : EINVAL);
+			DWORD attributes = GetFileAttributesW(wide);
 			int error = 0;
 			if (attributes == INVALID_FILE_ATTRIBUTES) {
-				if (!CreateDirectoryW(wide, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-					error = EIO;
+				DWORD reason = GetLastError();
+				if (reason != ERROR_FILE_NOT_FOUND && reason != ERROR_PATH_NOT_FOUND) {
+					error = ohmd_win32_error(reason);
+				} else if (!CreateDirectoryW(wide, NULL)) {
+					reason = GetLastError();
+					if (reason == ERROR_ALREADY_EXISTS) {
+						attributes = GetFileAttributesW(wide);
+						error = attributes == INVALID_FILE_ATTRIBUTES ? ohmd_win32_error(GetLastError()) :
+							(attributes & FILE_ATTRIBUTE_DIRECTORY ? 0 : ENOTDIR);
+					} else error = ohmd_win32_error(reason);
+				}
 			} else if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
 				error = ENOTDIR;
 			}
 			free(wide);
-			if (error)
-				return error;
+			if (error) return -error;
+			*cur = c;
 		}
-		if (c == 0)
-			return 0;
-		*cur = c;
+		if (c == 0) return 0;
 	}
 }
 
+/* Publishes only a completely written cache: a reader sees the old file or the whole new one. No
+ * FlushFileBuffers and no write-through move: this runs on the engine thread, where waiting for the
+ * disk can stall tracking, and a cache torn by a power cut fails to parse and is read from the
+ * controller again. */
 int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len)
 {
-	FILE* f = open_utf8(filename, L"wb");
-	if (f == NULL)
-		return errno;
-	const int failed = fwrite(buf, 1, buf_len, f) != buf_len;
-	if (fclose(f) != 0 || failed)
-		return EIO;
-	return 0;
+	static LONG sequence;
+	wchar_t *wide = widen(filename), *temporary = NULL;
+	HANDLE file = INVALID_HANDLE_VALUE;
+	bool created = false;
+	int ret = 0;
+	if (!wide) return -(errno ? errno : EINVAL);
+	const size_t count = wcslen(wide) + 48;
+	temporary = malloc(count * sizeof *temporary);
+	if (!temporary) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* CREATE_NEW owns a unique sibling without ever truncating an existing file. */
+	for (;;) {
+		int n = swprintf(temporary, count, L"%ls.tmp-%lu-%lu", wide, GetCurrentProcessId(),
+			(unsigned long)InterlockedIncrement(&sequence));
+		if (n < 0 || (size_t)n >= count) {
+			ret = -ENAMETOOLONG;
+			goto out;
+		}
+		file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (file != INVALID_HANDLE_VALUE) break;
+		DWORD error = GetLastError();
+		if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+			ret = -ohmd_win32_error(error);
+			goto out;
+		}
+	}
+	created = true;
+	DWORD written = 0;
+	if (!WriteFile(file, buf, (DWORD)buf_len, &written, NULL))
+		ret = -ohmd_win32_error(GetLastError());
+	else if (written != buf_len)
+		ret = -EIO;
+	if (!CloseHandle(file) && ret == 0)
+		ret = -ohmd_win32_error(GetLastError());
+	file = INVALID_HANDLE_VALUE;
+	if (ret == 0 && !MoveFileExW(temporary, wide, MOVEFILE_REPLACE_EXISTING))
+		ret = -ohmd_win32_error(GetLastError());
+	if (ret == 0) created = false;
+out:
+	if (file != INVALID_HANDLE_VALUE && !CloseHandle(file) && ret == 0)
+		ret = -ohmd_win32_error(GetLastError());
+	if (created) DeleteFileW(temporary);
+	free(temporary);
+	free(wide);
+	return ret;
 }
 
 static int absolute(const wchar_t *path)

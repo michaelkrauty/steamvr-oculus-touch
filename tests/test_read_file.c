@@ -2,7 +2,7 @@
 // Copyright 2026 michaelkrauty
 /* The POSIX file reader unwinds seek, allocation and read failures without
  * publishing a partial buffer. All file operations below are synthetic. */
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

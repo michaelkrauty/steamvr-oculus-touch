@@ -60,9 +60,14 @@ void ohmd_destroy_thread(ohmd_thread* thread);
 /* cv1touch: names the calling thread (Linux: 15 characters), so the daemon and profilers find it */
 void ohmd_set_thread_name(const char* name);
 
+/* Directory creation and writes return zero on success, a negative errno on failure.
+ * Writes publish a sibling temporary file by rename only after it is written and closed, so a
+ * reader sees the old file or the complete new one. Nothing is synced to disk: callers on the
+ * engine thread must not wait for it, and a cache torn by a power cut fails to parse. */
 int ohmd_ensure_path(const char* pathname);
-int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len);
 int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len);
+/* Reads return zero on success, nonzero on failure. */
+int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len);
 
 /* String functions */
 
