@@ -219,6 +219,23 @@ typedef struct {
 	rift_leds leds;
 } rift_touch_calibration;
 
+typedef struct {
+	const char *field, *reason; /* static, sanitized descriptions; never JSON bytes */
+	unsigned int defaults;
+} rift_touch_calibration_info;
+
+/* Engine-owned loading history for one hand, scoped to an observed factory hash. */
+typedef struct {
+	bool have_hash, cache_rejected;
+	uint8_t hash[16];
+	uint64_t retry_time;
+	unsigned int retry_delay; /* seconds, capped at 60 */
+	int error; /* last terminal failure, including the quiet first attempt */
+	rift_touch_calibration_info failure, reported_failure;
+	const char *source, *reported_source;
+	unsigned int defaults_warned;
+} rift_touch_calibration_state;
+
 typedef struct rift_tracked_device_s rift_tracked_device;
 typedef struct rift_hmd_s rift_hmd_t;
 typedef struct rift_device_priv_s rift_device_priv;
@@ -261,6 +278,7 @@ struct rift_touch_controller_s {
 	rift_tracked_device *tracked_dev;
 
 	bool have_calibration;
+	rift_touch_calibration_state calibration_state;
 	/* Snapshot of the factory calibration identity, owned by this controller. */
 	uint8_t cv1touch_calibration_hash[16];
 	rift_touch_calibration calibration;

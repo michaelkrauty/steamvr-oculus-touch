@@ -44,6 +44,8 @@ extern nx_json_unicode_encoder nx_json_unicode_to_utf8;
 
 const nx_json* nx_json_parse(char* text, nx_json_unicode_encoder encoder);
 const nx_json* nx_json_parse_utf8(char* text);
+/* Silent parse: error is 0, -EINVAL for malformed JSON, or -ENOMEM. */
+const nx_json* nx_json_parse_silent(char* text, nx_json_unicode_encoder encoder, int* error);
 void nx_json_free(const nx_json* js);
 const nx_json* nx_json_get(const nx_json* json, const char* key); // get object's property by key
 const nx_json* nx_json_item(const nx_json* json, int idx); // get array element by index

@@ -249,44 +249,47 @@ int findEndPoint(char* path, int endpoint)
 int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len)
 {
 	FILE* f = fopen(filename, "rb");
-  long file_len, total_read = 0;
-  char *buffer;
-  int ret;
+	long file_len, total_read = 0;
+	char *buffer = NULL;
+	int ret = 0;
 
-  if (f == NULL)
-    return errno;
+	if (f == NULL)
+		return errno ? errno : EIO;
 
-	ret = fseek(f, 0, SEEK_END);
-  if (ret != 0)
-    goto fail;
+	if (fseek(f, 0, SEEK_END) != 0 ||
+	    (file_len = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
+		ret = errno ? errno : EIO;
+		goto out;
+	}
 
-	file_len = ftell(f);
-  if (file_len < 0) {
-    ret = errno;
-    goto fail;
-  }
+	buffer = malloc((size_t)file_len + 1);
+	if (buffer == NULL) {
+		ret = ENOMEM;
+		goto out;
+	}
 
-	ret = fseek(f, 0, SEEK_SET);
+	while (total_read < file_len) {
+		errno = 0;
+		size_t n_read = fread(buffer + total_read, 1, (size_t)(file_len - total_read), f);
+		total_read += (long)n_read;
+		if (ferror(f)) {
+			ret = errno ? errno : EIO;
+			if (ret != EINTR)
+				goto out;
+			clearerr(f);
+		} else if (n_read == 0) {
+			ret = EIO;
+			goto out;
+		}
+	}
 
-	buffer = malloc(file_len + 1);
-  buffer[file_len] = 0;
-
-  while (total_read < file_len) {
-	  size_t n_read = fread(buffer, file_len, 1, f);
-    if (n_read > 0) {
-      total_read += file_len;
-    } else {
-      if (feof(f))
-        break;
-      ret = errno;
-      if (ret != EINTR)
-        goto fail;
-    }
-  }
-
-  *out_buf = buffer;
-  *out_len = (unsigned long) file_len;
-fail:
+	buffer[file_len] = 0;
+	*out_buf = buffer;
+	*out_len = (unsigned long)file_len;
+	buffer = NULL;
+	ret = 0;
+out:
+	free(buffer);
 	fclose(f);
 	return ret;
 }

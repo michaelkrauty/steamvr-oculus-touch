@@ -314,6 +314,113 @@ static void dump_controller_calibration(rift_touch_controller_t *touch)
 	}
 }
 
+/* Called only by the engine thread, from reports and from the no-report update path. */
+static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *touch)
+{
+	rift_touch_calibration_state *state = &touch->calibration_state;
+	rift_hmd_radio_state *radio = &hmd->radio;
+	const uint64_t second = ohmd_monotonic_per_sec(hmd->ctx);
+	const uint64_t now = ohmd_monotonic_get(hmd->ctx);
+	int ret;
+	const uint64_t progress = radio->calibration_progress;
+
+	/* Reports can have waited behind calibration I/O. Gate on fresh host time. */
+	if (now < state->retry_time)
+		return false;
+
+	/* Poll first: the engine thread can stall (a blocked USB call, a suspend), and a command that
+	 * finished meanwhile is read, not abandoned for having waited. */
+	ret = rift_touch_get_calibration(hmd->ctx, radio, touch->device_num,
+			&touch->calibration, state);
+	if (ret == -EINPROGRESS && radio->calibration_deadline && now >= radio->calibration_deadline &&
+	    progress == radio->calibration_progress) {
+		/* Abandon this read, including its result. The next operation must send
+		 * a new command, never consume this one's completion as its own. */
+		radio->device_in_progress = -1;
+		radio->cur_read_cmd = RIFT_RADIO_CMD_NONE;
+		radio->command_result_pending = false;
+		radio->discard_reply = true;
+		state->source = "radio";
+		state->failure = (rift_touch_calibration_info){ .field = "radio command", .reason = "no reply from the controller within 5 s" };
+		ret = -ETIMEDOUT;
+	}
+	const uint64_t completed = ohmd_monotonic_get(hmd->ctx);
+	if (ret == -EINPROGRESS) {
+		/* Bound each command, not a multi-block download. Busy polls do not
+		 * extend the wait; only a validated flash reply proves progress. */
+		if (!radio->calibration_deadline || progress != radio->calibration_progress)
+			radio->calibration_deadline = completed + 5 * second;
+		return false;
+	}
+	if (ret == -EBUSY)
+		return false;
+	radio->calibration_deadline = 0;
+	if (ret < 0) {
+		state->retry_delay = state->retry_delay ? OHMD_MIN(state->retry_delay * 2, 60) : 1;
+		state->retry_time = completed + second * state->retry_delay;
+		/* A missed answer on wake-up is normal. Warn on the second failure,
+		 * then only when the failure changes. Keep the backoff even when quiet. */
+		if (state->retry_delay > 1 && (state->retry_delay == 2 || state->error != ret || state->reported_source != state->source ||
+		    state->reported_failure.field != state->failure.field || state->reported_failure.reason != state->failure.reason)) {
+			LOGW("%s controller %s calibration: %s: %s; retrying in %u s. If this keeps happening, run cv1touch report and attach the file it writes to your bug report.",
+				touch->base.id == 1 ? "Right" : "Left", state->source ? state->source : "radio",
+				state->failure.field ? state->failure.field : "radio command",
+				state->failure.reason ? state->failure.reason : (ret == -ETIMEDOUT ? "the controller did not answer" : strerror(-ret)), state->retry_delay);
+		}
+		state->error = ret;
+		state->reported_source = state->source;
+		state->reported_failure = state->failure;
+		return false;
+	}
+	state->retry_time = 0;
+	state->retry_delay = 0;
+	state->error = 0;
+	rift_tracked_device_imu_calibration imu_calibration;
+	int i;
+
+	quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
+	posef imu_pose;
+	oposef_init(&imu_pose, &touch->calibration.imu_position, &imu_orient);
+
+	quatf model_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
+	vec3f model_pos = {{ 0.0, 0.0, 0.0 }};
+	posef model_pose;
+	oposef_init(&model_pose, &model_pos, &model_orient);
+
+	/* Copy into imu_calibration array */
+	imu_calibration.accel_offset = touch->calibration.accel_offset;
+	imu_calibration.gyro_offset = touch->calibration.gyro_offset;
+	for (i = 0; i < 9; i++) {
+		imu_calibration.accel_matrix[i] = touch->calibration.accel_matrix[i/3][i%3];
+		imu_calibration.gyro_matrix[i] = touch->calibration.gyro_matrix[i/3][i%3];
+	}
+
+	touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
+	memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
+	/* release: the radio thread's decoder copies the calibration once it sees the flag */
+	__atomic_store_n(&touch->have_calibration, true, __ATOMIC_RELEASE);
+	dump_controller_calibration(touch);
+	return true;
+}
+
+/* A sleeping or out-of-range controller need not send another report to release
+ * its pending command. Other controllers and haptics share this one radio. */
+static void update_pending_calibration(rift_hmd_t *hmd)
+{
+	rift_hmd_radio_state *radio = &hmd->radio;
+	if (radio->cur_read_cmd != RIFT_FW_READ_CMD_CALIBRATION_HASH &&
+	    radio->cur_read_cmd != RIFT_FW_READ_CMD_CALIBRATION_HDR &&
+	    radio->cur_read_cmd != RIFT_FW_READ_CMD_CALIBRATION)
+		return;
+	for (int hand = 0; hand < 2; hand++) {
+		rift_touch_controller_t *touch = &hmd->touch_dev[hand];
+		if (!touch->have_calibration && touch->device_num == radio->device_in_progress) {
+			update_touch_calibration(hmd, touch);
+			return;
+		}
+	}
+}
+
 static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 		rift_touch_controller_t *touch, pkt_rift_radio_message *msg)
 {
@@ -331,38 +438,8 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	if (touch_message_empty(msg))
 		return;
 
-	if (!touch->have_calibration) {
-		rift_tracked_device_imu_calibration imu_calibration;
-		int i;
-
-		/* We need calibration data to do any more */
-		if (rift_touch_get_calibration (hmd->ctx, &hmd->radio, touch->device_num,
-				&touch->calibration) < 0)
-			return;
-
-		quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
-		posef imu_pose;
-		oposef_init(&imu_pose, &touch->calibration.imu_position, &imu_orient);
-
-		quatf model_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
-		vec3f model_pos = {{ 0.0, 0.0, 0.0 }};
-		posef model_pose;
-		oposef_init(&model_pose, &model_pos, &model_orient);
-
-		/* Copy into imu_calibration array */
-		imu_calibration.accel_offset = touch->calibration.accel_offset;
-		imu_calibration.gyro_offset = touch->calibration.gyro_offset;
-		for (i = 0; i < 9; i++) {
-			imu_calibration.accel_matrix[i] = touch->calibration.accel_matrix[i/3][i%3];
-			imu_calibration.gyro_matrix[i] = touch->calibration.gyro_matrix[i/3][i%3];
-		}
-
-		touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
-		memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
-		/* release: the radio thread's decoder copies the calibration once it sees the flag */
-		__atomic_store_n(&touch->have_calibration, true, __ATOMIC_RELEASE);
-		dump_controller_calibration(touch);
-	}
+	if (!touch->have_calibration && !update_touch_calibration(hmd, touch))
+		return;
 
 	// time in microseconds
 	cv1touch_sample_time t = touch_sample_time(touch, msg);
@@ -478,7 +555,7 @@ static void check_haptics_state(rift_hmd_t *hmd, uint64_t ts, rift_touch_control
 		hs->haptics_on = false;
 
 	if (hs->in_progress) {
-		int ret = rift_touch_send_haptics(&hmd->radio, touch->device_num, hs->inflight_low_freq, hs->inflight_amplitude);
+		int ret = rift_touch_send_haptics(hmd->ctx, &hmd->radio, touch->device_num, hs->inflight_low_freq, hs->inflight_amplitude);
 		if (ret == -EINPROGRESS || ret == -EBUSY)
 			return;
 		hs->in_progress = false;
@@ -505,7 +582,7 @@ static void check_haptics_state(rift_hmd_t *hmd, uint64_t ts, rift_touch_control
 	hs->dirty = false;
 	hs->inflight_amplitude = want;
 	hs->inflight_low_freq = want_lf;
-	int ret = rift_touch_send_haptics(&hmd->radio, touch->device_num, want_lf, want);
+	int ret = rift_touch_send_haptics(hmd->ctx, &hmd->radio, touch->device_num, want_lf, want);
 	if (ret == -EINPROGRESS) {
 		hs->in_progress = true;
 	} else if (ret == -EBUSY) {
@@ -518,6 +595,8 @@ static void check_haptics_state(rift_hmd_t *hmd, uint64_t ts, rift_touch_control
 /* Keep-alive and haptics: what an update sends before it reads anything. */
 static void update_hmd_outputs(rift_hmd_t *priv, uint64_t now)
 {
+	update_pending_calibration(priv);
+	now = ohmd_monotonic_get(priv->ctx);
 	// Handle keep alive messages
 	double t = ohmd_get_tick();
 	if(t - priv->last_keep_alive >= (double)priv->sensor_config.keep_alive_interval / 1000.0 - .2){
