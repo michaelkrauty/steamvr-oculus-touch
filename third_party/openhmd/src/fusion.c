@@ -8,6 +8,7 @@
 /* Sensor Fusion Implementation */
 
 
+#include "log-output.h"
 #include <string.h>
 #include "openhmdi.h"
 
@@ -156,7 +157,7 @@ static void ofusion_update_dt(fusion* me, float dt, const vec3f* ang_vel, const 
 		oquatf_get_rotated(&me->orient, accel, &world_accel);
 
 #if 0
-		printf ("dt %f accel %f,%f,%f (mag %f) world %f,%f,%f (mag %f)\n", dt,
+		ohmd_log_printf ("dt %f accel %f,%f,%f (mag %f) world %f,%f,%f (mag %f)\n", dt,
 				accel->x, accel->y, accel->z, ovec3f_get_length(accel),
 				world_accel.x, world_accel.y, world_accel.z, ovec3f_get_length(&world_accel));
 #endif

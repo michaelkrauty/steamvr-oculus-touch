@@ -1,8 +1,9 @@
 // Copyright 2020, Jan Schmidt
 // SPDX-License-Identifier: BSL-1.0
+#include "log-output.h"
 #include <stddef.h>
 #include <stdio.h>
-#include <assert.h>
+#include "ohmd-assert.h"
 #include <stdlib.h>
 
 #include "unscented.h"
@@ -13,16 +14,16 @@ static void print_mat(const char *label, const matrix2d *mat)
     int i, j;
 
     if (label)
-        printf ("%s: %u rows, %u cols [\n", label, mat->rows, mat->cols);
+        ohmd_log_printf ("%s: %u rows, %u cols [\n", label, mat->rows, mat->cols);
 
     for (i = 0; i < mat->rows; i++) {
-        printf ("  [");
+        ohmd_log_printf ("  [");
         for (j = 0; j < mat->cols-1; j++) {
-            printf ("%8.4g, ", MATRIX2D_XY(mat, i, j));
+            ohmd_log_printf ("%8.4g, ", MATRIX2D_XY(mat, i, j));
         }
-        printf ("%10.4g ],\n", MATRIX2D_XY(mat, i, j));
+        ohmd_log_printf ("%10.4g ],\n", MATRIX2D_XY(mat, i, j));
     }
-    printf("]\n");
+    ohmd_log_printf("]\n");
 #endif
 }
 
@@ -331,7 +332,7 @@ ut_compute_transform (const unscented_transform *ut, const matrix2d *sigmas, mat
 static bool compute_one_residual(const unscented_transform *ut, const matrix2d *sigmas, const int i, const matrix2d *mean, matrix2d *dest) {
   int j;
 
-  assert(i >= 0 && i < ut->N_sigma);
+  OHMD_ASSERT(i >= 0 && i < ut->N_sigma);
 
   if (ut->residual_fn == NULL) {
     for (j = 0; j < ut->N_cov; j++) {

@@ -7,6 +7,23 @@ test_engine_api = executable('test_engine_api', 'test_engine_api.c', dependencie
 test('engine_api', test_engine_api)
 # Unity build of the engine's blob extraction (meson forbids grabbing subproject sources directly)
 rift_dir = meson.project_source_root() / 'third_party' / 'openhmd'
+test_daemon_log = executable('test_daemon_log', 'test_daemon_log.c',
+  c_args: ['-DOHMD_NONBLOCK_LOG', '-DOHMD_STATIC', '-I' + (rift_dir / 'include')],
+  dependencies: [dependency('libusb-1.0')])
+test('daemon_log', test_daemon_log)
+assert_python = import('python').find_installation()
+test_log_reentry = executable('test_native_log_reentry', 'test_native_log_reentry.c',
+  c_args: ['-DOHMD_NONBLOCK_LOG', '-DOHMD_STATIC', '-I' + (rift_dir / 'include')],
+  dependencies: [dependency('libusb-1.0')])
+test('native_log_reentry', assert_python,
+  args: [files('check_native_log_reentry.py'), test_log_reentry])
+test_assert_routed = executable('test_native_assert_routed', 'test_native_assert.cpp',
+  dependencies: [openhmd_dep])
+test('native_assert_routed', assert_python,
+  args: [files('check_native_assert.py'), test_assert_routed, 'routed'])
+test_assert_standalone = executable('test_native_assert_standalone', 'test_native_assert.cpp')
+test('native_assert_standalone', assert_python,
+  args: [files('check_native_assert.py'), test_assert_standalone, 'standalone'])
 test_blob_shape = executable('test_blob_shape', 'test_blob_shape.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
   dependencies: [openhmd_dep])
@@ -49,6 +66,10 @@ test('config_dir', test_config_dir)
 if windows
   subdir_done()
 endif
+
+# A dlopen-only test seam for the daemon's real logger and the engine's math assertion.
+shared_library('test_native_assert_bridge', 'native_assert_bridge.c',
+  c_args: ['-DOHMD_NONBLOCK_LOG'], dependencies: [openhmd_dep], link_args: libm)
 
 engine_probe = executable('engine_probe', 'engine_probe.c', dependencies: [openhmd_dep])
 # Deterministic callback/stop lock inversion; no device access.

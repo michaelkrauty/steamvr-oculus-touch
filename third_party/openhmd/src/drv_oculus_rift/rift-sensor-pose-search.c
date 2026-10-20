@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <inttypes.h>
 
 #include "rift-tracker.h"
@@ -515,7 +515,7 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	 * the camera->world pose. */
 	oposef_apply(&pose, &pf->camera_pose, &pose);
 
-	assert (pf->pose_cb != NULL);
+	OHMD_ASSERT(pf->pose_cb != NULL);
 
 	if (pf->pose_cb (pf->pose_cb_data, dev, frame, &pose, score)) {
 		dev_state->found_device_pose = true;

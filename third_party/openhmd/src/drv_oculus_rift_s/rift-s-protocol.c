@@ -11,7 +11,7 @@
 
 /* Oculus Rift S Driver - HID/USB Driver Implementation */
 
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <hidapi.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -125,7 +125,7 @@ rift_s_parse_controller_report (rift_s_controller_report_t *report, const unsign
 	}
 
 	if (avail > 0) {
-		assert (avail < sizeof (report->extra_bytes));
+		OHMD_ASSERT(avail < sizeof (report->extra_bytes));
 		report->extra_bytes_len = avail;
 		memcpy (report->extra_bytes, buf, avail);
 	}
@@ -450,7 +450,7 @@ int rift_s_read_devices_list (hid_device *handle, rift_s_devices_list_t *dev_lis
 	for (int i = 0; i < num_records; i++) {
 		dev_list->devices[i] = *(rift_s_device_type_record_t *)(pos);
 		pos += sizeof(rift_s_device_type_record_t);
-		assert (sizeof(rift_s_device_type_record_t) == 28);
+		OHMD_ASSERT(sizeof(rift_s_device_type_record_t) == 28);
 	}
 	dev_list->num_devices = num_records;
 

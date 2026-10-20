@@ -1,5 +1,6 @@
 // Copyright 2020, Jan Schmidt
 // SPDX-License-Identifier: BSL-1.0
+#include "log-output.h"
 #include <stdio.h>
 
 #include "ukf.h"
@@ -10,16 +11,16 @@ static void print_mat(const char *label, const matrix2d *mat)
     int i, j;
 
     if (label)
-        printf ("%s: %u rows, %u cols [\n", label, mat->rows, mat->cols);
+        ohmd_log_printf ("%s: %u rows, %u cols [\n", label, mat->rows, mat->cols);
 
     for (i = 0; i < mat->rows; i++) {
-        printf ("  [");
+        ohmd_log_printf ("  [");
         for (j = 0; j < mat->cols-1; j++) {
-            printf ("%8.4f, ", MATRIX2D_XY(mat, i, j));
+            ohmd_log_printf ("%8.4f, ", MATRIX2D_XY(mat, i, j));
         }
-        printf ("%10.4f ],\n", MATRIX2D_XY(mat, i, j));
+        ohmd_log_printf ("%10.4f ],\n", MATRIX2D_XY(mat, i, j));
     }
-    printf("]\n");
+    ohmd_log_printf("]\n");
 #endif
 }
 
@@ -93,7 +94,7 @@ bool ukf_base_predict_with_process(ukf_base *u, double dt, ukf_process_fn proces
 
   /* Generate the sigma points around the current state prior */
   if (!ut_compute_sigma_points(&u->ut_X, u->sigmas, u->x_prior, u->P_prior)) {
-      printf ("Prediction UKF weight computation failed\n");
+      ohmd_log_printf ("Prediction UKF weight computation failed\n");
       return false;
   }
 
@@ -112,7 +113,7 @@ bool ukf_base_predict_with_process(ukf_base *u, double dt, ukf_process_fn proces
   }
 
   if (!ut_compute_transform (&u->ut_X, u->sigmas, u->x, u->P, NULL)) {
-      printf ("Failed to compute UKF transformed mean and covariance\n");
+      ohmd_log_printf ("Failed to compute UKF transformed mean and covariance\n");
       return false;
   }
 
@@ -157,7 +158,7 @@ ukf_base_update(ukf_base *u, ukf_measurement *m)
   }
 
   if (!ut_compute_transform (&m->ut_Z, m->sigmas, m->Z_est, m->Pz, m->R)) {
-      printf ("Failed to compute UKF transformed mean and covariance of measurement\n");
+      ohmd_log_printf ("Failed to compute UKF transformed mean and covariance of measurement\n");
       return false;
   }
 

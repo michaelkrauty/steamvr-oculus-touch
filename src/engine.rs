@@ -149,56 +149,20 @@ pub struct Engine {
 }
 
 #[cfg(feature = "engine")]
-unsafe extern "C" fn frame_cb(
-    user: *mut c_void,
-    info: *const FrameInfo,
-    n: c_int,
-    blobs: *const Blob,
-) {
-    if info.is_null() {
-        return;
-    }
-    let sink = &*(user as *const Arc<dyn EngineSink>);
-    let blobs = if n > 0 && !blobs.is_null() {
-        std::slice::from_raw_parts(blobs, n as usize)
-    } else {
-        &[]
-    };
-    sink.frame(&*info, blobs);
-}
-
+mod callbacks;
 #[cfg(feature = "engine")]
-unsafe extern "C" fn image_cb(
-    user: *mut c_void,
-    info: *const FrameInfo,
-    width: c_int,
-    height: c_int,
-    stride: c_int,
-    pixels: *const u8,
-) {
-    if info.is_null() || pixels.is_null() || width <= 0 || height <= 0 || stride < width {
-        return;
-    }
-    let sink = &*(user as *const Arc<dyn EngineSink>);
-    let px = std::slice::from_raw_parts(pixels, stride as usize * height as usize);
-    sink.image(&*info, width as usize, height as usize, stride as usize, px);
-}
+use callbacks::{frame_cb, image_cb, report_cb};
 
+/// Run Rust entered from C. A panic must not reach Rust's non-unwinding ABI diagnostic,
+/// which writes directly to stderr. The daemon installs its nonblocking panic hook first.
 #[cfg(feature = "engine")]
-unsafe extern "C" fn report_cb(
-    user: *mut c_void,
-    source: c_int,
-    ts: u64,
-    data: *const u8,
-    len: c_int,
-) {
-    let sink = &*(user as *const Arc<dyn EngineSink>);
-    let data = if len > 0 && !data.is_null() {
-        std::slice::from_raw_parts(data, len as usize)
-    } else {
-        &[]
-    };
-    sink.report(source, ts, data);
+pub fn ffi_callback(run: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        // A user panic payload's destructor could panic again. We are terminating anyway.
+        std::mem::forget(payload);
+        // SAFETY: the native fatal path drains once within its bound and never returns.
+        unsafe { ffi::ohmd_cv1touch_abort() };
+    }
 }
 
 /// A NUL-terminated C char array field as a String.

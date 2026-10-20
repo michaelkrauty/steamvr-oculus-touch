@@ -5,6 +5,7 @@
  */
 #define _XOPEN_SOURCE 700
 
+#include "../log-output.h"
 #include <strings.h>
 
 #include <spa/param/video/format-utils.h>
@@ -68,7 +69,7 @@ static void on_stream_state_changed(void *_data, enum pw_stream_state old, enum 
 {
 	ohmd_pw_base_stream *s = _data;
 
-	printf("stream state: \"%s\"\n", pw_stream_state_as_string(state));
+	ohmd_log_printf("stream state: \"%s\"\n", pw_stream_state_as_string(state));
 	s->state = state;
 
 	switch (state) {

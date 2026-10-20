@@ -27,6 +27,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- A stalled system log no longer freezes the controllers or prevents the daemon from stopping. Logging uses bounded memory and discards excess lines with a count when output resumes. A failed native assertion or a panic in a native callback still ends the daemon for its supervisor to restart, even when the log is stalled. Native engine messages now share standard error with the daemon's Rust messages (previously they went to standard output); their prefixes stay as before.
 - Control requests give up within the caller's timeout even when the daemon stops accepting connections. Connecting, sending the command and reading its reply share one deadline on Linux and Windows; a reply arriving in pieces does not restart the timeout.
 - The supervisor no longer loses output it already received when a loaded machine schedules it after the one-second log-drain deadline. It writes those lines before leaving the output, even if something the daemon started keeps its pipes open and continues writing.
 - The supervisor gives the daemon ten seconds to accept a stop request and, if it accepts in time, ten seconds to stop. Failed attempts share the original deadline, and a late reply cannot postpone ending the daemon. Closing the console still leaves only the time Windows allows.

@@ -1,3 +1,4 @@
+#include "../../log-output.h"
 #include <errno.h>
 #include <libusb.h>
 #include <stdbool.h>
@@ -41,7 +42,7 @@ int rift_sensor_esp770u_read_reg(libusb_device_handle *dev, uint8_t reg_block, u
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0x82 || buf[2] != 0x00)
-		fprintf(stderr, "read_reg(0x%x,0x%x): %02x %02x %02x\n",
+		ohmd_log_fprintf(stderr, "read_reg(0x%x,0x%x): %02x %02x %02x\n",
 			reg_block, reg, buf[0], buf[1], buf[2]);
 	*val = buf[1];
 	return ret;
@@ -59,7 +60,7 @@ int rift_sensor_esp770u_write_reg(libusb_device_handle *dev, uint8_t reg_block, 
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0x02 || buf[1] != reg_block || buf[2] != reg || buf[3] != val)
-		fprintf(stderr, "write_reg(0x%x,0x%x,0x%x): %02x %02x %02x %02x\n",
+		ohmd_log_fprintf(stderr, "write_reg(0x%x,0x%x,0x%x): %02x %02x %02x %02x\n",
 			reg_block, reg, val, buf[0], buf[1], buf[2], buf[3]);
 	return ret;
 }
@@ -78,7 +79,7 @@ static int set_get_verify_a0(libusb_device_handle *dev, uint8_t val,
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0xa0 || buf[1] != retval || buf[2] != 0x00) {
-		fprintf(stderr, "response, should be a0 %02x 00: %02x %02x %02x\n",
+		ohmd_log_fprintf(stderr, "response, should be a0 %02x 00: %02x %02x %02x\n",
 			retval, buf[0], buf[1], buf[2]);
 		return -1;
 	}
@@ -217,20 +218,20 @@ static int radio_write(libusb_device_handle *devhandle, const uint8_t *buf, size
 		if (data[i])
 			break;
 	if (data[0] != buf[0] || data[1] != buf[1]) {
-		printf("eSP770U: Unexpected read (%02x %02x):\n", buf[0], buf[1]);
+		ohmd_log_printf("eSP770U: Unexpected read (%02x %02x):\n", buf[0], buf[1]);
 		for (i = 0; i < 127; i++)
-			printf("%02x ", data[i]);
-		printf("\n");
+			ohmd_log_printf("%02x ", data[i]);
+		ohmd_log_printf("\n");
 	}
 
 	uint8_t chksum = 0;
 	for (i = 0; i < 127; i++)
 		chksum += data[i];
 	if (chksum) {
-		printf("eSP770U: Checksum mismatch: %02x\n", chksum);
+		ohmd_log_printf("eSP770U: Checksum mismatch: %02x\n", chksum);
 		for (i = 0; i < 127; i++)
-			printf("%02x ", data[i]);
-		printf("\n");
+			ohmd_log_printf("%02x ", data[i]);
+		ohmd_log_printf("\n");
 	}
 
 	return 0;
@@ -277,13 +278,13 @@ int rift_sensor_esp770u_init_regs(libusb_device_handle *devhandle)
 
 	ret = esp770u_read_reg(devhandle, 0x5a, &val);
 	if (ret < 0) return ret;
-	if (val != 0x01 && val != 0x03) printf("unexpected 5a value: %02x\n", val);
+	if (val != 0x01 && val != 0x03) ohmd_log_printf("unexpected 5a value: %02x\n", val);
 
 	ret = esp770u_write_reg(devhandle, 0x5a, 0x01); /* &= 0x02? */
 	if (ret < 0) return ret;
 	ret = esp770u_read_reg(devhandle, 0x5a, &val);
 	if (ret < 0) return ret;
-	if (val != 0x01) printf("unexpected 5a value: %02x\n", val);
+	if (val != 0x01) ohmd_log_printf("unexpected 5a value: %02x\n", val);
 
 	ret = esp770u_read_reg(devhandle, 0x18, &val); /* |= 0x01 ? */
 	if (ret < 0) return ret;
@@ -304,27 +305,27 @@ int rift_sensor_esp770u_init_regs(libusb_device_handle *devhandle)
 	for (int i = 0; i < 256; i += 1) {
 		uint8_t rval;
 		if (i % 16 == 0)
-			printf("%02x: ", i);
+			ohmd_log_printf("%02x: ", i);
 		ret = esp770u_read_reg(devhandle, i, &rval);
 		if (ret < 0) return ret;
-		printf("%02x ", rval);
+		ohmd_log_printf("%02x ", rval);
 		if (i % 16 == 15)
-			printf("\n");
+			ohmd_log_printf("\n");
 	}
 
-	printf("--------------------------------------\n");
+	ohmd_log_printf("--------------------------------------\n");
 
 	for (int i = 0; i < 256; i += 1) {
 		uint8_t rval;
 		if (i % 16 == 0)
-			printf("%02x: ", i);
+			ohmd_log_printf("%02x: ", i);
 		ret = esp770u_read_reg_f1(devhandle, i, &rval);
 		if (ret < 0) return ret;
-		printf("%02x ", rval);
+		ohmd_log_printf("%02x ", rval);
 		if (i % 16 == 15)
-			printf("\n");
+			ohmd_log_printf("\n");
 	}
-	printf("--------------------------------------\n");
+	ohmd_log_printf("--------------------------------------\n");
 #endif
 
 	return ret;

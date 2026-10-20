@@ -8,6 +8,7 @@
 /* Logging and Error Handling */
 
 
+#include "log-output.h"
 #ifndef LOG_H
 #define LOG_H
 
@@ -18,7 +19,7 @@ void* ohmd_allocfn(ohmd_context* ctx, const char* e_msg, size_t size);
 #define LOGLEVEL 2
 #endif
 
-#define LOG(_level, _levelstr, ...) do{ if(_level >= LOGLEVEL){ printf("[%s] ", (_levelstr)); printf(__VA_ARGS__); puts(""); } } while(0)
+#define LOG(_level, _levelstr, ...) do{ if(_level >= LOGLEVEL){ ohmd_log_printf("[%s] ", (_levelstr)); ohmd_log_printf(__VA_ARGS__); ohmd_log_puts(""); } } while(0)
 
 #if LOGLEVEL == 0
 #define LOGD(...) LOG(0, "DD", __VA_ARGS__)

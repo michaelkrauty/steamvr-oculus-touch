@@ -3,7 +3,8 @@
 /*
  * OpenHMD - Free and Open Source API and drivers for immersive technology.
  */
-#include <assert.h>
+#include "../log-output.h"
+#include "../ohmd-assert.h"
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -168,7 +169,7 @@ get_visible_leds_and_bounds (posef *pose,
 		double led_radius_px = 4.0;
 		if (led_pos_m.z > 0.0) {
 			led_radius_px = focal_length * led_radius_mm / led_pos_m.z;
-			// printf ("led_radius_px %f = focal length %f led_radius %f Z = %f m\n", led_radius_px, focal_length, led_radius_mm, led_pos_m.z);
+			// ohmd_log_printf ("led_radius_px %f = focal length %f led_radius %f Z = %f m\n", led_radius_px, focal_length, led_radius_mm, led_pos_m.z);
 		}
 
 		/* Convert the position to a unit vector for dot product comparison */
@@ -179,7 +180,7 @@ get_visible_leds_and_bounds (posef *pose,
 		facing_dot = ovec3f_get_dot (&tmp, &normal);
 
 #if 0
-		printf ("device %d LED %u pos %f,%f,%f -> %f,%f (lin %f,%f,%f)\n",
+		ohmd_log_printf ("device %d LED %u pos %f,%f,%f -> %f,%f (lin %f,%f,%f)\n",
 			device_id, i, leds[i].pos.x, leds[i].pos.y, leds[i].pos.z,
 			led_pos_px->x, led_pos_px->y, led_pos_m.x, led_pos_m.y, led_pos_m.z);
 #endif
@@ -230,9 +231,9 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 	rift_rect_t bounds = { 0, };
 	int i;
 
-	assert (leds_model->num_points > 0);
-	assert (num_blobs > 0);
-	assert (score != NULL);
+	OHMD_ASSERT(leds_model->num_points > 0);
+	OHMD_ASSERT(num_blobs > 0);
+	OHMD_ASSERT(score != NULL);
 
 	score->match_flags = 0;
 	score->reprojection_error = 0.0;
@@ -245,7 +246,7 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 	if (score->visible_leds < 5)
 		goto done;
 
-	//printf ("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
+	//ohmd_log_printf ("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
 
 	/* Iterate the blobs and see which ones are within the bounding box and have a matching LED */
 	bool all_led_ids_matched = true;
@@ -307,8 +308,8 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 	/* If we have a pose prior, calculate the rotation and translation error and match flags as needed */
 	if (pose_prior) {
 		/* We can't validate a prior without error bounds */
-		assert (pos_error_thresh != NULL);
-		assert (rot_error_thresh != NULL);
+		OHMD_ASSERT(pos_error_thresh != NULL);
+		OHMD_ASSERT(rot_error_thresh != NULL);
 
 		check_pose_prior(score, pose, pose_prior, pos_error_thresh, rot_error_thresh);
 	}
@@ -317,7 +318,7 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 		if (error_per_led < 2.0 && (score->unmatched_blobs * 4 <= score->matched_blobs ||
 		    (2 * score->visible_leds <= 3 * score->matched_blobs))) {
 #if 0
-				printf("Got good prior match within pos (%f, %f, %f) rot (%f, %f, %f)\n",
+				ohmd_log_printf("Got good prior match within pos (%f, %f, %f) rot (%f, %f, %f)\n",
 						pos_error_thresh->x, pos_error_thresh->y, pos_error_thresh->z,
 						rot_error_thresh->x, rot_error_thresh->y, rot_error_thresh->z);
 #endif
@@ -344,7 +345,7 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 	}
 
 #if 0
-	printf ("score for pose is %u matched %u unmatched %u visible %f error\n",
+	ohmd_log_printf ("score for pose is %u matched %u unmatched %u visible %f error\n",
 		score->matched_blobs, score->unmatched_blobs, score->visible_leds, score->reprojection_error);
 #endif
 
@@ -394,12 +395,12 @@ void rift_mark_matching_blobs (posef *pose,
 	rift_rect_t bounds = { 0, };
 	int i;
 
-	assert (leds_model->num_points > 0);
-	assert (num_blobs > 0);
+	OHMD_ASSERT(leds_model->num_points > 0);
+	OHMD_ASSERT(num_blobs > 0);
 
 	get_visible_leds_and_bounds (pose, device_id, leds_model, calib, visible_led_points, &num_visible_leds, &bounds);
 
-	//printf ("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
+	//ohmd_log_printf ("Bounding box for pose is %f,%f -> %f,%f\n", bounds.left, bounds.top, bounds.right, bounds.bottom);
 
 	/* Iterate the blobs and see which ones are within the bounding box and have a matching LED */
 	for (i = 0; i < num_blobs; i++) {
@@ -502,7 +503,7 @@ void rift_dump_pose_leds (posef *pose,
 	rift_rect_t bounds = { 0, };
 	int i;
 
-	assert (leds_model->num_points > 0);
+	OHMD_ASSERT(leds_model->num_points > 0);
 
 	get_visible_leds_and_bounds (pose, device_id, leds_model, calib, visible_led_points, &num_visible_leds, &bounds);
 

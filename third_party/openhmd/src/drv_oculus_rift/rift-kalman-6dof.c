@@ -7,11 +7,12 @@
  *
  */
 
+#include "../log-output.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 
 #include "rift-kalman-6dof.h"
 
@@ -301,7 +302,7 @@ static bool calc_quat_mean(const matrix2d *sigmas, int quat_index, const matrix2
 		oquatd_mult(&tmp_q, &delta_q, &mean_orient);
 
 		if (iters++ > 100) {
-			printf("Quaternion mean failed\n");
+			ohmd_log_printf("Quaternion mean failed\n");
 			return false; /* Not converging */
 		}
 	} while (ovec3d_get_length(&error_s) > (1e-4));
@@ -642,7 +643,7 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 {
 	int i, d;
 
-	assert(num_delay_slots <= MAX_DELAY_SLOTS);
+	OHMD_ASSERT(num_delay_slots <= MAX_DELAY_SLOTS);
 
 	state->first_update = true;
 	state->saw_pose_update = false;
@@ -828,7 +829,7 @@ void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time,
 	/* If doing a delayed update, then the slot must be in use (
 	 * or else it contains empty data */
 	if (delay_slot != -1) {
-		assert(state->slot_inuse[delay_slot]);
+		OHMD_ASSERT(state->slot_inuse[delay_slot]);
 		/* HACK: Ignore the time when doing a delay slot update,
 		 * since we don't want time to go backward. The delay slot is
 		 * already tracking the delay */
@@ -859,7 +860,7 @@ void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t t
 	/* If doing a delayed update, then the slot must be in use (
 	 * or else it contains empty data */
 	if (delay_slot != -1)
-		assert(state->slot_inuse[delay_slot]);
+		OHMD_ASSERT(state->slot_inuse[delay_slot]);
 
 	m = &state->m_position;
 	MATRIX2D_Y(m->z, POSE_MEAS_POSITION+0) = pos->x;
@@ -883,8 +884,8 @@ void rift_kalman_6dof_get_delay_slot_pose_at(rift_kalman_6dof_filter *state, uin
 	int cov_orientation_index = COV_ORIENTATION;
 
 	if (delay_slot != -1) {
-	  assert(state->slot_inuse[delay_slot]);
-	  assert(delay_slot < MAX_DELAY_SLOTS);
+	  OHMD_ASSERT(state->slot_inuse[delay_slot]);
+	  OHMD_ASSERT(delay_slot < MAX_DELAY_SLOTS);
 
 		/* We want the position / orientation info from a delay slot */
 		int slot_index = BASE_STATE_SIZE + (DELAY_SLOT_STATE_SIZE * delay_slot);

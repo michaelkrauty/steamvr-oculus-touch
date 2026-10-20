@@ -1,4 +1,5 @@
 #define _GNU_SOURCE // For qsort_r
+#include "../log-output.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -11,7 +12,7 @@
 #define DUMP_FULL_DEBUG 0
 
 #if DUMP_FULL_DEBUG
-#define DEBUG(s,...) printf(s,__VA_ARGS__)
+#define DEBUG(s,...) ohmd_log_printf(s,__VA_ARGS__)
 #else
 #define DEBUG(s,...)
 #endif

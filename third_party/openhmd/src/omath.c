@@ -7,7 +7,7 @@
 
 /* Math Code Implementation */
 
-#include <assert.h>
+#include "ohmd-assert.h"
 #include <float.h>
 #include <string.h>
 #include <stdbool.h>
@@ -228,15 +228,15 @@ void oquatf_to_rotation(const quatf *me, vec3f *rot)
     ovec3f_multiply_scalar (&v, 2.0, rot);
   }
 
-  assert(!isnan(rot->x));
-  assert(!isnan(rot->y));
-  assert(!isnan(rot->z));
+  OHMD_ASSERT(!isnan(rot->x));
+  OHMD_ASSERT(!isnan(rot->y));
+  OHMD_ASSERT(!isnan(rot->z));
 }
 
 void oquatf_mult(const quatf* me, const quatf* q, quatf* out_q)
 {
-	assert (out_q != me);
-	assert (out_q != q);
+	OHMD_ASSERT(out_q != me);
+	OHMD_ASSERT(out_q != q);
 
 	out_q->x = me->w * q->x + me->x * q->w + me->y * q->z - me->z * q->y;
 	out_q->y = me->w * q->y - me->x * q->z + me->y * q->w + me->z * q->x;
@@ -823,15 +823,15 @@ void oquatd_to_rotation(const quatd *me, vec3d *rot)
     ovec3d_multiply_scalar (&v, 2.0, rot);
   }
 
-  assert(!isnan(rot->x));
-  assert(!isnan(rot->y));
-  assert(!isnan(rot->z));
+  OHMD_ASSERT(!isnan(rot->x));
+  OHMD_ASSERT(!isnan(rot->y));
+  OHMD_ASSERT(!isnan(rot->z));
 }
 
 void oquatd_mult(const quatd* me, const quatd* q, quatd* out_q)
 {
-	assert (out_q != me);
-	assert (out_q != q);
+	OHMD_ASSERT(out_q != me);
+	OHMD_ASSERT(out_q != q);
 
 	out_q->x = me->w * q->x + me->x * q->w + me->y * q->z - me->z * q->y;
 	out_q->y = me->w * q->y - me->x * q->z + me->y * q->w + me->z * q->x;

@@ -138,6 +138,27 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_contex
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
 OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device *device);
+/* Process-wide log receiver, installed before any engine worker starts and not changed while
+ * workers run. Each callback borrows one complete line, at most 2048 bytes, with its original
+ * prefix. Overlong lines are marked as truncated. The receiver must not block. With NULL,
+ * ordinary diagnostics keep their original stdout/stderr streams; assertions still abort
+ * without synchronous output. Does not change descriptor flags. */
+typedef void (*ohmd_cv1touch_log_cb)(const char *bytes, size_t len);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_log_callback(ohmd_cv1touch_log_cb callback);
+/* Same installation/lifetime rules. A native assertion enqueues its diagnostic, calls this
+ * best-effort bounded drain (which must return even with a blocked writer), then aborts.
+ * NULL skips the drain. It never calls ordinary stdio or joins native workers. */
+typedef void (*ohmd_cv1touch_log_fatal_cb)(void);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_log_fatal_callback(ohmd_cv1touch_log_fatal_cb callback);
+/* C-boundary panic: drain once and abort silently. Recursive receivers/fatal handlers skip
+ * callbacks and the drain. Ordinary thread context only; not async-signal-safe. */
+#ifdef _MSC_VER
+__declspec(noreturn)
+#else
+__attribute__((noreturn))
+#endif
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_abort(void);
+
 /* The engine logs to its C runtime's stdout, fully buffered when that is a pipe or a file. This
  * turns the buffering off, so each line goes out as it is written and none is lost when the
  * process ends abruptly. For Windows, where the library carries its own C runtime: elsewhere the

@@ -1,3 +1,4 @@
+#include "../../log-output.h"
 #include <errno.h>
 #include <libusb.h>
 #include <stdint.h>
@@ -45,7 +46,7 @@ int esp570_eeprom_read(libusb_device_handle *devh, uint16_t addr, uint8_t *data,
 		return ret;
 
 	if (buf[0] != 0x82 || buf[1] != len) {
-		printf("read_buf: error: 0x%02x 0x%02x\n", buf[0], buf[1]);
+		ohmd_log_printf("read_buf: error: 0x%02x 0x%02x\n", buf[0], buf[1]);
 		return -1;
 	}
 
@@ -67,7 +68,7 @@ int esp570_i2c_read(libusb_device_handle *devh, uint8_t addr, uint8_t reg,
 		return ret;
 
 	if (buf[0] != 0x84 || buf[4] != 0x00 || buf[5] != 0x00) {
-		printf("%s(%02x): %02x %02x %02x %02x %02x %02x\n", __func__,
+		ohmd_log_printf("%s(%02x): %02x %02x %02x %02x %02x %02x\n", __func__,
 		       reg, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
 		return -1;
 	}
@@ -91,14 +92,14 @@ int esp570_i2c_write(libusb_device_handle *devh, uint8_t addr, uint8_t reg,
 		return ret;
 
 	if (buf[0] != 0x04 || buf[1] != addr || buf[2] != reg || buf[5] != 0) {
-		printf("%s(%02x, %04x): %02x %02x %02x %02x %02x %02x\n",
+		ohmd_log_printf("%s(%02x, %04x): %02x %02x %02x %02x %02x %02x\n",
 		       __func__, reg, val, buf[0], buf[1], buf[2], buf[3],
 		       buf[4], buf[5]);
 		return -1;
 	}
 
 	if (buf[3] != (val >> 8) || buf[4] != (val & 0xff)) {
-		printf("%s(%02x, %04x): read back 0x%04x\n", __func__, reg,
+		ohmd_log_printf("%s(%02x, %04x): read back 0x%04x\n", __func__, reg,
 		       val, (buf[3] << 8) | buf[4]);
 	}
 
@@ -121,7 +122,7 @@ int esp570_setup_unknown_3(libusb_device_handle *devh)
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0x80 || buf[1] != 0xdc || buf[2] != 0x00)
-		printf("%s(80 14 00): %02x %02x %02x\n", __func__,
+		ohmd_log_printf("%s(80 14 00): %02x %02x %02x\n", __func__,
 		       buf[0], buf[1], buf[2]);
 
 	buf[0] = 0xa0;
@@ -131,7 +132,7 @@ int esp570_setup_unknown_3(libusb_device_handle *devh)
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0xa0 || buf[1] != 0x98 || buf[2] != 0x00)
-		printf("%s(80 14 00): %02x %02x %02x\n", __func__,
+		ohmd_log_printf("%s(80 14 00): %02x %02x %02x\n", __func__,
 		       buf[0], buf[1], buf[2]);
 
 	return 0;

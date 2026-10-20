@@ -9,7 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 
 #include "rift-s-radio.h"
 #include "rift-s-protocol.h"
@@ -77,12 +77,12 @@ rift_s_radio_update (rift_s_radio_state *state, hid_device *hid)
 		state->last_radio_seqnum = radio_response.seqnum;
 
 		/* We have the controller response! */
-		assert (ret > 3 && ret <= sizeof(radio_response));
+		OHMD_ASSERT(ret > 3 && ret <= sizeof(radio_response));
 
 		state->command_result_pending = false;
 		//rift_s_hexdump_buffer ("ControllerFWReply", (unsigned char *)(&radio_response), ret);
 
- 		assert (state->pending_commands != NULL);
+		OHMD_ASSERT(state->pending_commands != NULL);
 
  		rift_s_radio_command *cmd = state->pending_commands;
 
@@ -133,7 +133,7 @@ void rift_s_radio_queue_command (rift_s_radio_state *state, const uint64_t devic
 {
 	rift_s_radio_command *cmd = ohmd_alloc(state->ctx, sizeof(rift_s_radio_command));
 
-	assert (cmd_bytes_len <= sizeof (cmd->read_command.cmd_bytes));
+	OHMD_ASSERT(cmd_bytes_len <= sizeof (cmd->read_command.cmd_bytes));
 
 	cmd->read_command.device_id = device_id;
 	memcpy (cmd->read_command.cmd_bytes, cmd_bytes, cmd_bytes_len);
@@ -143,7 +143,7 @@ void rift_s_radio_queue_command (rift_s_radio_state *state, const uint64_t devic
 	/* Append to the pending commands queue. The command itself will be sent by the update() function
 	 * when possible */
 	if (state->pending_commands_tail == NULL) {
-		assert (state->pending_commands == NULL);
+		OHMD_ASSERT(state->pending_commands == NULL);
 		state->pending_commands = state->pending_commands_tail = cmd;
 	}
 	else {
@@ -205,7 +205,7 @@ read_json_cb (bool success, uint8_t *response_bytes, int response_bytes_len, rif
 			goto fail;
 		}
 		/* Assert if the MAX_JSON_LEN ever needs expanding */
-		assert (block_len <= MAX_JSON_LEN);
+		OHMD_ASSERT(block_len <= MAX_JSON_LEN);
 		if (block_len > MAX_JSON_LEN) {
 			LOGW("Remote configuration block too long. Please expand the read buffer (needed %u bytes)\n", block_len);
 			goto fail;

@@ -1,4 +1,5 @@
-#include <assert.h>
+#include "../../log-output.h"
+#include "../../ohmd-assert.h"
 #include <errno.h>
 #include <libusb.h>
 #include <stdbool.h>
@@ -94,7 +95,7 @@ int rift_sensor_uvc_set_cur(libusb_device_handle *dev, uint8_t interface, uint8_
 	ret = libusb_control_transfer(dev, bmRequestType, bRequest, wValue,
 			wIndex, data, wLength, timeout);
 	if (ret < 0) {
-		fprintf(stderr, "failed to transfer SET CUR %u %u: %d %d %m\n",
+		ohmd_log_fprintf(stderr, "failed to transfer SET CUR %u %u: %d %d %m\n",
 			entity, selector, ret, errno);
 	}
 	return ret;
@@ -114,7 +115,7 @@ int rift_sensor_uvc_get_cur(libusb_device_handle *dev, uint8_t interface, uint8_
 	ret = libusb_control_transfer(dev, bmRequestType, bRequest, wValue,
 			wIndex, data, wLength, timeout);
 	if (ret < 0) {
-		fprintf(stderr, "failed to transfer GET CUR %u %u: %d %d %m\n",
+		ohmd_log_fprintf(stderr, "failed to transfer GET CUR %u %u: %d %d %m\n",
 			entity, selector, ret, errno);
 	}
 	return ret;
@@ -155,7 +156,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 	error = (h->bmHeaderInfo & 0x40) != 0;
 
 	if (error) {
-		printf("UVC frame error\n");
+		ohmd_log_printf("UVC frame error\n");
 		return;
 	}
 
@@ -165,7 +166,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		 * when we see the frame change: */
 		if (stream->frame_collected != 0 && pts != stream->cur_pts &&
 				stream->format != OHMD_VIDEO_FRAME_FORMAT_JPEG) {
-			printf("UVC PTS changed in-frame at %u bytes. Lost %u ms\n",
+			ohmd_log_printf("UVC PTS changed in-frame at %u bytes. Lost %u ms\n",
 			    stream->frame_collected,
 			    (pts - stream->cur_pts) * 1000 / RIFT_SENSOR_CLOCK_FREQ);
 			stream->cur_pts = pts;
@@ -182,7 +183,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		uint64_t time;
 
 		if (stream->frame_collected > 0) {
-			printf("UVC Dropping short frame: %u < %u (%d lost)\n",
+			ohmd_log_printf("UVC Dropping short frame: %u < %u (%d lost)\n",
 						stream->frame_collected, stream->frame_size,
 						stream->frame_size - stream->frame_collected);
 		}
@@ -224,7 +225,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		ohmd_video_frame *frame = stream->cur_frame;
 
 		if (frame) {
-			assert (frame->data_block_size >= stream->frame_size);
+			OHMD_ASSERT(frame->data_block_size >= stream->frame_size);
 			frame->start_ts = time;
 			frame->pts = pts;
 			frame->stride = stream->stride;
@@ -243,7 +244,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		if (stream->cur_frame)
 			dt = time - stream->cur_frame->start_ts;
 
-		printf ("UVC dt %f PTS %f SCR %f delta %d\n",
+		ohmd_log_printf ("UVC dt %f PTS %f SCR %f delta %d\n",
 		    (double) (dt) / (1000000000.0),
 		    (double) (pts) / RIFT_SENSOR_CLOCK_FREQ,
 		    (double) (scr) / RIFT_SENSOR_CLOCK_FREQ,
@@ -255,7 +256,7 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		return;
 
 	if (stream->frame_collected + payload_len > stream->frame_size) {
-		printf("UVC frame buffer overflow: %u + %u > %u\n",
+		ohmd_log_printf("UVC frame buffer overflow: %u + %u > %u\n",
 		       stream->frame_collected, payload_len, stream->frame_size);
 		return;
 	}
@@ -373,19 +374,19 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	ret = libusb_set_auto_detach_kernel_driver(devh, 1);
 	/* cv1touch: there is no kernel driver to detach on Windows: libusb says not supported */
 	if (ret < 0 && ret != LIBUSB_ERROR_NOT_SUPPORTED) {
-		printf("could not detach uvcvideo driver\n");
+		ohmd_log_printf("could not detach uvcvideo driver\n");
 		return ret;
 	}
 
 	ret = libusb_claim_interface(devh, 0);
 	if (ret < 0) {
-		printf("could not claim control interface\n");
+		ohmd_log_printf("could not claim control interface\n");
 		return ret;
 	}
 
 	ret = libusb_claim_interface(devh, 1);
 	if (ret < 0) {
-		printf("could not claim UVC data interface\n");
+		ohmd_log_printf("could not claim UVC data interface\n");
 		return ret;
 	}
 
@@ -443,7 +444,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 		}
 		break;
 	default:
-		printf("Unknown / unhandled USB device VID/PID 0x%04x / 0x%04x\n",
+		ohmd_log_printf("Unknown / unhandled USB device VID/PID 0x%04x / 0x%04x\n",
 			desc->idVendor, desc->idProduct);
 		return -1;
 	}
@@ -456,14 +457,14 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	ret = rift_sensor_uvc_get_cur(devh, 1, 0, VS_PROBE_CONTROL, &control,
 			sizeof control);
 	if (ret < 0) {
-		printf("failed to get PROBE\n");
+		ohmd_log_printf("failed to get PROBE\n");
 		return ret;
 	}
 
 	ret = rift_sensor_uvc_set_cur(devh, 1, 0, VS_COMMIT_CONTROL, &control,
 			sizeof control);
 	if (ret < 0) {
-		printf("failed to set COMMIT\n");
+		ohmd_log_printf("failed to set COMMIT\n");
 		return ret;
 	}
 
@@ -492,7 +493,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	for (int i = 0; i < stream->num_transfers; i++) {
 		stream->transfer[i] = libusb_alloc_transfer(num_packets);
 		if (!stream->transfer[i]) {
-			fprintf(stderr, "failed to allocate isochronous transfer\n");
+			ohmd_log_fprintf(stderr, "failed to allocate isochronous transfer\n");
 			return -ENOMEM;
 		}
 
@@ -516,7 +517,7 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 					 TIMEOUT);
 		libusb_set_iso_packet_lengths(stream->transfer[i], packet_size);
 	}
-	printf("UVC: %d of %d transfers read into device memory\n", n_dev_mem, stream->num_transfers);
+	ohmd_log_printf("UVC: %d of %d transfers read into device memory\n", n_dev_mem, stream->num_transfers);
 
 	return 0;
 }
@@ -635,7 +636,7 @@ int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 int rift_sensor_uvc_stream_clear (struct rift_sensor_uvc_stream *stream)
 {
 	int i;
-	assert(!stream->video_running);
+	OHMD_ASSERT(!stream->video_running);
 
 	/* Analysis workers can own frames after USB stops. The device is cleared only
 	 * after its owner joins those workers, so reclaim the frame storage here. */
@@ -678,9 +679,9 @@ int rift_sensor_uvc_stream_clear (struct rift_sensor_uvc_stream *stream)
 static void
 rift_sensor_uvc_stream_release_frame(ohmd_video_frame *frame, rift_sensor_uvc_stream *stream)
 {
-	assert(frame->owner == stream);
-	assert(stream->n_free_frames < stream->n_alloced_frames);
-	assert(frame->data_block_size == stream->frame_size);
+	OHMD_ASSERT(frame->owner == stream);
+	OHMD_ASSERT(stream->n_free_frames < stream->n_alloced_frames);
+	OHMD_ASSERT(frame->data_block_size == stream->frame_size);
 
 	frame->data_size = 0;
 

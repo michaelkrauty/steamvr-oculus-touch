@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "ohmd-assert.h"
 
 #include "openhmd.h"
 #include "openhmd_cv1touch.h"

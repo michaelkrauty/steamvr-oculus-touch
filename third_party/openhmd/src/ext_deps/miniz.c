@@ -934,9 +934,9 @@ typedef unsigned char mz_validate_uint32[sizeof(mz_uint32)==4 ? 1 : -1];
 typedef unsigned char mz_validate_uint64[sizeof(mz_uint64)==8 ? 1 : -1];
 
 #include <string.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 
-#define MZ_ASSERT(x) assert(x)
+#define MZ_ASSERT(x) OHMD_ASSERT(x)
 
 #ifdef MINIZ_NO_MALLOC
   #define MZ_MALLOC(x) NULL

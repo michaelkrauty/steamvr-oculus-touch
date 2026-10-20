@@ -24,7 +24,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <errno.h>
-#include <assert.h>
+#include "ohmd-assert.h"
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -299,7 +299,7 @@ int ohmd_ensure_path(const char* pathname)
 	char *separator, *cur;
 
 	/* Path must be at least 2 chars */
-	assert (strlen(pathname) > 1);
+	OHMD_ASSERT(strlen(pathname) > 1);
 
 	/* Check if the path exists */
 	ret = stat(pathname, &sb);

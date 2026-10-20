@@ -3,7 +3,8 @@
  * Copyright 2014-2015 Philipp Zabel
  * SPDX-License-Identifier:	LGPL-2.0+ or BSL-1.0
  */
-#include <assert.h>
+#include "../log-output.h"
+#include "../ohmd-assert.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -72,8 +73,8 @@ struct blobservation_queue {
 
 #define PUSH_QUEUE(q,b) do { \
 	unsigned int next = ((q)->tail+1) % QUEUE_ENTRIES; \
-	assert(next != (q)->head); /* Check there's room */ \
-	assert ((b) != NULL); \
+	OHMD_ASSERT(next != (q)->head); /* Check there's room */ \
+	OHMD_ASSERT((b) != NULL); \
 	(q)->data[(q)->tail] = (b); \
 	(q)->tail = next; \
 } while(0)
@@ -456,7 +457,7 @@ void blobwatch_process(blobwatch *bw, uint8_t *frame,
 	bw->height = height;
 
 	ob = POP_QUEUE(&bw->observation_q);
-	assert(ob != NULL);
+	OHMD_ASSERT(ob != NULL);
 
 	process_frame(frame, bw, ob);
 
@@ -550,7 +551,7 @@ void blobwatch_process(blobwatch *bw, uint8_t *frame,
 			}
 		copy_matching_blob(b2, b1);
 		}
-	// printf("done matching\n");
+	// ohmd_log_printf("done matching\n");
 
 	/*
 	 * Clear the tracking array where blobs have gone missing.
@@ -581,7 +582,7 @@ void blobwatch_process(blobwatch *bw, uint8_t *frame,
 
 		if (b->track_index >= 0 &&
 		    ob->tracked[b->track_index] != i + 1) {
-			printf("Inconsistency! %d != %d\n",
+			ohmd_log_printf("Inconsistency! %d != %d\n",
 			       ob->tracked[b->track_index], i + 1);
 		}
 	}

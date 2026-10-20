@@ -10,7 +10,7 @@
 #include <hidapi.h>
 #include <string.h>
 #include <stdio.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 
 #include "vrtek.h"
 #include "../hid.h"
@@ -79,7 +79,7 @@ static int receive_response_packet(vrtek_priv* priv, uint8_t* buf,
 {
     const size_t read_length = 64;
     const int    read_timeout = 100;
-    assert(read_length <= buf_length);
+    OHMD_ASSERT(read_length <= buf_length);
     uint8_t report_num = 0;
     int ret = 0;
     int hid_reads = 0;
@@ -133,16 +133,16 @@ static void vrtek_send_command_and_receive_response(vrtek_priv* priv,
     size = vrtek_encode_command_packet(command_num, command_arg, command_data,
                                        command_data_len, buf);
     result = send_command_packet(priv, buf, size);
-    assert(result != -1);
+    OHMD_ASSERT(result != -1);
 
     size = receive_response_packet(priv, buf, REPORT_BUFFER_SIZE);
-    assert(size == RESPONSE_DATA_SIZE);
+    OHMD_ASSERT(size == RESPONSE_DATA_SIZE);
     result = vrtek_decode_command_packet(buf, &response_command_num,
                                          &response_command_arg, response_data,
                                          response_data_len);
-    assert(result == 0);
-    assert(response_command_num == command_num);
-    assert(response_command_arg == command_arg);
+    OHMD_ASSERT(result == 0);
+    OHMD_ASSERT(response_command_num == command_num);
+    OHMD_ASSERT(response_command_arg == command_arg);
 }
 
 static const char* vrtek_get_display_type_string(vrtek_display_type display)
@@ -155,7 +155,7 @@ static const char* vrtek_get_display_type_string(vrtek_display_type display)
         case VRTEK_DISP_UNKNOWN:
             return "Unknown";
         default:
-            assert(false);
+            OHMD_ASSERT(false);
     }
 }
 
@@ -239,7 +239,7 @@ static void vrtek_update_hmd_software_version(vrtek_priv* priv,
     if (hmd_soft_ver > max_supported_hmd_soft_ver) {
         LOGE("HMD software version 0x%4x incompatible, expected <= 0x%4x",
              max_supported_hmd_soft_ver, hmd_soft_ver);
-        assert(hmd_soft_ver <= 0x30010100);
+        OHMD_ASSERT(hmd_soft_ver <= 0x30010100);
     }
 
     priv->hmd_software_version = hmd_soft_ver;
@@ -259,7 +259,7 @@ static const char* vrtek_get_model_string(vrtek_hmd_sku model)
         case VRTEK_SKU_UNKNOWN_UNKNOWN:
             return "Unknown HMD";
         default:
-            assert(false);
+            OHMD_ASSERT(false);
     }
 }
 
@@ -361,8 +361,8 @@ static void vrtek_set_imu_state(vrtek_priv* priv, bool state)
                                             VRTEK_CONFIG_ARG_HMD_IMU,
                                             &imu_state, sizeof(uint8_t),
                                             response_data, &response_data_len);
-    assert(response_data_len == 1);
-    assert(response_data[0] == 0);
+    OHMD_ASSERT(response_data_len == 1);
+    OHMD_ASSERT(response_data[0] == 0);
 
     LOGI("HMD IMU %s", imu_state ? "enabled" : "disabled");
 
@@ -378,7 +378,7 @@ static void vrtek_read_config(vrtek_priv* priv)
                                             VRTEK_QUERY_ARG_HMD_CONFIG,
                                             NULL, 0,
                                             response_data, &response_data_len);
-    assert(response_data_len == 26);
+    OHMD_ASSERT(response_data_len == 26);
 
     /* display type is the second byte of the response */
     uint8_t display_type = response_data[1];
@@ -395,7 +395,7 @@ static void vrtek_read_model(vrtek_priv* priv)
                                             VRTEK_QUERY_ARG_HMD_MODEL,
                                             NULL, 0,
                                             response_data, &response_data_len);
-    assert(response_data_len == 56);
+    OHMD_ASSERT(response_data_len == 56);
 
     const char* model = (const char*) response_data;
     vrtek_update_hmd_model(priv, model, response_data_len);

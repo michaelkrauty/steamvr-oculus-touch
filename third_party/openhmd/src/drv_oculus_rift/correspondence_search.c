@@ -4,11 +4,12 @@
  * OpenHMD - Free and Open Source API and drivers for immersive technology.
  */
 #define _GNU_SOURCE // For qsort_r FIXME
+#include "../log-output.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <math.h>
 
 #include "lambdatwist/lambdatwist_p3p.h"
@@ -72,7 +73,7 @@
  *
  */
 
-//#define printf(s,...)
+//#define ohmd_log_printf(s,...)
 #define abs(x) ((x) >= 0 ? (x) : -(x))
 
 correspondence_search_t *
@@ -85,20 +86,20 @@ correspondence_search_new(rift_sensor_camera_params *camera_calib)
 }
 
 #if DUMP_FULL_DEBUG
-#define DEBUG(s,...) printf(s,__VA_ARGS__)
+#define DEBUG(s,...) ohmd_log_printf(s,__VA_ARGS__)
 #else
 #define DEBUG(s,...)
 #endif
 
 #if DUMP_TIMING
-#define DEBUG_TIMING(s,...) printf(s,__VA_ARGS__)
+#define DEBUG_TIMING(s,...) ohmd_log_printf(s,__VA_ARGS__)
 #else
 #define DEBUG_TIMING(s,...)
 #endif
 
 #undef LOG
 #if DUMP_FULL_LOG
-#define LOG(s,...) printf(s,__VA_ARGS__)
+#define LOG(s,...) ohmd_log_printf(s,__VA_ARGS__)
 #else
 #define LOG(s,...)
 #endif
@@ -115,7 +116,7 @@ correspondence_search_set_blobs (correspondence_search_t *cs, struct blob *blobs
     vec3f undistorted_points[MAX_BLOBS_PER_FRAME];
     cs_image_point_t *blob_list[MAX_BLOBS_PER_FRAME];
 
-    assert (num_blobs <= MAX_BLOBS_PER_FRAME);
+    OHMD_ASSERT(num_blobs <= MAX_BLOBS_PER_FRAME);
 
     /* Updating the blobs means we don't know if we have good poses any more */
     for (m = 0; m < cs->num_models; m++) {
@@ -134,7 +135,7 @@ correspondence_search_set_blobs (correspondence_search_t *cs, struct blob *blobs
     undistort_points (blobs, num_blobs, undistorted_points, cs->calib);
 
 #if DUMP_BLOBS
-    printf ("Building blobs search array\n");
+    ohmd_log_printf ("Building blobs search array\n");
 #endif
     for (i = 0; i < num_blobs; i++) {
         cs_image_point_t *p = cs->points + i;
@@ -152,7 +153,7 @@ correspondence_search_set_blobs (correspondence_search_t *cs, struct blob *blobs
         blob_list[i] = p;
 
 #if DUMP_BLOBS
-        printf ("Blob %u = (%f,%f %ux%u) -> (%f, %f) %f x %f (LED id %d)\n", i,
+        ohmd_log_printf ("Blob %u = (%f,%f %ux%u) -> (%f, %f) %f x %f (LED id %d)\n", i,
                 b->x, b->y, b->width, b->height,
                 p->point_homog[0], p->point_homog[1],
                 p->size[0], p->size[1], b->led_id);
@@ -216,7 +217,7 @@ dump_pose (correspondence_search_t *cs, led_search_model_t *model, posef *pose, 
     int i;
 	  rift_leds *leds = model->leds;
 
-    printf ("pose_points[%i] = [\n", mi->id);
+    ohmd_log_printf ("pose_points[%i] = [\n", mi->id);
     for (i = 0; i < leds->num_points; i++) {
       vec3f pos, dir;
 
@@ -240,10 +241,10 @@ dump_pose (correspondence_search_t *cs, led_search_model_t *model, posef *pose, 
       facing_dot = ovec3f_get_dot (&pos, &dir);
 
       if (facing_dot < 0) {
-          printf ("  (%f,%f),\n", x, y);
+          ohmd_log_printf ("  (%f,%f),\n", x, y);
       }
     }
-    printf ("]\n");
+    ohmd_log_printf ("]\n");
 }
 #endif
 
@@ -453,7 +454,7 @@ check_led_against_model_subset (correspondence_search_t *cs, cs_model_info_t *mi
       oquatf_normalize_me (&pose.orient);
 #else
       l = oquatf_get_length (&pose.orient);
-      assert (l > 0.9999 && l < 1.0001);
+      OHMD_ASSERT(l > 0.9999 && l < 1.0001);
 #endif
 
       /* This pose must yield a projection of the anchor
@@ -507,15 +508,15 @@ check_led_against_model_subset (correspondence_search_t *cs, cs_model_info_t *mi
         /* Convert back to pixels for the debug output */
         ovec3f_multiply_scalar (&checkpos, cs->camera_matrix->m[0], &checkpos);
 
-  	    printf ("model %u pose candidate orient %f %f %f %f pos %f %f %f\n",
+        ohmd_log_printf ("model %u pose candidate orient %f %f %f %f pos %f %f %f\n",
             mi->id, pose.orient.x, pose.orient.y, pose.orient.z, pose.orient.w,
             pose.pos.x, pose.pos.y, pose.pos.z);
-        printf ("4th point @ %f %f offset %f pixels\n",
+        ohmd_log_printf ("4th point @ %f %f offset %f pixels\n",
             checkpos.x, checkpos.y, distance * cs->camera_matrix->m[0]);
 #endif
         if (correspondence_search_project_pose (cs, model, &pose, mi, depth)) {
 #if 0
-          printf ("  P4P points %f,%f,%f -> %f %f\n"
+          ohmd_log_printf ("  P4P points %f,%f,%f -> %f %f\n"
                   "         %f,%f,%f -> %f %f\n"
                   "         %f,%f,%f -> %f %f\n"
                   "         %f,%f,%f -> %f %f\n",
@@ -564,8 +565,8 @@ select_k_blobs_from_n (correspondence_search_t *cs, cs_model_info_t *mi, rift_le
      *   take the first entry, then select k-1 from n-1
      *   don't take the first entry, select k from n-1 if n > k
      */
-    assert (k > 1);
-    assert (n > 1);
+    OHMD_ASSERT(k > 1);
+    OHMD_ASSERT(n > 1);
     output_list[0] = candidate_list[0];
     select_k_blobs_from_n (cs, mi, model_leds, result_list, output_list+1, candidate_list+1, k-1, n-1, depth);
 
@@ -665,8 +666,8 @@ select_k_leds_from_n (correspondence_search_t *cs,
      *   take the first entry, then select k-1 from n-1
      *   don't take the first entry, select k from n-1 if n > k
      */
-    assert (k > 1);
-    assert (n > 1);
+    OHMD_ASSERT(k > 1);
+    OHMD_ASSERT(n > 1);
     output_list[0] = candidate_list[0];
     select_k_leds_from_n (cs, mi, result_list, output_list+1, candidate_list+1, k-1, n-1, depth);
 
@@ -762,12 +763,12 @@ search_pose_for_model (correspondence_search_t *cs, cs_model_info_t *mi)
       anchor->num_neighbours = out_index;
 
 #if DUMP_FULL_LOG
-      printf ("Model %d, blob %d @ %f,%f neighbours %d Search list:\n", mi->id, b, anchor->blob->x, anchor->blob->y, anchor->num_neighbours);
+      ohmd_log_printf ("Model %d, blob %d @ %f,%f neighbours %d Search list:\n", mi->id, b, anchor->blob->x, anchor->blob->y, anchor->num_neighbours);
       for (int i = 0; i < anchor->num_neighbours; i++) {
           cs_image_point_t *p1 = anchor->neighbours[i];
           double dist = (p1->blob->y - anchor->blob->y) * (p1->blob->y - anchor->blob->y) +
                         (p1->blob->x - anchor->blob->x) * (p1->blob->x - anchor->blob->x);
-          printf ("  LED ID %u (%f,%f) @ %f,%f. Dist %f\n", p1->blob->led_id, p1->point_homog[0], p1->point_homog[1],
+          ohmd_log_printf ("  LED ID %u (%f,%f) @ %f,%f. Dist %f\n", p1->blob->led_id, p1->point_homog[0], p1->point_homog[1],
               p1->blob->x, p1->blob->y, sqrt(dist));
       }
 #endif
@@ -817,8 +818,8 @@ bool correspondence_search_find_one_pose (correspondence_search_t *cs, int model
 {
   int i;
 
-  assert (pose != NULL);
-  assert (score != NULL);
+  OHMD_ASSERT(pose != NULL);
+  OHMD_ASSERT(score != NULL);
 
   /* If neither deep nor shallow search was requested, do a full search */
   if ((search_flags & (CS_FLAG_SHALLOW_SEARCH|CS_FLAG_DEEP_SEARCH)) == 0)
@@ -833,8 +834,8 @@ bool correspondence_search_find_one_pose (correspondence_search_t *cs, int model
     mi->match_flags = 0;
 
     if (search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
-      assert(pos_error_thresh != NULL);
-      assert(rot_error_thresh != NULL);
+      OHMD_ASSERT(pos_error_thresh != NULL);
+      OHMD_ASSERT(rot_error_thresh != NULL);
 
       mi->pose_prior = *pose;
       mi->pos_error_thresh = pos_error_thresh;
@@ -845,8 +846,8 @@ bool correspondence_search_find_one_pose (correspondence_search_t *cs, int model
 	    quatf pose_gravity_twist;
 
       /* We need a pose prior to extract the gravity swing to match */
-      assert ((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
-      assert (gravity_vector != NULL);
+      OHMD_ASSERT((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
+      OHMD_ASSERT(gravity_vector != NULL);
 
       mi->gravity_vector = *gravity_vector;
       mi->gravity_tolerance_rad = gravity_tolerance_rad;

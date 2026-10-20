@@ -8,10 +8,11 @@
 #define _GNU_SOURCE
 #define __STDC_FORMAT_MACROS
 
+#include "../log-output.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <inttypes.h>
 
 #include "rift-sensor.h"
@@ -32,7 +33,7 @@
 
 #include "ohmd-pipewire.h"
 
-#define ASSERT_MSG(_v, label, ...) if(!(_v)){ fprintf(stderr, __VA_ARGS__); goto label; }
+#define ASSERT_MSG(_v, label, ...) if(!(_v)){ ohmd_log_fprintf(stderr, __VA_ARGS__); goto label; }
 
 /* We need 4 capture buffers:
  * 	1 to be capturing into
@@ -116,8 +117,8 @@ struct rift_sensor_ctx_s
 
 #define PUSH_QUEUE(q,f) do { \
 	unsigned int next = ((q)->tail+1) % QUEUE_SIZE; \
-	assert(next != (q)->head); /* Check there's room */ \
-	assert ((f) != NULL); \
+	OHMD_ASSERT(next != (q)->head); /* Check there's room */ \
+	OHMD_ASSERT((f) != NULL); \
 	(q)->data[(q)->tail] = (f); \
 	(q)->tail = next; \
 } while(0)
@@ -158,7 +159,7 @@ rift_sensor_add_device(rift_sensor_ctx *sensor, rift_tracked_device *device)
 	bool ret;
 
 	ohmd_lock_mutex(sensor->sensor_lock);
-	assert (sensor->n_devices < RIFT_MAX_TRACKED_DEVICES);
+	OHMD_ASSERT(sensor->n_devices < RIFT_MAX_TRACKED_DEVICES);
 
 	ret	= correspondence_search_set_model (sensor->pf.cs, device->id, device->led_search);
 
@@ -262,7 +263,7 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	rift_sensor_analysis_frame *frame;
 	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 
-	assert(sensor);
+	OHMD_ASSERT(sensor);
 
 	ohmd_lock_mutex (sensor->sensor_lock);
 
@@ -330,11 +331,11 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices,
 			rift_tracker_get_search_skip(sensor->tracker));
 #if 0
-		printf("Sensor %d phase %d Blobs: %d\n", sensor->id, led_pattern_phase, sensor->bwobs->num_blobs);
+		ohmd_log_printf("Sensor %d phase %d Blobs: %d\n", sensor->id, led_pattern_phase, sensor->bwobs->num_blobs);
 
 		for (int index = 0; index < sensor->bwobs->num_blobs; index++)
 		{
-			printf("Sensor %d Blob[%d]: %d,%d %dx%d id %d pattern %x age %u\n", sensor->id,
+			ohmd_log_printf("Sensor %d Blob[%d]: %d,%d %dx%d id %d pattern %x age %u\n", sensor->id,
 				index,
 				sensor->bwobs->blobs[index].x,
 				sensor->bwobs->blobs[index].y,

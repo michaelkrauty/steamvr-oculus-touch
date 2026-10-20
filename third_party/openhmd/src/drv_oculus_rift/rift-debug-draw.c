@@ -3,7 +3,7 @@
  * Copyright 2020 Jan Schmidt <thaytan@noraisin.net>
  * SPDX-License-Identifier: BSL-1.0
  */
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <string.h>
 
 #include "rift-debug-draw.h"
@@ -228,7 +228,7 @@ void rift_debug_draw_frame (uint8_t *pixels, struct blobservation* bwobs,
 			/* Tint known blobs by their device ID in the RHS image */
 			if (b->led_id != LED_INVALID_ID) {
 				int d = LED_OBJECT_ID (b->led_id);
-				assert (d < 3);
+				OHMD_ASSERT(d < 3);
 
 				colour_rgb_rect (rhs_dest, width, out_stride, height, start_x,
 					start_y, b->width, b->height, colours[d]);
@@ -253,7 +253,7 @@ void rift_debug_draw_frame (uint8_t *pixels, struct blobservation* bwobs,
 			rift_tracked_device *dev = devs[d];
 			rift_sensor_frame_device_state *dev_state = frame->capture_state + d;
 
-			assert(dev->leds != NULL);
+			OHMD_ASSERT(dev->leds != NULL);
 
 			/* Draw the capture pose blobs in yellow */
 			pose = frame->capture_state[d].capture_cam_pose;

@@ -7,11 +7,12 @@
 
 #define _GNU_SOURCE
 
+#include "../log-output.h"
 #include <libusb.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <inttypes.h>
 #include <stdarg.h>
 #include <time.h>
@@ -33,7 +34,7 @@
 
 #include "ohmd-pipewire.h"
 
-#define ASSERT_MSG(_v, label, ...) if(!(_v)){ fprintf(stderr, __VA_ARGS__); goto label; }
+#define ASSERT_MSG(_v, label, ...) if(!(_v)){ ohmd_log_fprintf(stderr, __VA_ARGS__); goto label; }
 
 
 /* Number of IMU observations we accumulate before output */
@@ -181,7 +182,7 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	snprintf(device_name,64,"openhmd-rift-device-%d", device_id);
 	device_name[63] = 0;
 
-	assert (ctx->n_devices < RIFT_MAX_TRACKED_DEVICES);
+	OHMD_ASSERT(ctx->n_devices < RIFT_MAX_TRACKED_DEVICES);
 
 	ohmd_lock_mutex (ctx->tracker_lock);
 	next_dev = ctx->devices + ctx->n_devices;
@@ -242,7 +243,7 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 		}
 	}
 
-	printf("device %d online. Now tracking.\n", device_id);
+	ohmd_log_printf("device %d online. Now tracking.\n", device_id);
 	return (rift_tracked_device *) next_dev;
 }
 
@@ -314,7 +315,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 
 		ret = libusb_open(devs[i], &usb_devh);
 		if (ret) {
-			fprintf (stderr, "Failed to open Rift Sensor device. Check permissions\n");
+			ohmd_log_fprintf (stderr, "Failed to open Rift Sensor device. Check permissions\n");
 			continue;
 		}
 
@@ -383,7 +384,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
         } else i++;
     }
 
-	printf ("Started %zu Rift Sensor cameras\n", tracker_ctx->n_sensors);
+	ohmd_log_printf ("Started %zu Rift Sensor cameras\n", tracker_ctx->n_sensors);
 	return tracker_ctx;
 
 fail:
@@ -1152,7 +1153,7 @@ void rift_tracked_device_frame_release(rift_tracked_device *dev_base, rift_track
 		/* This device existed when the exposure was taken and therefore has info */
 		rift_tracked_device_exposure_info *dev_info = exposure_info->devices + dev->index;
 		/* Check that the exposure_info matches the device we expect */
-		assert (dev_info->device_index == dev->index);
+		OHMD_ASSERT(dev_info->device_index == dev->index);
 		rift_tracked_device_exposure_release_locked(dev, dev_info);
 	}
 	ohmd_unlock_mutex (dev->device_lock);

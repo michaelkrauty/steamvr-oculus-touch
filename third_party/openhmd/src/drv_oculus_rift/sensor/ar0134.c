@@ -1,3 +1,4 @@
+#include "../../log-output.h"
 #include <libusb.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,7 +21,7 @@ static int ar0134_read_reg(libusb_device_handle *dev, uint16_t reg, uint16_t *va
 	if (ret < 0)
 		return ret;
 	if (buf[0] != 0x86)
-		fprintf(stderr, "%s(0x%x): %02x %02x %02x\n", __func__,
+		ohmd_log_fprintf(stderr, "%s(0x%x): %02x %02x %02x\n", __func__,
 			reg, buf[0], buf[1], buf[2]);
 	*val = (buf[2] << 8) | buf[1];
 	return ret;
@@ -40,7 +41,7 @@ static int ar0134_write_reg(libusb_device_handle *dev, uint16_t reg, uint16_t va
 	if (buf[0] != 0x06 || buf[1] != 0x20 ||
 	    buf[2] != (reg >> 8) || buf[3] != (reg & 0xff) ||
 	    buf[4] != (val >> 8) || buf[5] != (val & 0xff))
-		fprintf(stderr, "%s(0x%04x, 0x%04x): %02x %02x %02x %02x %02x %02x\n",
+		ohmd_log_fprintf(stderr, "%s(0x%04x, 0x%04x): %02x %02x %02x %02x %02x %02x\n",
 			__func__, reg, val, buf[0], buf[1], buf[2], buf[3],
 			buf[4], buf[5]);
 	return ret;
@@ -55,12 +56,12 @@ int rift_sensor_ar0134_init(libusb_device_handle *devh, bool usb2_mode)
 #if 0
 	for (int i = 0x3000; i < 0x3100; i += 2) {
 		if (i % 16 == 0)
-			printf("%04x: ", i);
+			ohmd_log_printf("%04x: ", i);
 		ret = ar0134_read_reg(devh, i, &val);
 		if (ret < 0) return ret;
-		printf("%04x ", val);
+		ohmd_log_printf("%04x ", val);
 		if (i % 16 == 14)
-			printf("\n");
+			ohmd_log_printf("\n");
 	}
 #endif
 
@@ -75,24 +76,24 @@ int rift_sensor_ar0134_init(libusb_device_handle *devh, bool usb2_mode)
 	}
 	if (ret < 0) return ret;
 	if (val != 0x2406)
-		fprintf(stderr, "This is not an AR0134 sensor: 0x%04x\n", val);
+		ohmd_log_fprintf(stderr, "This is not an AR0134 sensor: 0x%04x\n", val);
 
 	ret = ar0134_read_reg(devh, 0x300e, &val);
 	if (ret < 0) return ret;
 	if (val != 0x1300)
-		fprintf(stderr, "Unexpected revision number: 0x%04x\n", val);
+		ohmd_log_fprintf(stderr, "Unexpected revision number: 0x%04x\n", val);
 
 	ret = ar0134_read_reg(devh, 0x30b0, &val);
 	if (ret < 0) return ret;
 	if (val != 0x0080)
-		fprintf(stderr, "Expected monochrome mode instead of 0x%04x\n", val);
+		ohmd_log_fprintf(stderr, "Expected monochrome mode instead of 0x%04x\n", val);
 
 	/* Disable embedded register data and statistics. For now we can't use
 	 * this anyway. */
 	ret = ar0134_read_reg(devh, 0x3064, &val);
 	if (ret < 0) return ret;
 	if (val != 0x1882 && val != 0x1982)
-		printf("Unexpected embedded data control: %04x\n", val);
+		ohmd_log_printf("Unexpected embedded data control: %04x\n", val);
 	ret = ar0134_write_reg(devh, 0x3064, val & ~0x0180);
 	if (ret < 0) return ret;
 
@@ -149,7 +150,7 @@ int rift_sensor_ar0134_init(libusb_device_handle *devh, bool usb2_mode)
 	ret = ar0134_read_reg(devh, 0x300c, &val);
 	if (ret < 0) return ret;
 	if (val != 1388)
-		fprintf(stderr, "Too many pixel clocks per line: %u\n", val);
+		ohmd_log_fprintf(stderr, "Too many pixel clocks per line: %u\n", val);
 
 	/* Set coarse integration time (in multiples of lines) and
 	 * fine integration time (in multiples of the pixel clock). */
@@ -160,17 +161,17 @@ int rift_sensor_ar0134_init(libusb_device_handle *devh, bool usb2_mode)
 	ret = ar0134_read_reg(devh, 0x3012, &val);
 	if (ret < 0) return ret;
 	if (val != 26)
-		fprintf(stderr, "Failed to set coarse integration time: %u\n", val);
+		ohmd_log_fprintf(stderr, "Failed to set coarse integration time: %u\n", val);
 	ret = ar0134_read_reg(devh, 0x3014, &val);
 	if (ret < 0) return ret;
 	if (val != 646)
-		fprintf(stderr, "Failed to set fine integration time: %u\n", val);
+		ohmd_log_fprintf(stderr, "Failed to set fine integration time: %u\n", val);
 
 	/* Stop streaming, trigger external exposure from nRF51288 */
 	ret = ar0134_read_reg(devh, 0x301a, &val);
 	if (ret < 0) return ret;
 	if (val != 0x10dc)
-		fprintf(stderr, "Unexpected reset register value: 0x%04x\n", val);
+		ohmd_log_fprintf(stderr, "Unexpected reset register value: 0x%04x\n", val);
 	/* Force PLL always enabled */
 	val |= 1 << 11;
 	/* Enable trigger input pin */
@@ -203,7 +204,7 @@ int rift_sensor_ar0134_init(libusb_device_handle *devh, bool usb2_mode)
 	/* Read temperature sensor */
 	ret = ar0134_read_reg(devh, 0x30b2, &val);
 	if (ret < 0) return ret;
-	printf("Temperature: %.1f °C\n", 50.0 + 20.0 * (val - calib_50c) /
+	ohmd_log_printf("Temperature: %.1f °C\n", 50.0 + 20.0 * (val - calib_50c) /
 	       (calib_70c - calib_50c));
 
 	return 0;

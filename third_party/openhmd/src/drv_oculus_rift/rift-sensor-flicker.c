@@ -3,6 +3,7 @@
  * Copyright 2015 Philipp Zabel
  * SPDX-License-Identifier:	LGPL-2.0+ or BSL-1.0
  */
+#include "../log-output.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -116,7 +117,7 @@ void rift_sensor_flicker_process(struct blob *blobs, int num_blobs,
 			continue;
 
 #if 0
-		printf ("blob %d age %d pattern %x phase %d bits %d %d %d %d %d %d %d %d %d %d\n",
+		ohmd_log_printf ("blob %d age %d pattern %x phase %d bits %d %d %d %d %d %d %d %d %d %d\n",
 			(int)((b-blobs)), b->age, pattern, phase,
 			b->pattern_bits[0], b->pattern_bits[1], b->pattern_bits[2],
 			b->pattern_bits[3], b->pattern_bits[4], b->pattern_bits[5],
@@ -140,7 +141,7 @@ void rift_sensor_flicker_process(struct blob *blobs, int num_blobs,
 					     &b->led_id);
 		  }
 		  if (b->led_id != led_id) {
-		  	printf("Changing led %d from %d to %d pattern 0x%x at age %d\n", b->track_index, led_id, b->led_id, pattern, b->age);
+            ohmd_log_printf("Changing led %d from %d to %d pattern 0x%x at age %d\n", b->track_index, led_id, b->led_id, pattern, b->age);
 		  }
 		}
 	}

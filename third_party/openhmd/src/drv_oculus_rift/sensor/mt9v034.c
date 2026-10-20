@@ -1,3 +1,4 @@
+#include "../../log-output.h"
 #include <errno.h>
 #include <libusb.h>
 #include <stdbool.h>
@@ -101,7 +102,7 @@ static int mt9v034_enable_sync(libusb_device_handle *devh)
 	if (chip_control != (MT9V034_CHIP_CONTROL_MASTER_MODE |
 			     MT9V034_CHIP_CONTROL_DOUT_ENABLE |
 			     MT9V034_CHIP_CONTROL_SEQUENTIAL)) {
-		printf("MT9V034: Unexpected chip control value: 0x%04x\n",
+		ohmd_log_printf("MT9V034: Unexpected chip control value: 0x%04x\n",
 		       chip_control);
 	}
 	mt9v034_write_reg(devh, MT9V034_CHIP_CONTROL,

@@ -11,6 +11,7 @@
 /* Oculus Rift Driver - HID/USB Driver Implementation */
 
 
+#include "../log-output.h"
 #include <stdlib.h>
 #include <hidapi.h>
 #include <string.h>
@@ -848,10 +849,10 @@ void
 rift_leds_dump (rift_leds *leds, const char *desc)
 {
 	int i;
-	printf ("LED model: %s\n", desc);
+	ohmd_log_printf ("LED model: %s\n", desc);
 	for (i = 0; i < leds->num_points; i++) {
 		rift_led *p = leds->points + i;
-		printf ("{ .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
+		ohmd_log_printf ("{ .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
 		    p->pos.x, p->pos.y, p->pos.z,
 		    p->dir.x, p->dir.y, p->dir.z,
 		    p->pattern);
@@ -982,7 +983,7 @@ static int rift_get_led_info(rift_hmd_t *priv)
 		for (in_index = 0; in_index < priv->leds.num_points; in_index++) {
 			rift_led *led = &priv->leds.points[in_index];
 			if (led->pos.z < -0.1) {
-				printf ("Dropping headband LED { .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
+				ohmd_log_printf ("Dropping headband LED { .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
 					led->pos.x, led->pos.y, led->pos.z,
 					led->dir.x, led->dir.y, led->dir.z,
 					led->pattern);

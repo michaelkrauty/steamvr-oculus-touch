@@ -15,10 +15,11 @@ extern "C" {
 #endif
 
 
+#include "../log-output.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
+#include "../ohmd-assert.h"
 #include <errno.h>
 #include <locale.h>
 
@@ -32,7 +33,7 @@ extern "C" {
 
 // redefine NX_JSON_REPORT_ERROR to use custom error reporting
 #ifndef NX_JSON_REPORT_ERROR
-#define NX_JSON_REPORT_ERROR(msg, p) fprintf(stderr, "NXJSON PARSE ERROR (%d): " msg " at %s\n", __LINE__, p)
+#define NX_JSON_REPORT_ERROR(msg, p) ohmd_log_fprintf(stderr, "NXJSON PARSE ERROR (%d): " msg " at %s\n", __LINE__, p)
 #endif
 
 #define IS_WHITESPACE(c) ((unsigned char)(c)<=(unsigned char)' ')
@@ -41,7 +42,7 @@ static const nx_json dummy={ NX_JSON_NULL };
 
 static nx_json* create_json(nx_json_type type, const char* key, nx_json* parent) {
   nx_json* js=NX_JSON_CALLOC();
-  assert(js);
+  OHMD_ASSERT(js);
   js->type=type;
   js->key=key;
   js->parent=parent;

@@ -46,6 +46,7 @@ dep_jpeg = dependency('libjpeg', required: false)
 deps = [
 	dep_libm,
 	dep_threads,
+	dep_libusb,
 ]
 
 
@@ -55,6 +56,7 @@ deps = [
 
 sources = [
 	'src/openhmd.c',
+	'src/log-output.c',
 	'src/drv_dummy/dummy.c',
 	'src/omath.c',
 	'src/exponential-filter.c',
@@ -70,8 +72,7 @@ else
 	sources += 'src/platform-posix.c'
 endif
 
-c_args = []
-publish_c_args = []
+c_args = ['-DOHMD_NONBLOCK_LOG']
 if host_machine.system() == 'windows'
 	# cv1touch: the C library functions are used as on Linux; M_PI from math.h
 	c_args += ['-D_CRT_SECURE_NO_WARNINGS', '-D_USE_MATH_DEFINES']
@@ -94,7 +95,8 @@ if have_pipewire
 	sources += [ 'src/drv_oculus_rift/ohmd-pipewire.c' ]
 endif
 
-publish_c_args = []
+# Internal headers included by linked C/C++ clients use the same bounded assertion path.
+publish_c_args = ['-DOHMD_NONBLOCK_ASSERT']
 
 if get_option('default_library') == 'shared'
 	if host_machine.system() == 'windows'
@@ -144,7 +146,6 @@ if _drivers.contains('rift')
 	c_args += '-DDRIVER_OCULUS_RIFT'
 	c_args += '-DHAVE_OPENCV=1'
 	deps += dep_hidapi
-	deps += dep_libusb
 	deps += dep_opencv
 	if dep_jpeg.found()
 		deps += dep_jpeg

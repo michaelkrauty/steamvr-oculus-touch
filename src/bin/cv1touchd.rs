@@ -29,6 +29,22 @@ use cv1touch::track::repose;
 use cv1touch::track::tracker::Stats;
 use cv1touch::{align, calib, ffi, input_calibration, modes, settings, setup, supervise, track};
 
+#[path = "cv1touchd/log.rs"]
+mod daemon_log;
+
+#[cfg(all(test, unix))]
+#[path = "cv1touchd/callback_tests.rs"]
+mod callback_tests;
+
+macro_rules! log {
+    ($($args:tt)*) => { daemon_log::line(format_args!($($args)*)) };
+}
+
+/// Compatibility for preformatted diagnostics; formatting callers can use `log!` without a String.
+fn log(msg: impl AsRef<str>) {
+    daemon_log::line(format_args!("{}", msg.as_ref()));
+}
+
 /// Disable headset tracking LEDs by default while retaining the headset radio for Touch.
 const DEFAULT_HMD_LEDS_OFF: bool = true;
 const IO_FAILURES_BEFORE_REOPEN: u32 = 50;
@@ -262,13 +278,13 @@ impl BiasMemory {
         if let Some(e) = self.file.controllers.get(&key) {
             p.seed_biases(hand, e.gyro(), e.accel());
             let a = e.accel();
-            log(format!(
+            log!(
                 "{}: IMU biases from the last run (accelerometer {:+.3} {:+.3} {:+.3} m/s^2)",
                 ["left", "right"][hand],
                 a.x,
                 a.y,
                 a.z
-            ));
+            );
         }
         self.keys[hand] = Some(key);
     }
@@ -311,7 +327,7 @@ impl BiasMemory {
 
 fn save_biases(f: &track::biases::BiasFile) {
     if let Err(e) = track::biases::save(&track::biases::default_path(), f) {
-        log(format!("IMU biases not saved: {e}"));
+        log!("IMU biases not saved: {e}");
     }
 }
 
@@ -386,11 +402,11 @@ impl LandmarkWatch {
         match track::landmarks::load(&path) {
             Ok(f) if !f.landmarks.is_empty() => {
                 let sensors = f.landmarks.iter().map(|l| l.serial.clone()).collect();
-                log(format!(
+                log!(
                     "watching {} landmarks from {} for moved sensors",
                     f.landmarks.len(),
                     path.display()
-                ));
+                );
                 Some(LandmarkWatch {
                     monitor: track::landmarks::Monitor::new(f.landmarks, LANDMARK_WINDOW_NS),
                     sensors,
@@ -443,8 +459,8 @@ impl LandmarkWatch {
                     self.missing.remove(sensor);
                     out.insert(sensor.clone(), (s.shift.x, s.shift.y, s.landmarks));
                     match notice {
-                        Some(LandmarkNotice::Moved) => log(format!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y)),
-                        Some(LandmarkNotice::Back) => log(format!("sensor {sensor}: landmarks back in place")),
+                        Some(LandmarkNotice::Moved) => log!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y),
+                        Some(LandmarkNotice::Back) => log!("sensor {sensor}: landmarks back in place"),
                         None => {}
                     }
                 }
@@ -452,7 +468,7 @@ impl LandmarkWatch {
                     let n = self.missing.entry(sensor.clone()).or_default();
                     *n += 1;
                     if *n == 3 {
-                        log(format!("sensor {sensor}: none of its landmarks seen for 3 minutes (moved more than a pixel, or the base stations are off)"));
+                        log!("sensor {sensor}: none of its landmarks seen for 3 minutes (moved more than a pixel, or the base stations are off)");
                     }
                 }
             }
@@ -515,7 +531,7 @@ impl EngineSink for Daemon {
                 // drop will show what the channel really is
                 let was = self.battery[hand].swap(pct, Ordering::Relaxed);
                 if was != pct {
-                    log(format!(
+                    log!(
                         "{} Touch battery {pct}%{}",
                         ["left", "right"][hand],
                         if was >= 0 {
@@ -523,7 +539,7 @@ impl EngineSink for Daemon {
                         } else {
                             String::new()
                         }
-                    ));
+                    );
                 }
             }
         }
@@ -533,13 +549,6 @@ impl EngineSink for Daemon {
             }
         }
     }
-}
-
-/// A line for the log. One that cannot be written is lost: under a supervisor that has ended,
-/// standard error is a closed pipe, and the daemon still has to stop cleanly.
-fn log(msg: impl AsRef<str>) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "cv1touchd: {}", msg.as_ref());
 }
 
 fn publish_disconnected(d: &Daemon) {
@@ -1065,10 +1074,10 @@ fn universe_watch(d: Arc<Daemon>) {
             Err(e) => {
                 if !warned_log {
                     warned_log = true;
-                    log(format!(
+                    log!(
                         "universe watch: SteamVR's log {}: {e}",
                         steamvr_log.path().display()
-                    ));
+                    );
                 }
             }
         }
@@ -1122,7 +1131,7 @@ fn universe_watch(d: Arc<Daemon>) {
                 }
                 Err(e) if !warned_layouts => {
                     warned_layouts = true;
-                    log(format!("universe watch: {e} (the layout is not kept)"));
+                    log!("universe watch: {e} (the layout is not kept)");
                 }
                 Err(_) => {}
             }
@@ -1133,7 +1142,7 @@ fn universe_watch(d: Arc<Daemon>) {
                 Some(b) if now.iter().any(|(s, _)| s == b) => {
                     if !warned_disagree {
                         warned_disagree = true;
-                        log(format!("universe watch: SteamVR tracks the headset from base station {b}, which the registration has no place for, and the base stations disagree on how the universe moved; registration left as it is"));
+                        log!("universe watch: SteamVR tracks the headset from base station {b}, which the registration has no place for, and the base stations disagree on how the universe moved; registration left as it is");
                     }
                 }
                 // a base SteamVR does not report for a moment: left as it is
@@ -1141,19 +1150,19 @@ fn universe_watch(d: Arc<Daemon>) {
                     let (since, said) = held.get_or_insert((std::time::Instant::now(), false));
                     if !*said && since.elapsed() > Duration::from_secs(10) {
                         *said = true;
-                        log(format!("universe watch: SteamVR has not reported base station {b}, which it tracks the headset from, for 10 s; registration left as it is"));
+                        log!("universe watch: SteamVR has not reported base station {b}, which it tracks the headset from, for 10 s; registration left as it is");
                     }
                 }
                 None if !warned_disagree => {
                     warned_disagree = true;
-                    log("universe watch: the base stations disagree on how the universe moved (one bumped?), and SteamVR's log names no station it tracks the headset from; registration left as it is");
+                    log!("universe watch: the base stations disagree on how the universe moved (one bumped?), and SteamVR's log names no station it tracks the headset from; registration left as it is");
                 }
                 None => {}
             }
             continue;
         };
         if held.take().is_some_and(|(_, said)| said) {
-            log("universe watch: SteamVR reports the base station again");
+            log!("universe watch: SteamVR reports the base station again");
         }
         warned_disagree = false;
         let s = how.now_from_then();
@@ -1184,11 +1193,11 @@ fn universe_watch(d: Arc<Daemon>) {
                 || prev.is_some_and(|p| p != nalgebra::Isometry3::identity())))
             || changed_how
         {
-            log(format!(
+            log!(
                 "universe watch: registration follows {how}: {:.1} mm, {:.2} deg in the play area since it was fitted",
                 (s * reg.play_area_point() - reg.play_area_point()).norm() * 1e3,
                 s.rotation.angle().to_degrees(),
-            ));
+            );
         }
         following = Some(how);
     }
@@ -1217,7 +1226,7 @@ fn engine_main(d: Arc<Daemon>) {
             Ok(e) => e,
             Err(err) => {
                 if err != last_err {
-                    log(format!("waiting for headset: {err}"));
+                    log!("waiting for headset: {err}");
                     last_err = err;
                 }
                 publish_disconnected(&d);
@@ -1251,17 +1260,12 @@ fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engin
     d.sensor_poses.lock().unwrap().clear();
     d.sensor_agreement.lock().unwrap().clear();
     d.sensors_unsure.store(false, Ordering::Relaxed);
-    log(format!(
-        "engine running with {} sensor(s)",
-        e.sensors().len()
-    ));
+    log!("engine running with {} sensor(s)", e.sensors().len());
     make_usb_thread_realtime();
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
     d.track_in.lock().unwrap().register(open.iter().cloned());
     for serial in modes::unposed_sensors(opts, &open) {
-        log(format!(
-            "sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)"
-        ));
+        log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
     }
     let link = RadioLink::default();
     // the radio thread holds a decoder pointing into the engine: the scope joins it first
@@ -1277,7 +1281,7 @@ fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engin
                 match hid::Device::open(&path) {
                     Ok(f) => Some(f),
                     Err(err) => {
-                        log(format!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display()));
+                        log!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display());
                         None
                     }
                 }
@@ -1285,7 +1289,7 @@ fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engin
             // Opening the HID handle already starts a Windows read: mark a startup panic before
             // its local handle can wait for cancellation while unwinding.
             let _startup = WorkerExit { failed: &d.failed_worker, worker: ENGINE_WORKER, panic_only: true };
-            log(format!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display()));
+            log!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display());
             let watch = LandmarkWatch::load();
             let (d, link) = (d, &link);
             let job = WorkerResources::starting(&d.failed_worker, ENGINE_WORKER, (dec, file, pipe, watch));
@@ -1453,11 +1457,9 @@ fn exit_on_worker_failure(failed: &AtomicU8, shared: &ShmWriter) {
         RADIO_WORKER => "radio thread",
         _ => return,
     };
-    log(format!(
-        "{name} stopped unexpectedly; exiting so the daemon can restart"
-    ));
+    log!("{name} stopped unexpectedly; exiting so the daemon can restart");
     shared.retire();
-    process::exit(1);
+    daemon_log::exit(1);
 }
 
 /// Stops the radio thread when the engine loop ends, a panic included (the scope would wait on
@@ -1623,7 +1625,7 @@ impl Reposing {
                 }
             });
         if let Err(e) = spawned {
-            log(format!("no solver thread for moved sensors ({e})"));
+            log!("no solver thread for moved sensors ({e})");
         }
         Reposing {
             monitor: repose::Monitor::new(repose::WINDOW_NS),
@@ -1684,9 +1686,7 @@ impl Reposing {
                 why: why.to_string(),
             },
         );
-        log(format!(
-            "sensor {serial}: {why}; tracking with it again as calibrated"
-        ));
+        log!("sensor {serial}: {why}; tracking with it again as calibrated");
     }
 
     fn tick(
@@ -1765,10 +1765,10 @@ impl Reposing {
                             matches: fit.pairs,
                         },
                     );
-                    log(format!(
+                    log!(
                         "sensor {serial}: placed again from the other sensors, {moved_mm:.0} mm and {turned_deg:.1} degrees from its calibrated pose ({:.2} px median over {} LED matches in {} frames); tracking with it again",
                         fit.median_px, fit.pairs, fit.frames
-                    ));
+                    );
                 }
                 repose::Outcome::GaveUp {
                     attempts, reason, ..
@@ -1798,9 +1798,9 @@ impl Reposing {
                             reason: reason.clone(),
                         },
                     );
-                    log(format!(
+                    log!(
                         "sensor {serial}: no pose for it from the other sensors after {attempts} tries ({reason}); it stays out of tracking until cv1touch setup or a restart"
-                    ));
+                    );
                 }
             }
         }
@@ -1824,9 +1824,9 @@ impl Reposing {
                                 reason: format!("placed again {recent} times in half an hour"),
                             },
                         );
-                        log(format!(
+                        log!(
                             "sensor {serial}: judged moved again, after {recent} placements in half an hour: it stays out of tracking until cv1touch setup or a restart"
-                        ));
+                        );
                         continue;
                     }
                     pipe.probe(&serial, true);
@@ -1857,16 +1857,16 @@ impl Reposing {
                             a.bias_px.norm()
                         )
                     };
-                    log(format!(
+                    log!(
                         "sensor {serial}: disagrees with the other sensors (missed {} of {} checks; {matched}): it moved; placing it again from them while the controllers are in its view",
                         a.misses, a.checks
-                    ));
+                    );
                 }
                 repose::Change::Unsure => {
                     self.unsure_until = now + 2 * repose::WINDOW_NS;
                     if now.saturating_sub(self.unsure_logged) >= UNSURE_LOG_NS {
                         self.unsure_logged = now;
-                        log("fewer than two sensors agree with each other: sensors moved, but which cannot be told from here; if tracking is off, run cv1touch setup");
+                        log!("fewer than two sensors agree with each other: sensors moved, but which cannot be told from here; if tracking is off, run cv1touch setup");
                     }
                 }
             }
@@ -1914,7 +1914,7 @@ impl Reposing {
                 .send(SolveJob { job, model, bodies })
                 .is_err()
             {
-                log("the solver thread for moved sensors is gone");
+                log!("the solver thread for moved sensors is gone");
             }
         }
     }
@@ -1929,10 +1929,10 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
         r.orient_xyzw.map(f64::from),
         r.pos.map(f64::from),
     ) {
-        log(format!(
+        log!(
             "sensor {}: the engine did not take the pose ({err}); it has what it had",
             r.serial
-        ));
+        );
     }
     if !r.write {
         return;
@@ -1948,14 +1948,14 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     let written = match loaded {
         Some(loaded) => match write_reposed(&loaded, r, &platform::dirs::get().state) {
             Ok((backup, sha256)) => {
-                log(format!(
+                log!(
                     "sensor {}: wrote its new pose to {}{}",
                     r.serial,
                     loaded.path.display(),
                     backup
                         .as_ref()
                         .map_or(String::new(), |b| format!(" (previous: {})", b.display()))
-                ));
+                );
                 if let Some(c) = d.calibration.lock().unwrap().as_mut() {
                     c.sha256 = sha256;
                 }
@@ -1965,15 +1965,15 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
                 true
             }
             Err(err) => {
-                log(format!("sensor {}: new pose not written: {err}", r.serial));
+                log!("sensor {}: new pose not written: {err}", r.serial);
                 false
             }
         },
         None => {
-            log(format!(
+            log!(
                 "sensor {}: new pose not written: no calibration file is loaded",
                 r.serial
-            ));
+            );
             false
         }
     };
@@ -1984,12 +1984,12 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     let landmarks = track::landmarks::default_path();
     match track::landmarks::forget_in_file(&landmarks, &r.serial) {
         Ok(0) => {}
-        Ok(n) => log(format!(
+        Ok(n) => log!(
             "sensor {}: dropped its {n} landmark(s) from {}, learned where it stood; cv1touch setup learns new ones",
             r.serial,
             landmarks.display()
-        )),
-        Err(err) => log(format!("sensor {}: {err}", r.serial)),
+        ),
+        Err(err) => log!("sensor {}: {err}", r.serial),
     }
 }
 
@@ -2043,8 +2043,8 @@ fn write_reposed(
     if let Ok(Some(mut checkpoint)) = setup::load(&journal) {
         if setup::carry_camera_fingerprint(&mut checkpoint, &loaded.sha256, &sha256) {
             match setup::save(&journal, &checkpoint) {
-                Ok(()) => log("setup's stages stay as they were: they are bound to the new file"),
-                Err(e) => log(format!("{}: {e}", journal.display())),
+                Ok(()) => log!("setup's stages stay as they were: they are bound to the new file"),
+                Err(e) => log!("{}: {e}", journal.display()),
             }
         }
     }
@@ -2077,12 +2077,12 @@ fn thin_own_backups(own: &mut Vec<PathBuf>, backup: PathBuf) {
     while own.len() > KEPT_BACKUPS {
         let oldest = own.remove(0);
         match std::fs::remove_file(&oldest) {
-            Ok(()) => log(format!(
+            Ok(()) => log!(
                 "removed the daemon's oldest backup {}, keeping {KEPT_BACKUPS}",
                 oldest.display()
-            )),
+            ),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => log(format!("{}: {e}", oldest.display())),
+            Err(e) => log!("{}: {e}", oldest.display()),
         }
     }
 }
@@ -2157,10 +2157,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
     let (mut failures, mut next_sensors) = (0u32, 0u64);
     while !d.quit.load(Ordering::Acquire) {
         if d.reopen.swap(false, Ordering::AcqRel) {
-            log(format!(
-                "reopening the engine for {} mode",
-                d.mode.lock().unwrap()
-            ));
+            log!("reopening the engine for {} mode", d.mode.lock().unwrap());
             return;
         }
         let pending = mem::take(&mut *d.haptics.lock().unwrap());
@@ -2172,7 +2169,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         if e.update().is_err() {
             failures += 1;
             if failures >= IO_FAILURES_BEFORE_REOPEN {
-                log("headset I/O failing; reopening");
+                log!("headset I/O failing; reopening");
                 return;
             }
         } else {
@@ -2223,10 +2220,10 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         for change in std::mem::take(&mut *link.reposed.lock().unwrap()) {
             match change {
                 PoseChange::Cleared(serial) => match e.clear_sensor_pose(&serial) {
-                    Ok(()) => log(format!(
+                    Ok(()) => log!(
                         "sensor {serial}: the engine labels its blobs by the long search while it is placed"
-                    )),
-                    Err(err) => log(format!("sensor {serial}: {err}")),
+                    ),
+                    Err(err) => log!("sensor {serial}: {err}"),
                 },
                 PoseChange::Set(r) => apply_reposed(d, e, &r),
             }
@@ -2298,7 +2295,7 @@ impl BodyFinder {
                     self.next_try[h] = now + 5_000_000_000;
                     if !self.warned[h] {
                         self.warned[h] = true;
-                        log(format!("{}: no factory IMU position cached for its LED model; publishing OpenHMD poses for it", ["left", "right"][h]));
+                        log!("{}: no factory IMU position cached for its LED model; publishing OpenHMD poses for it", ["left", "right"][h]);
                     }
                 }
             }
@@ -2326,11 +2323,11 @@ fn radio_main(
 ) {
     let me = system::current_thread();
     if let Err(err) = set_rt_affinity(me) {
-        log(format!("radio thread keeps the process's CPUs ({err})"));
+        log!("radio thread keeps the process's CPUs ({err})");
     }
     match system::make_realtime(me, RADIO_RT_PRIORITY) {
-        Ok(how) => log(format!("radio thread real-time ({how})")),
-        Err(err) => log(format!("radio thread stays normal priority ({err})")),
+        Ok(how) => log!("radio thread real-time ({how})"),
+        Err(err) => log!("radio thread stays normal priority ({err})"),
     }
     d.radio_on.store(true, Ordering::Release);
     let _exit = RadioExit { d, link };
@@ -2371,7 +2368,7 @@ fn radio_main(
                 Err(err) => {
                     // the headset gone (waiting on a dead device returns at once, which would
                     // spin this thread): the engine reopens, with a new radio thread
-                    log(format!("radio read failed ({err}); reopening the engine"));
+                    log!("radio read failed ({err}); reopening the engine");
                     radio_failed = true;
                     break;
                 }
@@ -2422,14 +2419,14 @@ fn radio_main(
         }
         for b in link.bodies.lock().unwrap().drain(..) {
             pipe.body(b.device_id, b.leds.clone(), b.imu);
-            log(format!(
+            log!(
                 "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
                 ["left", "right"][b.hand],
                 b.leds.len(),
                 b.imu.x * 1e3,
                 b.imu.y * 1e3,
                 b.imu.z * 1e3
-            ));
+            );
             biases.seed(pipe, b.hand, &b.leds);
             link.hands.request(b.hand);
         }
@@ -2690,19 +2687,19 @@ fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
         } => d.flight.cancel(h, last_sample_host_ns),
         _ => {}
     }
-    log(match event {
-        GapEvent::Began { moving, .. } => format!(
+    match event {
+        GapEvent::Began { moving, .. } => log!(
             "{name}: radio silent ({}): holding it as it was, inputs included, for up to {ride_s:.0} s",
             if moving { "in use" } else { "still" }
         ),
         GapEvent::Ended { silent_ns, .. } => {
-            format!("{name}: radio back after {:.2} s", silent_ns as f64 * 1e-9)
+            log!("{name}: radio back after {:.2} s", silent_ns as f64 * 1e-9)
         }
-        GapEvent::Expired { silent_ns } => format!(
+        GapEvent::Expired { silent_ns } => log!(
             "{name}: radio silent for {:.0} s: standby, inputs released",
             silent_ns as f64 * 1e-9
         ),
-    });
+    }
 }
 
 /// Hands due dropout recordings to the daemon's single writer without waiting for storage.
@@ -2716,12 +2713,12 @@ fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
             continue;
         };
         match writer.submit(dropout, unix_s) {
-            Ok(Some(dropped)) => log(format!(
+            Ok(Some(dropped)) => log!(
                 "{}: dropped a dropout recording because storage fell behind",
                 ["left", "right"][dropped.hand]
-            )),
+            ),
             Ok(None) => {}
-            Err(e) => log(format!("could not record a dropout: {e}")),
+            Err(e) => log!("could not record a dropout: {e}"),
         }
     }
 }
@@ -2799,10 +2796,10 @@ fn publish_hand_state(
         let wl = p.stats(h).wrong_locks;
         if wl != memory.wrong_locks {
             memory.wrong_locks = wl;
-            log(format!(
+            log!(
                 "{}: dropped a wrong lock (accelerometer bias ran off)",
                 ["left", "right"][h]
-            ));
+            );
         }
         let latest = p.latest(h);
         apply_tracker(&mut state, latest.as_ref(), memory, |state, s| {
@@ -2817,7 +2814,7 @@ fn publish_hand_state(
         let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
         let tracking = latest.is_some_and(|s| s.output.tracking);
         if let Some(change) = memory.observe(connected, tracking, now) {
-            log(format!("{}: {change}", ["left", "right"][h]));
+            log!("{}: {change}", ["left", "right"][h]);
         }
     }
     d.inputs.lock().unwrap().apply(h, &mut state);
@@ -2889,7 +2886,7 @@ impl HoldStats {
         for h in 0..2 {
             let v = &mut self.samples[h];
             if v.len() >= 100 {
-                log(hold_summary(["left", "right"][h], v));
+                log!("{}", hold_summary(["left", "right"][h], v));
             }
             v.clear();
         }
@@ -3099,10 +3096,10 @@ fn handle(d: &Daemon, line: &str) -> String {
             match on {
                 Some(true) => {
                     d.inject.arm(now);
-                    log(format!(
+                    log!(
                         "test input injection armed for {} s",
                         INJECT_ARMED_NS / 1_000_000_000
-                    ));
+                    );
                 }
                 Some(false) => d.inject.disarm(),
                 None => {}
@@ -3257,18 +3254,6 @@ fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
     format!("ok {mode}")
 }
 
-/// OpenHMD logs through C's stdout, which is block-buffered when it is not a terminal: under
-/// systemd its lines reached the journal in 4 KB batches, stamped with the flush time rather than
-/// when they happened. Line-buffered, each lands as it is written. Must run before anything prints.
-/// (On Windows the engine's DLL carries its own C runtime and stdout: ohmd_cv1touch_unbuffer_log.)
-#[cfg(unix)]
-fn line_buffer_stdout() {
-    extern "C" {
-        static mut stdout: *mut libc::FILE;
-    }
-    unsafe { libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IOLBF, 0) };
-}
-
 /// The radio thread's real-time priority: on Linux SCHED_RR above every normal thread, below
 /// PipeWire's (20) and the compositor's (90 and up).
 const RADIO_RT_PRIORITY: u32 = 10;
@@ -3340,15 +3325,15 @@ fn make_usb_thread_realtime() {
         system::thread_named("cv1t-usb")
     });
     let Some(tid) = found else {
-        log("no cv1t-usb thread: OpenHMD's USB event thread stays as it is");
+        log!("no cv1t-usb thread: OpenHMD's USB event thread stays as it is");
         return;
     };
     if let Err(err) = set_rt_affinity(tid) {
-        log(format!("cv1t-usb keeps the process's CPUs ({err})"));
+        log!("cv1t-usb keeps the process's CPUs ({err})");
     }
     match system::make_realtime(tid, USB_RT_PRIORITY) {
-        Ok(how) => log(format!("cv1t-usb real-time ({how})")),
-        Err(err) => log(format!("cv1t-usb stays normal priority ({err})")),
+        Ok(how) => log!("cv1t-usb real-time ({how})"),
+        Err(err) => log!("cv1t-usb stays normal priority ({err})"),
     }
 }
 
@@ -3425,10 +3410,10 @@ fn with_container_control(
             Some(endpoint.to_path_buf())
         }
         Err(e) => {
-            log(format!(
+            log!(
                 "control socket for Steam's container {}: {e}; using the usual socket only",
                 endpoint.display()
-            ));
+            );
             None
         }
     };
@@ -3460,7 +3445,7 @@ fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer
                             // once per failure, not at every retry
                             let why = e.to_string();
                             if failing.as_ref() != Some(&why) {
-                                log(format!("control endpoint: {why}"));
+                                log!("control endpoint: {why}");
                                 failing = Some(why);
                             }
                             thread::sleep(Duration::from_millis(100));
@@ -3500,8 +3485,9 @@ fn serve_client(d: &Daemon, conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
 const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --supervise [OPTIONS]   run it as a child process, restarted after a failure, its output in a log file\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
 
 fn usage() -> ! {
-    eprintln!("{USAGE}");
-    process::exit(2);
+    let _logging = daemon_log::init().unwrap_or_else(|_| process::exit(1));
+    daemon_log::raw(format_args!("{USAGE}"));
+    daemon_log::exit(2);
 }
 
 /// `--supervise`: runs the daemon with the other arguments as a child process, started again
@@ -3606,6 +3592,13 @@ fn main() {
     if arguments.first().map(String::as_str) == Some("--supervise") {
         process::exit(supervise(&arguments[1..]));
     }
+    // Block shutdown signals before the writer or any engine thread can inherit them.
+    let shutdown = shutdown::Requests::take();
+    let _logging = daemon_log::init().unwrap_or_else(|_| process::exit(1));
+    let shutdown = shutdown.unwrap_or_else(|e| {
+        log!("cannot take over shutdown requests: {e}");
+        daemon_log::exit(1);
+    });
     let affinity = affinity_setting().and_then(|spec| {
         if let Some(spec) = spec {
             let allowed = system::allowed_cpus(system::current_thread())
@@ -3615,31 +3608,15 @@ fn main() {
         Ok(())
     });
     if let Err(e) = affinity {
-        eprintln!("cv1touchd: {e}");
-        process::exit(2);
+        log!("{e}");
+        daemon_log::exit(2);
     }
-    // First, before any thread exists: on Linux the recorder and engine threads inherit the
-    // blocked SIGINT and SIGTERM, which must reach only the shutdown requests, never a thread
-    // whose default action kills us.
-    let shutdown = shutdown::Requests::take().unwrap_or_else(|e| {
-        log(format!("cannot take over shutdown requests: {e}"));
-        process::exit(1);
-    });
-    #[cfg(unix)]
-    line_buffer_stdout();
-    #[cfg(windows)]
-    // SAFETY: takes nothing; nothing has printed through the engine's stdout yet.
-    unsafe {
-        ffi::ohmd_cv1touch_unbuffer_log()
-    };
     if let Err(e) = system::opt_out_of_throttling() {
-        log(format!("power throttling stays as Windows sets it ({e})"));
+        log!("power throttling stays as Windows sets it ({e})");
     }
     match system::lock_memory() {
-        Ok(()) => log("memory locked: pages stay in RAM once touched"),
-        Err(e) => log(format!(
-            "memory not locked ({e}): pages can be swapped out under pressure"
-        )),
+        Ok(()) => log!("memory locked: pages stay in RAM once touched"),
+        Err(e) => log!("memory not locked ({e}): pages can be swapped out under pressure"),
     }
     let mut opts = EngineOptions {
         radio_wait_ms: 2,
@@ -3706,71 +3683,63 @@ fn main() {
         if calibration.is_some() || path.exists() {
             match modes::calibrated(&opts, &path) {
                 Ok((o, n)) => {
-                    log(format!(
-                        "calibrated: {n} sensor poses from {}",
-                        path.display()
-                    ));
+                    log!("calibrated: {n} sensor poses from {}", path.display());
                     (o, "calibrated".to_string(), Some(path))
                 }
                 Err(e) => {
-                    log(format!(
-                        "{e} (fix or remove it, or start with --provisional)"
-                    ));
-                    process::exit(1);
+                    log!("{e} (fix or remove it, or start with --provisional)");
+                    daemon_log::exit(1);
                 }
             }
         } else {
-            log(format!(
+            log!(
                 "no calibration at {}: provisional placement (run `cv1touch setup`)",
                 path.display()
-            ));
+            );
             (modes::provisional(&opts), "provisional".to_string(), None)
         }
     };
 
     if let Err(e) = cv1touch::platform::fs::create_private_dir_all(&runtime_dir) {
-        log(format!("{}: {e}", runtime_dir.display()));
-        process::exit(1);
+        log!("{}: {e}", runtime_dir.display());
+        daemon_log::exit(1);
     }
     // Lock before touching shared memory or the socket: a second instance must not clobber the first.
     let lock_path = runtime_dir.join("daemon.lock");
     let _lock = control::lock_single_instance(&lock_path).unwrap_or_else(|e| {
-        log(format!(
-            "another cv1touchd holds {} ({e})",
-            lock_path.display()
-        ));
-        process::exit(1);
+        log!("another cv1touchd holds {} ({e})", lock_path.display());
+        daemon_log::exit(1);
     });
     let shm = ShmWriter::create(&shm_name, random_u64()).unwrap_or_else(|e| {
-        log(format!("shared memory {shm_name}: {e}"));
-        process::exit(1);
+        log!("shared memory {shm_name}: {e}");
+        daemon_log::exit(1);
     });
     let settings_path = settings::default_path();
     let settings = settings::load(&settings_path).unwrap_or_else(|e| {
-        log(format!("settings: {e}; using the defaults"));
+        log!("settings: {e}; using the defaults");
         settings::Settings::default()
     });
     if (settings.prediction_percent, settings.rotation_percent()) != (100, 100) {
-        log(format!(
+        log!(
             "prediction: {} ({})",
             prediction_text(settings.prediction_percent, settings.rotation_percent()),
             settings_path.display()
-        ));
+        );
     }
     if start_latency_ns(&settings) != 0 {
-        log(format!(
+        log!(
             "latency: {} ({})",
             latency_text(start_latency_ns(&settings)),
             settings_path.display()
-        ));
+        );
     }
     let start_tilt_deg = start_tilt_mdeg(&settings) as f64 / 1000.0;
     if start_tilt_deg != 0.0 {
-        log(format!(
+        log!(
             "tilt: {} ({})",
             tilt_text(start_tilt_deg),
             settings_path.display()
-        ));
+        );
     }
     let (alignment, notes) = align::load_default();
     for n in notes {
@@ -3785,14 +3754,14 @@ fn main() {
     if let Some(path) = &record {
         if let Err(e) = rec.start(path, shm::now_ns()) {
             log(e);
-            process::exit(1);
+            daemon_log::exit(1);
         }
     }
     let sock_path = runtime_dir.join("control.sock");
     // a stale socket goes (the lock guarantees no live owner); private to this user
     let listener = ipc::Listener::bind(&sock_path).unwrap_or_else(|e| {
-        log(format!("control socket {}: {e}", sock_path.display()));
-        process::exit(1);
+        log!("control socket {}: {e}", sock_path.display());
+        daemon_log::exit(1);
     });
 
     let listeners = vec![listener];
@@ -3805,7 +3774,7 @@ fn main() {
     match input_calibration::load(&input_calibration::default_path()) {
         Ok(calibration) => inputs.calibration = calibration,
         Err(error) => {
-            log(format!("{error}; using factory input defaults"));
+            log!("{error}; using factory input defaults");
             inputs.error = Some(error);
         }
     }
@@ -3861,7 +3830,7 @@ fn main() {
     let dropout_writer = match flight_writer::Writer::start(platform::dirs::get().state, log) {
         Ok(writer) => Some(writer),
         Err(e) => {
-            log(format!("could not start the dropout recording thread: {e}"));
+            log!("could not start the dropout recording thread: {e}");
             None
         }
     };
@@ -3883,7 +3852,7 @@ fn main() {
             .spawn(move || universe_watch(d))
             .expect("universe thread")
     };
-    log(format!(
+    log!(
         "running: shm {shm_name}, control {}, {} mode, hmd leds {}, ignoring sensors {:?}",
         sock_path.display(),
         d.mode.lock().unwrap(),
@@ -3893,7 +3862,7 @@ fn main() {
             "on"
         },
         d.opts.lock().unwrap().ignore_sensors
-    ));
+    );
 
     let control = serve_control(Arc::clone(&d), listeners);
     loop {
@@ -3904,11 +3873,11 @@ fn main() {
         d.shm.heartbeat(shm::now_ns());
         save_dropouts(&d, dropout_writer.as_ref());
         if let Some(why) = shutdown.wait(Duration::from_millis(200)) {
-            log(format!("{why}: shutting down"));
+            log!("{why}: shutting down");
             break;
         }
         if d.stop_requested.load(Ordering::Acquire) {
-            log("asked to stop: shutting down");
+            log!("asked to stop: shutting down");
             break;
         }
     }
@@ -3923,12 +3892,12 @@ fn main() {
     #[cfg(unix)]
     if let Some(path) = container_socket {
         if let Err(e) = ipc::unlink_private_socket(&path) {
-            log(format!("removing control socket {}: {e}", path.display()));
+            log!("removing control socket {}: {e}", path.display());
         }
     }
     // the control threads still hold `d`, so retire the segment here rather than on its drop
     d.shm.retire();
-    log("stopped");
+    log!("stopped");
 }
 
 #[cfg(test)]
@@ -4529,6 +4498,18 @@ mod tests {
         let Some(which) = std::env::var_os("CV1TOUCH_TEST_FAILED_WORKER") else {
             return;
         };
+        struct DeferredStderr;
+        impl io::Write for DeferredStderr {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                // Make a missing fatal drain observable even if the writer is scheduled first.
+                thread::sleep(Duration::from_millis(30));
+                io::Write::write(&mut io::stderr(), bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                io::Write::flush(&mut io::stderr())
+            }
+        }
+        let _logging = daemon_log::init_with_writer(DeferredStderr).unwrap();
         let worker = if which == "radio" {
             RADIO_WORKER
         } else {
@@ -4573,7 +4554,76 @@ mod tests {
                 stderr.contains(&format!(
                     "{reason} stopped unexpectedly; exiting so the daemon can restart"
                 )),
-                "{stderr}"
+                "missing worker failure diagnostic: {stderr}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_worker_exits_with_a_full_stderr_pipe() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        for worker in ["engine", "radio"] {
+            let mut fds = [-1; 2];
+            // SAFETY: two descriptor slots, each then owned by one File.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let mut read = unsafe { fs::File::from_raw_fd(fds[0]) };
+            let mut write = unsafe { fs::File::from_raw_fd(fds[1]) };
+            let fd = write.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            loop {
+                match write.write(&[b'x'; 4096]) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("fill stderr: {e}"),
+                }
+            }
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+            let observed = write.try_clone().unwrap();
+            let mut child = process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::failed_worker_exit_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CV1TOUCH_TEST_FAILED_WORKER", worker)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(write))
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if start.elapsed() >= Duration::from_secs(2) {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let after = unsafe { libc::fcntl(observed.as_raw_fd(), libc::F_GETFL) };
+            drop(observed);
+            read.read_to_end(&mut Vec::new()).unwrap();
+            assert!(
+                status.is_some(),
+                "{worker} failure waited for a full stderr pipe"
+            );
+            assert_eq!(status.unwrap().code(), Some(1));
+            assert_eq!(
+                after, flags,
+                "worker failure changed the pipe's blocking mode"
             );
         }
     }

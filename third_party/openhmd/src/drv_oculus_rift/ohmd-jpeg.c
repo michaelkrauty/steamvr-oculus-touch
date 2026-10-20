@@ -3,7 +3,8 @@
  * Copyright 2021 Jan Schmidt
  * SPDX-License-Identifier: BSL-1.0
  */
-#include <assert.h>
+#include "../log-output.h"
+#include "../ohmd-assert.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -114,14 +115,14 @@ static bool get_output_frame(ohmd_jpeg_decoder *jd, ohmd_video_frame *in, ohmd_v
 		ohmd_video_frame *cur_frame = jd->free_frames[jd->n_free_frames];
 
 		/* Frame format must match or something is very wrong */
-		assert (in->width == cur_frame->width && in->height == cur_frame->height);
+		OHMD_ASSERT(in->width == cur_frame->width && in->height == cur_frame->height);
 		*out = cur_frame;
 		goto done;
 	}
 
 	/* No free frame available, allocate one. assert if there's no room
 	 * because the limit is too small */
-	assert(jd->n_alloced_frames < MAX_QUEUE_FRAMES);
+	OHMD_ASSERT(jd->n_alloced_frames < MAX_QUEUE_FRAMES);
 
 	ohmd_video_frame *frame = ohmd_alloc(jd->ohmd_ctx, sizeof (ohmd_video_frame));
 	size_t data_size = in->width * in->height;
@@ -210,7 +211,7 @@ bool ohmd_jpeg_decoder_decode(ohmd_jpeg_decoder *jd, ohmd_video_frame *in, ohmd_
 	sprintf(fname, "/tmp/openhmd-jpeg/frame-%05d.jpg", file_index++);
 	FILE *f = fopen(fname, "wb");
 	if (f == NULL) {
-		fprintf(stderr, "Decode fail: err %d %m", errno);
+		ohmd_log_fprintf(stderr, "Decode fail: err %d %m", errno);
 		return false;
 	}
 	fwrite(in->data, in->data_size, 1, f);
@@ -233,11 +234,11 @@ fail:
 static void
 ohmd_jpeg_release_frame(ohmd_video_frame *frame, ohmd_jpeg_decoder *jd)
 {
-	assert(frame->owner == jd);
+	OHMD_ASSERT(frame->owner == jd);
 
 	/* Put the frame back on the free queue */
 	ohmd_lock_mutex(jd->frames_lock);
-	assert(jd->n_free_frames < jd->n_alloced_frames);
+	OHMD_ASSERT(jd->n_free_frames < jd->n_alloced_frames);
 	jd->free_frames[jd->n_free_frames++] = frame;
 	ohmd_unlock_mutex(jd->frames_lock);
 }

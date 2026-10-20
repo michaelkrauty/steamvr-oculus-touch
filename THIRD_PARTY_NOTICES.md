@@ -14,6 +14,12 @@ The root Apache 2.0 license covers original SteamVR Oculus Touch code and local 
 
 The unused upstream GStreamer plugin and 3Glasses driver are not distributed in this snapshot. OpenHMD files bearing both LGPL and Boost alternatives are used under Boost, with their original notices intact.
 
+The local OpenHMD log callback forwards the daemon's native diagnostics to its bounded logging queue; other clients retain the engine's original stdout/stderr behavior for ordinary logs. The libusb callback covers its normal logging implementation; special libusb build options can bypass it.
+
+Native assertion sites use a project macro and fixed-buffer failure callback, so the daemon can drain briefly and abort without its C runtime's blocking assertion printer. Assertions remain enabled in production. Without an installed receiver, engine assertions abort without synchronous output; standalone unity harnesses retain their ordinary assertions.
+
+Fatal records are independent of the native printf accumulator. Reentered log receivers and fatal callbacks abort silently without invoking callbacks or draining again.
+
 ## Build and runtime dependencies
 
 Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.

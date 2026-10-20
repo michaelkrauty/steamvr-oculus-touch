@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSL-1.0
  */
 
+#include "../log-output.h"
 #include <libusb.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +21,7 @@
 #include "sensor/esp570.h"
 #include "sensor/uvc.h"
 
-#define ASSERT_MSG(_v, label, ...) if(!(_v)){ fprintf(stderr, __VA_ARGS__); goto label; }
+#define ASSERT_MSG(_v, label, ...) if(!(_v)){ ohmd_log_fprintf(stderr, __VA_ARGS__); goto label; }
 
 typedef struct rift_sensor_usb_device rift_sensor_usb_device;
 
@@ -166,7 +167,7 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	struct libusb_device_descriptor desc;
 	ret = libusb_get_device_descriptor(usb_dev, &desc);
 	if (ret < 0) {
-		printf ("Failed to read device descriptor!\n");
+		ohmd_log_printf ("Failed to read device descriptor!\n");
 		libusb_close (usb_devh);
 		return NULL;
 	}
@@ -186,7 +187,7 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	dev->usb_pid = desc.idProduct;
 	dev->usb2_mode = (desc.bcdUSB < 0x300);
 
-	printf ("Opened Rift Sensor %d w/ Serial %s. Connecting to Radio address 0x%02x%02x%02x%02x%02x\n",
+	ohmd_log_printf ("Opened Rift Sensor %d w/ Serial %s. Connecting to Radio address 0x%02x%02x%02x%02x%02x\n",
 		id, serial_no, hmd_radio_id[0], hmd_radio_id[1], hmd_radio_id[2], hmd_radio_id[3], hmd_radio_id[4]);
 
 	ret = rift_sensor_uvc_stream_setup (ohmd_ctx, usb_ctx, dev->usb_devh, &desc, &dev->uvc_stream);
