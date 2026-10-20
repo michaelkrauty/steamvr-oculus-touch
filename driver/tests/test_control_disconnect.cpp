@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -41,7 +42,7 @@ extern "C" ssize_t __wrap_send(int fd, const void *p, size_t n, int flags)
 
 int main()
 {
-    const std::string dir = "/tmp/cv1t-disconnect-" + std::to_string(getpid());
+    const std::string dir = (std::filesystem::temp_directory_path() / ("cv1t-disconnect-" + std::to_string(getpid()))).string();
     assert(mkdir(dir.c_str(), 0700) == 0);
     const std::string path = dir + "/control.sock";
     const std::string fallback = dir + "/fallback.sock";
@@ -49,11 +50,13 @@ int main()
     assert(server >= 0);
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+    assert(path.size() < sizeof addr.sun_path);
     std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
     assert(bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0);
     assert(listen(server, 4) == 0);
     const int other = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(other >= 0);
+    assert(fallback.size() < sizeof addr.sun_path);
     std::strcpy(addr.sun_path, fallback.c_str());
     assert(bind(other, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0);
     assert(listen(other, 4) == 0);

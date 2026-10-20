@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 #ifndef _WIN32
@@ -162,11 +163,12 @@ static void sends_to_the_socket()
 /* The worker delivers the line to a control socket and reads the reply. */
 static void sends_to_the_socket()
 {
-	const std::string path = "/tmp/cv1t-hapt-" + std::to_string(getpid()) + ".sock";
+	const std::string path = (std::filesystem::temp_directory_path() / ("cv1t-hapt-" + std::to_string(getpid()) + ".sock")).string();
 	unlink(path.c_str());
 	int srv = socket(AF_UNIX, SOCK_STREAM, 0);
 	sockaddr_un addr{};
 	addr.sun_family = AF_UNIX;
+	assert(path.size() < sizeof addr.sun_path);
 	std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
 	assert(bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0 && listen(srv, 4) == 0);
 	HapticSender s(path);

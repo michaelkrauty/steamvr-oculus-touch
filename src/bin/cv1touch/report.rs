@@ -349,15 +349,18 @@ fn write(path: &Path, created: SystemTime, report: &mut Report) -> io::Result<()
 /// Where a report goes unless asked: the desktop on Windows, where people look for a file they
 /// were asked to send; the current directory on Linux. Named for when it was made, in UTC.
 fn default_path(created: SystemTime) -> PathBuf {
-    let t = Utc::of(created);
-    let name = format!(
-        "cv1touch-report-{:04}-{:02}-{:02}-{:02}{:02}{:02}-UTC.zip",
-        t.year, t.month, t.day, t.hour, t.minute, t.second
-    );
     platform::dirs::desktop()
         .filter(|d| d.is_dir())
         .unwrap_or_default()
-        .join(name)
+        .join(default_name(created))
+}
+
+fn default_name(created: SystemTime) -> String {
+    let t = Utc::of(created);
+    format!(
+        "cv1touch-report-{:04}-{:02}-{:02}-{:02}{:02}{:02}-UTC.zip",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
 }
 
 /// What the report holds, for the person sending it.
@@ -516,10 +519,7 @@ mod tests {
     #[test]
     fn the_default_name_says_when() {
         let at = std::time::UNIX_EPOCH + Duration::from_secs(1_791_997_503);
-        let name = default_path(at);
-        assert_eq!(
-            name.file_name().unwrap(),
-            "cv1touch-report-2026-10-14-170503-UTC.zip"
-        );
+        let name = default_name(at);
+        assert_eq!(name, "cv1touch-report-2026-10-14-170503-UTC.zip");
     }
 }

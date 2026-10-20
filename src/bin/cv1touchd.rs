@@ -1824,7 +1824,7 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     }
     let loaded = d.calibration.lock().unwrap().clone();
     let written = match loaded {
-        Some(loaded) => match write_reposed(&loaded, r) {
+        Some(loaded) => match write_reposed(&loaded, r, &platform::dirs::get().state) {
             Ok((backup, sha256)) => {
                 log(format!(
                     "sensor {}: wrote its new pose to {}{}",
@@ -1878,9 +1878,9 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
 fn write_reposed(
     loaded: &LoadedCalibration,
     r: &Reposed,
+    state: &std::path::Path,
 ) -> Result<(Option<PathBuf>, String), String> {
     let path = &loaded.path;
-    let state = platform::dirs::get().state;
     // held until the journal is written too, so that setup cannot start in between
     let _setup_kept_out = match control::lock_single_instance(&state.join("setup.lock")) {
         Ok(lock) => Some(lock),
@@ -4526,6 +4526,8 @@ mod tests {
     fn a_new_pose_is_written_only_into_the_file_that_was_loaded() {
         let dir = std::env::temp_dir().join(format!("cv1t-reposed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
         let path = dir.join("calibration.json");
         let cal = calib::file::CalibrationFile {
             format: calib::file::FORMAT.into(),
@@ -4565,17 +4567,38 @@ mod tests {
         let mut other = cal.clone();
         other.source = "someone else's".into();
         calib::file::save(&path, &other).unwrap();
-        let err = write_reposed(&loaded, &r).unwrap_err();
+        let err = write_reposed(&loaded, &r, &state).unwrap_err();
         assert!(err.contains("changed since"), "{err}");
         // as loaded: written, with the pose, a note, and a backup
         let loaded = LoadedCalibration::at(path.clone());
-        let (backup, sha) = write_reposed(&loaded, &r).unwrap();
+        let journal = state.join("setup.json");
+        let mut checkpoint = setup::Checkpoint::default();
+        checkpoint.completed.insert(
+            setup::Stage::Camera,
+            setup::Binding {
+                artifact_sha256: loaded.sha256.clone(),
+                ..Default::default()
+            },
+        );
+        setup::save(&journal, &checkpoint).unwrap();
+        let lock = control::lock_single_instance(&state.join("setup.lock")).unwrap();
+        let err = write_reposed(&loaded, &r, &state).unwrap_err();
+        assert!(err.contains("cv1touch setup is running"), "{err}");
+        assert_eq!(setup::fingerprint(&path).unwrap(), loaded.sha256);
+        drop(lock);
+        let (backup, sha) = write_reposed(&loaded, &r, &state).unwrap();
         assert!(backup.is_some_and(|b| b.exists()));
         let written = calib::file::load(&path).unwrap();
         assert_eq!(written.sensors[0].pos, [0.1, 2.0, 1.0]);
         assert_eq!(written.sensors[0].observations, 4000);
         assert!(written.source.contains("placed again by cv1touchd"));
         assert_eq!(setup::fingerprint(&path).unwrap(), sha);
+        let rebound = setup::load(&journal).unwrap().unwrap();
+        assert_eq!(
+            rebound.completed[&setup::Stage::Camera].artifact_sha256,
+            sha,
+            "the checkpoint in the supplied state directory follows the new calibration"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
