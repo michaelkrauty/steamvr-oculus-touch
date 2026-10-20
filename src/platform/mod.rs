@@ -724,12 +724,9 @@ pub mod ipc {
     mod tests {
         use super::*;
 
-        fn pair(tag: &str) -> (Connection, Connection, PathBuf) {
-            let dir =
-                std::env::temp_dir().join(format!("cv1t-deadline-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("control.sock");
+        fn pair(tag: &str) -> (Connection, Connection, crate::socket_dir::SocketDir) {
+            let dir = crate::socket_dir::SocketDir::new();
+            let path = dir.path().join(format!("{tag}.sock"));
             let mut listener = Listener::bind(&path).unwrap();
             let client = Connection::connect(&path).unwrap();
             let server = listener.accept(true).unwrap();
@@ -751,7 +748,7 @@ pub mod ipc {
             client.read_exact(&mut byte).unwrap();
             assert_eq!(byte, *b"x");
             drop(client);
-            std::fs::remove_dir_all(dir).unwrap();
+            drop(dir);
         }
 
         #[test]
@@ -767,7 +764,7 @@ pub mod ipc {
             server.read_to_end(&mut bytes).unwrap();
             assert!(bytes.is_empty(), "{bytes:?}");
             drop(server);
-            std::fs::remove_dir_all(dir).unwrap();
+            drop(dir);
         }
     }
 }
@@ -942,16 +939,15 @@ mod tests {
     use super::ipc::{Connection, Listener};
     use std::io::{BufRead, BufReader, Read, Write};
 
-    fn endpoint(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cv1t-ipc-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("control.sock")
+    fn endpoint(tag: &str) -> (crate::socket_dir::SocketDir, std::path::PathBuf) {
+        let dir = crate::socket_dir::SocketDir::new();
+        let path = dir.path().join(format!("{tag}.sock"));
+        (dir, path)
     }
 
     #[test]
     fn a_connection_carries_a_line_each_way() {
-        let path = endpoint("line");
+        let (_fixture, path) = endpoint("line");
         assert_eq!(
             Connection::connect(&path).err().map(|e| e.kind()),
             Some(std::io::ErrorKind::NotFound)
@@ -983,7 +979,7 @@ mod tests {
 
     #[test]
     fn a_silent_listener_times_a_read_out_and_a_second_listener_is_refused() {
-        let path = endpoint("timeout");
+        let (_fixture, path) = endpoint("timeout");
         let mut listener = Listener::bind(&path).unwrap();
         let mut client = Connection::connect(&path).unwrap();
         let _server = listener.accept(true).unwrap();
@@ -1011,7 +1007,7 @@ mod tests {
 
     #[test]
     fn the_listener_keeps_serving_after_clients_vanish() {
-        let path = endpoint("vanish");
+        let (_fixture, path) = endpoint("vanish");
         let mut listener = Listener::bind(&path).unwrap();
         let server = std::thread::spawn(move || loop {
             // clients that came and went read as an immediate end of stream
@@ -1049,7 +1045,7 @@ mod tests {
         use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
 
-        let path = endpoint("squat");
+        let (_fixture, path) = endpoint("squat");
         let mut name =
             super::pipe_name(&path.as_os_str().encode_wide().collect::<Vec<u16>>()).unwrap();
         name.push(0);
@@ -1101,7 +1097,8 @@ mod tests {
 
     #[test]
     fn the_daemon_lock_is_exclusive_until_released() {
-        let path = endpoint("lock").with_file_name("cv1touchd.lock");
+        let (_fixture, endpoint) = endpoint("lock");
+        let path = endpoint.with_file_name("cv1touchd.lock");
         let first = super::ipc::lock_exclusive(&path).unwrap();
         assert!(super::ipc::lock_exclusive(&path).is_err());
         drop(first);

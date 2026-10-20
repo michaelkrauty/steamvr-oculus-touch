@@ -2,6 +2,7 @@
 // Copyright 2026 michaelkrauty
 
 #include "haptics.h"
+#include "socket_dir.h"
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -19,17 +20,15 @@
 using cv1t::ControlClient;
 
 struct Paths {
+	SocketDir directory;
 	std::string root, legacy, shared;
 	Paths()
 	{
-		char path[] = "/tmp/cv1t-container-client-XXXXXX";
-		assert(mkdtemp(path));
-		root = path;
+		root = directory.path();
 		legacy = root + "/legacy.sock";
 		assert(mkdir((root + "/shared").c_str(), 0700) == 0);
 		shared = root + "/shared/control.sock";
 	}
-	~Paths() { std::filesystem::remove_all(root); }
 };
 
 struct Environment {

@@ -2,6 +2,7 @@
 // Copyright 2026 michaelkrauty
 
 #include "haptics.h"
+#include "socket_dir.h"
 #include <cassert>
 #include <csignal>
 #include <cstdio>
@@ -42,8 +43,8 @@ extern "C" ssize_t __wrap_send(int fd, const void *p, size_t n, int flags)
 
 int main()
 {
-    const std::string dir = (std::filesystem::temp_directory_path() / ("cv1t-disconnect-" + std::to_string(getpid()))).string();
-    assert(mkdir(dir.c_str(), 0700) == 0);
+    SocketDir fixture;
+    const std::string &dir = fixture.path();
     const std::string path = dir + "/control.sock";
     const std::string fallback = dir + "/fallback.sock";
     const int server = socket(AF_UNIX, SOCK_STREAM, 0);

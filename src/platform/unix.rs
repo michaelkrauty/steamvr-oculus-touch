@@ -1591,12 +1591,10 @@ mod container_control_tests {
     use super::*;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
-    fn endpoint(tag: &str) -> std::path::PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("cv1t-container-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        root.join("private/control.sock")
+    fn endpoint() -> (crate::socket_dir::SocketDir, std::path::PathBuf) {
+        let root = crate::socket_dir::SocketDir::new();
+        let path = root.path().join("private/control.sock");
+        (root, path)
     }
 
     #[test]
@@ -1613,7 +1611,7 @@ mod container_control_tests {
 
     #[test]
     fn container_control_creates_a_private_directory_and_socket() {
-        let path = endpoint("create");
+        let (_fixture, path) = endpoint();
         let listener = Listener::bind_private(&path).unwrap();
         let dir = std::fs::symlink_metadata(path.parent().unwrap()).unwrap();
         let socket = std::fs::symlink_metadata(&path).unwrap();
@@ -1654,7 +1652,7 @@ mod container_control_tests {
             assert!(status.success());
             return;
         }
-        let path = endpoint("umask");
+        let (_fixture, path) = endpoint();
         // SAFETY: this isolated test process owns its umask; it is restored below.
         let old = unsafe { libc::umask(0o777) };
         let result = Listener::bind_private(&path);
@@ -1673,7 +1671,7 @@ mod container_control_tests {
 
     #[test]
     fn container_control_refuses_existing_unsafe_directories_without_changing_them() {
-        let path = endpoint("unsafe");
+        let (_fixture, path) = endpoint();
         let dir = path.parent().unwrap();
         std::fs::create_dir(dir).unwrap();
         for mode in [0o755, 0o770, 0o1700] {
@@ -1700,7 +1698,7 @@ mod container_control_tests {
 
     #[test]
     fn container_control_replaces_only_its_stale_socket_and_cleans_up_only_a_socket() {
-        let path = endpoint("stale");
+        let (_fixture, path) = endpoint();
         let first = Listener::bind_private(&path).unwrap();
         assert!(
             Listener::bind_private(&path).is_err(),

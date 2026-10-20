@@ -10,7 +10,8 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 messages=$(mktemp)
-trap 'rm -f "$messages"' EXIT
+socket_tests=
+trap 'rm -f -- "$messages"; rm -rf -- "${socket_tests:-}"' EXIT
 cargo build --locked --release --bins --message-format=json > "$messages"
 # Cargo reports the actual executable location, including custom target directories
 # and an explicitly selected native target triple.
@@ -38,3 +39,18 @@ readelf -d "$daemon" | grep -F '$ORIGIN/../lib/cv1touch' >/dev/null
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_driver_package.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_setup.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_report.py
+# Exercise every socket fixture with a long base even when the caller's TMPDIR is short.
+# All files stay in a private tree under this build's output and are removed by the trap.
+socket_tests=$(mktemp -d "$(dirname "$daemon")/socket-tests.XXXXXX")
+chmod 700 "$socket_tests"
+long_tmp="$socket_tests/$(printf '%080d' 0)"
+mkdir -m 700 "$long_tmp"
+(
+    export TMPDIR="$long_tmp"
+    echo "Checking socket suites with a long TMPDIR"
+    cargo test --locked --all-targets
+    meson test -C "$native" --no-rebuild --print-errorlogs
+    cargo run --locked --release --example driver_contract -- "$native/driver/test_daemon_contract"
+    CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_setup.py
+    CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_report.py
+)

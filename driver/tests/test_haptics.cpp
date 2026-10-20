@@ -20,6 +20,7 @@
 
 #include "cv1touch_shm.h"
 #include "haptics.h"
+#include "socket_dir.h"
 
 using namespace cv1t;
 
@@ -163,7 +164,8 @@ static void sends_to_the_socket()
 /* The worker delivers the line to a control socket and reads the reply. */
 static void sends_to_the_socket()
 {
-	const std::string path = (std::filesystem::temp_directory_path() / ("cv1t-hapt-" + std::to_string(getpid()) + ".sock")).string();
+	SocketDir fixture;
+	const std::string path = fixture.path() + "/control.sock";
 	unlink(path.c_str());
 	int srv = socket(AF_UNIX, SOCK_STREAM, 0);
 	sockaddr_un addr{};

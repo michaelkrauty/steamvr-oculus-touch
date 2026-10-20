@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
-import tempfile
+from socket_dir import SocketDirectory
 import threading
 import time
 import pty
@@ -19,7 +19,7 @@ LIBRARY_PATH = os.environ.get("CV1TOUCH_TEST_LIBRARY_PATH")
 @unittest.skipUnless(BINARY and LIBRARY_PATH, "requires built CLI and native library path")
 class SetupTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cv1touch-setup-cli-")
+        temporary = SocketDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"),

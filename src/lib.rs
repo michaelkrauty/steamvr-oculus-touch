@@ -3,6 +3,10 @@
 
 //! cv1touch: Rift CV1 Touch controller tracking daemon library.
 
+#[cfg(test)]
+#[path = "../tests/support/socket_dir.rs"]
+mod socket_dir;
+
 pub mod align;
 pub mod calendar;
 pub mod calib;

@@ -9,7 +9,7 @@ git clone https://github.com/michaelkrauty/steamvr-oculus-touch.git
 cd steamvr-oculus-touch
 ```
 
-Install the dependencies in [setup](docs/setup.md), then run the checks in `scripts/check.sh`. Bug fixes should include a regression that fails before the fix. Hardware-dependent tests should be explicitly marked and describe the required procedure; do not replace missing hardware coverage with unconditional passes.
+Install the dependencies in [setup](docs/setup.md), then run the checks in `scripts/check.sh`. Bug fixes should include a regression that fails before the fix. Hardware-dependent tests should be explicitly marked and describe the required procedure; do not replace missing hardware coverage with unconditional passes. See [Unix socket test paths](docs/testing-sockets.md) for the socket fixtures' ownership and byte budgets.
 
 CI runs `scripts/check.sh` with Rust 1.85.0 and stable. In the upstream repository, the maintainer's pull requests and pushes to `main` run automatically on a dedicated Linux runner with preinstalled native dependencies. External fork pull requests require the maintainer to choose **Approve and run** before their checks execute on that runner; approval is for the current revision, so new commits require another approval. A pending approval is not a passing check. Fork owners can also enable Actions in their own repositories to run the same checks on GitHub-hosted Linux runners.
 

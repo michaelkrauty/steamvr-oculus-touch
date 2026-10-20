@@ -447,10 +447,13 @@ mod tests {
     fn client_pair(
         tag: &str,
         idle: Duration,
-    ) -> (PathBuf, ipc::Connection, thread::JoinHandle<Vec<String>>) {
-        let path =
-            std::env::temp_dir().join(format!("cv1t-deadline-{}-{tag}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    ) -> (
+        crate::socket_dir::SocketDir,
+        ipc::Connection,
+        thread::JoinHandle<Vec<String>>,
+    ) {
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join(format!("{tag}.sock"));
         let mut listener = ipc::Listener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let conn = listener.accept(true).unwrap();
@@ -463,7 +466,7 @@ mod tests {
         });
         let mut conn = ipc::Connection::connect(&path).unwrap();
         conn.set_timeout(Some(Duration::from_secs(5))).unwrap();
-        (path, conn, server)
+        (fixture, conn, server)
     }
 
     fn reply(conn: &mut ipc::Connection) -> String {
@@ -480,17 +483,17 @@ mod tests {
 
     #[test]
     fn an_idle_client_is_closed_without_a_request() {
-        let (path, mut conn, server) = client_pair("idle", Duration::from_millis(50));
+        let (fixture, mut conn, server) = client_pair("idle", Duration::from_millis(50));
         let closed = matches!(conn.read(&mut [0]), Ok(0));
         drop(conn); // releases a server with a missing deadline before asserting
         assert!(server.join().unwrap().is_empty());
-        let _ = std::fs::remove_file(path);
+        drop(fixture);
         assert!(closed, "an idle client kept its reader thread");
     }
 
     #[test]
     fn partial_bytes_do_not_extend_a_request_deadline() {
-        let (path, mut conn, server) = client_pair("trickle", Duration::from_millis(150));
+        let (fixture, mut conn, server) = client_pair("trickle", Duration::from_millis(150));
         conn.write_all(b"ping\n").unwrap();
         assert_eq!(reply(&mut conn), "ok ping\n");
         let mut ended = false;
@@ -504,7 +507,7 @@ mod tests {
         ended |= server.is_finished();
         drop(conn);
         let seen = server.join().unwrap();
-        let _ = std::fs::remove_file(path);
+        drop(fixture);
         assert!(ended, "partial bytes kept the connection alive");
         assert_eq!(seen, ["ping"]);
     }
@@ -512,7 +515,7 @@ mod tests {
     #[test]
     fn complete_requests_keep_a_persistent_connection_alive() {
         let idle = Duration::from_millis(500);
-        let (path, mut conn, server) = client_pair("persistent", idle);
+        let (fixture, mut conn, server) = client_pair("persistent", idle);
         let began = std::time::Instant::now();
         for _ in 0..8 {
             conn.write_all(b"ping\n").unwrap();
@@ -522,18 +525,18 @@ mod tests {
         assert!(began.elapsed() > idle);
         drop(conn);
         assert_eq!(server.join().unwrap(), ["ping"; 8]);
-        let _ = std::fs::remove_file(path);
+        drop(fixture);
     }
 
     #[test]
     fn an_overlong_complete_request_is_not_handled() {
-        let (path, mut conn, server) = client_pair("long", Duration::from_secs(2));
+        let (fixture, mut conn, server) = client_pair("long", Duration::from_secs(2));
         let bytes = [vec![b'x'; 5000], vec![b'\n']].concat();
         let _ = conn.write_all(&bytes);
         let _ = conn.read(&mut [0]);
         drop(conn);
         assert!(server.join().unwrap().is_empty());
-        let _ = std::fs::remove_file(path);
+        drop(fixture);
     }
 
     /// An absolute directory on this platform; `C:/` needs no escaping in the JSON-quoted form.
@@ -868,7 +871,8 @@ mod tests {
 
     #[test]
     fn request_roundtrip() {
-        let path = std::env::temp_dir().join(format!("cv1t-ctl-test-{}.sock", std::process::id()));
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join("control.sock");
         let _ = std::fs::remove_file(&path);
         let mut listener = ipc::Listener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -886,8 +890,8 @@ mod tests {
 
     #[test]
     fn a_request_times_out_when_the_daemon_does_not_accept_connections() {
-        let path =
-            std::env::temp_dir().join(format!("cv1t-ctl-backlog-{}.sock", std::process::id()));
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join("control.sock");
         let _ = std::fs::remove_file(&path);
         #[cfg(unix)]
         let (listener, queued) = {

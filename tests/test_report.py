@@ -4,7 +4,7 @@
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+from socket_dir import SocketDirectory
 import unittest
 from unittest import mock
 import zipfile
@@ -16,7 +16,7 @@ LIBRARY_PATH = os.environ.get("CV1TOUCH_TEST_LIBRARY_PATH")
 @unittest.skipUnless(BINARY and LIBRARY_PATH, "requires built CLI and native library path")
 class ReportTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cv1touch-report-")
+        temporary = SocketDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.journal = b"fixture: cv1touchd started\nfixture: controller waiting\n"

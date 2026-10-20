@@ -4,6 +4,10 @@
 //! cv1touchd: owns the Rift CV1 headset radio and sensors through the vendored OpenHMD engine and
 //! publishes both Touch controllers' state to shared memory.
 
+#[cfg(test)]
+#[path = "../../tests/support/socket_dir.rs"]
+mod socket_dir;
+
 use std::fs;
 use std::io;
 use std::mem;
@@ -5718,8 +5722,8 @@ mod tests {
     #[test]
     fn idle_control_clients_release_all_sixteen_slots() {
         use std::io::{BufRead, BufReader, Read, Write};
-        let dir = std::env::temp_dir().join(format!("cv1t-control-idle-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path().to_path_buf();
         let endpoint = dir.join("control.sock");
         let second_endpoint = dir.join("private/control.sock");
         let listeners = vec![ipc::Listener::bind(&endpoint).unwrap()];
@@ -5775,9 +5779,8 @@ mod tests {
     #[test]
     fn the_control_server_answers_each_line_until_it_stops() {
         use std::io::{ErrorKind, Read, Write};
-        let dir = std::env::temp_dir().join(format!("cv1t-control-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path().to_path_buf();
         let endpoint = dir.join("control.sock");
         let second_endpoint = dir.join("private/control.sock");
         let listeners = vec![ipc::Listener::bind(&endpoint).unwrap()];
@@ -5899,8 +5902,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_control_is_not_published_after_either_instance_override() {
-        let root = std::env::temp_dir().join(format!("cv1t-instance-{}", std::process::id()));
-        fs::create_dir(&root).unwrap();
+        let fixture = socket_dir::SocketDir::new();
+        let root = fixture.path().to_path_buf();
         let mut cases = vec![("default", InstanceOptions::default(), true)];
         for (tag, option, value) in [
             (
@@ -5958,10 +5961,8 @@ mod tests {
     #[test]
     fn an_unsafe_container_directory_keeps_the_legacy_control_server() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir =
-            std::env::temp_dir().join(format!("cv1t-container-server-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path().to_path_buf();
         let private = dir.join("private");
         fs::create_dir(&private).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5988,8 +5989,8 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::{UnixListener, UnixStream};
-        let dir = std::env::temp_dir().join(format!("cv1t-busy-control-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path().to_path_buf();
         let private = dir.join("private");
         fs::create_dir(&private).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();

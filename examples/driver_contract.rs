@@ -5,6 +5,9 @@
 //! (driver/tests/test_daemon_contract.cpp) with the daemon's own shared-memory and control code, so
 //! both sides must agree, on this platform, on the object names, the layout, the clock and the
 //! wake-ups. Each "publish" request on the control endpoint bumps the update counter once.
+#[path = "../tests/support/socket_dir.rs"]
+mod socket_dir;
+
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -42,7 +45,8 @@ fn main() -> ExitCode {
     };
     let id = std::process::id();
     let name = format!("/cv1t-contract-{id}");
-    let control = std::env::temp_dir().join(format!("cv1t-contract-{id}.sock"));
+    let fixture = socket_dir::SocketDir::new();
+    let control = fixture.path().join("control.sock");
 
     let shm = ShmWriter::create(&name, 0xC0FFEE).expect("shared memory");
     shm.publish_hand(
@@ -61,9 +65,7 @@ fn main() -> ExitCode {
     shm.heartbeat(now_ns());
     let mut listener = ipc::Listener::bind(&control).expect("control endpoint");
     #[cfg(unix)]
-    let shared = std::env::temp_dir()
-        .join(format!("cv1t-contract-private-{id}"))
-        .join("control.sock");
+    let shared = fixture.path().join("private/control.sock");
     #[cfg(unix)]
     let mut shared_listener =
         ipc::Listener::bind_private(&shared).expect("private control endpoint");
