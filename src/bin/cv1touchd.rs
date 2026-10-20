@@ -309,16 +309,69 @@ fn save_biases(f: &track::biases::BiasFile) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LandmarkNotice {
+    Moved,
+    Back,
+}
+
+#[derive(Default)]
+struct LandmarkAlert {
+    over: u32,
+    /// The threshold and landmark count needed to clear the current alert.
+    active: Option<(f64, usize)>,
+}
+
+impl LandmarkAlert {
+    fn update(&mut self, measurement: Option<(f64, usize)>) -> Option<LandmarkNotice> {
+        let Some((magnitude, landmarks)) = measurement else {
+            self.over = 0;
+            return None;
+        };
+        let threshold = if landmarks >= 2 {
+            LANDMARK_ALERT_PX
+        } else {
+            LANDMARK_ALERT_SINGLE_PX
+        };
+        if let Some((mut active_threshold, mut active_landmarks)) = self.active {
+            if landmarks < active_landmarks {
+                return None;
+            }
+            if threshold < active_threshold {
+                active_threshold = threshold;
+                active_landmarks = landmarks;
+            }
+            self.active = Some((active_threshold, active_landmarks));
+            if magnitude < active_threshold {
+                self.active = None;
+                self.over = 0;
+                return Some(LandmarkNotice::Back);
+            }
+            return None;
+        }
+        self.over = if magnitude >= threshold {
+            self.over.saturating_add(1)
+        } else {
+            0
+        };
+        if self.over >= 2 {
+            self.active = Some((threshold, landmarks));
+            Some(LandmarkNotice::Moved)
+        } else {
+            None
+        }
+    }
+}
+
 /// Watches the landmarks (static infrared sources such as the base stations) for a moved sensor.
 struct LandmarkWatch {
     monitor: track::landmarks::Monitor,
     sensors: std::collections::BTreeSet<String>,
-    /// Per sensor: the last alert (shift magnitude), to report changes only.
-    alerted: std::collections::BTreeMap<String, f64>,
+    /// Per sensor: whether its movement has been reported, and the consecutive windows over
+    /// the alert threshold.
+    alerts: std::collections::BTreeMap<String, LandmarkAlert>,
     /// Consecutive windows without any landmark measured, per sensor.
     missing: std::collections::BTreeMap<String, u32>,
-    /// Consecutive windows over the alert threshold, per sensor.
-    over: std::collections::BTreeMap<String, u32>,
 }
 
 impl LandmarkWatch {
@@ -335,9 +388,8 @@ impl LandmarkWatch {
                 Some(LandmarkWatch {
                     monitor: track::landmarks::Monitor::new(f.landmarks, LANDMARK_WINDOW_NS),
                     sensors,
-                    alerted: Default::default(),
+                    alerts: Default::default(),
                     missing: Default::default(),
-                    over: Default::default(),
                 })
             }
             Ok(_) => None,
@@ -354,9 +406,8 @@ impl LandmarkWatch {
     fn forget(&mut self, d: &Daemon, serial: &str) {
         self.monitor.forget(serial);
         self.sensors.remove(serial);
-        self.alerted.remove(serial);
+        self.alerts.remove(serial);
         self.missing.remove(serial);
-        self.over.remove(serial);
         d.landmark_shifts.lock().unwrap().remove(serial);
     }
 
@@ -375,25 +426,20 @@ impl LandmarkWatch {
         };
         let mut out = d.landmark_shifts.lock().unwrap();
         for sensor in &self.sensors {
-            match shifts.iter().find(|s| &s.serial == sensor) {
+            let shift = shifts.iter().find(|s| &s.serial == sensor);
+            let notice = self
+                .alerts
+                .entry(sensor.clone())
+                .or_default()
+                .update(shift.map(|s| (s.shift.norm(), s.landmarks)));
+            match shift {
                 Some(s) => {
                     self.missing.remove(sensor);
-                    let m = s.shift.norm();
                     out.insert(sensor.clone(), (s.shift.x, s.shift.y, s.landmarks));
-                    let last = self.alerted.get(sensor).copied().unwrap_or(0.0);
-                    let threshold = if s.landmarks >= 2 {
-                        LANDMARK_ALERT_PX
-                    } else {
-                        LANDMARK_ALERT_SINGLE_PX
-                    };
-                    let over = self.over.entry(sensor.clone()).or_default();
-                    *over = if m >= threshold { *over + 1 } else { 0 };
-                    if *over >= 2 && (m - last).abs() >= 0.2 {
-                        log(format!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y));
-                        self.alerted.insert(sensor.clone(), m);
-                    } else if *over == 0 && last >= LANDMARK_ALERT_PX {
-                        log(format!("sensor {sensor}: landmarks back in place"));
-                        self.alerted.insert(sensor.clone(), m);
+                    match notice {
+                        Some(LandmarkNotice::Moved) => log(format!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y)),
+                        Some(LandmarkNotice::Back) => log(format!("sensor {sensor}: landmarks back in place")),
+                        None => {}
                     }
                 }
                 None => {
@@ -3569,6 +3615,92 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landmark_visibility_changes_do_not_report_recovery() {
+        let mut alert = LandmarkAlert::default();
+        let notices: Vec<_> = [2, 2, 1, 2, 2, 1]
+            .into_iter()
+            .filter_map(|landmarks| alert.update(Some((0.7, landmarks))))
+            .collect();
+        assert_eq!(notices, [LandmarkNotice::Moved]);
+        assert_eq!(alert.update(Some((0.1, 1))), None);
+        assert_eq!(alert.update(Some((0.3, 2))), Some(LandmarkNotice::Back));
+        assert_eq!(alert.update(Some((0.3, 2))), None);
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        assert_eq!(alert.update(Some((0.7, 2))), Some(LandmarkNotice::Moved));
+    }
+
+    #[test]
+    fn missing_landmarks_break_a_pending_movement_streak() {
+        let mut alert = LandmarkAlert::default();
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        for _ in 0..3 {
+            assert_eq!(alert.update(None), None);
+        }
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        assert_eq!(alert.update(Some((0.7, 2))), Some(LandmarkNotice::Moved));
+    }
+
+    #[test]
+    fn an_active_landmark_alert_survives_missing_windows() {
+        let mut alert = LandmarkAlert::default();
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        assert_eq!(alert.update(Some((0.7, 2))), Some(LandmarkNotice::Moved));
+        for _ in 0..3 {
+            assert_eq!(alert.update(None), None);
+        }
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        assert_eq!(alert.update(Some((0.1, 1))), None);
+        assert_eq!(alert.update(Some((0.3, 2))), Some(LandmarkNotice::Back));
+        assert_eq!(alert.update(Some((0.3, 2))), None);
+    }
+
+    #[test]
+    fn landmark_recovery_needs_the_activation_landmark_count() {
+        let mut alert = LandmarkAlert::default();
+        assert_eq!(alert.update(Some((0.7, 4))), None);
+        assert_eq!(alert.update(Some((0.7, 4))), Some(LandmarkNotice::Moved));
+        assert_eq!(alert.update(Some((0.1, 3))), None);
+        assert_eq!(alert.update(Some((0.1, 4))), Some(LandmarkNotice::Back));
+    }
+
+    #[test]
+    fn landmark_alert_can_tighten_but_fewer_landmarks_cannot_relax_it() {
+        let mut alert = LandmarkAlert::default();
+        assert_eq!(alert.update(Some((1.2, 1))), None);
+        assert_eq!(alert.update(Some((1.2, 1))), Some(LandmarkNotice::Moved));
+        assert_eq!(alert.update(Some((0.7, 2))), None);
+        assert_eq!(alert.update(Some((0.1, 1))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), None);
+        assert_eq!(alert.update(Some((0.3, 2))), Some(LandmarkNotice::Back));
+    }
+
+    #[test]
+    fn landmark_movement_is_reported_once_until_recovery() {
+        let mut alert = LandmarkAlert::default();
+        assert_eq!(alert.update(Some((0.5, 2))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), Some(LandmarkNotice::Moved));
+        for magnitude in [0.8, 0.6, 1.1] {
+            assert_eq!(alert.update(Some((magnitude, 2))), None);
+        }
+        assert_eq!(alert.update(Some((0.1, 2))), Some(LandmarkNotice::Back));
+        assert_eq!(alert.update(Some((0.1, 2))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), Some(LandmarkNotice::Moved));
+    }
+
+    #[test]
+    fn landmark_noise_needs_two_windows_over_the_applicable_threshold() {
+        let mut alert = LandmarkAlert::default();
+        for _ in 0..3 {
+            assert_eq!(alert.update(Some((0.7, 1))), None);
+        }
+        assert_eq!(alert.update(Some((0.5, 2))), None);
+        assert_eq!(alert.update(Some((0.3, 2))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), None);
+        assert_eq!(alert.update(Some((0.5, 2))), Some(LandmarkNotice::Moved));
+    }
 
     fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
