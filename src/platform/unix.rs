@@ -1257,8 +1257,23 @@ pub(crate) fn usb_devices_in(
             .ok()
             .map(|s| s.trim().to_string())
     };
-    let hex =
-        |dir: &Path, name: &str| read(dir, name).and_then(|s| u16::from_str_radix(&s, 16).ok());
+    let hex = |dir: &Path, name: &str| -> io::Result<u16> {
+        let text = std::fs::read_to_string(dir.join(name)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot read a USB device's {name}: {error}"),
+            )
+        })?;
+        u16::from_str_radix(text.trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid USB {name}")))
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let device_name = |name: &str| {
+        name.strip_prefix("usb").is_some_and(digits)
+            || name
+                .split_once('-')
+                .is_some_and(|(bus, ports)| digits(bus) && ports.split('.').all(digits))
+    };
     let driver = |dir: &Path| {
         std::fs::read_link(dir.join("driver"))
             .ok()?
@@ -1267,16 +1282,19 @@ pub(crate) fn usb_devices_in(
             .map(String::from)
     };
     let names: Vec<String> = std::fs::read_dir(root)?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .map(|entry| entry.map(|e| e.file_name().into_string().ok()))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect();
     let mut products = std::collections::BTreeMap::new();
     let mut nodes = Vec::new();
-    for name in names.iter().filter(|n| !n.contains(':')) {
+    for name in names.iter().filter(|n| device_name(n)) {
         let dir = root.join(name);
-        if hex(&dir, "idVendor") != Some(vendor) {
+        if hex(&dir, "idVendor")? != vendor {
             continue;
         }
-        let product = hex(&dir, "idProduct").unwrap_or(0);
+        let product = hex(&dir, "idProduct")?;
         products.insert(name.as_str(), product);
         let product_name = read(&dir, "product").unwrap_or_default();
         nodes.push(Node {
@@ -1560,6 +1578,28 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_usb_identity_is_unknown_instead_of_an_absent_sensor() {
+        for field in ["idVendor", "idProduct"] {
+            let root = std::env::temp_dir()
+                .join(format!("cv1t-usb-identity-{}-{field}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let device = root.join("1-2");
+            std::fs::create_dir_all(&device).unwrap();
+            std::fs::write(device.join("idVendor"), "2833\n").unwrap();
+            std::fs::write(device.join("idProduct"), "0211\n").unwrap();
+            // A directory cannot be read as an identity file, even as an elevated user.
+            std::fs::remove_file(device.join(field)).unwrap();
+            std::fs::create_dir(device.join(field)).unwrap();
+            let result = usb_devices_in(&root, 0x2833);
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(
+                result.is_err(),
+                "unreadable {field} became known absence: {result:?}"
+            );
+        }
     }
 
     /// A sensor is opened through its file under /dev/bus/usb, which sysfs names by bus and

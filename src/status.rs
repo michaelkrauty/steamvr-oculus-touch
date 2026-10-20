@@ -43,6 +43,47 @@ pub fn same_sensor(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// Released analysis-buffer counters, retained for setup and older daemons' board rates.
+pub fn frame_counters(value: &serde_json::Value) -> HashMap<String, u64> {
+    sensor_counters(value, "frames")
+}
+
+/// Frames delivered by the camera, before analysis queues or locks can delay them.
+pub fn received_frame_counters(value: &serde_json::Value) -> HashMap<String, u64> {
+    sensor_counters(value, "frames_received")
+}
+
+/// The capability flag distinguishes an empty modern sensor list from an older daemon.
+pub fn has_received_frame_counters(value: &serde_json::Value) -> bool {
+    value["sensor_frames_received"] == true
+        || value["sensors"]
+            .as_array()
+            .is_some_and(|sensors| sensors.iter().any(|s| s.get("frames_received").is_some()))
+}
+
+/// The board shows received video when available, with released-buffer rates for older daemons.
+pub fn board_frame_counters(value: &serde_json::Value) -> HashMap<String, u64> {
+    if has_received_frame_counters(value) {
+        received_frame_counters(value)
+    } else {
+        frame_counters(value)
+    }
+}
+
+fn sensor_counters(value: &serde_json::Value, field: &str) -> HashMap<String, u64> {
+    value["sensors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((sensor_identity(s["serial"].as_str()?), s[field].as_u64()?)))
+        .collect()
+}
+
+/// Received counters are 64-bit. Any decrease, including an older u32 wrap, starts a new sample.
+pub fn frames_advanced(previous: u64, current: u64) -> bool {
+    current > previous
+}
+
 /// Decode the complete sensor list from control JSON, independently of the
 /// fixed-size compatibility block in controller shared memory.
 pub fn sensors_from_status(value: &serde_json::Value) -> Result<Vec<SensorStatus>, String> {
@@ -166,7 +207,7 @@ pub fn render(
 /// are measured between the times counter changes were first observed, over at least `window_ns`.
 pub struct RateTracker {
     window_ns: u64,
-    changes: std::collections::VecDeque<(u64, [u32; 3])>,
+    changes: std::collections::VecDeque<(u64, [u64; 3])>,
 }
 
 impl RateTracker {
@@ -179,7 +220,14 @@ impl RateTracker {
 
     /// Records the counters seen at `now_ns`; returns per-second rates (zeros if the counters
     /// have not changed within the window).
-    pub fn update(&mut self, now_ns: u64, counts: [u32; 3]) -> [f64; 3] {
+    pub fn update(&mut self, now_ns: u64, counts: [u64; 3]) -> [f64; 3] {
+        if self
+            .changes
+            .back()
+            .is_some_and(|(_, previous)| (0..3).any(|i| counts[i] < previous[i]))
+        {
+            self.changes.clear();
+        }
         if self.changes.back().is_none_or(|(_, c)| *c != counts) {
             self.changes.push_back((now_ns, counts));
         }
@@ -192,7 +240,7 @@ impl RateTracker {
             return [0.0; 3];
         }
         let dt = (t1 - t0) as f64 / 1e9;
-        [0, 1, 2].map(|i| c1[i].wrapping_sub(c0[i]) as f64 / dt)
+        [0, 1, 2].map(|i| c1[i].saturating_sub(c0[i]) as f64 / dt)
     }
 }
 
@@ -300,7 +348,7 @@ mod tests {
         for i in 0..20u64 {
             let now = 1_000_000_000 + i * 200_000_000;
             let steps = (now - 1_000_000_000) / 250_000_000; // publishes so far
-            let frames = (steps * 13) as u32; // 52 frames/s
+            let frames = steps * 13; // 52 frames/s
             last = r.update(now, [frames, frames / 2, 0]);
         }
         assert!((last[0] - 52.0).abs() < 5.2, "frames/s {}", last[0]);
@@ -312,7 +360,7 @@ mod tests {
     fn rate_tracker_reports_zero_when_counters_stall() {
         let mut r = RateTracker::new(2_000_000_000);
         for i in 0..10u64 {
-            r.update(i * 250_000_000, [(i * 13) as u32, 0, 0]);
+            r.update(i * 250_000_000, [i * 13, 0, 0]);
         }
         let stalled = r.update(10 * 250_000_000 + 2_500_000_000, [117, 0, 0]);
         assert_eq!(stalled, [0.0; 3]);
@@ -328,5 +376,31 @@ mod tests {
             1,
         );
         assert_eq!(text.matches("not paired / never seen").count(), 2);
+    }
+
+    #[test]
+    fn upper_half_counter_resets_do_not_make_video_or_rate_progress() {
+        assert!(!frames_advanced(3_000_000_000, 0));
+        let mut rates = RateTracker::new(2_000_000_000);
+        rates.update(1_000_000_000, [3_000_000_000, 0, 0]);
+        assert_eq!(rates.update(2_000_000_000, [0, 0, 0]), [0.0; 3]);
+        assert_eq!(rates.update(3_000_000_000, [52, 0, 0]), [52.0, 0.0, 0.0]);
+    }
+    #[test]
+    fn board_rates_use_received_video_and_keep_legacy_released_counts() {
+        for (modern, expected) in [(true, 52.0), (false, 1.0)] {
+            let mut tracker = RateTracker::new(2_000_000_000);
+            let mut rate = [0.0; 3];
+            for (step, frames, received) in [(1, 40, 4_294_967_296u64), (2, 41, 4_294_967_348)] {
+                let mut value =
+                    serde_json::json!({"sensors":[{"serial":"Camera1", "frames":frames}]});
+                if modern {
+                    value["sensors"][0]["frames_received"] = received.into();
+                }
+                let counts = board_frame_counters(&value);
+                rate = tracker.update(step * 1_000_000_000, [counts["CAMERA1"], 0, 0]);
+            }
+            assert_eq!(rate[0], expected);
+        }
     }
 }

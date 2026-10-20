@@ -1520,7 +1520,7 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
         SetupDiGetDeviceInstanceIdW, CR_SUCCESS, DIGCF_ALLCLASSES, DN_HAS_PROBLEM,
         SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_SERVICE, SP_DEVINFO_DATA,
     };
-    let wanted = format!("VID_{vendor:04X}");
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     // SAFETY: SetupAPI calls with valid out-pointers and correctly sized structures; the device
     // information set is destroyed once.
     unsafe {
@@ -1533,64 +1533,65 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
         if set == INVALID_HANDLE_VALUE as isize {
             return Err(io::Error::last_os_error());
         }
-        let mut nodes = Vec::new();
-        for index in 0.. {
-            let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
-            data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
-            if SetupDiEnumDeviceInfo(set, index, &mut data) == 0 {
-                break;
-            }
-            let mut id = [0u16; 512];
-            if SetupDiGetDeviceInstanceIdW(
-                set,
-                &data,
-                id.as_mut_ptr(),
-                id.len() as u32,
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                continue;
-            }
-            let len = id.iter().position(|&c| c == 0).unwrap_or(id.len());
-            let id = String::from_utf16_lossy(&id[..len]);
-            let upper = id.to_uppercase();
-            if !(upper.starts_with("USB\\") || upper.starts_with("HID\\"))
-                || !upper.contains(&wanted)
-            {
-                continue;
-            }
-            let product = upper
-                .split_once("PID_")
-                .and_then(|(_, rest)| u16::from_str_radix(rest.get(..4)?, 16).ok())
-                .unwrap_or(0);
-            let (mut status, mut problem) = (0, 0);
-            let problem = (CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0)
-                == CR_SUCCESS
-                && status & DN_HAS_PROBLEM != 0)
-                .then_some(problem);
-            let mut parent_node = 0;
-            let mut parent = [0u16; 512];
-            let parent = (CM_Get_Parent(&mut parent_node, data.DevInst, 0) == CR_SUCCESS
-                && CM_Get_Device_IDW(parent_node, parent.as_mut_ptr(), parent.len() as u32, 0)
-                    == CR_SUCCESS)
-                .then(|| {
-                    let len = parent.iter().position(|&c| c == 0).unwrap_or(parent.len());
-                    String::from_utf16_lossy(&parent[..len])
+        let result = (|| -> io::Result<Vec<Node>> {
+            let mut nodes = Vec::new();
+            for index in 0.. {
+                let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
+                data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+                if SetupDiEnumDeviceInfo(set, index, &mut data) == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
+                        break;
+                    }
+                    return Err(error);
+                }
+                let mut id = [0u16; 512];
+                let identity = if SetupDiGetDeviceInstanceIdW(
+                    set,
+                    &data,
+                    id.as_mut_ptr(),
+                    id.len() as u32,
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    Err(io::Error::last_os_error())
+                } else {
+                    let len = id.iter().position(|&c| c == 0).unwrap_or(id.len());
+                    Ok(String::from_utf16_lossy(&id[..len]))
+                };
+                let Some((id, product)) = crate::platform::usb::instance(vendor, identity)? else {
+                    continue;
+                };
+                let (mut status, mut problem) = (0, 0);
+                let problem = (CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0)
+                    == CR_SUCCESS
+                    && status & DN_HAS_PROBLEM != 0)
+                    .then_some(problem);
+                let mut parent_node = 0;
+                let mut parent = [0u16; 512];
+                let parent = (CM_Get_Parent(&mut parent_node, data.DevInst, 0) == CR_SUCCESS
+                    && CM_Get_Device_IDW(parent_node, parent.as_mut_ptr(), parent.len() as u32, 0)
+                        == CR_SUCCESS)
+                    .then(|| {
+                        let len = parent.iter().position(|&c| c == 0).unwrap_or(parent.len());
+                        String::from_utf16_lossy(&parent[..len])
+                    });
+                nodes.push(Node {
+                    id,
+                    product,
+                    name: device_property(set, &data, SPDRP_FRIENDLYNAME)
+                        .or_else(|| device_property(set, &data, SPDRP_DEVICEDESC))
+                        .unwrap_or_default(),
+                    driver: device_property(set, &data, SPDRP_SERVICE),
+                    problem,
+                    parent,
                 });
-            nodes.push(Node {
-                id,
-                product,
-                name: device_property(set, &data, SPDRP_FRIENDLYNAME)
-                    .or_else(|| device_property(set, &data, SPDRP_DEVICEDESC))
-                    .unwrap_or_default(),
-                driver: device_property(set, &data, SPDRP_SERVICE),
-                problem,
-                parent,
-            });
-        }
+            }
+            nodes.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(nodes)
+        })();
         SetupDiDestroyDeviceInfoList(set);
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(nodes)
+        result
     }
 }
 

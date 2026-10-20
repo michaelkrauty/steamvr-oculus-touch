@@ -28,6 +28,8 @@ use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 mod guided_setup;
 #[path = "cv1touch/report.rs"]
 mod report;
+#[path = "cv1touch/sensor_streams.rs"]
+mod sensor_streams;
 #[path = "cv1touch/sensors.rs"]
 mod sensors;
 #[path = "cv1touch/truth_capture.rs"]
@@ -281,7 +283,9 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
             "calibration",
             calibration.is_ok(),
             calibration
+                .as_ref()
                 .err()
+                .cloned()
                 .unwrap_or_else(|| file::default_path().display().to_string()),
         ),
         (
@@ -301,7 +305,7 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     ];
     #[cfg(windows)]
     checks.push(sensors::doctor_check());
-    let daemon = status_json();
+    let ((stream_ok, stream_detail), daemon) = sensor_streams::doctor(calibration.as_ref().ok());
     let socket = control::socket_path();
     let detail = daemon
         .as_ref()
@@ -309,6 +313,7 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
         .map_or_else(|| socket.display().to_string(), ToString::to_string);
     let daemon = daemon.ok().flatten();
     checks.push(("daemon", daemon.is_some(), detail));
+    checks.push(("sensor_streams", stream_ok, stream_detail));
     if let Some(d) = &daemon {
         let (ok, detail) = sensor_poses_check(d);
         checks.push(("sensor_poses", ok, detail));
@@ -385,7 +390,7 @@ fn doctor(json: bool) -> i32 {
             println!("{} {name}: {detail}", if *ok { "ok" } else { "FAIL" });
         }
         #[cfg(unix)]
-        println!("Wake sleeping controllers before checking tracking. USB access needs active-session udev permissions; logs: journalctl --user -u cv1touchd.");
+        println!("Wake sleeping controllers before checking tracking. USB access needs active-session udev permissions; logs: journalctl --user _COMM=cv1touchd.");
         #[cfg(windows)]
         println!(
             "Wake sleeping controllers before checking tracking. The daemon's log: {}",
@@ -407,6 +412,8 @@ fn status_board(shm_name: &str) -> i32 {
     }
     let mut reader: Option<ShmReader> = None;
     let mut trackers: HashMap<String, status::RateTracker> = HashMap::new();
+    let mut stream_sample: Option<(u64, serde_json::Value)> = None;
+    let mut stream_note = "sensor_streams: skipped: waiting for video samples".to_string();
     loop {
         let now = shm::now_ns();
         if reader.as_ref().is_none_or(|r| r.stale(now, 500_000_000)) {
@@ -427,6 +434,22 @@ fn status_board(shm_name: &str) -> i32 {
                 serde_json::from_str::<serde_json::Value>(reply.strip_prefix("ok ")?).ok()
             })
             .filter(|v| v["generation"].as_u64() == Some(r.generation()));
+        if let Some(current) = &complete {
+            match &stream_sample {
+                Some((then, previous))
+                    if now.saturating_sub(*then)
+                        >= sensor_streams::SAMPLE_INTERVAL.as_nanos() as u64 =>
+                {
+                    stream_note = sensor_streams::board_note(Some(previous), Some(current));
+                    stream_sample = Some((now, current.clone()));
+                }
+                None => stream_sample = Some((now, current.clone())),
+                _ => {}
+            }
+        } else {
+            stream_sample = None;
+            stream_note = "sensor_streams: skipped: control diagnostics unavailable".into();
+        }
         let (sensors, sensor_note) = match complete.as_ref().map(status::sensors_from_status) {
             Some(Ok(sensors)) => {
                 let note = if complete.as_ref().unwrap()["sensor_total"].as_u64().is_none() {
@@ -437,6 +460,10 @@ fn status_board(shm_name: &str) -> i32 {
             _ => (r.sensors().unwrap_or_default(),
                 "Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors)."),
         };
+        let received = complete
+            .as_ref()
+            .is_some_and(status::has_received_frame_counters);
+        let frame_counts = complete.as_ref().map(status::board_frame_counters);
         let mut rates = HashMap::new();
         for s in &sensors {
             let key = shm::serial_str(s);
@@ -445,7 +472,16 @@ fn status_board(shm_name: &str) -> i32 {
                 .or_insert_with(|| status::RateTracker::new(2_000_000_000));
             let [frames, left, right] = tracker.update(
                 now,
-                [s.frames, s.pose_fixes[HAND_LEFT], s.pose_fixes[HAND_RIGHT]],
+                [
+                    frame_counts.as_ref().map_or(u64::from(s.frames), |counts| {
+                        counts
+                            .get(&status::sensor_identity(&key))
+                            .copied()
+                            .unwrap_or(0)
+                    }),
+                    u64::from(s.pose_fixes[HAND_LEFT]),
+                    u64::from(s.pose_fixes[HAND_RIGHT]),
+                ],
             );
             rates.insert(key, (frames, left, right));
         }
@@ -458,9 +494,15 @@ fn status_board(shm_name: &str) -> i32 {
             "\x1b[H\x1b[2J{}",
             status::render(&hands, &sensors, &rates, age, r.generation())
         );
+        if !received {
+            println!(
+                "Received-video counters unavailable; frames/s shows released analysis buffers."
+            );
+        }
         if !sensor_note.is_empty() {
             println!("{sensor_note}");
         }
+        println!("{stream_note}");
         let _ = io::stdout().flush();
         thread::sleep(Duration::from_millis(200));
     }
@@ -739,16 +781,11 @@ fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
         if v["mode"] != mode {
             continue;
         }
-        let frames: HashMap<String, u64> = v["sensors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| Some((s["serial"].as_str()?.to_string(), s["frames"].as_u64()?)))
-            .collect();
+        let frames = status::frame_counters(&v);
         let advancing = !frames.is_empty()
             && frames
                 .iter()
-                .all(|(k, f)| last.get(k).is_some_and(|p| f > p));
+                .all(|(k, f)| last.get(k).is_some_and(|p| status::frames_advanced(*p, *f)));
         last = frames;
         if advancing {
             return Ok(last.len());

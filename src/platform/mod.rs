@@ -847,6 +847,40 @@ pub mod usb {
         os::usb_devices(vendor)
     }
 
+    /// The identity read from SetupAPI, filtered to the requested maker's USB/HID nodes.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(crate) fn instance(
+        vendor: u16,
+        id: io::Result<String>,
+    ) -> io::Result<Option<(String, u16)>> {
+        let id = id?;
+        let upper = id.to_uppercase();
+        if !(upper.starts_with("USB\\") || upper.starts_with("HID\\")) {
+            return Ok(None);
+        }
+        let hardware = upper.split('\\').nth(1).unwrap_or_default();
+        let part = |prefix: &str| {
+            hardware
+                .split('&')
+                .find_map(|part| part.strip_prefix(prefix))
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid USB device identity");
+        let hex = |value: &str| -> io::Result<u16> {
+            if value.len() != 4 {
+                return Err(invalid());
+            }
+            u16::from_str_radix(value, 16).map_err(|_| invalid())
+        };
+        let Some(found_vendor) = part("VID_") else {
+            return Ok(None);
+        };
+        if hex(found_vendor)? != vendor {
+            return Ok(None);
+        }
+        let product = hex(part("PID_").ok_or_else(invalid)?)?;
+        Ok(Some((id, product)))
+    }
+
     /// The device interface a device node set up by `use_winusb` is offered under (Windows):
     /// libusb finds a WinUSB device by the interface its registry entry names.
     pub const WINUSB_INTERFACE: &str = "{00CFBFC2-E6AB-4A1F-98D6-1E197D3841CC}";
@@ -2130,5 +2164,41 @@ mod tests {
         assert!(fs::swap_dir(&dir.join("other"), &live, false).is_err());
         assert_eq!(std::fs::read_to_string(live.join("v")).unwrap(), "3");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn usb_identity_read_failures_are_unknown_instead_of_absent() {
+        let result = super::usb::instance(
+            0x2833,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn usb_identity_requires_a_valid_product_for_the_requested_vendor() {
+        for id in [r"USB\VID_2833\CAMERA1", r"USB\VID_2833&PID_02ZZ\CAMERA1"] {
+            assert!(
+                super::usb::instance(0x2833, Ok(id.into())).is_err(),
+                "invalid identity became known absence: {id}"
+            );
+        }
+        let id = r"USB\VID_2833&PID_0211\CAMERA1";
+        assert_eq!(
+            super::usb::instance(0x2833, Ok(id.into())).unwrap(),
+            Some((id.into(), 0x0211))
+        );
+        assert!(
+            super::usb::instance(0x2833, Ok(r"USB\ROOT_HUB30\HUB1".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::usb::instance(0x2833, Ok(r"HID\VID_1234\OTHER".into()))
+                .unwrap()
+                .is_none()
+        );
     }
 }

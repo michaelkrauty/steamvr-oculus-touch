@@ -82,6 +82,7 @@ class ReportTests(unittest.TestCase):
                         "Daemon status", "Setup (cv1touch setup --check --json)"):
             self.assertIn(section, summary)
         self.assertIn("FAIL daemon", summary)
+        self.assertIn("sensor_streams: skipped: daemon isn't running", summary)
         self.assertIn("cv1touchd: not answering", summary)
         self.assertIn("SteamVR (vrserver): not running", summary)
         self.assertIn("calibration.json.bak-1  19 bytes", summary)

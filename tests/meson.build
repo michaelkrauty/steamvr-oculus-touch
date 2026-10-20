@@ -118,6 +118,12 @@ test_sensor_discovery = executable('test_sensor_discovery', 'test_sensor_discove
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections'])
 test('sensor_discovery', test_sensor_discovery)
+# Camera delivery is counted before analysis; releasing old buffers is separate.
+test_sensor_video = executable('test_sensor_video', 'test_sensor_video.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections'])
+test('sensor_video', test_sensor_video)
+
 # The brute-force search leaves out the devices cv1touch's tracker holds or that are asleep.
 test_search_skip = executable('test_search_skip', 'test_search_skip.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections',

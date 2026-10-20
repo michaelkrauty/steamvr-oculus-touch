@@ -74,6 +74,7 @@ struct rift_sensor_ctx_s
 
 	/* cv1touch counters (atomic) */
 	uint32_t cv1touch_frames;
+	uint64_t cv1touch_frames_received;
 	uint32_t cv1touch_pose_fixes[3];
 
 	ohmd_mutex *sensor_lock;
@@ -278,9 +279,10 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 {
 	rift_sensor_ctx *sensor = cb_data;
 	rift_sensor_analysis_frame *frame;
-	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
-
 	OHMD_ASSERT(sensor);
+	/* Acquisition progresses even when analysis is still releasing older frames. */
+	__atomic_fetch_add(&sensor->cv1touch_frames_received, 1, __ATOMIC_RELAXED);
+	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 
 	/* The UVC assembler checks raw frames before delivery. Also protect callers
 	 * using a different capture backend before taking ownership or queueing work. */
@@ -837,6 +839,13 @@ bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial
 	sensor->have_pending_pose = false;
 	ohmd_unlock_mutex(sensor->sensor_lock);
 	return true;
+}
+
+void rift_sensor_get_video_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_video *out)
+{
+	memset(out, 0, sizeof *out);
+	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);
+	out->frames_received = __atomic_load_n(&sensor->cv1touch_frames_received, __ATOMIC_RELAXED);
 }
 
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out)

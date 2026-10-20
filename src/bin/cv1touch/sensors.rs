@@ -73,6 +73,30 @@ fn sensors(nodes: &[Node]) -> Vec<Sensor> {
         .collect()
 }
 
+/// Present camera identities from the OS listing, without opening a USB device.
+pub(super) fn connected_serials() -> Result<Vec<String>, String> {
+    let nodes = usb::devices(OCULUS).map_err(|e| e.to_string())?;
+    sensors(&nodes)
+        .iter()
+        .map(|s| {
+            #[cfg(unix)]
+            let serial = std::fs::read_to_string(
+                Path::new("/sys/bus/usb/devices")
+                    .join(&s.device.id)
+                    .join("serial"),
+            )
+            .map_err(|e| format!("cannot read a sensor's USB serial: {e}"))?;
+            #[cfg(windows)]
+            let serial = s.name().to_owned();
+            let serial = serial.trim();
+            if serial.is_empty() || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err("the system did not report a sensor's USB serial".into());
+            }
+            Ok(serial.to_owned())
+        })
+        .collect()
+}
+
 /// What a sensor needs before the engine can read it (on Windows).
 #[derive(Debug, PartialEq)]
 enum Need {

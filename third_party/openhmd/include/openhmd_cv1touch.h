@@ -65,6 +65,13 @@ typedef struct ohmd_cv1touch_controller {
 	float imu_gyro[3];                 /* same sample: rad/s */
 } ohmd_cv1touch_controller;
 
+/* Separate acquisition diagnostics: frames delivered before any analysis lock or
+ * queue. Serial-keyed and 64-bit; the existing released-buffer sample is unchanged. */
+typedef struct ohmd_cv1touch_sensor_video {
+	char serial[32];
+	uint64_t frames_received;
+} ohmd_cv1touch_sensor_video;
+
 typedef struct ohmd_cv1touch_sensor {
 	char serial[32];
 	bool have_camera_pose;
@@ -192,6 +199,9 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *dev
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *device, ohmd_cv1touch_led *out, int max);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_count(ohmd_device *device);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device, int index, ohmd_cv1touch_sensor *out);
+/* Current sensor acquisition counters; indices can change after discovery.
+ * Returns -1 past the last record. Engine thread only; counters are atomic. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video(ohmd_device *device, int index, ohmd_cv1touch_sensor_video *out);
 /* Gives the sensor pose->serial names the camera -> world pose it tracks with from now on, as its
  * fixed pose at start did; applied by the sensor's own analysis thread before its next frame.
  * Returns 0, or -1 when no such sensor is open. */

@@ -45,6 +45,9 @@ int main(void)
 	CHECK(ohmd_cv1touch_get_io_errors(NULL) == 0);
 	CHECK(sizeof(ohmd_cv1touch_blob) == 20);
 	CHECK(frames_seen == 0);
+	CHECK(sizeof(ohmd_cv1touch_sensor_video) == 40);
+	ohmd_cv1touch_sensor_video video;
+	CHECK(ohmd_cv1touch_get_sensor_video(NULL, 0, &video) == -1);
 	CHECK(sizeof(ohmd_cv1touch_led) == 24);
 	CHECK(sizeof(ohmd_cv1touch_frame_device) == 64);
 	CHECK(sizeof(ohmd_cv1touch_frame_info) == 248);

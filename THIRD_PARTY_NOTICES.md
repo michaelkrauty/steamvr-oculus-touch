@@ -22,6 +22,8 @@ Native assertion sites use a project macro and fixed-buffer failure callback, so
 
 Fatal records are independent of the native printf accumulator. Reentered log receivers and fatal callbacks abort silently without invoking callbacks or draining again.
 
+Local OpenHMD changes count received camera frames atomically before analysis locks or queues and expose these 64-bit counters through the separate `ohmd_cv1touch_get_sensor_video` extension. Existing native sensor samples and controller shared memory retain their 32-bit released-buffer counter and layout.
+
 ## Build and runtime dependencies
 
 Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.

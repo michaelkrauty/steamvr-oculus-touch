@@ -1721,6 +1721,16 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *devi
 	return n;
 }
 
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video(ohmd_device *device, int index, ohmd_cv1touch_sensor_video *out)
+{
+	if (device == NULL || device->getf != getf || out == NULL)
+		return -1;
+	rift_hmd_t *hmd = rift_device_priv_get(device)->hmd;
+	if (hmd->tracker_ctx == NULL)
+		return -1;
+	return rift_tracker_get_sensor_video(hmd->tracker_ctx, index, out);
+}
+
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_count(ohmd_device *device)
 {
 	if (device == NULL || device->getf != getf)

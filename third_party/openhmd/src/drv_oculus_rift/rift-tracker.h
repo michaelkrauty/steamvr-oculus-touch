@@ -51,6 +51,7 @@ int rift_tracker_get_sensor_count(rift_tracker_ctx *ctx);
  * Any thread. */
 void rift_tracker_set_search_skip(rift_tracker_ctx *ctx, uint32_t device_mask);
 uint32_t rift_tracker_get_search_skip(rift_tracker_ctx *ctx);
+int rift_tracker_get_sensor_video(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor_video *out);
 int rift_tracker_get_sensor_info(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor *out);
 int rift_tracker_set_sensor_pose(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_pose *pose);
 int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial);

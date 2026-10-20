@@ -183,6 +183,8 @@ struct Daemon {
     track_in: Mutex<FrameQueue<QueuedFrame>>,
     /// Complete sensor diagnostics; the SHM block is only a compatibility prefix.
     sensors: Mutex<Vec<SensorStatus>>,
+    /// Acquisition counters from the same publication, separate from released analysis buffers.
+    sensor_video: Mutex<Vec<engine::SensorVideo>>,
     track_stats: Mutex<[(Stats, bool); 2]>,
     pending_frames_dropped: std::sync::atomic::AtomicU64,
     /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
@@ -600,13 +602,17 @@ fn publish_disconnected(d: &Daemon) {
             },
         );
     }
-    publish_sensor_snapshot(d, &[]);
+    publish_sensor_snapshot(d, &[], &[]);
     d.shm.signal();
     d.shm.heartbeat(now);
 }
 
-fn publish_sensor_snapshot(d: &Daemon, sensors: &[SensorStatus]) {
-    *d.sensors.lock().unwrap() = sensors.to_vec();
+fn publish_sensor_snapshot(d: &Daemon, sensors: &[SensorStatus], video: &[engine::SensorVideo]) {
+    // Status takes these locks in the same order, so released and received counters share one sample.
+    let mut current = d.sensors.lock().unwrap();
+    *d.sensor_video.lock().unwrap() = video.to_vec();
+    *current = sensors.to_vec();
+    drop(current);
     d.shm.publish_sensors(sensors);
 }
 
@@ -2285,7 +2291,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         if now >= next_sensors {
             let sensors: Vec<SensorStatus> =
                 e.sensors().iter().map(|s| sensor_status(d, s)).collect();
-            publish_sensor_snapshot(d, &sensors);
+            publish_sensor_snapshot(d, &sensors, &e.sensor_video());
             next_sensors = now + SENSOR_PUBLISH_NS;
             if d.rec.active() {
                 write_session_info(d, e);
@@ -2963,9 +2969,29 @@ fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
 }
 
 fn status_json(d: &Daemon) -> String {
-    let engine_ready = engine_is_ready(d);
+    let (engine_ready, mode, calibrated_sensors, ignored_sensors) = {
+        let opts = d.opts.lock().unwrap();
+        let mode = d.mode.lock().unwrap().clone();
+        // Publish the requested calibration even while its engine is reopening. Null
+        // distinguishes capture/provisional from an older daemon without this field.
+        let calibrated = (mode == "calibrated").then(|| {
+            opts.fixed_poses
+                .iter()
+                .map(|p| p.serial.clone())
+                .collect::<Vec<_>>()
+        });
+        (
+            engine_is_ready(d, &opts),
+            mode,
+            calibrated,
+            opts.ignore_sensors.clone(),
+        )
+    };
     let hands = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap_or_default());
-    let sensors = d.sensors.lock().unwrap().clone();
+    let (sensors, sensor_video) = {
+        let sensors = d.sensors.lock().unwrap();
+        (sensors.clone(), d.sensor_video.lock().unwrap().clone())
+    };
     let st = d.rec.stats();
     let al = d.shm.alignment().unwrap_or_default();
     let hands_json: Vec<String> = hands
@@ -2982,6 +3008,15 @@ fn status_json(d: &Daemon) -> String {
     let shifts = d.landmark_shifts.lock().unwrap();
     let poses = d.sensor_poses.lock().unwrap();
     let agreements = d.sensor_agreement.lock().unwrap();
+    let received: std::collections::HashMap<_, _> = sensor_video
+        .iter()
+        .map(|video| {
+            (
+                cv1touch::status::sensor_identity(&video.serial),
+                video.frames_received,
+            )
+        })
+        .collect();
     let sensors_json: Vec<serde_json::Value> = sensors
         .iter()
         .map(|s| {
@@ -2998,6 +3033,7 @@ fn status_json(d: &Daemon) -> String {
                 "samples": a.samples, "checks": a.checks, "misses": a.misses})
             });
             serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
+            "frames_received": received.get(&cv1touch::status::sensor_identity(&serial)).copied(),
             "fixes": s.pose_fixes, "camera_orient": s.camera_orient, "camera_pos": s.camera_pos,
             "landmark_shift": shift, "pose": pose, "agreement": agreement})
         })
@@ -3009,11 +3045,11 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_frames_received\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
-        d.mode.lock().unwrap(),
+        mode,
         d.extra_latency_ns.load(Ordering::Relaxed) as f64 / 1e6,
         tilt_deg(d),
         engine_ready,
@@ -3033,6 +3069,8 @@ fn status_json(d: &Daemon) -> String {
         sensors.len().min(shm::MAX_SENSORS),
         sensors.len() > shm::MAX_SENSORS,
         serde_json::to_string(&queue).unwrap(),
+        serde_json::to_string(&ignored_sensors).unwrap(),
+        serde_json::to_string(&calibrated_sensors).unwrap(),
     )
 }
 
@@ -3286,8 +3324,8 @@ fn requested_engine_options(d: &Daemon) -> (EngineOptions, u64) {
     (opts.clone(), d.engine_requested.load(Ordering::Acquire))
 }
 
-fn engine_is_ready(d: &Daemon) -> bool {
-    let _opts = d.opts.lock().unwrap();
+// The caller keeps the engine options locked through the status snapshot.
+fn engine_is_ready(d: &Daemon, _opts: &EngineOptions) -> bool {
     let requested = d.engine_requested.load(Ordering::Acquire);
     requested != 0 && d.engine_applied.load(Ordering::Acquire) == requested
 }
@@ -3930,6 +3968,7 @@ fn main() {
         tracker,
         track_in: Mutex::new(FrameQueue::default()),
         sensors: Mutex::new(Vec::new()),
+        sensor_video: Mutex::new(Vec::new()),
         track_stats: Mutex::new([(Stats::default(), false); 2]),
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
@@ -5083,6 +5122,7 @@ mod tests {
             tracker: TrackerKind::Rust,
             track_in: Mutex::new(FrameQueue::default()),
             sensors: Mutex::new(Vec::new()),
+            sensor_video: Mutex::new(Vec::new()),
             track_stats: Mutex::new([(Stats::default(), false); 2]),
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
@@ -6359,6 +6399,90 @@ mod tests {
     }
 
     #[test]
+    fn status_names_sensors_explicitly_left_closed() {
+        let d = status_daemon();
+        d.opts.lock().unwrap().ignore_sensors = vec!["IGNOREDCAMERA".into()];
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(
+            value["ignored_sensors"],
+            serde_json::json!(["IGNOREDCAMERA"])
+        );
+    }
+
+    #[test]
+    fn status_names_the_active_sensor_calibration_even_before_its_engine_opens() {
+        let d = status_daemon();
+        let opts = EngineOptions {
+            fixed_poses: ["CAMERA1", "CAMERA2"]
+                .map(|serial| engine::SensorPose {
+                    serial: serial.into(),
+                    orient: [0.0, 0.0, 0.0, 1.0],
+                    pos: [0.0; 3],
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        switch_mode(&d, opts.clone(), "calibrated");
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(
+            value["calibrated_sensors"],
+            serde_json::json!(["CAMERA1", "CAMERA2"])
+        );
+        switch_mode(&d, modes::capture(&opts), "capture");
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert!(value
+            .as_object()
+            .unwrap()
+            .contains_key("calibrated_sensors"));
+        assert!(value["calibrated_sensors"].is_null());
+    }
+
+    #[test]
+    fn status_publishes_received_video_by_serial_at_full_u64_width() {
+        let d = status_daemon();
+        let mut sensor = SensorStatus {
+            frames: 41,
+            ..Default::default()
+        };
+        shm::set_serial(&mut sensor, "Camera1");
+        let video = engine::SensorVideo {
+            serial: "CAMERA1".into(),
+            frames_received: 4_294_967_348,
+        };
+        publish_sensor_snapshot(&d, &[sensor], &[video]);
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["sensors"][0]["frames"], 41);
+        assert_eq!(value["sensors"][0]["frames_received"], 4_294_967_348u64);
+        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_video>(), 40);
+        publish_disconnected(&d);
+        assert!(d.sensor_video.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_keeps_an_unavailable_received_counter_distinct_from_zero() {
+        let d = status_daemon();
+        let mut sensor = SensorStatus::default();
+        shm::set_serial(&mut sensor, "CAMERA1");
+        publish_sensor_snapshot(&d, &[sensor], &[]);
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert!(value["sensors"][0]["frames_received"].is_null());
+    }
+
+    #[test]
+    fn status_advertises_received_video_even_with_an_empty_sensor_list() {
+        let d = status_daemon();
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["sensor_frames_received"], true);
+        assert_eq!(value["sensors"], serde_json::json!([]));
+    }
+
+    #[test]
     fn status_does_not_report_the_engine_ready_before_initialization() {
         let d = status_daemon();
         let reply = status_json(&d);
@@ -6372,22 +6496,22 @@ mod tests {
         let d = status_daemon();
         let (_, first) = requested_engine_options(&d);
         d.engine_applied.store(first, Ordering::Release);
-        assert!(engine_is_ready(&d));
+        assert!(engine_is_ready(&d, &d.opts.lock().unwrap()));
         assert_eq!(
             switch_mode(&d, Default::default(), "calibrated"),
             "ok calibrated"
         );
         assert_eq!(*d.mode.lock().unwrap(), "calibrated");
-        assert!(!engine_is_ready(&d));
+        assert!(!engine_is_ready(&d, &d.opts.lock().unwrap()));
         // An older open can finish after a newer request without satisfying it.
         d.engine_applied.store(first, Ordering::Release);
-        assert!(!engine_is_ready(&d));
+        assert!(!engine_is_ready(&d, &d.opts.lock().unwrap()));
         let (_, latest) = requested_engine_options(&d);
         assert_ne!(latest, first);
         d.engine_applied.store(latest, Ordering::Release);
-        assert!(engine_is_ready(&d));
+        assert!(engine_is_ready(&d, &d.opts.lock().unwrap()));
         publish_disconnected(&d);
-        assert!(!engine_is_ready(&d));
+        assert!(!engine_is_ready(&d, &d.opts.lock().unwrap()));
     }
 
     #[test]
@@ -6403,7 +6527,7 @@ mod tests {
                 s
             })
             .collect();
-        publish_sensor_snapshot(&d, &sensors);
+        publish_sensor_snapshot(&d, &sensors, &[]);
         let reply = status_json(&d);
         let v: serde_json::Value =
             serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();

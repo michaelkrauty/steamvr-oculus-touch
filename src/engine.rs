@@ -41,6 +41,22 @@ pub use ffi::ohmd_cv1touch_frame_info as FrameInfo;
 pub use ffi::ohmd_cv1touch_led as LedEntry;
 pub use ffi::ohmd_cv1touch_sensor as Sensor;
 
+/// Frames delivered by a camera, independent of analysis-buffer completion.
+#[derive(Clone, Debug)]
+pub struct SensorVideo {
+    pub serial: String,
+    pub frames_received: u64,
+}
+
+impl From<ffi::ohmd_cv1touch_sensor_video> for SensorVideo {
+    fn from(video: ffi::ohmd_cv1touch_sensor_video) -> Self {
+        Self {
+            serial: cstr_field(&video.serial),
+            frames_received: video.frames_received,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorPose {
     pub serial: String,
@@ -336,6 +352,20 @@ impl Engine {
                 })
                 .collect()
         }
+    }
+
+    /// Read current acquisition counters by serial; discovery can change their set/order.
+    pub fn sensor_video(&self) -> Vec<SensorVideo> {
+        (0..c_int::MAX)
+            .map_while(|index| {
+                let mut video = ffi::ohmd_cv1touch_sensor_video::default();
+                // SAFETY: this engine owns the device; output matches the native record.
+                (unsafe {
+                    ffi::ohmd_cv1touch_get_sensor_video(self.hands[HAND_RIGHT], index, &mut video)
+                } == 0)
+                    .then(|| video.into())
+            })
+            .collect()
     }
 
     /// Gives the open sensor `serial` the camera -> world pose it tracks with from its next frame
