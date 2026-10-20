@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::log_lines::{LineBuffer, READ_BYTES};
+
 /// What a line of the log says about a device's tracking base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -28,13 +30,15 @@ pub enum Event {
     Lost { device: String },
     /// Every device lost its tracking: the universe was dropped, or the Lighthouse driver started.
     AllLost,
+    /// Log input or event history was discarded; earlier bases cannot be trusted.
+    Skipped,
 }
 
 impl Event {
     fn device(&self) -> Option<&str> {
         match self {
             Event::Bootstrapped { device, .. } | Event::Lost { device } => Some(device),
-            Event::AllLost => None,
+            Event::AllLost | Event::Skipped => None,
         }
     }
 }
@@ -81,8 +85,10 @@ pub struct Bases {
     /// The device SteamVR logs as the headset, once one has bootstrapped.
     pub headset: Option<String>,
     /// Device serial -> the base station it last bootstrapped from, kept while it is without
-    /// tracking (until SteamVR starts a new log).
+    /// tracking (until SteamVR starts a new log or input is skipped).
     pub last: BTreeMap<String, String>,
+    /// Skipped history makes an unnamed headset base unknown, rather than known to be lost.
+    skipped: bool,
 }
 
 impl Bases {
@@ -103,7 +109,17 @@ impl Bases {
                 self.by_device.remove(device);
             }
             Event::AllLost => self.by_device.clear(),
+            Event::Skipped => {
+                self.by_device.clear();
+                self.last.clear();
+                self.skipped = true;
+            }
         }
+    }
+
+    /// Whether skipped input left the headset's base unknown. A later bootstrap names it again.
+    pub fn tracking_unknown(&self, reference: &str) -> bool {
+        self.skipped && self.last_of_headset(reference).is_none()
     }
 
     /// The base station `device` is tracked from now.
@@ -118,9 +134,13 @@ impl Bases {
 
     /// The base station the headset was last tracked from in this log, through a moment without
     /// tracking; `reference`'s when the log has named no headset (a log from before SteamVR
-    /// tagged it).
+    /// tagged it), provided no input has been skipped.
     pub fn last_of_headset(&self, reference: &str) -> Option<&str> {
-        let device = self.headset.as_deref().unwrap_or(reference);
+        let device = match self.headset.as_deref() {
+            Some(device) => device,
+            None if self.skipped => return None,
+            None => reference,
+        };
         self.last.get(device).map(String::as_str)
     }
 }
@@ -128,7 +148,7 @@ impl Bases {
 /// The devices whose tracking base was the same from `start` to `end` with nothing in `events`
 /// (what the log said in between) touching it: device serial -> base.
 pub fn steady(start: &Bases, end: &Bases, events: &[Event]) -> BTreeMap<String, String> {
-    if events.contains(&Event::AllLost) {
+    if events.contains(&Event::AllLost) || events.contains(&Event::Skipped) {
         return BTreeMap::new();
     }
     let touched: BTreeSet<&str> = events.iter().filter_map(Event::device).collect();
@@ -148,21 +168,19 @@ pub fn server_log() -> PathBuf {
 /// The log as it grows. SteamVR starts a new one each time it starts (the old one becomes
 /// vrserver.previous.txt): a file that no longer begins as it did, or is shorter than what was
 /// read, is read again from its start.
-pub struct Tail {
+struct Tail {
     path: PathBuf,
     /// Whether a poll has read the file yet.
     started: bool,
     offset: u64,
     head: Vec<u8>,
-    partial: Vec<u8>,
+    partial: LineBuffer,
 }
 
-/// What a poll read: whether the file was read from its start (the first poll, or a new log),
-/// and its complete lines since the last poll.
-#[derive(Debug, Default, PartialEq)]
-pub struct Polled {
-    pub restarted: bool,
-    pub lines: Vec<String>,
+enum LogLine<'a> {
+    Restart,
+    Text(&'a [u8]),
+    Discarded,
 }
 
 /// Bytes compared to tell a new log from the one being read (its first line has the date and
@@ -176,7 +194,7 @@ impl Tail {
             started: false,
             offset: 0,
             head: Vec::new(),
-            partial: Vec::new(),
+            partial: LineBuffer::default(),
         }
     }
 
@@ -184,7 +202,7 @@ impl Tail {
         &self.path
     }
 
-    pub fn poll(&mut self) -> std::io::Result<Polled> {
+    fn poll(&mut self, mut line: impl FnMut(LogLine<'_>)) -> std::io::Result<()> {
         let mut f = std::fs::File::open(&self.path)?;
         let len = f.metadata()?.len();
         let mut head = vec![0u8; HEAD_BYTES.min(len as usize)];
@@ -198,32 +216,45 @@ impl Tail {
         if restarted {
             self.started = true;
             self.offset = 0;
-            self.partial.clear();
+            self.partial = LineBuffer::default();
+            line(LogLine::Restart);
         }
         if restarted || head.len() > self.head.len() {
             self.head = head;
         }
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        self.offset += buf.len() as u64;
-        self.partial.extend_from_slice(&buf);
-        let mut lines = Vec::new();
-        if let Some(end) = self.partial.iter().rposition(|&b| b == b'\n') {
-            let complete: Vec<u8> = self.partial.drain(..=end).collect();
-            lines = complete
-                .split(|&b| b == b'\n')
-                .filter(|l| !l.is_empty())
-                .map(|l| {
-                    String::from_utf8_lossy(l)
-                        .trim_end_matches('\r')
-                        .to_string()
-                })
-                .collect();
+        // Read only the file as it stood when opened, in fixed chunks. A writer appending
+        // continuously cannot keep this poll running forever.
+        let mut remaining = len.saturating_sub(self.offset);
+        let mut buf = [0u8; READ_BYTES];
+        while remaining != 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = match f.read(&mut buf[..want]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            self.offset += n as u64;
+            remaining -= n as u64;
+            self.partial.push(&buf[..n], |text, truncated| {
+                // A shortened prefix could look like a valid tracking event: discard the
+                // whole overlong line, including its suffix through the next newline.
+                if !truncated {
+                    line(LogLine::Text(text));
+                } else {
+                    line(LogLine::Discarded);
+                }
+            });
+            if self.partial.is_truncated() {
+                line(LogLine::Discarded);
+            }
         }
-        Ok(Polled { restarted, lines })
+        Ok(())
     }
 }
+
+const MAX_EVENTS: usize = 1024;
 
 /// Follows the tracking bases through a log: `poll` brings them up to date.
 pub struct Watch {
@@ -245,25 +276,38 @@ impl Watch {
 
     /// Reads what the log added; returns the events it held (a new log starts from no bases,
     /// and counts as every device losing its tracking; a log that cannot be read leaves none).
+    /// More than `MAX_EVENTS` events return only `Skipped`, so captures cannot mistake missing
+    /// history for steady tracking. Earlier bases are forgotten; later complete events still
+    /// update the current bases and a later bootstrap can name the headset's base again.
     pub fn poll(&mut self) -> std::io::Result<Vec<Event>> {
-        let p = match self.tail.poll() {
-            Ok(p) => p,
-            Err(e) => {
-                // what the log said no longer stands for what SteamVR does now; once it can be
-                // read again it is read from its start
-                self.bases = Bases::default();
-                self.tail = Tail::new(&self.tail.path.clone());
-                return Err(e);
-            }
-        };
         let mut events = Vec::new();
-        if p.restarted {
+        let mut overflow = false;
+        let result = self.tail.poll(|line| {
+            let event = match line {
+                LogLine::Restart => {
+                    self.bases = Bases::default();
+                    Some(Event::AllLost)
+                }
+                LogLine::Discarded => Some(Event::Skipped),
+                LogLine::Text(text) => parse_line(&String::from_utf8_lossy(text)),
+            };
+            if let Some(e) = event {
+                if !overflow && events.len() == MAX_EVENTS {
+                    self.bases.apply(&Event::Skipped);
+                    events.clear();
+                    events.push(Event::Skipped);
+                    overflow = true;
+                }
+                self.bases.apply(&e);
+                if !overflow {
+                    events.push(e);
+                }
+            }
+        });
+        if let Err(e) = result {
             self.bases = Bases::default();
-            events.push(Event::AllLost);
-        }
-        for e in p.lines.iter().filter_map(|l| parse_line(l)) {
-            self.bases.apply(&e);
-            events.push(e);
+            self.tail = Tail::new(&self.tail.path.clone());
+            return Err(e);
         }
         Ok(events)
     }
@@ -297,6 +341,272 @@ impl Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_burst_of_events_is_bounded_without_leaving_the_bases_out_of_date() {
+        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-burst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        let boot = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)\n";
+        let later = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best)\nx lighthouse: LHR-CONTROLLER: ----- BOOTSTRAPPED base 11112222 (best)\nx lighthouse: LHR-CONTROLLER: Resetting tracking: no samples\nx lighthouse: LHR-EXAMPLE H: Resetting tracking: no samples\n";
+        std::fs::write(&path, boot.repeat(1100) + later).unwrap();
+        let mut w = Watch::new(&path);
+        assert_eq!(w.poll().unwrap(), [Event::Skipped]);
+        assert_eq!(w.bases.of_headset(), None);
+        assert_eq!(
+            w.bases.last_of_headset("LHR-REFERENCE"),
+            Some("LHB-8765DCBA")
+        );
+        assert_eq!(w.bases.of("LHR-CONTROLLER"), None);
+        assert_eq!(
+            w.bases.last.get("LHR-CONTROLLER").map(String::as_str),
+            Some("LHB-11112222")
+        );
+        assert!(w.poll().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_skipped_log_cannot_use_the_reference_before_identifying_the_headset() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("cv1t-vrlog-unidentified-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        for overflow in [false, true] {
+            std::fs::write(
+                &path,
+                "x lighthouse: LHR-REFERENCE: ----- BOOTSTRAPPED base 1234ABCD (best)\n",
+            )
+            .unwrap();
+            let mut watch = Watch::new(&path);
+            watch.poll().unwrap();
+            assert_eq!(
+                watch.bases.last_of_headset("LHR-REFERENCE"),
+                Some("LHB-1234ABCD")
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            if overflow {
+                write!(
+                    file,
+                    "{}",
+                    "x lighthouse: LHR-REFERENCE: Resetting tracking: no samples\n"
+                        .repeat(MAX_EVENTS + 1)
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    file,
+                    "x lighthouse: LHR-HEADSET H: ----- BOOTSTRAPPED base 8765DCBA (best){}",
+                    "x".repeat(8192)
+                )
+                .unwrap();
+            }
+            writeln!(
+                file,
+                "x lighthouse: LHR-REFERENCE: ----- BOOTSTRAPPED base 11112222 (best)"
+            )
+            .unwrap();
+            assert!(watch.poll().unwrap().contains(&Event::Skipped));
+            assert_eq!(watch.bases.headset, None);
+            assert_eq!(watch.bases.of("LHR-REFERENCE"), Some("LHB-11112222"));
+            assert_eq!(watch.bases.last_of_headset("LHR-REFERENCE"), None);
+            assert!(watch.bases.tracking_unknown("LHR-REFERENCE"));
+            writeln!(
+                file,
+                "x lighthouse: LHR-HEADSET H: ----- BOOTSTRAPPED base 8765DCBA (best)"
+            )
+            .unwrap();
+            watch.poll().unwrap();
+            assert_eq!(
+                watch.bases.last_of_headset("LHR-REFERENCE"),
+                Some("LHB-8765DCBA")
+            );
+            assert!(!watch.bases.tracking_unknown("LHR-REFERENCE"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn skipped_history_keeps_the_headset_identity() {
+        let mut bases = Bases::default();
+        bases.apply(&boot("LHR-HEADSET", true, "LHB-1234ABCD"));
+        bases.apply(&boot("LHR-CONTROLLER", false, "LHB-11112222"));
+        bases.apply(&Event::Skipped);
+        bases.apply(&boot("LHR-CONTROLLER", false, "LHB-8765DCBA"));
+        assert_eq!(bases.last_of_headset("LHR-CONTROLLER"), None);
+        assert!(bases.tracking_unknown("LHR-CONTROLLER"));
+        bases.apply(&boot("LHR-HEADSET", false, "LHB-55556666"));
+        assert_eq!(
+            bases.last_of_headset("LHR-CONTROLLER"),
+            Some("LHB-55556666")
+        );
+        assert!(!bases.tracking_unknown("LHR-CONTROLLER"));
+    }
+
+    #[test]
+    fn skipped_bootstraps_forget_the_remembered_headset_base_until_named_again() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("cv1t-vrlog-remembered-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        for tag in [" H", ""] {
+            let a = format!(
+                "x lighthouse: LHR-EXAMPLE{tag}: ----- BOOTSTRAPPED base 1234ABCD (best)\n"
+            );
+            let b =
+                format!("x lighthouse: LHR-EXAMPLE{tag}: ----- BOOTSTRAPPED base 8765DCBA (best)");
+            for ending in ["\n", ""] {
+                std::fs::write(&path, &a).unwrap();
+                let mut watch = Watch::new(&path);
+                watch.poll().unwrap();
+                assert_eq!(
+                    watch.bases.last_of_headset("LHR-EXAMPLE"),
+                    Some("LHB-1234ABCD")
+                );
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                write!(file, "{b}{}{ending}", "x".repeat(8192)).unwrap();
+                watch.poll().unwrap();
+                assert_eq!(
+                    watch.bases.last_of_headset("LHR-EXAMPLE"),
+                    None,
+                    "a discarded bootstrap could have changed the base"
+                );
+                write!(file, "\n{b}\n").unwrap();
+                watch.poll().unwrap();
+                if tag.is_empty() {
+                    assert_eq!(watch.bases.last_of_headset("LHR-EXAMPLE"), None);
+                    assert!(watch.bases.tracking_unknown("LHR-EXAMPLE"));
+                    writeln!(
+                        file,
+                        "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best)"
+                    )
+                    .unwrap();
+                    watch.poll().unwrap();
+                }
+                assert_eq!(
+                    watch.bases.last_of_headset("LHR-EXAMPLE"),
+                    Some("LHB-8765DCBA")
+                );
+                watch.bases.apply(&Event::Lost {
+                    device: "LHR-EXAMPLE".into(),
+                });
+                assert_eq!(
+                    watch.bases.last_of_headset("LHR-EXAMPLE"),
+                    Some("LHB-8765DCBA"),
+                    "ordinary loss retains the named base"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflow_forgets_the_remembered_base_until_a_later_bootstrap() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-overflow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        std::fs::write(
+            &path,
+            "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)\n",
+        )
+        .unwrap();
+        let mut watch = Watch::new(&path);
+        watch.poll().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(
+            file,
+            "{}",
+            "x lighthouse: LHR-CONTROLLER: Resetting tracking: no samples\n".repeat(MAX_EVENTS + 1)
+        )
+        .unwrap();
+        assert!(!watch.poll().unwrap().is_empty());
+        assert_eq!(watch.bases.last_of_headset("LHR-EXAMPLE"), None);
+        writeln!(
+            file,
+            "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best)"
+        )
+        .unwrap();
+        watch.poll().unwrap();
+        assert_eq!(
+            watch.bases.last_of_headset("LHR-EXAMPLE"),
+            Some("LHB-8765DCBA")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_line_stays_bounded_and_is_not_parsed_after_truncation() {
+        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        let boot = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)";
+        std::fs::write(&path, format!("header\n{boot}{}", "x".repeat(32 * 1024))).unwrap();
+        let mut w = Watch::new(&path);
+        assert!(w
+            .poll()
+            .unwrap()
+            .iter()
+            .all(|e| matches!(e, Event::AllLost | Event::Skipped)));
+        assert!(w.tail.partial.len() <= 8192);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "\n{boot}").unwrap();
+        let events = w.poll().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            Event::Skipped,
+            "the overlong line must be discarded"
+        );
+        assert_eq!(w.bases.of_headset(), Some("LHB-1234ABCD"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_overlong_line_cannot_hide_a_tracking_change_during_a_capture() {
+        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-discard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        for ending in ["\n", ""] {
+            std::fs::write(
+                &path,
+                "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)\n",
+            )
+            .unwrap();
+            let span = Span::begin(&path);
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            write!(
+                log,
+                "x lighthouse: LHR-EXAMPLE H: Resetting tracking: {}{ending}",
+                "x".repeat(8192)
+            )
+            .unwrap();
+            assert!(
+                span.finish().is_empty(),
+                "discarding a line lost its tracking change"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     const BOOT: &str = "Thu Oct 15 2026 17:14:51.820611 [Info] - lighthouse: LHR-D6E2112A H: ----- BOOTSTRAPPED base 2B1973A2 (best) distance 3.28m velocity 0.44m/s base pitch ~135.0 deg roll ~-7.5 deg -----";
 
@@ -413,6 +723,7 @@ mod tests {
             BTreeMap::from([("LHR-C".to_string(), "LHB-B".to_string())])
         );
         assert!(steady(&start, &end, &[Event::AllLost]).is_empty());
+        assert!(steady(&start, &start, &[Event::Skipped]).is_empty());
         let mut moved = end.clone();
         moved.apply(&boot("LHR-C", false, "LHB-D"));
         assert_eq!(steady(&start, &moved, &[]).len(), 1);

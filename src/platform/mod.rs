@@ -1267,6 +1267,39 @@ mod tests {
         drop(first);
         drop(super::ipc::lock_exclusive(&path).unwrap());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_ordinary_reader_does_not_own_the_supervisor_lock() {
+        let (_fixture, endpoint) = endpoint("reader-lock");
+        let path = endpoint.with_file_name("logs.lock");
+        std::fs::write(&path, b"").unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+        let held = super::ipc::lock_exclusive(&path).expect("a reader is not a supervisor");
+        let next = super::ipc::lock_exclusive(&path).unwrap_err();
+        assert_eq!(next.kind(), std::io::ErrorKind::WouldBlock);
+        drop(held);
+        drop(super::ipc::lock_exclusive(&path).unwrap());
+        drop(reader);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_sharing_failure_is_not_lock_contention() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_fixture, endpoint) = endpoint("sharing-lock");
+        let path = endpoint.with_file_name("logs.lock");
+        std::fs::write(&path, b"").unwrap();
+        let reader = std::fs::File::options()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = super::ipc::lock_exclusive(&path).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(reader);
+    }
+
     use super::shm::{OpenError, OpenedSegment, OwnedSegment};
     use std::sync::atomic::{AtomicU32, Ordering};
 

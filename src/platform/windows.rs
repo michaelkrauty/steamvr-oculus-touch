@@ -458,20 +458,43 @@ pub fn runtime_dir() -> std::path::PathBuf {
 }
 
 pub fn lock_exclusive(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, FILE_SHARE_DELETE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .share_mode(0)
-        .open(path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    // Ownership is a byte-range lock, not a refusal to let editors or scanners open the file.
+    // SAFETY: a live synchronous handle and a zeroed offset/event. FAIL_IMMEDIATELY never waits;
+    // closing this handle releases the one-byte lock, even though the file may be empty.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(
+            if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
                 io::Error::new(io::ErrorKind::WouldBlock, "held by another process")
             } else {
-                e
-            }
-        })
+                error
+            },
+        );
+    }
+    Ok(file)
 }
 
 fn pipe_name(endpoint: &Path) -> io::Result<Vec<u16>> {

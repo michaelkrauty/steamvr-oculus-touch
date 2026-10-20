@@ -20,6 +20,7 @@ pub mod flight_writer;
 pub mod hand;
 pub mod headset_watch;
 pub mod input_calibration;
+mod log_lines;
 pub mod modes;
 pub mod platform;
 pub mod recorder;

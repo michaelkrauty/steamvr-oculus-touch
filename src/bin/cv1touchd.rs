@@ -963,6 +963,27 @@ const UNIVERSE_TICK_MS: u64 = 1_000;
 /// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS` while connected.
 const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
 
+#[derive(Default)]
+struct SkippedLogNotice {
+    next: Option<std::time::Instant>,
+}
+
+impl SkippedLogNotice {
+    fn notice(
+        &mut self,
+        now: std::time::Instant,
+        events: &[cv1touch::steamvr_log::Event],
+    ) -> Option<&'static str> {
+        if !events.contains(&cv1touch::steamvr_log::Event::Skipped)
+            || self.next.is_some_and(|next| now < next)
+        {
+            return None;
+        }
+        self.next = Some(now + Duration::from_secs(60));
+        Some("universe watch: SteamVR log lines were skipped; its tracking history is incomplete")
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum UniverseConnectionState {
     #[default]
@@ -1098,15 +1119,17 @@ impl UniverseConnection {
 /// within a minute on 2026-10-15); the stations themselves do not move. So the registration
 /// follows that station alone, from where it is in the world (`align::Registration::station_map`)
 /// and where SteamVR has it now; SteamVR's log names it (`steamvr_log`). Through a dropout the
-/// watch keeps to the last station named; with none named yet, it follows the stations' moves
-/// together. The stations' poses come from the driver every 2 s, or a short-lived background
-/// OpenVR connection at most once a minute while SteamVR runs (one that never keeps SteamVR from
-/// quitting, with longer waits after failed inits); each layout SteamVR settles on is kept
-/// (`align::Layouts`), to place the stations no registration measured.
+/// watch keeps to the last station named; skipped log input forgets that name. Without a trusted
+/// name it follows the stations' moves together. The stations' poses come from the driver every
+/// 2 s, or a short-lived background OpenVR connection at most once a minute while SteamVR runs
+/// (one that never keeps SteamVR from quitting, with longer waits after failed inits); each
+/// layout SteamVR settles on is kept (`align::Layouts`), to place the stations no registration
+/// measured.
 fn universe_watch(d: Arc<Daemon>) {
     let mut first = true;
     let mut warned_disagree = false;
     let mut warned_log = false;
+    let mut skipped_log = SkippedLogNotice::default();
     let mut warned_layouts = false;
     let mut connection = UniverseConnection::default();
     let mut steamvr_log = cv1touch::steamvr_log::Watch::new(&cv1touch::steamvr_log::server_log());
@@ -1129,7 +1152,12 @@ fn universe_watch(d: Arc<Daemon>) {
             continue;
         }
         match steamvr_log.poll() {
-            Ok(_) => warned_log = false,
+            Ok(events) => {
+                warned_log = false;
+                if let Some(message) = skipped_log.notice(std::time::Instant::now(), &events) {
+                    log(message);
+                }
+            }
             Err(e) => {
                 if !warned_log {
                     warned_log = true;
@@ -3510,12 +3538,16 @@ struct ControlSocketPathError {
 
 impl ControlSocketPathError {
     fn log(&self) {
-        log!(
+        self.report(daemon_log::line);
+    }
+
+    fn report(&self, mut line: impl FnMut(std::fmt::Arguments<'_>)) {
+        line(format_args!(
             "cannot start: the path of its control socket (the file it listens on for commands) is too long ({} bytes; Linux allows at most {} bytes). The path is built from {}: use a shorter one.",
             self.long.bytes,
             self.long.limit,
             self.setting.name()
-        );
+        ));
         // Keep the full path even when it is larger than the bounded logger's line buffer.
         let text = self.path.to_string_lossy();
         let mut remaining = text.as_ref();
@@ -3527,7 +3559,10 @@ impl ControlSocketPathError {
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            log!("control socket path{continued}: {}", &remaining[..end]);
+            line(format_args!(
+                "control socket path{continued}: {}",
+                &remaining[..end]
+            ));
             remaining = &remaining[end..];
             continued = " (continued)";
         }
@@ -3747,12 +3782,6 @@ fn supervise(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--supervise") {
         usage();
     }
-    // before any thread: as the daemon does, so Ctrl+C, closing the console or SIGTERM reaches
-    // the supervisor as a request to stop, which it passes on to the daemon
-    let requests = shutdown::Requests::take().unwrap_or_else(|e| {
-        eprintln!("cv1touchd: cannot take over shutdown requests: {e}");
-        process::exit(1);
-    });
     // the last one, as the daemon takes it
     let option = args
         .iter()
@@ -3764,13 +3793,28 @@ fn supervise(args: &[String]) -> i32 {
         RuntimeSetting::Environment
     };
     let runtime = option.map_or_else(control::runtime_dir, PathBuf::from);
-    let endpoint = control_socket_path(&runtime, setting).unwrap_or_else(|e| {
-        let _logging = daemon_log::init().unwrap_or_else(|_| process::exit(1));
-        e.log();
-        daemon_log::exit(1);
-    });
+    let endpoint = match control_socket_path(&runtime, setting) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            // Terminal-only output never opens the log backend or creates runtime state.
+            let log = supervise::Writer::open(&supervise::log_dir());
+            e.report(|line| log.terminal(&line.to_string()));
+            return 1;
+        }
+    };
+    // before any thread: as the daemon does, so Ctrl+C, closing the console or SIGTERM reaches
+    // the supervisor as a request to stop, which it passes on to the daemon
+    let requests = shutdown::Requests::take();
+    let mut log = supervise::Writer::open(&supervise::log_dir());
+    let requests = match requests {
+        Ok(requests) => requests,
+        Err(e) => {
+            log.terminal(&format!("cannot take over shutdown requests: {e}"));
+            return 1;
+        }
+    };
     if let Err(e) = platform::fs::create_private_dir_all(&runtime) {
-        eprintln!("cv1touchd: {}: {e}", runtime.display());
+        log.terminal(&format!("{}: {e}", runtime.display()));
         return 1;
     }
     // one supervisor per runtime directory, as there is one daemon
@@ -3778,32 +3822,25 @@ fn supervise(args: &[String]) -> i32 {
     let _lock = match ipc::lock_exclusive(&lock_path) {
         Ok(lock) => lock,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            println!("cv1touchd: a supervisor is already running");
+            log.terminal("a supervisor is already running");
             return 0;
         }
         Err(e) => {
-            eprintln!("cv1touchd: {}: {e}", lock_path.display());
-            return 1;
-        }
-    };
-    let mut log = match supervise::Log::open(&supervise::log_dir()) {
-        Ok(log) => log,
-        Err(e) => {
-            eprintln!("cv1touchd: {}: {e}", supervise::log_dir().display());
+            log.terminal(&format!("{}: {e}", lock_path.display()));
             return 1;
         }
     };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("cv1touchd: cannot find its own program: {e}");
+            log.terminal(&format!("cannot find its own program: {e}"));
             return 1;
         }
     };
-    println!(
-        "cv1touchd: supervising the daemon, its log in {}",
+    log.terminal(&format!(
+        "supervising the daemon, its log in {}",
         log.path().display()
-    );
+    ));
     let daemon = || {
         let mut daemon = std::process::Command::new(&exe);
         daemon.args(args);
@@ -4572,6 +4609,32 @@ mod tests {
     }
 
     #[test]
+    fn skipped_log_notices_are_limited_to_once_a_minute() {
+        use cv1touch::steamvr_log::Event;
+        let mut notice = SkippedLogNotice::default();
+        let now = std::time::Instant::now();
+        assert_eq!(notice.notice(now, &[]), None);
+        assert_eq!(notice.notice(now, &[Event::AllLost]), None);
+        assert!(notice
+            .notice(now, &[Event::Skipped])
+            .unwrap()
+            .contains("log lines were skipped"));
+        for seconds in [0, 1, 59] {
+            assert_eq!(
+                notice.notice(now + Duration::from_secs(seconds), &[Event::Skipped]),
+                None
+            );
+        }
+        assert!(notice
+            .notice(now + Duration::from_secs(60), &[Event::Skipped])
+            .is_some());
+        assert_eq!(notice.notice(now + Duration::from_secs(120), &[]), None);
+        assert!(notice
+            .notice(now + Duration::from_secs(120), &[Event::Skipped])
+            .is_some());
+    }
+
+    #[test]
     fn landmark_visibility_changes_do_not_report_recovery() {
         let mut alert = LandmarkAlert::default();
         let notices: Vec<_> = [2, 2, 1, 2, 2, 1]
@@ -5156,6 +5219,60 @@ mod tests {
         release.send(()).unwrap();
         worker.join().unwrap();
         assert_eq!(marked, ENGINE_WORKER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_supervisor_starts_a_child_when_runtime_and_logs_overlap() {
+        let fixture = socket_dir::SocketDir::new();
+        let root = fixture.path();
+        let mut child = process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::supervisor_entry_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CV1TOUCH_TEST_SUPERVISOR_ROOT", root)
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= until {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(1),
+            "the supervisor did not run its child to the failure limit"
+        );
+        let text = fs::read_to_string(root.join("state/cv1touch/logs/cv1touchd.log")).unwrap();
+        assert!(text.contains("started the daemon"), "{text}");
+    }
+
+    // The real supervisor entry point spawns this test executable with an unsupported option.
+    // That child exits before any test or hardware code; repeated failures end supervision.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run by the_supervisor_starts_a_child_when_runtime_and_logs_overlap"]
+    fn supervisor_entry_fixture() {
+        let root = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_SUPERVISOR_ROOT").unwrap());
+        process::exit(supervise(&[
+            "--runtime-dir".into(),
+            root.join("state/cv1touch/logs").to_str().unwrap().into(),
+        ]));
     }
 
     // An offline child of the failure-exit regression; it never opens an engine or USB device.

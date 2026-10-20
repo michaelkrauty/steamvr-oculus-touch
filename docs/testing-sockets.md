@@ -77,6 +77,7 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `src/bin/cv1touchd.rs` | `an_unsafe_container_directory_keeps_the_legacy_control_server` | T + P + 44 = 131 | 50 |
 | `src/bin/cv1touchd.rs` | `a_full_container_control_backlog_keeps_the_legacy_server_available` | T + P + 40 = 127 | 50 |
 | `src/bin/cv1touchd.rs` | `container_control_is_not_published_after_either_instance_override` | T + P + 61 = 148 | 75 |
+| `src/bin/cv1touchd.rs` | `the_supervisor_starts_a_child_when_runtime_and_logs_overlap` / `supervisor_entry_fixture` | new fixture | 62 |
 | `examples/driver_contract.rs` | `legacy control endpoint` | T + P + 20 = 107 | 42 |
 | `examples/driver_contract.rs` | `private fallback endpoint` | T + P + 36 = 123 | 50 |
 | `examples/driver_contract.rs` | `missing legacy candidate` | T + P + 23 = 110 | 45 |
@@ -100,6 +101,7 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `tests/test_setup.py` | `SetupTests.test_human_actions_are_bold_when_forced_but_json_and_no_color_stay_plain` | T + R + 46 = 134 | 55 |
 | `tests/test_setup.py` | `SetupTests.test_malformed_journal_is_read_only_and_never_contacts_daemon` | T + R + 46 = 134 | 55 |
 | `tests/test_report.py` | `ReportTests.test_logs_settings_and_a_summary_in_one_zip` | T + R + 43 = 131 | 55 |
+| `tests/test_report.py` | `ReportTests.test_an_interrupted_log_rotation_is_listed_by_name_and_size` | T + R + 43 = 131 | 55 |
 | `tests/test_report.py` | `ReportTests.test_a_missing_or_non_executable_stub_cannot_reach_the_host_journal` | T + R + 43 = 131 | 55 |
 | `tests/test_report.py` | `ReportTests.test_an_existing_file_is_left_alone` | T + R + 43 = 131 | 55 |
 | `src/bin/cv1touch.rs` | `another_clients_early_end_acknowledgement_never_completes_our_capture` | T + N + 31 = 131 | 42 |
@@ -156,6 +158,19 @@ additional paths listed above.
   `the_daemon_lock_is_exclusive_until_released` in `src/platform/mod.rs` exercise
   ordinary lock files. They do not use `sun_path`; the latter shares the endpoint
   fixture.
+- `ControlSocketPathTests.test_a_rejected_supervisor_path_does_not_wait_for_stderr`
+  in `tests/test_runtime_dir.py` deliberately supplies an overlong runtime path.
+  It must reject it before creating state or binding a socket; its full stderr
+  pipe has no pathname. The fixture stays alive until the child exits.
+- The overlapping runtime/logs supervisor entry fixture uses `SocketDir` and keeps it
+  alive through the child test process's exit. Its control candidate is
+  `root/state/cv1touch/logs/control.sock` (29 + 33 = 62 bytes). The test child
+  rejects its arguments before any hardware or control listener starts.
+- The `src/supervise.rs` fixtures use log and lock files, child-process pipes,
+  and ordinary stop/ready files. `stand_in_daemon` and `unavailable_log_fixture`
+  do not start a real daemon or create a control endpoint. Their parent tests
+  wait for the children before removing the fixtures. These directories are
+  not socket runtime directories and do not need a short view.
 - The HID tests use an unnamed `socketpair` (`fake_hid` in
   `src/platform/unix.rs`), which has no pathname length. Ignored live OpenVR
   probes do not construct a test Unix socket address.

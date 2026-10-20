@@ -80,6 +80,33 @@ class ControlSocketPathTests(unittest.TestCase):
                 self.check_startup(runtime / "cv1touch/control.sock", [], env,
                                    "XDG_RUNTIME_DIR", "--runtime-dir", supervise=True)
 
+    def test_a_rejected_supervisor_path_does_not_wait_for_stderr(self):
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        self.addCleanup(os.close, write)
+        os.set_blocking(write, False)
+        while True:
+            try:
+                os.write(write, b"x" * 4096)
+            except BlockingIOError:
+                break
+        os.set_blocking(write, True)
+        runtime = self.root / ("r" * 256)
+        # The invalid shared-memory name also prevents hardware access if validation regresses.
+        child = subprocess.Popen(
+            [BINARY, "--supervise", "--provisional", "--shm-name", "/invalid/test",
+             "--runtime-dir", str(runtime)], env=self.env,
+            stdout=subprocess.DEVNULL, stderr=write)
+        try:
+            status = child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            self.fail("rejecting the path waited for the supervisor's stderr")
+        self.assertEqual(status, 1)
+        self.assertTrue(os.get_blocking(write), "the supervisor changed its stderr mode")
+        self.assertEqual(list(self.root.iterdir()), [], "invalid path created runtime state")
+
     def test_a_large_runtime_environment_value_is_logged_in_full(self):
         # Below Linux's 128 KiB per-string argument/environment limit, but larger
         # than the logger queue if the path is split into unnecessarily small lines.

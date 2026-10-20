@@ -88,6 +88,27 @@ class ReportTests(unittest.TestCase):
         self.assertIn("calibration.json.bak-1  19 bytes", summary)
         self.assertIn("capture.rec  1000 bytes", summary)
 
+    def test_an_interrupted_log_rotation_is_listed_by_name_and_size(self):
+        logs = self.state / "logs"
+        staging = logs / "cv1touchd.log.rotation"
+        staging.mkdir()
+        (staging / "cv1touchd.log").write_text("an old log\n")
+        (staging / "unrelated").write_text("not a log")
+        (logs / "cv1touchd.log").write_text("the current log\n")
+        out = self.root / "report.zip"
+        self.report(out)
+        with zipfile.ZipFile(out) as archive:
+            summary = archive.read("report.txt").decode()
+            # names and sizes only: the staged files are not sent
+            self.assertFalse(any("rotation" in n or "unrelated" in n for n in archive.namelist()))
+        self.assertIn(f"{logs}:", summary)
+        self.assertIn("  cv1touchd.log  16 bytes", summary)
+        self.assertIn("  cv1touchd.log.rotation/", summary)
+        self.assertIn(f"{staging}:", summary)
+        self.assertIn("  cv1touchd.log  11 bytes", summary)
+        self.assertIn("  unrelated  9 bytes", summary)
+        self.assertNotIn("not a log", summary)
+
     def test_a_missing_or_non_executable_stub_cannot_reach_the_host_journal(self):
         host_bin = self.root / "host-bin"
         host_bin.mkdir()

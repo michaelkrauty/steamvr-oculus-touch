@@ -313,6 +313,10 @@ fn collect() -> Report {
     }
     report.listing(&dirs.config);
     report.listing(&dirs.state);
+    // an interrupted log rotation leaves its logs in a staging folder and can leave a file in
+    // the way of putting them back: the names and sizes say which
+    report.listing(&logs);
+    report.listing(&supervise::staging_dir());
     report
 }
 

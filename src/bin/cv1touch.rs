@@ -5292,6 +5292,26 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
     })
 }
 
+fn universe_headset_status(bases: &cv1touch::steamvr_log::Bases, reference: &str) -> String {
+    if bases.tracking_unknown(reference) {
+        return "SteamVR's headset tracking state is unknown (log lines were skipped)".into();
+    }
+    let base = bases.last_of_headset(reference);
+    let tracked = bases
+        .headset
+        .as_deref()
+        .map_or_else(|| bases.of(reference), |h| bases.of(h));
+    match (base, tracked) {
+        (Some(b), Some(_)) => {
+            format!("SteamVR tracks the headset from base station {b} (its log says)")
+        }
+        (Some(b), None) => format!(
+            "SteamVR has lost the headset's tracking; it last tracked it from base station {b}"
+        ),
+        (None, _) => "SteamVR's log names no base station it has tracked the headset from".into(),
+    }
+}
+
 /// How the installed registration applies now: the base station SteamVR tracks the headset from
 /// (its log), where each station is in the world and how, and how SteamVR has each since the
 /// registration (what cv1touchd's universe watch follows).
@@ -5325,22 +5345,7 @@ fn universe_cmd() -> i32 {
             .bases
             .last_of_headset(&reg.reference)
             .map(str::to_string);
-        let tracked = log
-            .bases
-            .headset
-            .as_deref()
-            .map_or_else(|| log.bases.of(&reg.reference), |h| log.bases.of(h));
-        match (&base, tracked) {
-            (Some(b), Some(_)) => {
-                println!("SteamVR tracks the headset from base station {b} (its log says)")
-            }
-            (Some(b), None) => println!(
-                "SteamVR has lost the headset's tracking; it last tracked it from base station {b}"
-            ),
-            (None, _) => {
-                println!("SteamVR's log names no base station it has tracked the headset from")
-            }
-        }
+        println!("{}", universe_headset_status(&log.bases, &reg.reference));
         let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
         let map = reg.station_map(&layouts);
         let followed = base
@@ -6291,6 +6296,58 @@ fn main() {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn universe_reports_skipped_tracking_as_unknown_and_recovers() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("cv1t-universe-skipped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vrserver.txt");
+        std::fs::write(
+            &path,
+            "x lighthouse: LHR-REFERENCE: ----- BOOTSTRAPPED base 1234ABCD (best)\n",
+        )
+        .unwrap();
+        let mut watch = cv1touch::steamvr_log::Watch::new(&path);
+        watch.poll().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best){}",
+            "x".repeat(8192)
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "x lighthouse: LHR-REFERENCE: ----- BOOTSTRAPPED base 11112222 (best)"
+        )
+        .unwrap();
+        watch.poll().unwrap();
+        assert_eq!(
+            universe_headset_status(&watch.bases, "LHR-REFERENCE"),
+            "SteamVR's headset tracking state is unknown (log lines were skipped)"
+        );
+        writeln!(
+            file,
+            "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best)"
+        )
+        .unwrap();
+        watch.poll().unwrap();
+        assert_eq!(
+            universe_headset_status(&watch.bases, "LHR-REFERENCE"),
+            "SteamVR tracks the headset from base station LHB-8765DCBA (its log says)"
+        );
+        watch.bases.apply(&cv1touch::steamvr_log::Event::Lost {
+            device: "LHR-EXAMPLE".into(),
+        });
+        assert!(universe_headset_status(&watch.bases, "LHR-REFERENCE")
+            .starts_with("SteamVR has lost the headset's tracking;"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
 
     fn serial_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, file::CalibrationFile) {
