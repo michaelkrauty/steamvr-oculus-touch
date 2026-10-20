@@ -31,6 +31,18 @@ const TOUCHES: [(&str, u32); 7] = [
 ];
 const HAND_NAMES: [&str; 2] = ["left", "right"];
 
+/// One identity for serials from calibration, USB enumeration, daemon diagnostics and the
+/// `--ignore-sensor` option. The native engine ignores ASCII letter case when it matches serials,
+/// so everything on the Rust side does too; each source keeps the spelling it reported.
+pub fn sensor_identity(serial: &str) -> String {
+    serial.to_ascii_uppercase()
+}
+
+/// Whether two serials name the same sensor.
+pub fn same_sensor(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 /// Decode the complete sensor list from control JSON, independently of the
 /// fixed-size compatibility block in controller shared memory.
 pub fn sensors_from_status(value: &serde_json::Value) -> Result<Vec<SensorStatus>, String> {
@@ -188,6 +200,16 @@ impl RateTracker {
 mod tests {
     use super::*;
     use crate::hand::{BTN_A, FLAG_CALIBRATED, FLAG_CONNECTED, FLAG_POSITION, TOUCH_TRIGGER};
+
+    #[test]
+    fn serials_name_the_same_sensor_whatever_their_ascii_letter_case() {
+        assert!(same_sensor("WMTD000000001", "wmtd000000001"));
+        assert!(same_sensor("Camera1", "cAMERA1"));
+        assert!(!same_sensor("CAMERA1", "CAMERA10"));
+        assert!(!same_sensor("CAMERA1", "CAMERA"));
+        assert_eq!(sensor_identity("Camera1"), sensor_identity("cAMERA1"));
+        assert_ne!(sensor_identity("CAMERA1"), sensor_identity("CAMERA2"));
+    }
 
     fn state(flags: u32) -> ControllerState {
         ControllerState {

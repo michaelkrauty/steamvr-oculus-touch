@@ -209,7 +209,12 @@ impl Pipeline {
         let id = self.cams.len();
         self.cams
             .insert(serial.to_string(), RegisteredCamera { id, camera });
-        if self.opts.probe_sensors.contains(&serial.to_string()) {
+        if self
+            .opts
+            .probe_sensors
+            .iter()
+            .any(|s| crate::status::same_sensor(s, serial))
+        {
             self.probed.insert(id);
         }
         for tracker in self.trackers.iter_mut().flatten() {
@@ -958,6 +963,81 @@ mod tests {
             "fifth sensor never updated replay"
         );
         assert!(!replay.hands[HAND_RIGHT].is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The daemon places a camera whose calibration is spelled in another letter case than the
+    /// device's, and so does the replay of its recording, under the recording's spelling.
+    #[test]
+    fn replay_places_sensors_calibrated_in_another_letter_case() {
+        let path = std::env::temp_dir().join(format!(
+            "cv1t-letter-case-replay-{}.rec",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let recorder = crate::recorder::Recorder::new(4 << 20);
+        recorder.start(&path, H0).unwrap();
+        let (_, _, p, mut calibration) = run_with_sensors(
+            1.5,
+            None,
+            IMU_DELAY,
+            3,
+            Some(&recorder),
+            MATCH_GOOD | MATCH_STRONG,
+        );
+        let stats = recorder.stop();
+        assert_eq!((stats.dropped, stats.write_errors), (0, 0));
+        for sensor in &mut calibration.sensors {
+            sensor.serial = sensor.serial.to_ascii_lowercase();
+        }
+        let replay = super::super::replay::replay(
+            &path,
+            &calibration,
+            &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+            &p.opts,
+        )
+        .unwrap();
+        let mut registered: Vec<_> = replay.agreement.iter().map(|(s, _)| s.as_str()).collect();
+        registered.sort();
+        assert_eq!(registered, ["SENSOR0", "SENSOR1", "SENSOR2"]);
+        assert!(!replay.hands[HAND_RIGHT].is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mixed_case_probe_options_keep_recorded_frames_out_of_tracking() {
+        let path = std::env::temp_dir().join(format!("cv1t-probe-case-{}.rec", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let recorder = crate::recorder::Recorder::new(4 << 20);
+        recorder.start(&path, H0).unwrap();
+        let (_, _, p, mut cal) = run_with_sensors(
+            2.0,
+            None,
+            IMU_DELAY,
+            3,
+            Some(&recorder),
+            MATCH_GOOD | MATCH_STRONG,
+        );
+        let stats = recorder.stop();
+        assert_eq!((stats.dropped, stats.write_errors), (0, 0));
+        let options = Options {
+            probe_sensors: vec!["sensor0".into()],
+            ..p.opts
+        };
+        for unposed in [false, true] {
+            if unposed {
+                cal.remove_sensor("SENSOR0");
+            }
+            let replay = super::super::replay::replay(
+                &path,
+                &cal,
+                &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+                &options,
+            )
+            .unwrap();
+            assert!(!replay.probes.is_empty(), "unposed={unposed}");
+            assert!(replay.probes.iter().all(|p| p.camera == 0));
+        }
         std::fs::remove_file(path).unwrap();
     }
 

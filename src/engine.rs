@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::ffi;
 #[cfg(feature = "engine")]
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
+use crate::status::sensor_identity;
 
 pub use ffi::ohmd_cv1touch_blob as Blob;
 pub use ffi::ohmd_cv1touch_controller as Controller;
@@ -97,6 +98,24 @@ fn serial(s: &str) -> Result<[c_char; 32], String> {
     Ok(out)
 }
 
+/// The engine matches serials without regard to ASCII letter case and refuses a list that names
+/// one sensor twice, for every open attempt. Say which entries clash instead.
+#[cfg_attr(not(feature = "engine"), allow(dead_code))]
+fn refuse_repeated_sensors<'a>(
+    serials: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashMap::new();
+    for serial in serials {
+        if let Some(first) = seen.insert(sensor_identity(serial), serial) {
+            return Err(format!(
+                "{what} {serial} names the same sensor as {first} (serial letter case does not matter)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(feature = "engine"), allow(dead_code))]
 fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
     if opts.ignore_sensors.len() > c_int::MAX as usize
@@ -120,6 +139,14 @@ fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    refuse_repeated_sensors(
+        opts.ignore_sensors.iter().map(String::as_str),
+        "ignored sensor",
+    )?;
+    refuse_repeated_sensors(
+        opts.fixed_poses.iter().map(|p| p.serial.as_str()),
+        "calibrated sensor",
+    )?;
     Ok(SensorConfig { ignored, poses })
 }
 
@@ -509,6 +536,36 @@ mod tests {
             opts.ignore_sensors[0] = bad.into();
             assert!(build_sensor_config(&opts).is_err());
         }
+    }
+
+    /// The engine refuses a sensor named twice, case included: say which entries clash, not
+    /// "rejected" on every open attempt.
+    #[test]
+    fn sensors_named_twice_in_any_letter_case_are_refused_by_name() {
+        let pose = |serial: &str| SensorPose {
+            serial: serial.into(),
+            orient: [0., 0., 0., 1.],
+            pos: [0., 0., 0.],
+        };
+        let mut opts = EngineOptions {
+            ignore_sensors: vec!["camera1".into(), "CAMERA2".into()],
+            fixed_poses: vec![pose("camera3"), pose("CAMERA4")],
+            ..Default::default()
+        };
+        assert!(build_sensor_config(&opts).is_ok());
+        opts.ignore_sensors.push("CAMERA1".into());
+        let err = build_sensor_config(&opts).err().unwrap();
+        assert!(
+            err.contains("ignored sensor CAMERA1 names the same sensor as camera1"),
+            "{err}"
+        );
+        opts.ignore_sensors.pop();
+        opts.fixed_poses.push(pose("Camera3"));
+        let err = build_sensor_config(&opts).err().unwrap();
+        assert!(
+            err.contains("calibrated sensor Camera3 names the same sensor as camera3"),
+            "{err}"
+        );
     }
 
     #[test]

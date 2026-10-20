@@ -8,7 +8,8 @@
 use std::path::Path;
 
 use crate::calib::file;
-use crate::engine::EngineOptions;
+use crate::engine::{EngineOptions, SensorPose};
+use crate::status::same_sensor;
 
 pub fn provisional(base: &EngineOptions) -> EngineOptions {
     EngineOptions {
@@ -40,6 +41,27 @@ pub fn calibrated(base: &EngineOptions, path: &Path) -> Result<(EngineOptions, u
     ))
 }
 
+/// `--ignore-sensor SERIAL`: leaves a sensor closed. Naming one twice, in whatever letter case,
+/// is refused here: the engine would turn the whole configuration down on every open attempt.
+pub fn ignore_sensor(opts: &mut EngineOptions, serial: String) -> Result<(), String> {
+    if let Some(first) = opts.ignore_sensors.iter().find(|s| same_sensor(s, &serial)) {
+        return Err(format!(
+            "--ignore-sensor {serial} names the same sensor as an earlier --ignore-sensor {first} (serial letter case does not matter)"
+        ));
+    }
+    opts.ignore_sensors.push(serial);
+    Ok(())
+}
+
+/// The calibrated pose of the sensor the engine reports as `serial`. The native engine matches
+/// serials without regard to ASCII letter case, and so does this: a calibration spelled
+/// `wmtd...` places the camera a device reports as `WMTD...`.
+pub fn calibrated_pose<'a>(opts: &'a EngineOptions, serial: &str) -> Option<&'a SensorPose> {
+    opts.fixed_poses
+        .iter()
+        .find(|p| same_sensor(&p.serial, serial))
+}
+
 /// Open sensors that will only observe because the calibration has no pose for them (empty unless
 /// calibrated mode).
 pub fn unposed_sensors(opts: &EngineOptions, open: &[String]) -> Vec<String> {
@@ -47,7 +69,7 @@ pub fn unposed_sensors(opts: &EngineOptions, open: &[String]) -> Vec<String> {
         return Vec::new();
     }
     open.iter()
-        .filter(|s| !opts.fixed_poses.iter().any(|p| &p.serial == *s))
+        .filter(|s| calibrated_pose(opts, s).is_none())
         .cloned()
         .collect()
 }
@@ -115,6 +137,46 @@ mod tests {
         std::fs::write(&path, "{\"format\":\"cv1touch-calibration\"}").unwrap();
         assert!(calibrated(&base(), &path).is_err()); // incomplete
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_sensor_ignored_twice_in_any_letter_case_is_refused() {
+        let mut o = base();
+        ignore_sensor(&mut o, "camera1".into()).unwrap();
+        ignore_sensor(&mut o, "CAMERA2".into()).unwrap();
+        let err = ignore_sensor(&mut o, "CAMERA1".into()).unwrap_err();
+        assert!(
+            err.contains("--ignore-sensor CAMERA1 names the same sensor as an earlier --ignore-sensor camera1"),
+            "{err}"
+        );
+        assert!(ignore_sensor(&mut o, "camera2".into()).is_err());
+        assert_eq!(o.ignore_sensors, ["WMTD000000004", "camera1", "CAMERA2"]);
+    }
+
+    /// A calibration spelled in another letter case than the device's names the same sensor, as in
+    /// the native engine: the camera has its pose, and is not reported as unposed.
+    #[test]
+    fn calibrated_poses_match_device_serials_regardless_of_letter_case() {
+        let mut poses = CalibrationFile::example().sensor_poses();
+        poses[0].serial = poses[0].serial.to_ascii_lowercase();
+        let o = EngineOptions {
+            fixed_poses_only: true,
+            fixed_poses: poses,
+            ..base()
+        };
+        let pose = calibrated_pose(&o, "WMTD000000001").expect("the lowercase entry matches");
+        assert_eq!(
+            pose.serial, "wmtd000000001",
+            "the calibration's spelling is kept"
+        );
+        assert!(calibrated_pose(&o, "wmtd000000001").is_some());
+        assert!(calibrated_pose(&o, "WMTD00000000").is_none());
+        assert!(calibrated_pose(&o, "WMTD0000000010").is_none());
+        let open = ["WMTD000000001".to_string(), "WMTD000000003".to_string()];
+        assert_eq!(
+            unposed_sensors(&o, &open),
+            vec!["WMTD000000003".to_string()]
+        );
     }
 
     /// Review fix 4: in calibrated mode an open sensor without a pose only observes; name it.

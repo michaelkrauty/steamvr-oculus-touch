@@ -56,6 +56,19 @@ fn read_status() -> io::Result<Option<serde_json::Value>> {
         .and_then(|json| serde_json::from_str(json).ok()))
 }
 
+/// Connected sensors the calibration has no pose for. It may spell a serial in another letter
+/// case than the device does, as the engine allows.
+fn unplaced_sensors(
+    calibration: Option<&file::CalibrationFile>,
+    sensors: &[shm::SensorStatus],
+) -> Vec<String> {
+    sensors
+        .iter()
+        .map(shm::serial_str)
+        .filter(|serial| calibration.is_none_or(|cal| cal.sensor(serial).is_none()))
+        .collect()
+}
+
 fn camera_artifact(path: &Path) -> (Artifact, Option<file::CalibrationFile>) {
     let mut calibration = None;
     let camera = artifact(path, || {
@@ -166,7 +179,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             && old.len() == new.len()
             && new.iter().all(|sensor| {
                 old.iter().any(|previous| {
-                    shm::serial_str(previous) == shm::serial_str(sensor)
+                    status::same_sensor(&shm::serial_str(previous), &shm::serial_str(sensor))
                         && sensor.frames > previous.frames
                 })
             })
@@ -175,16 +188,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         .as_ref()
         .and_then(|v| status::sensors_from_status(v).ok())
         .unwrap_or_default();
-    let unplaced: Vec<_> = sensors
-        .iter()
-        .filter_map(|sensor| {
-            let serial = shm::serial_str(sensor);
-            (!calibration
-                .as_ref()
-                .is_some_and(|cal| cal.sensors.iter().any(|entry| entry.serial == serial)))
-            .then_some(serial)
-        })
-        .collect();
+    let unplaced = unplaced_sensors(calibration.as_ref(), &sensors);
     let recording = second.as_ref().is_some_and(|v| v["recording"] == true);
     let normal_mode = second
         .as_ref()
@@ -265,7 +269,10 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         unplaced,
         identities: identities.filter(|_| known_identities),
         generation: second.as_ref().and_then(|v| v["generation"].as_u64()),
-        sensors: sensors.iter().map(shm::serial_str).collect(),
+        sensors: sensors
+            .iter()
+            .map(|s| status::sensor_identity(&shm::serial_str(s)))
+            .collect(),
         engine_ready: second.as_ref().and_then(|v| v["engine_ready"].as_bool()),
     }
 }
@@ -734,14 +741,22 @@ fn wait_reload_with(
                 !sensors.is_empty()
                     && (expected_mode != "calibrated"
                         || sensors.iter().all(|sensor| sensor.placed != 0))
-                    && sensors.iter().map(shm::serial_str).collect::<BTreeSet<_>>()
+                    && sensors
+                        .iter()
+                        .map(|s| status::sensor_identity(&shm::serial_str(s)))
+                        .collect::<BTreeSet<_>>()
                         == before.sensors
                     && sensors.len() == before.sensors.len()
             })
             .map(|sensors| {
                 sensors
                     .into_iter()
-                    .map(|sensor| (shm::serial_str(&sensor), sensor.frames))
+                    .map(|sensor| {
+                        (
+                            status::sensor_identity(&shm::serial_str(&sensor)),
+                            sensor.frames,
+                        )
+                    })
                     .collect::<BTreeMap<_, _>>()
             });
         if let Some(current) = current {
@@ -947,7 +962,11 @@ fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
         || status["engine_ready"] == false
         || sensors.len() != before.sensors.len()
         || sensors.iter().any(|sensor| sensor.placed == 0)
-        || sensors.iter().map(shm::serial_str).collect::<BTreeSet<_>>() != before.sensors
+        || sensors
+            .iter()
+            .map(|s| status::sensor_identity(&shm::serial_str(s)))
+            .collect::<BTreeSet<_>>()
+            != before.sensors
     {
         return Err(
             "the sensors or their calibration changed; your previous calibration is unchanged"
@@ -1668,6 +1687,41 @@ mod tests {
         }
     }
     #[test]
+    fn a_sensor_calibrated_in_another_letter_case_is_placed() {
+        let sensor = |serial: &str| {
+            let mut s = shm::SensorStatus::default();
+            shm::set_serial(&mut s, serial);
+            s
+        };
+        let entry = |serial: &str| file::SensorEntry {
+            serial: serial.into(),
+            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.0, 2.0, 1.0],
+            rms_px: 0.3,
+            observations: 100,
+        };
+        let calibration = file::CalibrationFile {
+            format: file::FORMAT.into(),
+            version: file::VERSION,
+            created_unix_s: 1,
+            world: "gravity".into(),
+            source: "a test".into(),
+            sensors: vec![entry("camtest")],
+            stats: file::Stats {
+                reference: "test".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 100,
+                rejected_views: 0,
+            },
+        };
+        let connected = [sensor("CAMTEST"), sensor("NEWCAM")];
+        assert_eq!(unplaced_sensors(Some(&calibration), &connected), ["NEWCAM"]);
+        assert_eq!(unplaced_sensors(None, &connected), ["CAMTEST", "NEWCAM"]);
+    }
+
+    #[test]
     fn controls_need_a_press_buzz_and_another_confirmation_press_for_each_hand() {
         let events = std::cell::RefCell::new(Vec::new());
         confirm_registration_controls_with(
@@ -2184,6 +2238,19 @@ mod tests {
     ) -> Result<(), String> {
         simulated_engine("calibrated", samples)
     }
+    #[test]
+    fn mixed_case_reload_samples_keep_the_same_sensor() {
+        let mut first = reload_sample(1, 10);
+        first["sensors"][0]["serial"] = "camtest".into();
+        let mut second = reload_sample(1, 11);
+        second["sensors"][0]["serial"] = "CamTest".into();
+        assert!(simulated_reload(vec![
+            (Some(first), Some(reload_inputs())),
+            (Some(second), Some(reload_inputs()))
+        ])
+        .is_ok());
+    }
+
     #[test]
     fn reload_acknowledgement_must_survive_transient_disconnected_publication() {
         let disconnected = serde_json::json!({"generation": 1, "mode": "calibrated", "recording": false, "engine_ready": false, "sensors": []});

@@ -5,7 +5,6 @@
 //! wrote the records: a frame's record is written after its image processing, so frames reach the
 //! trackers as late as they reached the engine live.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use nalgebra::{Isometry3, Vector3};
@@ -51,11 +50,6 @@ pub fn replay(
     imu_position: &dyn Fn(&[Led]) -> Option<Vector3<f64>>,
     o: &Options,
 ) -> Result<Replay, String> {
-    let poses: BTreeMap<String, Isometry3<f64>> = cal
-        .sensors
-        .iter()
-        .map(|s| (s.serial.clone(), iso_from_xyzw(s.orient_xyzw, s.pos)))
-        .collect();
     let mut p = Pipeline::new(o.clone());
     let mut out = Replay::default();
     let o_delayed = o.delayed_ns;
@@ -66,9 +60,15 @@ pub fn replay(
                     continue;
                 };
                 let serial = cstr_field(&s.serial);
-                if let Some(w) = poses.get(&serial) {
-                    p.sensor(&serial, CameraModel::from_sensor(&s), *w);
-                } else if o.probe_sensors.contains(&serial) {
+                // as live: the calibration's serial may be spelled in another letter case
+                if let Some(entry) = cal.sensor(&serial) {
+                    let w = iso_from_xyzw(entry.orient_xyzw, entry.pos);
+                    p.sensor(&serial, CameraModel::from_sensor(&s), w);
+                } else if o
+                    .probe_sensors
+                    .iter()
+                    .any(|s| crate::status::same_sensor(s, &serial))
+                {
                     // a sensor being placed has no pose yet; probing needs only its frames
                     p.sensor(&serial, CameraModel::from_sensor(&s), Isometry3::identity());
                 }

@@ -14,6 +14,8 @@ The root Apache 2.0 license covers original SteamVR Oculus Touch code and local 
 
 The unused upstream GStreamer plugin and 3Glasses driver are not distributed in this snapshot. OpenHMD files bearing both LGPL and Boost alternatives are used under Boost, with their original notices intact.
 
+Local OpenHMD changes match configured, discovered and calibrated sensor serials without regard to ASCII letter case, using bounded comparisons.
+
 The local OpenHMD log callback forwards the daemon's native diagnostics to its bounded logging queue; other clients retain the engine's original stdout/stderr behavior for ordinary logs. The libusb callback covers its normal logging implementation; special libusb build options can bypass it.
 
 Native assertion sites use a project macro and fixed-buffer failure callback, so the daemon can drain briefly and abort without its C runtime's blocking assertion printer. Assertions remain enabled in production. Without an installed receiver, engine assertions abort without synchronous output; standalone unity harnesses retain their ordinary assertions.

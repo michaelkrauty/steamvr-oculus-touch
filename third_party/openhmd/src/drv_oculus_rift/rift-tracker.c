@@ -329,7 +329,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
         }
         bool duplicate = false;
         for (size_t k = 0; k < tracker_ctx->n_sensors; k++)
-            if (!strcmp(rift_sensor_serial_no(tracker_ctx->sensors[k]), (const char *)serial))
+            if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(tracker_ctx->sensors[k]), (const char *)serial))
                 duplicate = true;
         if (duplicate) {
             LOGW("Ignoring duplicate Rift Sensor identity");

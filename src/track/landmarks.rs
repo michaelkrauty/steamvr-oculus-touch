@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use nalgebra::Vector2;
 use serde::{Deserialize, Serialize};
 
+use crate::status::same_sensor;
+
 pub const FORMAT: &str = "cv1touch-landmarks";
 
 /// Radius used to learn one sharp spot. Displacement matching searches independently.
@@ -56,7 +58,7 @@ pub fn forget_in_file(path: &Path, serial: &str) -> Result<usize, String> {
     }
     let mut f = load(path)?;
     let before = f.landmarks.len();
-    f.landmarks.retain(|l| l.serial != serial);
+    f.landmarks.retain(|l| !same_sensor(&l.serial, serial));
     let gone = before - f.landmarks.len();
     if gone > 0 {
         save(path, &f)?;
@@ -618,9 +620,9 @@ pub struct Monitor {
 impl Monitor {
     /// Stops watching the sensor `serial`'s landmarks: they were learned where it stood.
     pub fn forget(&mut self, serial: &str) {
-        self.refs.retain(|l| l.serial != serial);
-        self.seen.remove(serial);
-        self.latest.remove(serial);
+        self.refs.retain(|l| !same_sensor(&l.serial, serial));
+        self.seen.retain(|s, _| !same_sensor(s, serial));
+        self.latest.retain(|s, _| !same_sensor(s, serial));
     }
 
     pub fn new(refs: Vec<Landmark>, window_ns: u64) -> Monitor {
@@ -645,14 +647,23 @@ impl Monitor {
         if self.start == 0 {
             self.start = host_ns;
         }
+        // Use the landmark file's key for collection too, without allocating a folded
+        // serial on each frame. A file and device may spell the same camera differently.
+        let key = self
+            .refs
+            .iter()
+            .find(|l| same_sensor(&l.serial, serial))
+            .map(|l| l.serial.as_str());
         for b in blobs {
             if self.refs.iter().any(|l| {
-                l.serial == serial && (*b - Vector2::new(l.x, l.y)).norm() <= COLLECTION_RADIUS_PX
+                same_sensor(&l.serial, serial)
+                    && (*b - Vector2::new(l.x, l.y)).norm() <= COLLECTION_RADIUS_PX
             }) {
-                if let Some(bucket) = self.seen.get_mut(serial) {
+                if let Some(bucket) = self.seen.get_mut(key.expect("matched landmark")) {
                     bucket.push(*b);
                 } else {
-                    self.seen.insert(serial.to_owned(), vec![*b]);
+                    self.seen
+                        .insert(key.expect("matched landmark").to_owned(), vec![*b]);
                 }
             }
         }
@@ -662,9 +673,12 @@ impl Monitor {
         self.start = host_ns;
         let mut per = BTreeMap::<String, Vec<Vector2<f64>>>::new();
         for l in &self.refs {
-            per.entry(l.serial.clone())
-                .or_default()
-                .push(Vector2::new(l.x, l.y));
+            let point = Vector2::new(l.x, l.y);
+            if let Some((_, points)) = per.iter_mut().find(|(s, _)| same_sensor(s, &l.serial)) {
+                points.push(point);
+            } else {
+                per.insert(l.serial.clone(), vec![point]);
+            }
         }
         self.latest.clear();
         let mut shifts = Vec::new();
@@ -1340,6 +1354,72 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].landmarks, 2);
         assert!((out[0].shift.x - 0.6).abs() < 0.02);
+    }
+
+    #[test]
+    fn mixed_case_landmark_aliases_share_one_window() {
+        let refs = vec![
+            Landmark {
+                serial: "camera1".into(),
+                x: 100.0,
+                y: 300.0,
+                seen: 1.0,
+            },
+            Landmark {
+                serial: "CAMERA1".into(),
+                x: 500.0,
+                y: 300.0,
+                seen: 1.0,
+            },
+        ];
+        let mut m = Monitor::new(refs, 1000);
+        for k in 0..100 {
+            m.frame(
+                "Camera1",
+                1 + k * 10,
+                &[Vector2::new(100.5, 300.0), Vector2::new(500.5, 300.0)],
+                20,
+            );
+        }
+        let shifts = m.frame("Camera1", 1001, &[], 20).unwrap();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(shifts[0].landmarks, 2);
+        assert!((shifts[0].shift.x - 0.5).abs() < 1e-8);
+    }
+
+    #[test]
+    fn mixed_case_landmarks_follow_frames_and_forget_the_same_sensor() {
+        let path =
+            std::env::temp_dir().join(format!("cv1t-landmark-case-{}.json", std::process::id()));
+        let refs = vec![Landmark {
+            serial: "camera1".into(),
+            x: 100.0,
+            y: 300.0,
+            seen: 1.0,
+        }];
+        save(
+            &path,
+            &LandmarkFile {
+                format: FORMAT.into(),
+                version: 1,
+                created_unix_s: 0,
+                source: "test".into(),
+                landmarks: refs.clone(),
+            },
+        )
+        .unwrap();
+        let mut m = Monitor::new(refs, 1000);
+        for k in 0..100 {
+            m.frame("CAMERA1", 1 + k * 10, &[Vector2::new(100.5, 300.0)], 20);
+        }
+        let measured = m.frame("CAMERA1", 1001, &[], 20).unwrap();
+        assert_eq!(measured.len(), 1);
+        assert!((measured[0].shift.x - 0.5).abs() < 1e-8);
+        m.forget("CaMeRa1");
+        assert!(m.refs.is_empty() && m.seen.is_empty() && m.latest.is_empty());
+        assert_eq!(forget_in_file(&path, "CAMERA1").unwrap(), 1);
+        assert!(load(&path).unwrap().landmarks.is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     fn jitter(k: usize) -> Vector2<f64> {

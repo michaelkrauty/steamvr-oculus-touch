@@ -87,7 +87,7 @@ int fake_serial(libusb_device_handle *handle, uint8_t index,
   if ((int)(uintptr_t)handle == fail_serial)
     return -1;
   if ((int)(uintptr_t)handle == duplicate_serial)
-    handle = (void *)1;
+    return snprintf((char *)data, len, "test%06d", 1);
   return snprintf((char *)data, len, "TEST%06zu", (size_t)(uintptr_t)handle);
 }
 ohmd_thread *fake_thread(ohmd_context *ctx, unsigned int (*routine)(void *),
@@ -206,7 +206,7 @@ int main(void) {
   }
   /* Full context configuration reaches discovery beyond the legacy eighth
    * entry. */
-  char ignored[1][32] = {"TEST000065"};
+  char ignored[1][32] = {"test000065"};
   CHECK(ohmd_cv1touch_configure_sensors(ctx, ignored, 1, NULL, 0) == 0);
   requested = 65;
   rift_tracker_ctx *filtered = rift_tracker_new(ctx, radio);

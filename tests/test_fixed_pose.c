@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-/* Fixed (calibrated) sensor poses are looked up by exact serial; orientation is normalised. */
+/* Fixed (calibrated) sensor poses are looked up by serial, ignoring ASCII letter case; orientation is normalised. */
 #include <string.h>
 
 #include "omath.c"
@@ -25,6 +25,7 @@ int main(void)
 	CHECK(!cv1touch_fixed_pose_lookup(&cfg, "WMTD00000000", &p)); /* a prefix is not a match */
 	CHECK(!cv1touch_fixed_pose_lookup(&cfg, "WMTD000000003", &p));
 	CHECK(cv1touch_fixed_pose_lookup(&cfg, "WMTD000000002", &p));
+	CHECK(cv1touch_fixed_pose_lookup(&cfg, "wmtd000000002", &p)); /* letter case does not matter */
 	CHECK_NEAR(p.orient.w, 1.0, 1e-6);
 	CHECK_NEAR(p.orient.x, 0.0, 1e-6);
 	CHECK_NEAR(p.pos.x, 1.5, 1e-6);

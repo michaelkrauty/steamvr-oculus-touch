@@ -3722,10 +3722,17 @@ fn published_in_current_frame(
 /// are in a world frame the calibration has since turned away from).
 fn replayed_now(base: &Path) -> Result<[Vec<eval::Published>; 2], String> {
     let cal = file::load(&file::default_path())?;
+    replayed_with_calibration(base, &cal)
+}
+
+fn replayed_with_calibration(
+    base: &Path,
+    cal: &file::CalibrationFile,
+) -> Result<[Vec<eval::Published>; 2], String> {
     let dir = track::factory::openhmd_config_dir();
     Ok(track::replay::replay(
         &base.with_extension("rec"),
-        &cal,
+        cal,
         &|l| track::factory::imu_position(&dir, l),
         &track::replay::Options::default(),
     )?
@@ -3847,10 +3854,7 @@ fn landmarks_learn(rec: &Path, write: bool) -> i32 {
             .iso();
         let (models, _) = track::refine::recording_models(rec)?;
         let near_station = |serial: &str, l: &track::landmarks::Landmark| -> bool {
-            let (Some(e), Some(m)) = (
-                cal.sensors.iter().find(|e| e.serial == serial),
-                models.get(serial),
-            ) else {
+            let (Some(e), Some(m)) = (cal.sensor(serial), models.get(serial)) else {
                 return false;
             };
             let w = calib::iso_from_xyzw(e.orient_xyzw, e.pos);
@@ -4551,36 +4555,81 @@ fn register_from_capture_with(
     }
 }
 
+/// Resolve a calibration or CLI serial to the recording's own key. Frame records and
+/// replay camera IDs use that key; a calibration entry keeps its original spelling.
+fn recording_sensor<'a>(
+    models: &'a BTreeMap<String, calib::camera::CameraModel>,
+    serial: &str,
+) -> Option<(&'a String, &'a calib::camera::CameraModel)> {
+    models.iter().find(|(s, _)| status::same_sensor(s, serial))
+}
+
+fn recording_serials(
+    models: &BTreeMap<String, calib::camera::CameraModel>,
+    cal: &file::CalibrationFile,
+) -> Result<Vec<String>, String> {
+    cal.sensors
+        .iter()
+        .map(|entry| {
+            recording_sensor(models, &entry.serial)
+                .map(|(s, _)| s.clone())
+                .ok_or_else(|| {
+                    format!("no intrinsics for sensor {} in the recording", entry.serial)
+                })
+        })
+        .collect()
+}
+
 /// Registration from the Lighthouse base stations the Rift sensors see (see `calib::stations`):
 /// the stations' poses from SteamVR now, their spots from a recording's unlabelled blobs.
 fn register_stations(rec: &Path, write: bool, out: Option<&Path>) -> i32 {
+    register_stations_with(
+        rec,
+        write,
+        out,
+        &file::default_path(),
+        &align::registration_path(),
+        || {
+            let client = vr::Client::connect()?;
+            let poses = client.raw_poses();
+            let stations: Vec<(String, nalgebra::Isometry3<f64>)> = client
+                .devices()
+                .into_iter()
+                .filter(|d| {
+                    d.class == vr::CLASS_TRACKING_REFERENCE && d.tracking_system == "lighthouse"
+                })
+                .filter_map(|d| {
+                    Some((
+                        d.serial.clone(),
+                        poses.get(d.index as usize).copied().flatten()?,
+                    ))
+                })
+                .collect();
+            drop(client);
+            Ok(stations)
+        },
+    )
+}
+
+fn register_stations_with(
+    rec: &Path,
+    write: bool,
+    out: Option<&Path>,
+    cal_path: &Path,
+    reg_path: &Path,
+    stations: impl FnOnce() -> Result<align::Stations, String>,
+) -> i32 {
     use cv1touch::calib::stations;
     let run = || -> Result<(), String> {
-        let client = vr::Client::connect()?;
-        let poses = client.raw_poses();
-        let stations: Vec<(String, nalgebra::Isometry3<f64>)> = client
-            .devices()
-            .into_iter()
-            .filter(|d| {
-                d.class == vr::CLASS_TRACKING_REFERENCE && d.tracking_system == "lighthouse"
-            })
-            .filter_map(|d| {
-                Some((
-                    d.serial.clone(),
-                    poses.get(d.index as usize).copied().flatten()?,
-                ))
-            })
-            .collect();
-        drop(client);
+        let stations = stations()?;
         if stations.is_empty() {
             return Err("SteamVR reports no base station poses (is it running?)".into());
         }
-        let cal = file::load(&file::default_path())?;
-        let reg_path = align::registration_path();
-        let mut reg = align::load_registration(&reg_path)?;
+        let cal = file::load(cal_path)?;
+        let mut reg = align::load_registration(reg_path)?;
         let x0 = reg.lighthouse_from_world.iso();
         let (models, _) = track::refine::recording_models(rec)?;
-        let serials: Vec<String> = cal.sensors.iter().map(|e| e.serial.clone()).collect();
+        let serials = recording_serials(&models, &cal)?;
         let cams = serials
             .iter()
             .map(|s| {
@@ -4693,7 +4742,7 @@ fn register_stations(rec: &Path, write: bool, out: Option<&Path>) -> i32 {
         reg.pairs = spots.len();
         reg.pos_rms_mm = 0.0;
         reg.rot_rms_deg = 0.0;
-        let reg_path = out.map_or(reg_path, Path::to_path_buf);
+        let reg_path = out.map_or_else(|| reg_path.to_path_buf(), Path::to_path_buf);
         let b = align::save(&reg_path, &reg)?;
         println!(
             "wrote {} (previous: {:?}); run `cv1touch alignment reload`",
@@ -4714,6 +4763,28 @@ fn register_stations(rec: &Path, write: bool, out: Option<&Path>) -> i32 {
 /// Joint calibration from a rig capture's static holds (see `calib::rig`): the sensors (the
 /// calibration's reference sensor held), the registration and the Touches' rig offsets.
 fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
+    match calibrate_rig_with(
+        base,
+        write,
+        out_dir,
+        &file::default_path(),
+        &align::registration_path(),
+    ) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("cv1touch: {e}");
+            1
+        }
+    }
+}
+
+fn calibrate_rig_with(
+    base: &Path,
+    write: bool,
+    out_dir: Option<&Path>,
+    cal_path: &Path,
+    reg_path: &Path,
+) -> Result<(), String> {
     use cv1touch::calib::rig;
     let run = || -> Result<(), String> {
         let truth_path = base.with_extension("truth.json");
@@ -4722,10 +4793,8 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
                 .map_err(|e| format!("{}: {e}", truth_path.display()))?,
         )
         .map_err(|e| e.to_string())?;
-        let cal_path = file::default_path();
-        let mut cal = file::load(&cal_path)?;
-        let reg_path = align::registration_path();
-        let mut reg = align::load_registration(&reg_path)?;
+        let mut cal = file::load(cal_path)?;
+        let mut reg = align::load_registration(reg_path)?;
         if reg.reference != tf.reference {
             return Err(format!(
                 "the capture's reference controller is {}, the registration's {}",
@@ -4733,12 +4802,13 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
             ));
         }
         let holds = rig::holds(&eval::truth_samples(&tf.samples), 1_500_000_000);
-        let serials: Vec<String> = cal.sensors.iter().map(|e| e.serial.clone()).collect();
-        let fixed = serials
+        let fixed = cal
+            .sensors
             .iter()
-            .position(|s| *s == cal.stats.reference)
+            .position(|s| status::same_sensor(&s.serial, &cal.stats.reference))
             .ok_or("the calibration's reference sensor is not among its sensors")?;
         let (models, leds) = track::refine::recording_models(&base.with_extension("rec"))?;
+        let serials = recording_serials(&models, &cal)?;
         let cameras = serials
             .iter()
             .map(|s| {
@@ -4774,7 +4844,7 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
                 );
             }
         }
-        let published = replayed_now(base)?;
+        let published = replayed_with_calibration(base, &cal)?;
         let x0 = reg.lighthouse_from_world.iso();
         let mut touches = Vec::new();
         let mut offsets = Vec::new();
@@ -4923,7 +4993,7 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
         cal.source = format!("{}; rig-calibrated against {}", cal.source, base.display());
         let (cal_path, reg_path) = match out_dir {
             Some(d) => (d.join("calibration.json"), d.join("registration.json")),
-            None => (cal_path, reg_path),
+            None => (cal_path.to_path_buf(), reg_path.to_path_buf()),
         };
         let cb = file::save(&cal_path, &cal)?;
         reg.lighthouse_from_world = align::PoseEntry::from_iso(&full.state.lighthouse_from_world);
@@ -4962,13 +5032,7 @@ fn calibrate_rig(base: &Path, write: bool, out_dir: Option<&Path>) -> i32 {
         );
         Ok(())
     };
-    match run() {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("cv1touch: {e}");
-            1
-        }
-    }
+    run()
 }
 
 /// Re-poses sensors that disagree with the others, against the controller poses the tracker gets
@@ -4983,11 +5047,11 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
         for round in 1..=3 {
             let mut results = Vec::new();
             for entry in &cal.sensors {
-                let Some(model) = models.get(&entry.serial) else {
+                let Some((recorded, model)) = recording_sensor(&models, &entry.serial) else {
                     continue;
                 };
                 let o = track::replay::Options {
-                    probe_sensors: vec![entry.serial.clone()],
+                    probe_sensors: vec![recorded.clone()],
                     ..Default::default()
                 };
                 let r = track::replay::replay(rec, &cal, &imu, &o)?;
@@ -5192,15 +5256,14 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
     let run = || -> Result<(), String> {
         let mut cal = file::load(path)?;
         let (models, leds) = track::refine::recording_models(rec)?;
-        let model = models
-            .get(serial)
+        let (recorded, model) = recording_sensor(&models, serial)
             .ok_or_else(|| format!("{serial} is not in {}", rec.display()))?;
         let dir = track::factory::openhmd_config_dir();
         let imu = |l: &[capture::Led]| track::factory::imu_position(&dir, l);
         let mut without = cal.clone();
-        without.sensors.retain(|e| e.serial != serial);
+        without.remove_sensor(serial);
         let o = track::replay::Options {
-            probe_sensors: vec![serial.to_string()],
+            probe_sensors: vec![recorded.clone()],
             ..Default::default()
         };
         let r = track::replay::replay(rec, &without, &imu, &o)?;
@@ -5222,7 +5285,7 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
             "refined on {} matches in {} frames: median {:.2} px (moved {:.1} mm, {:.2} deg); at ({:.2}, {:.2}, {:.2}) m looking ({:+.2}, {:+.2}, {:+.2})",
             rf.pairs, rf.frames, rf.after_px, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees(), p.x, p.y, p.z, fwd.x, fwd.y, fwd.z
         );
-        if let Some(old) = cal.sensors.iter().find(|e| e.serial == serial) {
+        if let Some(old) = cal.sensor(serial) {
             let d = calib::iso_from_xyzw(old.orient_xyzw, old.pos).inverse() * rf.world_from_cam;
             println!(
                 "the calibration had it {:.1} mm, {:.2} deg away",
@@ -5234,15 +5297,7 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
             println!("(not written: run with --write)");
             return Ok(());
         }
-        let (orient_xyzw, pos) = calib::iso_to_xyzw(&rf.world_from_cam);
-        cal.sensors.retain(|e| e.serial != serial);
-        cal.sensors.push(file::SensorEntry {
-            serial: serial.to_string(),
-            orient_xyzw,
-            pos,
-            rms_px: rf.after_px,
-            observations: rf.pairs,
-        });
+        store_placed_sensor(&mut cal, serial, &rf);
         cal.source = format!("{}; placed {serial} against {}", cal.source, rec.display());
         let mut backup = None;
         commit_fit(interrupted(), || {
@@ -5262,6 +5317,24 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
             eprintln!("cv1touch: {e}");
             1
         }
+    }
+}
+
+fn store_placed_sensor(cal: &mut file::CalibrationFile, serial: &str, rf: &track::refine::Refined) {
+    let (orient_xyzw, pos) = calib::iso_to_xyzw(&rf.world_from_cam);
+    if let Some(entry) = cal.sensor_mut(serial) {
+        entry.orient_xyzw = orient_xyzw;
+        entry.pos = pos;
+        entry.rms_px = rf.after_px;
+        entry.observations = rf.pairs;
+    } else {
+        cal.sensors.push(file::SensorEntry {
+            serial: serial.to_string(),
+            orient_xyzw,
+            pos,
+            rms_px: rf.after_px,
+            observations: rf.pairs,
+        });
     }
 }
 
@@ -6059,6 +6132,131 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn serial_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, file::CalibrationFile) {
+        let dir = std::env::temp_dir().join(format!("cv1t-identity-{}-{tag}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = dir.join("capture.rec");
+        let path = dir.join("calibration.json");
+        let reg = dir.join("registration.json");
+        let cal: file::CalibrationFile = serde_json::from_value(serde_json::json!({
+            "format": file::FORMAT, "version": 1, "created_unix_s": 1,
+            "world": "test", "source": "synthetic recording",
+            "sensors": [{"serial": "camera1", "orient_xyzw": [0,0,0,1], "pos": [0,0,0], "rms_px": 0, "observations": 100}],
+            "stats": {"reference": "camera1", "gravity_mps2": 9.81, "gravity_spread_deg": 0,
+                "motion_segments": 10, "samples": 1000, "rejected_views": 0}
+        })).unwrap();
+        file::save(&path, &cal).unwrap();
+        let mut registration = initial_registration(1);
+        registration.reference = "REFERENCE".into();
+        align::save(&reg, &registration).unwrap();
+        let recorder = recorder::Recorder::new(1 << 20);
+        recorder.start(&rec, 1).unwrap();
+        let mut sensor = recorder::SensorInfo {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            ..Default::default()
+        };
+        for (out, byte) in sensor.serial.iter_mut().zip(b"CAMERA1") {
+            *out = *byte as _;
+        }
+        recorder.write(recorder::SENSOR_INFO, 1, &[recorder::as_bytes(&sensor)]);
+        let spots = [(-0.5, -0.3, 2.0), (0.6, -0.2, 2.5), (0.0, 0.6, 3.0)];
+        let model = calib::camera::CameraModel::from_sensor(&sensor);
+        let blobs: Vec<_> = spots
+            .iter()
+            .map(|&(x, y, z)| {
+                let xy = model.project(&nalgebra::Vector3::new(x, y, z)).unwrap();
+                recorder::Blob {
+                    x: xy.x as _,
+                    y: xy.y as _,
+                    led_id: -1,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        for k in 0..120 {
+            let info = recorder::FrameInfo {
+                serial: sensor.serial,
+                frame_start_host_ns: 1 + k,
+                ..Default::default()
+            };
+            recorder.write(
+                recorder::FRAME_OBS,
+                1 + k,
+                &[recorder::as_bytes(&info), recorder::slice_bytes(&blobs)],
+            );
+        }
+        let stats = recorder.stop();
+        assert_eq!((stats.dropped, stats.write_errors), (0, 0));
+        (rec, path, reg, cal)
+    }
+
+    #[test]
+    fn mixed_case_station_command_uses_recorded_models_and_frames() {
+        let (rec, path, reg, _) = serial_fixture("stations");
+        let stations = [(-0.5, -0.3, 2.0), (0.6, -0.2, 2.5), (0.0, 0.6, 3.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y, z))| {
+                (
+                    format!("BASE{i}"),
+                    nalgebra::Isometry3::translation(x, y, z),
+                )
+            })
+            .collect();
+        assert_eq!(
+            register_stations_with(&rec, false, None, &path, &reg, || Ok(stations)),
+            0
+        );
+        std::fs::remove_dir_all(rec.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mixed_case_rig_command_gets_past_reference_and_intrinsics() {
+        let (rec, path, reg, mut cal) = serial_fixture("rig");
+        cal.stats.reference = "CAMERA1".into();
+        file::save(&path, &cal).unwrap();
+        std::fs::write(rec.with_extension("truth.json"), serde_json::to_vec(&serde_json::json!({
+            "format": "cv1touch-truth", "version": 1, "reference": "REFERENCE", "universe_id": 1,
+            "windows": [], "samples": []
+        })).unwrap()).unwrap();
+        // No controllers were recorded: the command must reach that diagnosis,
+        // rather than rejecting the reference or silently losing the camera model.
+        let error = calibrate_rig_with(&rec, false, None, &path, &reg).unwrap_err();
+        assert_eq!(error, "no Touch was tracked through the holds");
+        std::fs::remove_dir_all(rec.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mixed_case_place_preserves_the_saved_spelling_and_reference() {
+        let (rec, path, _, mut cal) = serial_fixture("place");
+        let rf = track::refine::Refined {
+            world_from_cam: nalgebra::Isometry3::translation(0.1, 0.2, 0.3),
+            before_px: 1.0,
+            after_px: 0.2,
+            pairs: 500,
+            frames: 100,
+        };
+        store_placed_sensor(&mut cal, "CAMERA1", &rf);
+        assert_eq!(cal.sensors.len(), 1);
+        assert_eq!(cal.sensors[0].serial, "camera1");
+        assert_eq!(cal.stats.reference, cal.sensors[0].serial);
+        assert_eq!(cal.sensors[0].observations, 500);
+        assert_eq!(cal.sensors[0].pos, [0.1, 0.2, 0.3]);
+        file::save(&path, &cal).unwrap();
+        let saved = file::load(&path).unwrap();
+        assert_eq!(saved.sensors[0].serial, "camera1");
+        assert_eq!(saved.stats.reference, saved.sensors[0].serial);
+        store_placed_sensor(&mut cal, "CAMERA2", &rf);
+        assert_eq!(cal.sensors.len(), 2);
+        assert_eq!(cal.sensors[1].serial, "CAMERA2");
+        std::fs::remove_dir_all(rec.parent().unwrap()).unwrap();
+    }
 
     fn capture_device(index: u32, class: vr::DeviceClass, serial: &str) -> vr::Device {
         vr::Device {

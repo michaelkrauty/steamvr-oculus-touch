@@ -17,6 +17,21 @@ typedef struct {
   char (*ignored)[32];
   ohmd_cv1touch_sensor_pose *poses;
 } cv1touch_sensor_config;
+/* Serial identities ignore ASCII letter case and stay within their 32-byte fields. */
+static inline bool cv1touch_sensor_serial_equal(const char *a, const char *b) {
+  for (size_t i = 0; i < 32; i++) {
+    unsigned char x = a[i], y = b[i];
+    if (x >= 'a' && x <= 'z')
+      x -= 'a' - 'A';
+    if (y >= 'a' && y <= 'z')
+      y -= 'a' - 'A';
+    if (x != y)
+      return false;
+    if (x == 0)
+      return true;
+  }
+  return false;
+}
 static inline bool cv1touch_sensor_serial_valid(const char serial[32]) {
   size_t n = 0;
   while (n < 32 && serial[n])
@@ -49,14 +64,14 @@ cv1touch_sensor_config_set(cv1touch_sensor_config *c, const char (*ignored)[32],
     if (!cv1touch_sensor_serial_valid(ignored[i]))
       return -1;
     for (size_t j = 0; j < i; j++)
-      if (!strcmp(ignored[i], ignored[j]))
+      if (cv1touch_sensor_serial_equal(ignored[i], ignored[j]))
         return -1;
   }
   for (size_t i = 0; i < np; i++) {
     if (!cv1touch_sensor_serial_valid(poses[i].serial))
       return -1;
     for (size_t j = 0; j < i; j++)
-      if (!strcmp(poses[i].serial, poses[j].serial))
+      if (cv1touch_sensor_serial_equal(poses[i].serial, poses[j].serial))
         return -1;
     double norm = 0;
     for (int k = 0; k < 4; k++) {
@@ -99,9 +114,10 @@ static inline bool cv1touch_sensor_ignored(const cv1touch_sensor_config *c,
                                            const char *serial) {
   size_t n = c->configured ? c->ignored_count : 8;
   for (size_t i = 0; i < n; i++)
-    if (!strcmp(c->configured ? c->ignored[i]
-                              : legacy->ignore_sensor_serials[i],
-                serial))
+    if (cv1touch_sensor_serial_equal(c->configured
+                                         ? c->ignored[i]
+                                         : legacy->ignore_sensor_serials[i],
+                                     serial))
       return true;
   return false;
 }

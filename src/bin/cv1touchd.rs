@@ -442,9 +442,14 @@ impl LandmarkWatch {
     /// Stops watching the sensor `serial`: its landmarks were learned where it stood.
     fn forget(&mut self, d: &Daemon, serial: &str) {
         self.monitor.forget(serial);
-        self.alerts.remove(serial);
-        self.missing.remove(serial);
-        d.landmark_shifts.lock().unwrap().remove(serial);
+        self.alerts
+            .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+        self.missing
+            .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+        d.landmark_shifts
+            .lock()
+            .unwrap()
+            .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
     }
 
     fn frame(&mut self, info: &engine::FrameInfo, blobs: &[Blob]) {
@@ -666,19 +671,27 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
     if d.tracker != TrackerKind::Rust || opts.fixed_poses.is_empty() {
         return None;
     }
+    let p = calibrated_pipeline(opts, &e.sensors());
+    d.track_in.lock().unwrap().clear();
+    Some(p)
+}
+
+/// A pipeline with the open sensors the calibration has a pose for, registered under the
+/// spelling their frames carry (the calibration may spell the serial in another letter case, as
+/// the native engine allows).
+fn calibrated_pipeline(opts: &EngineOptions, sensors: &[engine::Sensor]) -> Pipeline {
     let mut p = Pipeline::new(pipeline::Options::default());
-    for s in e.sensors() {
-        let serial = engine::sensor_serial(&s);
-        if let Some(pose) = opts.fixed_poses.iter().find(|f| f.serial == serial) {
+    for s in sensors {
+        let serial = engine::sensor_serial(s);
+        if let Some(pose) = modes::calibrated_pose(opts, &serial) {
             p.sensor(
                 &serial,
-                calib::camera::CameraModel::from_sensor(&s),
+                calib::camera::CameraModel::from_sensor(s),
                 calib::iso_from_xyzw(pose.orient, pose.pos),
             );
         }
     }
-    d.track_in.lock().unwrap().clear();
-    Some(p)
+    p
 }
 
 /// The prediction percents a daemon starts with: (positions, orientations).
@@ -1965,13 +1978,7 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     if !r.write {
         return;
     }
-    {
-        let mut opts = d.opts.lock().unwrap();
-        if let Some(p) = opts.fixed_poses.iter_mut().find(|p| p.serial == r.serial) {
-            p.orient = r.orient_xyzw;
-            p.pos = r.pos;
-        }
-    }
+    adopt_reposed_pose(&mut d.opts.lock().unwrap(), r);
     let loaded = d.calibration.lock().unwrap().clone();
     let written = match loaded {
         Some(loaded) => match write_reposed(&loaded, r, &platform::dirs::get().state) {
@@ -2021,6 +2028,19 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     }
 }
 
+/// Keeps a sensor's new pose in the options a reopened engine starts with. The calibration's
+/// own spelling of the serial stays, in whichever letter case it is.
+fn adopt_reposed_pose(opts: &mut EngineOptions, r: &Reposed) {
+    if let Some(p) = opts
+        .fixed_poses
+        .iter_mut()
+        .find(|p| cv1touch::status::same_sensor(&p.serial, &r.serial))
+    {
+        p.orient = r.orient_xyzw;
+        p.pos = r.pos;
+    }
+}
+
 /// Writes the sensor's new pose into the loaded calibration file: the backup of the old file and
 /// the new file's fingerprint. Not while `cv1touch setup` runs, and not over a file changed
 /// since the daemon loaded it. Setup's stages bound to the old file are bound to the new one, so
@@ -2048,9 +2068,7 @@ fn write_reposed(
     }
     let mut cal = calib::file::load(path)?;
     let entry = cal
-        .sensors
-        .iter_mut()
-        .find(|s| s.serial == r.serial)
+        .sensor_mut(&r.serial)
         .ok_or_else(|| format!("{} has no sensor {}", path.display(), r.serial))?;
     entry.orient_xyzw = r.orient_xyzw;
     entry.pos = r.pos;
@@ -2969,8 +2987,9 @@ fn status_json(d: &Daemon) -> String {
         .map(|s| {
             let serial = shm::serial_str(s);
             let shift = shifts
-                .get(&serial)
-                .map(|(x, y, n)| serde_json::json!({"dx": x, "dy": y, "landmarks": n}));
+                .iter()
+                .find(|(s, _)| cv1touch::status::same_sensor(s, &serial))
+                .map(|(_, (x, y, n))| serde_json::json!({"dx": x, "dy": y, "landmarks": n}));
             let pose = poses
                 .get(&serial)
                 .map(|note| serde_json::to_value(note).unwrap_or_default());
@@ -3748,9 +3767,13 @@ fn main() {
                     _ => usage(),
                 }
             }
-            "--ignore-sensor" => opts
-                .ignore_sensors
-                .push(args.next().unwrap_or_else(|| usage())),
+            "--ignore-sensor" => {
+                let serial = args.next().unwrap_or_else(|| usage());
+                if let Err(e) = modes::ignore_sensor(&mut opts, serial) {
+                    log!("{e}");
+                    daemon_log::exit(2);
+                }
+            }
             "--record" => record = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--calibration" => {
                 calibration = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())))
@@ -5011,6 +5034,31 @@ mod tests {
         assert!(!due[1].began_in_use);
     }
 
+    #[test]
+    fn mixed_case_landmark_status_and_forget_join_device_and_file_names() {
+        let d = status_daemon();
+        let mut sensor = SensorStatus::default();
+        shm::set_serial(&mut sensor, "CAMERA1");
+        *d.sensors.lock().unwrap() = vec![sensor];
+        d.landmark_shifts
+            .lock()
+            .unwrap()
+            .insert("camera1".into(), (0.5, 0.0, 1));
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["sensors"][0]["landmark_shift"]["dx"], 0.5);
+        let mut watch = LandmarkWatch {
+            monitor: track::landmarks::BackgroundMonitor::new(vec![], 1, 1).unwrap(),
+            alerts: Default::default(),
+            missing: Default::default(),
+        };
+        watch.alerts.insert("camera1".into(), Default::default());
+        watch.missing.insert("camera1".into(), 1);
+        watch.forget(&d, "CAMERA1");
+        assert!(watch.alerts.is_empty() && watch.missing.is_empty());
+        assert!(d.landmark_shifts.lock().unwrap().is_empty());
+    }
+
     fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -5320,6 +5368,146 @@ mod tests {
                 && !dir.join("calibration.json.bak-101").exists()
         );
         assert!(dir.join("calibration.json.bak-102").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn serial_field(name: &str) -> [std::os::raw::c_char; 32] {
+        let mut field = [0; 32];
+        for (d, b) in field.iter_mut().zip(name.bytes()) {
+            *d = b as std::os::raw::c_char;
+        }
+        field
+    }
+
+    fn calibrated_as(serial: &str) -> EngineOptions {
+        EngineOptions {
+            fixed_poses_only: true,
+            fixed_poses: vec![engine::SensorPose {
+                serial: serial.into(),
+                orient: [0.0, 0.0, 0.0, 1.0],
+                pos: [1.0, 2.0, 3.0],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The native engine places a camera whose calibration is spelled in another letter case than
+    /// the device's, and the Rust tracker has to as well: it registers the camera under the
+    /// device's spelling and uses its frames, rather than skipping them all.
+    #[test]
+    fn the_pipeline_uses_a_camera_calibrated_in_another_letter_case() {
+        let opts = calibrated_as("camera1");
+        let sensor = |name: &str| engine::Sensor {
+            serial: serial_field(name),
+            width: 1280,
+            height: 960,
+            fx: 700.0,
+            fy: 700.0,
+            cx: 640.0,
+            cy: 480.0,
+            ..Default::default()
+        };
+        let mut p = calibrated_pipeline(&opts, &[sensor("CAMERA1"), sensor("CAMERA10")]);
+        assert!(
+            p.camera_id("CAMERA1").is_some(),
+            "registered as the device spells it"
+        );
+        assert!(p.camera_id("camera1").is_none());
+        assert!(
+            p.camera_id("CAMERA10").is_none(),
+            "a longer serial is another sensor"
+        );
+        let pose = p
+            .camera("CAMERA1")
+            .unwrap()
+            .world_from_cam
+            .translation
+            .vector;
+        assert_eq!((pose.x, pose.y, pose.z), (1.0, 2.0, 3.0));
+        p.hmd_clock_sample(5_000_000_000, 77_000);
+        let frame = |name: &str| engine::FrameInfo {
+            serial: serial_field(name),
+            exposure_valid: 1,
+            exposure_hmd_ts: 77_000,
+            ..Default::default()
+        };
+        p.frame(&frame("CAMERA1"), &[]);
+        assert_eq!(p.frames_skipped, 0, "its frames are not skipped");
+        p.frame(&frame("CAMERA10"), &[]);
+        assert_eq!(p.frames_skipped, 1);
+    }
+
+    /// A sensor placed again keeps its new pose in the options of a reopened engine whatever the
+    /// letter case of the calibration's serial, and the options keep that spelling.
+    #[test]
+    fn a_new_pose_reaches_the_options_of_a_camera_calibrated_in_another_letter_case() {
+        let mut opts = calibrated_as("camera1");
+        let r = Reposed {
+            serial: "CAMERA1".into(),
+            orient_xyzw: [0.0, 0.0, 1.0, 0.0],
+            pos: [0.5, 0.25, 0.125],
+            median_px: 0.2,
+            matches: 10,
+            moved_mm: 50.0,
+            turned_deg: 0.0,
+            write: true,
+        };
+        adopt_reposed_pose(&mut opts, &r);
+        assert_eq!(opts.fixed_poses[0].serial, "camera1");
+        assert_eq!(opts.fixed_poses[0].orient, [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(opts.fixed_poses[0].pos, [0.5, 0.25, 0.125]);
+    }
+
+    /// The new pose goes into the calibration's entry for a camera spelled in another letter case
+    /// than the device's, rather than failing with "has no sensor"; the file's spelling stays.
+    #[test]
+    fn a_new_pose_is_written_to_a_calibration_entry_in_another_letter_case() {
+        let dir = std::env::temp_dir().join(format!("cv1t-reposed-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = dir.join("calibration.json");
+        let entry = |serial: &str| calib::file::SensorEntry {
+            serial: serial.into(),
+            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.0, 2.0, 1.0],
+            rms_px: 0.3,
+            observations: 100,
+        };
+        let cal = calib::file::CalibrationFile {
+            format: calib::file::FORMAT.into(),
+            version: calib::file::VERSION,
+            created_unix_s: 1,
+            world: "gravity".into(),
+            source: "a test".into(),
+            sensors: vec![entry("wmtd000000001"), entry("WMTD000000002")],
+            stats: calib::file::Stats {
+                reference: "test".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 100,
+                rejected_views: 0,
+            },
+        };
+        calib::file::save(&path, &cal).unwrap();
+        let loaded = LoadedCalibration::at(path.clone());
+        let r = Reposed {
+            serial: "WMTD000000001".into(),
+            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.1, 2.0, 1.0],
+            median_px: 0.25,
+            matches: 4000,
+            moved_mm: 100.0,
+            turned_deg: 0.0,
+            write: true,
+        };
+        write_reposed(&loaded, &r, &state).unwrap();
+        let written = calib::file::load(&path).unwrap();
+        assert_eq!(written.sensors[0].serial, "wmtd000000001");
+        assert_eq!(written.sensors[0].pos, [0.1, 2.0, 1.0]);
+        assert_eq!(written.sensors[0].observations, 4000);
+        assert_eq!(written.sensors.len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

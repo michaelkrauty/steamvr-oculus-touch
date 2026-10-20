@@ -827,7 +827,7 @@ bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_
 
 bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial)
 {
-	if (strcmp(sensor->serial_no, serial) != 0)
+	if (!cv1touch_sensor_serial_equal(sensor->serial_no, serial))
 		return false;
 	/* a sensor that may place itself would do so from its own fusion at once: not for it */
 	if (sensor->pf.cv1touch_allow_placement)

@@ -91,7 +91,23 @@ static void close_device(rift_sensor_device *d) {
   closed++;
   free(d);
 }
+static void serial_case_matches(void) {
+  rift_sensor_ctx sensor = {.sensor_lock = (void *)1};
+  strcpy(sensor.serial_no, "CAMERA1");
+  ohmd_cv1touch_sensor_pose pose = {
+      .serial = "cAmErA1", .orient = {0, 0, 0, 1}, .pos = {1, 2, 3}};
+  CHECK(rift_sensor_set_cv1touch_pose(&sensor, &pose));
+  CHECK(sensor.have_pending_pose && !sensor.pending_clear);
+  CHECK(sensor.pending_pose.pos.x == 1);
+  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera10"));
+  CHECK(rift_sensor_clear_cv1touch_pose(&sensor, "camera1"));
+  CHECK(sensor.pending_clear && !sensor.have_pending_pose);
+  sensor.pf.cv1touch_allow_placement = true;
+  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera1"));
+}
+
 int main(void) {
+  serial_case_matches();
   ohmd_context ctx = {0};
   rift_sensor_device_funcs funcs = {.stop = stop, .free = close_device};
   /* Buffers and outer analyser are freed directly, so subtract their successful

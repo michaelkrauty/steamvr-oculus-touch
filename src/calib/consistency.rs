@@ -75,12 +75,7 @@ pub fn from_capture(c: &Capture, cal: &CalibrationFile) -> Result<Consistency, S
     let poses: Vec<Option<Isometry3<f64>>> = c
         .serials
         .iter()
-        .map(|s| {
-            cal.sensors
-                .iter()
-                .find(|e| &e.serial == s)
-                .map(|e| iso_from_xyzw(e.orient_xyzw, e.pos))
-        })
+        .map(|s| cal.sensor(s).map(|e| iso_from_xyzw(e.orient_xyzw, e.pos)))
         .collect();
     if poses.iter().flatten().count() < 2 {
         return Err("fewer than two of the recorded sensors are in the calibration".into());
@@ -112,6 +107,37 @@ mod tests {
             c.pairs > 100 && c.pos_median_mm < 1e-6 && c.rot_median_deg < 1e-6,
             "{c}"
         );
+    }
+
+    /// A calibration whose serials are spelled in another letter case than the recording's names
+    /// the same sensors, as it does in the engine.
+    #[test]
+    fn a_calibration_in_another_letter_case_is_for_the_same_sensors() {
+        let sc = exact();
+        let capture = Capture {
+            serials: sc.serials.clone(),
+            samples: sc.samples.clone(),
+            ..Default::default()
+        };
+        let mut cal = CalibrationFile::example();
+        cal.sensors = sc
+            .serials
+            .iter()
+            .zip(&sc.world_from_cam)
+            .map(|(serial, w)| {
+                let (orient_xyzw, pos) = crate::calib::iso_to_xyzw(w);
+                crate::calib::file::SensorEntry {
+                    serial: serial.to_ascii_lowercase(),
+                    orient_xyzw,
+                    pos,
+                    rms_px: 0.0,
+                    observations: 1,
+                }
+            })
+            .collect();
+        assert_ne!(cal.sensors[0].serial, sc.serials[0]);
+        let c = from_capture(&capture, &cal).unwrap();
+        assert!(c.pairs > 100, "{c}");
     }
 
     #[test]

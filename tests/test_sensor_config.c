@@ -12,7 +12,35 @@ static void *config_alloc(size_t n) {
 #include "omath.c"
 #include "rift-cv1touch-poses.h"
 #include "test_util.h"
+static void serial_case_matches(void) {
+  cv1touch_sensor_config c = {0};
+  ohmd_cv1touch_config legacy = {0};
+  char ignored[1][32] = {"camera1"};
+  ohmd_cv1touch_sensor_pose poses[2] = {
+      {.serial = "camera2", .orient = {0, 0, 0, 1}, .pos = {1, 2, 3}},
+      {.serial = "CAMERA2", .orient = {0, 0, 0, 1}}};
+  posef found;
+  CHECK(cv1touch_sensor_config_set(&c, ignored, 1, poses, 1) == 0);
+  CHECK(cv1touch_sensor_ignored(&c, &legacy, "CaMeRa1"));
+  CHECK(!cv1touch_sensor_ignored(&c, &legacy, "CAMERA"));
+  CHECK(!cv1touch_sensor_ignored(&c, &legacy, "CAMERA10"));
+  CHECK(cv1touch_fixed_pose_lookup_list(c.poses, c.pose_count, "CaMeRa2", &found));
+  CHECK(found.pos.x == 1 && found.pos.y == 2 && found.pos.z == 3);
+  char duplicates[2][32] = {"camera1", "CAMERA1"};
+  CHECK(cv1touch_sensor_config_set(&c, duplicates, 2, poses, 1) == -1);
+  CHECK(cv1touch_sensor_config_set(&c, ignored, 1, poses, 2) == -1);
+  CHECK(c.ignored_count == 1 && c.pose_count == 1);
+  cv1touch_sensor_config_clear(&c);
+  strcpy(legacy.ignore_sensor_serials[0], "cAmErA1");
+  legacy.fixed_poses[0] = poses[0];
+  CHECK(cv1touch_sensor_ignored(&c, &legacy, "CAMERA1"));
+  CHECK(cv1touch_sensor_ignored(&c, &legacy, "camera1"));
+  CHECK(!cv1touch_sensor_ignored(&c, &legacy, "CAMERA10"));
+  CHECK(cv1touch_fixed_pose_lookup(&legacy, "CAMERA2", &found));
+}
+
 int main(void) {
+  serial_case_matches();
   char names[65][32] = {0};
   ohmd_cv1touch_sensor_pose poses[65] = {0};
   for (int i = 0; i < 65; i++) {

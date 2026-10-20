@@ -6,6 +6,7 @@
 //! the daemon's radio thread raises its priority. Neither side holds a lock during analysis.
 
 use super::{analyse, Landmark, Shift, COLLECTION_RADIUS_PX};
+use crate::status::same_sensor;
 use nalgebra::Vector2;
 use std::collections::BTreeMap;
 use std::io;
@@ -87,9 +88,12 @@ impl BackgroundMonitor {
     ) -> io::Result<Self> {
         let mut per = BTreeMap::<String, Vec<Vector2<f64>>>::new();
         for r in reference {
-            per.entry(r.serial)
-                .or_default()
-                .push(Vector2::new(r.x, r.y));
+            let point = Vector2::new(r.x, r.y);
+            if let Some((_, points)) = per.iter_mut().find(|(s, _)| same_sensor(s, &r.serial)) {
+                points.push(point);
+            } else {
+                per.insert(r.serial, vec![point]);
+            }
         }
         let sensors: Vec<_> = per
             .into_iter()
@@ -184,7 +188,7 @@ impl BackgroundMonitor {
         let Some(s) = self
             .sensors
             .iter_mut()
-            .find(|s| s.enabled && &*s.serial == serial)
+            .find(|s| s.enabled && same_sensor(&s.serial, serial))
         else {
             return;
         };
@@ -298,7 +302,11 @@ impl BackgroundMonitor {
     /// publish into this epoch. The daemon does not call this: after a pose change it only
     /// calls `forget`, and the sensor stays unwatched until the engine reopens.
     pub fn replace(&mut self, serial: &str, reference: Vec<Vector2<f64>>, host_ns: u64) {
-        if let Some(s) = self.sensors.iter_mut().find(|s| &*s.serial == serial) {
+        if let Some(s) = self
+            .sensors
+            .iter_mut()
+            .find(|s| same_sensor(&s.serial, serial))
+        {
             s.generation += 1;
             s.sequence += 1;
             s.reference = reference.into();
@@ -312,7 +320,11 @@ impl BackgroundMonitor {
     }
 
     pub fn forget(&mut self, serial: &str) {
-        if let Some(s) = self.sensors.iter_mut().find(|s| &*s.serial == serial) {
+        if let Some(s) = self
+            .sensors
+            .iter_mut()
+            .find(|s| same_sensor(&s.serial, serial))
+        {
             s.generation += 1;
             s.enabled = false;
             s.samples.clear();
@@ -363,6 +375,32 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    #[test]
+    fn mixed_case_background_aliases_share_one_sensor() {
+        let mut refs = reference();
+        let mut other = refs[0].clone();
+        other.serial = "a".into();
+        other.x = 500.0;
+        refs.push(other);
+        let m = BackgroundMonitor::new(refs, 1000, 20).unwrap();
+        assert_eq!(m.sensors.len(), 1);
+        assert_eq!(m.sensors[0].reference.len(), 2);
+    }
+
+    #[test]
+    fn mixed_case_background_collection_replacement_and_forgetting() {
+        let mut m = BackgroundMonitor::new(reference(), 1000, 20).unwrap();
+        for k in 0..100 {
+            m.frame("a", 1 + k * 10, [Vector2::new(101.5, 300.0)]);
+        }
+        m.tick(1001);
+        assert!((drain(&mut m).unwrap().shift.x - 1.5).abs() < 1e-8);
+        m.replace("a", vec![Vector2::new(200.0, 300.0)], 1001);
+        assert_eq!(&*m.sensors[0].reference, &[Vector2::new(200.0, 300.0)]);
+        m.forget("a");
+        assert!(!m.sensors[0].enabled);
+    }
+
     #[test]
     fn analysis_runs_off_the_collector_thread_and_results_need_no_new_frame() {
         let (tx, rx) = mpsc::sync_channel(1);

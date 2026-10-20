@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "openhmd_cv1touch.h"
+#include "../cv1touch-sensor-config.h"
 #include "../omath.h"
 
 static inline bool cv1touch_fixed_pose_lookup_list(const ohmd_cv1touch_sensor_pose *poses, size_t count, const char *serial, posef *out)
@@ -13,7 +13,7 @@ static inline bool cv1touch_fixed_pose_lookup_list(const ohmd_cv1touch_sensor_po
 	for (size_t i = 0; i < count; i++) {
 		const ohmd_cv1touch_sensor_pose *p = poses + i;
 
-		if (p->serial[0] == '\0' || strncmp(p->serial, serial, sizeof p->serial) != 0)
+		if (p->serial[0] == '\0' || !cv1touch_sensor_serial_equal(p->serial, serial))
 			continue;
 		out->orient.x = p->orient[0];
 		out->orient.y = p->orient[1];

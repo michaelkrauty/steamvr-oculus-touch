@@ -4,7 +4,7 @@
 //! calibration.json: each sensor's world pose (camera -> world, OpenCV camera axes) plus residuals
 //! and provenance. Loaded by cv1touchd at startup and on `calibration load`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use super::iso_to_xyzw;
 use super::solve::Solution;
 use crate::engine::SensorPose;
+use crate::status::{same_sensor, sensor_identity};
 
 pub const FORMAT: &str = "cv1touch-calibration";
 pub const VERSION: u32 = 1;
@@ -94,6 +95,24 @@ impl CalibrationFile {
             .collect()
     }
 
+    /// The entry of the sensor a device calls `serial`, in whichever ASCII letter case either is
+    /// spelled.
+    pub fn sensor(&self, serial: &str) -> Option<&SensorEntry> {
+        self.sensors.iter().find(|s| same_sensor(&s.serial, serial))
+    }
+
+    pub fn sensor_mut(&mut self, serial: &str) -> Option<&mut SensorEntry> {
+        self.sensors
+            .iter_mut()
+            .find(|s| same_sensor(&s.serial, serial))
+    }
+
+    /// Drops the entry of the sensor a device calls `serial`, whatever the letter case of its
+    /// spelling in the file.
+    pub fn remove_sensor(&mut self, serial: &str) {
+        self.sensors.retain(|s| !same_sensor(&s.serial, serial));
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.format != FORMAT || self.version != VERSION {
             return Err(format!("unsupported calibration format {:?} version {} (expected {FORMAT:?} version {VERSION})", self.format, self.version));
@@ -101,7 +120,8 @@ impl CalibrationFile {
         if self.sensors.is_empty() {
             return Err("calibration lists no sensors (expected at least one)".into());
         }
-        let mut seen = HashSet::new();
+        // One sensor per identity: the engine matches serials without regard to ASCII letter case
+        let mut seen: HashMap<String, &str> = HashMap::new();
         for s in &self.sensors {
             if s.serial.is_empty()
                 || s.serial.len() > 31
@@ -109,8 +129,15 @@ impl CalibrationFile {
             {
                 return Err(format!("invalid sensor serial {:?}", s.serial));
             }
-            if !seen.insert(s.serial.as_str()) {
-                return Err(format!("duplicate sensor {}", s.serial));
+            if let Some(first) = seen.insert(sensor_identity(&s.serial), &s.serial) {
+                return Err(if first == s.serial {
+                    format!("duplicate sensor {}", s.serial)
+                } else {
+                    format!(
+                        "duplicate sensor {}: {first} is already listed (serial letter case does not matter)",
+                        s.serial
+                    )
+                });
             }
             let norm = s
                 .orient_xyzw
@@ -177,7 +204,7 @@ pub fn missing_from(previous: &CalibrationFile, serials: &[String]) -> Vec<Strin
         .sensors
         .iter()
         .map(|s| s.serial.clone())
-        .filter(|s| !serials.contains(s))
+        .filter(|s| !serials.iter().any(|t| same_sensor(t, s)))
         .collect()
 }
 
@@ -299,7 +326,11 @@ pub fn world_change(
         &nalgebra::Isometry3<f64>,
     )> = then
         .iter()
-        .filter_map(|(s, a)| now.iter().find(|(t, _)| t == s).map(|(_, b)| (s, a, b)))
+        .filter_map(|(s, a)| {
+            now.iter()
+                .find(|(t, _)| same_sensor(t, s))
+                .map(|(_, b)| (s, a, b))
+        })
         .collect();
     if pairs.len() < 2 {
         return None;
@@ -483,6 +514,28 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_world_change_recovers_the_recorded_transform() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+        let then = vec![
+            ("camera1".into(), Isometry3::translation(-1.0, 0.5, 2.0)),
+            ("camera2".into(), Isometry3::translation(1.0, 1.5, -2.0)),
+        ];
+        let change = Isometry3::from_parts(
+            Translation3::new(0.4, -0.2, 0.1),
+            UnitQuaternion::from_euler_angles(0.1, -0.2, 0.3),
+        );
+        let now: Vec<_> = then
+            .iter()
+            .map(|(s, p): &(String, _)| (s.to_ascii_uppercase(), change * p))
+            .collect();
+        let recovered = world_change(&then, &now).expect("two common sensors");
+        let error = recovered.change.inverse() * change;
+        assert!(error.translation.vector.norm() < 1e-9);
+        assert!(error.rotation.angle() < 1e-9);
+        assert!(recovered.within_tolerance());
+    }
+
+    #[test]
     fn saved_fingerprint_matches_exact_bytes_and_survives_external_replacement() {
         let path = tmp("saved-fingerprint");
         let a = CalibrationFile::example();
@@ -542,6 +595,48 @@ mod tests {
         assert!(f.validate().is_err());
     }
 
+    /// The engine takes `camera1` and `CAMERA1` for one sensor and refuses both: the file is
+    /// refused at load, saying which entries clash, rather than failing every engine start.
+    #[test]
+    fn serials_that_differ_only_in_letter_case_are_duplicates() {
+        let mut f = CalibrationFile::example();
+        f.sensors[0].serial = "Camera1".into();
+        f.sensors[1].serial = "cAMERA1".into();
+        let err = f.validate().unwrap_err();
+        assert!(
+            err.contains("duplicate sensor cAMERA1") && err.contains("Camera1 is already listed"),
+            "{err}"
+        );
+        f.sensors[1].serial = "CAMERA10".into();
+        f.validate().unwrap();
+        let path = tmp("case-duplicates");
+        f.sensors[1].serial = "CAMERA1".into();
+        assert!(save(&path, &f).unwrap_err().contains("duplicate sensor"));
+        std::fs::write(&path, serde_json::to_string(&f).unwrap()).unwrap();
+        assert!(load(&path)
+            .unwrap_err()
+            .contains("duplicate sensor CAMERA1"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// An entry is the sensor a device reports whatever the letter case of either; the file's
+    /// own spelling stays.
+    #[test]
+    fn sensors_are_looked_up_regardless_of_letter_case() {
+        let mut f = CalibrationFile::example();
+        f.sensors[0].serial = "wmtd000000001".into();
+        assert_eq!(f.sensor("WMTD000000001").unwrap().serial, "wmtd000000001");
+        assert!(f.sensor("WMTD00000000").is_none());
+        assert!(f.sensor("WMTD0000000010").is_none());
+        f.sensor_mut("WmTd000000001").unwrap().observations = 7;
+        assert_eq!(f.sensors[0].observations, 7);
+        f.remove_sensor("WMTD000000001");
+        assert_eq!(f.sensors.len(), 1);
+        assert_eq!(f.sensors[0].serial, "WMTD000000002");
+        f.remove_sensor("WMTD000000009");
+        assert_eq!(f.sensors.len(), 1);
+    }
+
     #[test]
     fn missing_or_corrupt_files_name_the_path() {
         let path = tmp("corrupt");
@@ -573,6 +668,11 @@ mod tests {
         assert_eq!(
             missing_from(&prev, &["WMTD000000001".into()]),
             vec!["WMTD000000002".to_string()]
+        );
+        // a device's serial in another letter case is the same sensor
+        assert_eq!(
+            missing_from(&prev, &["wmtd000000001".into(), "Wmtd000000002".into()]),
+            Vec::<String>::new()
         );
     }
     #[test]
