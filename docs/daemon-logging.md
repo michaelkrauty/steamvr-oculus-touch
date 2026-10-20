@@ -13,12 +13,15 @@ The tracking daemon's Rust output originally used `log` in `src/bin/cv1touchd.rs
 | `Daemon::report` battery notices | native update/engine | Battery value changes | May hold the native device lock; no shared Rust guard in the callback |
 | `universe_watch` | universe | Changed/error state; normal connection check once a minute; failed inits back off from 60 s to 15 minutes | No shared Rust guard at the calls |
 | `engine_main`, `engine_session` | engine | Open/reopen/error/retry (1 s wait), worker startup | No shared Rust guard at these calls (bias saving listed separately) |
+| `start_engine_run` | engine | Each reopen, once initialization is done: `engine reopened after N s` | No shared Rust guard at the call |
 | `Reposing::start`, `release`, `tick` | radio | Solver startup, pose changes, timeouts, errors; monitor windows | No shared Rust guard at these calls; the pipeline is exclusively borrowed |
 | `apply_reposed`, `write_reposed`, `thin_own_backups` | engine | A replacement pose is applied/saved | Yes: `RadioLink::reposed` while applying changes, the setup file lock, and `own_backups` while thinning |
 | `engine_loop` | engine | Mode changes, I/O failure, sensor updates | Mode guard during formatting; native device lock in native calls |
 | `BodyFinder::find` | engine | New controller model without cached IMU | No shared Rust guard at its diagnostic |
 | `radio_main` | radio | Start/priority result, read failure, each new body | `RadioLink::bodies` while reporting bodies/biases |
-| `note_gap`, `publish_hand_state` | radio, or engine fallback | Radio begins/ends/expires; position lost/regained; wrong-lock loss | No shared Rust guard at the current call sites; the hand is exclusively borrowed |
+| `publish_hand_state` with `gap_notice` | radio, or engine fallback | A gap begins/ends/expires (named by what began it: radio silence, an engine reopen or a stalled thread); position lost/regained; wrong-lock loss | No: the hand's state lives in the daemon's `Mutex<HandPublisher>`, and its notices are emitted after publishing and releasing that lock |
+| `refresh_radio_hands` | radio | A hand given to the radio thread before its first sample of it: its gap begins once nothing has published it for 100 ms, or expires | No: emitted after the hand's lock is released |
+| `publish_unavailable` | heartbeat every 200 ms; engine at close and failed opens | A gap begins/expires while the engine is closed or opening, or when no worker has published a hand for over 100 ms | No: both hands are published and their locks released before any notice. It reads `hand_workers` without a lock and takes a hand's lock only when no worker has that hand |
 | `HoldStats::note` | radio, or engine fallback | Two summary lines per minute while samples flow | No shared Rust guard at the current calls |
 | `save_dropouts`, `flight_writer::Writer` callback | heartbeat for submission/loss/start errors; one dropout writer for save results | A dropout recording is due or the bounded writer queue drops one | No; recorder/queue guards have been released before the diagnostic |
 | `handle` | control client | Test-input injection notice | Control turn mutex |

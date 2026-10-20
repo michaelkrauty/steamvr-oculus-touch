@@ -89,7 +89,18 @@ impl Default for HandConfig {
 const MOTION_RAD_S: f32 = 0.5;
 const MOTION_WINDOW_NS: u64 = 3_000_000_000;
 
-/// A change in a controller's radio gap (see `HandConfig::ride_through_ns`).
+/// Why a controller published live is held through a gap. A gap keeps the cause it began with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapCause {
+    /// Its samples stopped arriving: a radio gap.
+    Radio,
+    /// The tracking engine is closing or opening and has no sample to give.
+    Reopen,
+    /// The thread publishing it published nothing for longer than the connect timeout.
+    Stall,
+}
+
+/// A change in a controller's gap (see `HandConfig::ride_through_ns`), with what began it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapEvent {
     /// Its samples stopped: no sample since `last_sample_host_ns`. `moving`: it turned within a
@@ -97,14 +108,16 @@ pub enum GapEvent {
     Began {
         last_sample_host_ns: u64,
         moving: bool,
+        cause: GapCause,
     },
     /// Its samples came back after `silent_ns` without, the last before at `last_sample_host_ns`.
     Ended {
         last_sample_host_ns: u64,
         silent_ns: u64,
+        cause: GapCause,
     },
     /// No sample for the whole ride-through: published as in standby from now.
-    Expired { silent_ns: u64 },
+    Expired { silent_ns: u64, cause: GapCause },
 }
 
 /// The inputs a controller last reported while its samples arrived, held through a radio gap.
@@ -129,6 +142,7 @@ pub struct Hand {
     /// Published live since its samples last stopped for good: what a radio gap holds.
     seen_live: bool,
     in_gap: bool,
+    gap_cause: GapCause,
     last_motion_host_ns: u64,
     event: Option<GapEvent>,
 }
@@ -156,6 +170,7 @@ impl Hand {
             held: HeldInputs::default(),
             seen_live: false,
             in_gap: false,
+            gap_cause: GapCause::Radio,
             last_motion_host_ns: 0,
             event: None,
         }
@@ -209,6 +224,49 @@ impl Hand {
     }
 
     pub fn update(&mut self, c: &ffi::ohmd_cv1touch_controller, now_ns: u64) -> ControllerState {
+        if !c.calibrated {
+            // a new engine has no calibrated controller until it reads the controller's setup
+            return self.unavailable(now_ns, GapCause::Reopen);
+        }
+        if c.received_host_ns < self.last_advance_host_ns {
+            if c.received_host_ns == 0 {
+                // a new engine's controller before its first sample
+                return self.unavailable(now_ns, GapCause::Reopen);
+            }
+            // The engine and the radio thread stamp their own reads of the same reports, so the
+            // first samples after a hand passes between them can be stamped before the newest
+            // one published: the controller still reporting. Its inputs count; its times, on the
+            // other reader's clocks, do not, so it does not advance.
+            let reread = ffi::ohmd_cv1touch_controller {
+                device_time_ns: self.last_device_ns,
+                received_host_ns: self.last_advance_host_ns,
+                last_pose_fix_device_ns: 0,
+                ..*c
+            };
+            return self.update_state(&reread, now_ns, None);
+        }
+        self.update_state(c, now_ns, None)
+    }
+
+    /// There is no sample to offer, for `cause` (a gap this starts keeps it). Keep the same gap
+    /// and its deadline, even when the last sample was less than 100 ms ago.
+    pub fn unavailable(&mut self, now_ns: u64, cause: GapCause) -> ControllerState {
+        let c = ffi::ohmd_cv1touch_controller {
+            calibrated: self.last_advance_host_ns != 0,
+            device_time_ns: self.last_device_ns,
+            received_host_ns: self.last_advance_host_ns,
+            ..Default::default()
+        };
+        self.update_state(&c, now_ns, Some(cause))
+    }
+
+    /// `missing`: no sample, and why (see `unavailable`).
+    fn update_state(
+        &mut self,
+        c: &ffi::ohmd_cv1touch_controller,
+        now_ns: u64,
+        missing: Option<GapCause>,
+    ) -> ControllerState {
         let mut out = ControllerState {
             publish_host_ns: now_ns,
             battery_percent: -1,
@@ -219,12 +277,14 @@ impl Hand {
         }
         out.flags |= FLAG_CALIBRATED;
 
-        if c.device_time_ns != self.last_device_ns {
+        if c.device_time_ns != self.last_device_ns || c.received_host_ns > self.last_advance_host_ns
+        {
             if self.in_gap {
                 self.in_gap = false;
                 self.event = Some(GapEvent::Ended {
                     last_sample_host_ns: self.last_advance_host_ns,
                     silent_ns: c.received_host_ns.saturating_sub(self.last_advance_host_ns),
+                    cause: self.gap_cause,
                 });
             }
             self.last_device_ns = c.device_time_ns;
@@ -236,7 +296,9 @@ impl Hand {
             }
         }
         let silent_ns = now_ns.saturating_sub(self.last_advance_host_ns);
-        let connected = self.last_advance_host_ns != 0 && silent_ns < self.cfg.connect_timeout_ns;
+        let connected = missing.is_none()
+            && self.last_advance_host_ns != 0
+            && silent_ns < self.cfg.connect_timeout_ns;
         // a controller whose samples stopped stays as it was for the ride-through: a radio that
         // drops it for a moment, or for the seconds it takes to find it again, takes nothing from
         // the hand holding it. Only one published live since: there is nothing else to hold.
@@ -244,6 +306,7 @@ impl Hand {
         let gap = self.seen_live && !connected && silent_ns < self.cfg.ride_through_ns;
         if gap && !self.in_gap {
             self.in_gap = true;
+            self.gap_cause = missing.unwrap_or(GapCause::Radio);
             self.event = Some(GapEvent::Began {
                 last_sample_host_ns: self.last_advance_host_ns,
                 moving: self.last_motion_host_ns != 0
@@ -251,12 +314,16 @@ impl Hand {
                         .last_advance_host_ns
                         .saturating_sub(self.last_motion_host_ns)
                         <= MOTION_WINDOW_NS,
+                cause: self.gap_cause,
             });
         } else if !gap && !connected {
             self.seen_live = false;
             if self.in_gap {
                 self.in_gap = false;
-                self.event = Some(GapEvent::Expired { silent_ns });
+                self.event = Some(GapEvent::Expired {
+                    silent_ns,
+                    cause: self.gap_cause,
+                });
             }
         }
         if gap {
@@ -288,7 +355,9 @@ impl Hand {
         out.imu_gyro = c.imu_gyro;
         out.pos_stddev = c.pos_stddev;
         out.rot_stddev = c.rot_stddev;
-        self.update_touches(&c.cap);
+        if missing.is_none() {
+            self.update_touches(&c.cap);
+        }
         if connected {
             self.held = HeldInputs {
                 trigger: c.trigger,
@@ -410,6 +479,39 @@ mod tests {
         h.update(c, host)
     }
 
+    /// The engine and the radio thread stamp their own reads of the same reports, so the first
+    /// samples after a hand passes between them can be stamped before the newest one published.
+    /// That is the controller still reporting: live, with no gap.
+    #[test]
+    fn a_sample_stamped_before_the_newest_is_no_gap() {
+        let mut h = Hand::new(HAND_RIGHT, HandConfig::default());
+        let mut c = input();
+        let host = 5_000_000_000;
+        let first = live_sample(&mut h, &mut c, host);
+        // the other reader: its own device clock, and an earlier stamp
+        let mut other = input();
+        other.device_time_ns = 900_000_000;
+        other.received_host_ns = host - 1_000_000;
+        other.buttons = 0x1;
+        let reread = h.update(&other, host + 500_000);
+        assert_eq!(reread.flags, FLAG_CALIBRATED | FLAG_CONNECTED);
+        assert_eq!(h.take_event(), None);
+        assert_eq!(reread.buttons, BTN_A);
+        assert_eq!(
+            (reread.received_host_ns, reread.sample_host_ns),
+            (first.received_host_ns, first.sample_host_ns)
+        );
+        other.device_time_ns += 2_000_000;
+        other.received_host_ns = host + 1_000_000;
+        let next = h.update(&other, host + 1_000_000);
+        assert_eq!(next.flags, FLAG_CALIBRATED | FLAG_CONNECTED);
+        assert_eq!(next.received_host_ns, host + 1_000_000);
+        assert_eq!(h.take_event(), None);
+        // the connect timeout still runs from the newest stamp
+        let late = h.update(&other, host + 101_000_001);
+        assert_eq!(late.flags & FLAG_RADIO_GAP, FLAG_RADIO_GAP);
+    }
+
     /// Through a radio gap the controller stays connected with every input as it last reported
     /// it, whatever the engine keeps or a sleeping controller's beacon says, and without a
     /// position; the gap is reported as it begins and as it ends.
@@ -452,7 +554,8 @@ mod tests {
             h.take_event(),
             Some(GapEvent::Began {
                 last_sample_host_ns: host,
-                moving: true
+                moving: true,
+                cause: GapCause::Radio
             })
         );
         // reported once
@@ -469,8 +572,102 @@ mod tests {
             h.take_event(),
             Some(GapEvent::Ended {
                 last_sample_host_ns: host,
-                silent_ns: 9_500_000_000
+                silent_ns: 9_500_000_000,
+                cause: GapCause::Radio
             })
+        );
+    }
+
+    /// A gap keeps the cause it began with: one begun without a sample to offer says why, and a
+    /// radio gap under way stays one when the engine then has no sample either.
+    #[test]
+    fn a_gap_keeps_the_cause_it_began_with() {
+        let host = 5_000_000_000;
+        for cause in [GapCause::Reopen, GapCause::Stall] {
+            let mut h = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut c = input();
+            c.trigger = 1.0;
+            live_sample(&mut h, &mut c, host);
+            let held = h.unavailable(host + 20_000_000, cause);
+            assert_eq!(held.flags & FLAG_RADIO_GAP, FLAG_RADIO_GAP);
+            assert_eq!(held.trigger, 1.0);
+            assert!(
+                matches!(h.take_event(), Some(GapEvent::Began { cause: began, .. }) if began == cause)
+            );
+            // a radio-late sample during it is the same gap
+            h.update(&c, host + 3_000_000_000);
+            assert_eq!(h.take_event(), None);
+            live_sample(&mut h, &mut c, host + 7_000_000_000);
+            assert_eq!(
+                h.take_event(),
+                Some(GapEvent::Ended {
+                    last_sample_host_ns: host,
+                    silent_ns: 7_000_000_000,
+                    cause
+                })
+            );
+            h.unavailable(host + 7_200_000_000, GapCause::Radio);
+            assert!(matches!(
+                h.take_event(),
+                Some(GapEvent::Began {
+                    cause: GapCause::Radio,
+                    ..
+                })
+            ));
+            h.unavailable(host + 17_000_000_000, cause);
+            assert_eq!(
+                h.take_event(),
+                Some(GapEvent::Expired {
+                    silent_ns: 10_000_000_000,
+                    cause: GapCause::Radio
+                })
+            );
+        }
+        let mut h = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut c = input();
+        live_sample(&mut h, &mut c, host);
+        h.update(&c, host + 200_000_000);
+        assert!(matches!(
+            h.take_event(),
+            Some(GapEvent::Began {
+                cause: GapCause::Radio,
+                ..
+            })
+        ));
+        h.unavailable(host + 300_000_000, GapCause::Reopen);
+        assert_eq!(h.take_event(), None);
+        live_sample(&mut h, &mut c, host + 7_000_000_000);
+        assert!(matches!(
+            h.take_event(),
+            Some(GapEvent::Ended {
+                cause: GapCause::Radio,
+                ..
+            })
+        ));
+    }
+
+    /// A new engine's controller can be calibrated before its first sample: that is no sample,
+    /// and its empty readings leave the held touches alone.
+    #[test]
+    fn a_controller_without_a_sample_yet_keeps_the_gap_as_it_was() {
+        let mut h = Hand::new(HAND_RIGHT, HandConfig::default());
+        let mut c = input();
+        c.cap = [1.0; 5];
+        let host = 5_000_000_000;
+        live_sample(&mut h, &mut c, host);
+        h.unavailable(host + 20_000_000, GapCause::Reopen);
+        assert!(h.take_event().is_some());
+        let empty = input();
+        let held = h.update(&empty, host + 6_000_000_000);
+        assert_eq!(held.flags & FLAG_RADIO_GAP, FLAG_RADIO_GAP);
+        assert_eq!(h.take_event(), None);
+        // in the hysteresis band: the touches stay as they were before the gap
+        c.cap = [0.5; 5];
+        let back = live_sample(&mut h, &mut c, host + 7_000_000_000);
+        assert!(reporting(back.flags));
+        assert_eq!(
+            back.touches,
+            TOUCH_A | TOUCH_B | TOUCH_TRIGGER | TOUCH_STICK | TOUCH_THUMBREST
         );
     }
 
@@ -495,7 +692,8 @@ mod tests {
         assert_eq!(
             h.take_event(),
             Some(GapEvent::Expired {
-                silent_ns: 10_001_000_000
+                silent_ns: 10_001_000_000,
+                cause: GapCause::Radio
             })
         );
         h.update(&c, host + 12_000_000_000);

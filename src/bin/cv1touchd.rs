@@ -18,7 +18,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::flight::{self, FlightRecorder};
 use cv1touch::flight_writer;
 use cv1touch::frame_queue::FrameQueue;
-use cv1touch::hand::{GapEvent, Hand, HandConfig};
+use cv1touch::hand::{GapCause, GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
@@ -254,6 +254,18 @@ struct Daemon {
     /// Input injection for automated tests.
     inject: Injection,
     inputs: Mutex<InputRuntime>,
+    /// Publication outlives every engine and radio thread. The ownership handshake keeps these
+    /// locks uncontended while samples flow. The main thread's heartbeat checks `hand_workers`
+    /// without them and tries a hand's lock only when no worker has that hand (the engine is
+    /// closed or opening, or its worker stalled). Tracker work stays outside these locks;
+    /// shutdown takes them to disconnect immediately.
+    hands: [Mutex<HandPublisher>; 2],
+    /// Per hand: when a worker last published it, or, given it before a sample of its own, last
+    /// looked after it (shm clock; 0: never). Written under the hand's lock.
+    hand_workers: [std::sync::atomic::AtomicU64; 2],
+    engine_offline: AtomicBool,
+    /// First stop in this reopen, before waiting for workers. Retries retain this boundary.
+    engine_stopped_ns: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
@@ -592,13 +604,135 @@ impl EngineSink for Daemon {
     }
 }
 
-fn publish_disconnected(d: &Daemon) {
+/// Hand publication passes to the heartbeat before waiting for the radio or native teardown.
+/// A worker still finishing is rejected under its hand lock; retries keep the same deadline.
+fn engine_unavailable(d: &Daemon, now: u64) {
+    if !d.engine_offline.load(Ordering::Acquire) {
+        d.engine_stopped_ns.store(now, Ordering::Relaxed);
+    }
+    d.engine_offline.store(true, Ordering::Release);
+    clear_engine_snapshot(d);
+    publish_unavailable(d, now);
+}
+
+fn clear_engine_snapshot(d: &Daemon) {
     d.engine_applied.store(0, Ordering::Release);
     d.track_in.lock().unwrap().register([]);
     d.pending_frames_dropped.store(0, Ordering::Relaxed);
-    d.inputs.lock().unwrap().latest = Default::default();
+    publish_sensor_snapshot(d, &[], &[], &[]);
+}
+
+/// A native engine may be open but still blocked in its first update. Only an actual recent
+/// worker write hands this hand over; a missing write lets the heartbeat keep its deadline.
+fn publish_unavailable(d: &Daemon, now: u64) {
+    publish_unavailable_with_log(d, now, log);
+}
+
+/// Whether a worker has hand `h` at `now`: the engine is open and a worker published the hand,
+/// or looked after it, within the connect timeout. Takes no lock.
+fn worker_has(d: &Daemon, h: usize, now: u64) -> bool {
+    let at = d.hand_workers[h].load(Ordering::Acquire);
+    !d.engine_offline.load(Ordering::Acquire)
+        && at != 0
+        && now.saturating_sub(at) < HandConfig::default().connect_timeout_ns
+}
+
+fn publish_unavailable_with_log(d: &Daemon, now: u64, emit: impl FnMut(String)) {
+    publish_unavailable_with_lock(d, now, emit, |h| d.hands[h].try_lock().ok());
+}
+
+fn publish_unavailable_with_lock<'a>(
+    d: &'a Daemon,
+    now: u64,
+    mut emit: impl FnMut(String),
+    mut lock: impl FnMut(usize) -> Option<std::sync::MutexGuard<'a, HandPublisher>>,
+) {
+    let mut notices = [None; 2];
+    let mut published = false;
+    for h in [HAND_LEFT, HAND_RIGHT] {
+        if d.quit.load(Ordering::Acquire) || worker_has(d, h, now) {
+            continue;
+        }
+        // A busy or poisoned lock must not delay the other hand, shutdown or failure checks.
+        // A failed worker is handled by main's next tick; a busy publisher by a later tick.
+        let Some(mut publisher) = lock(h) else {
+            continue;
+        };
+        // checked again under the lock, which a worker publishes under
+        if d.quit.load(Ordering::Acquire) || worker_has(d, h, now) {
+            continue;
+        }
+        let Ok(mut inputs) = d.inputs.try_lock() else {
+            continue;
+        };
+        let cause = unavailable_cause(d, h, &publisher, now);
+        let mut state = publisher.hand.unavailable(now, cause);
+        inputs.apply(h, &mut state);
+        drop(inputs);
+        notices[h] = publisher.publish(d, h, state, now);
+        published = true;
+    }
+    // Release both hands and wake readers before any notice can wait on stderr.
+    if published {
+        d.shm.signal();
+    }
+    for (h, event) in notices.into_iter().enumerate() {
+        if let Some(event) = event {
+            emit(gap_notice(h, event));
+        }
+    }
+}
+
+/// Distinguish silence already observed by a working publisher from a publisher that stalled.
+/// Judge it at teardown's first boundary, even if contention defers the heartbeat until later.
+fn unavailable_cause(d: &Daemon, h: usize, publisher: &HandPublisher, now: u64) -> GapCause {
+    let reopening = d.engine_offline.load(Ordering::Acquire);
+    let stopped = d.engine_stopped_ns.load(Ordering::Acquire);
+    let boundary = if reopening && stopped != 0 {
+        stopped
+    } else {
+        now
+    };
+    let timeout = HandConfig::default().connect_timeout_ns;
+    if let Some(last) = publisher.memory.last_live {
+        if boundary.saturating_sub(last.received_host_ns) >= timeout {
+            let worker = d.hand_workers[h].load(Ordering::Acquire);
+            return if worker != 0 && boundary.saturating_sub(worker) < timeout {
+                GapCause::Radio
+            } else {
+                GapCause::Stall
+            };
+        }
+    }
+    if reopening {
+        GapCause::Reopen
+    } else {
+        GapCause::Stall
+    }
+}
+
+fn shutdown_and_drain<T>(d: &Daemon, drain: impl FnOnce() -> T) -> T {
+    begin_shutdown(d);
+    drain()
+}
+
+fn begin_shutdown(d: &Daemon) {
+    d.quit.store(true, Ordering::Release);
+    publish_disconnected(d);
+}
+
+/// The hands first, before the sensor snapshot's locks. Their state is replaced whole, so a lock
+/// a failed worker poisoned holds nothing this needs.
+fn publish_disconnected(d: &Daemon) {
+    d.inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .latest = Default::default();
     let now = shm::now_ns();
     for h in [HAND_LEFT, HAND_RIGHT] {
+        let mut publisher = d.hands[h].lock().unwrap_or_else(PoisonError::into_inner);
+        *publisher = HandPublisher::new(h);
+        d.hand_workers[h].store(0, Ordering::Release);
         d.shm.publish_hand(
             h,
             &ControllerState {
@@ -608,9 +742,9 @@ fn publish_disconnected(d: &Daemon) {
             },
         );
     }
-    publish_sensor_snapshot(d, &[], &[], &[]);
     d.shm.signal();
     d.shm.heartbeat(now);
+    clear_engine_snapshot(d);
 }
 
 fn publish_sensor_snapshot(
@@ -1327,6 +1461,7 @@ fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
 /// The only thread that touches OpenHMD.
 fn engine_main(d: Arc<Daemon>) {
     let mut last_err = String::new();
+    let mut reopening_since = None;
     while !d.quit.load(Ordering::Acquire) {
         let (opts, revision) = requested_engine_options(&d);
         let e = match Engine::open(&opts, d.clone()) {
@@ -1336,16 +1471,15 @@ fn engine_main(d: Arc<Daemon>) {
                     log!("waiting for headset: {err}");
                     last_err = err;
                 }
-                publish_disconnected(&d);
+                engine_unavailable(&d, shm::now_ns());
                 sleep_interruptible(&d, 1000);
                 continue;
             }
         };
         last_err.clear();
         watch_worker_resources(&d.failed_worker, ENGINE_WORKER, true, e, |e| {
-            engine_session(&d, &opts, revision, e);
+            engine_session(&d, &opts, revision, e, &mut reopening_since);
         });
-        publish_disconnected(&d);
     }
 }
 
@@ -1361,8 +1495,19 @@ fn radio_resources<D, H>(
 }
 
 /// One open engine, including setup and the radio scope, borrows its owner's native resources.
-fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engine) {
-    d.engine_applied.store(revision, Ordering::Release);
+fn engine_session(
+    d: &Daemon,
+    opts: &EngineOptions,
+    revision: u64,
+    e: &mut Engine,
+    reopening_since: &mut Option<std::time::Instant>,
+) {
+    for hand in &d.hands {
+        let mut publisher = hand.lock().unwrap();
+        // The tracker starts over; only publication and the gap outlive it.
+        publisher.memory.wrong_locks = 0;
+        publisher.shaper = VelocityShaper::new(ShapeParams::default());
+    }
     d.session.lock().unwrap().reset(); // sensors may differ after a reopen
     d.sensor_poses.lock().unwrap().clear();
     d.sensor_agreement.lock().unwrap().clear();
@@ -1378,42 +1523,46 @@ fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engin
     // the radio thread holds a decoder pointing into the engine: the scope joins it first
     engine_scope(&d.failed_worker, |scope| {
         let stop = StopRadio { d, link: &link };
-        let radio = new_pipeline(d, opts, e).and_then(|pipe| {
-            let Some(path) = hid::headset_interface(1) else {
-                log("no HID interface for the headset's radio: publishing OpenHMD poses");
-                return None;
-            };
-            // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
-            let (dec, file) = radio_resources(|| unsafe { e.radio_decoder() }, || {
-                match hid::Device::open(&path) {
-                    Ok(f) => Some(f),
-                    Err(err) => {
-                        log!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display());
-                        None
+        let radio = start_engine_run(d, revision, reopening_since, || {
+            new_pipeline(d, opts, e).and_then(|pipe| {
+                let Some(path) = hid::headset_interface(1) else {
+                    log!("no HID interface for the headset's radio: publishing OpenHMD poses");
+                    return None;
+                };
+                // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
+                let (dec, file) = radio_resources(|| unsafe { e.radio_decoder() }, || {
+                    match hid::Device::open(&path) {
+                        Ok(f) => Some(f),
+                        Err(err) => {
+                            log!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display());
+                            None
+                        }
                     }
+                })?;
+                // Opening the HID handle already starts a Windows read: mark a startup panic before
+                // its local handle can wait for cancellation while unwinding.
+                let _startup = WorkerExit { failed: &d.failed_worker, worker: ENGINE_WORKER, panic_only: true };
+                log!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display());
+                let watch = LandmarkWatch::load();
+                let (d, link) = (d, &link);
+                let job = WorkerResources::starting(&d.failed_worker, ENGINE_WORKER, (dec, file, pipe, watch));
+                match thread::Builder::new().name("cv1t-radio".into()).spawn_scoped(scope, move || {
+                    job.run_as(RADIO_WORKER, true, |(dec, file, pipe, watch)| {
+                        radio_main(d, link, dec, file, pipe, watch);
+                    });
+                }) {
+                    Ok(radio) => Some(radio),
+                    Err(err) => panic!("could not start the radio thread: {err}"),
                 }
-            })?;
-            // Opening the HID handle already starts a Windows read: mark a startup panic before
-            // its local handle can wait for cancellation while unwinding.
-            let _startup = WorkerExit { failed: &d.failed_worker, worker: ENGINE_WORKER, panic_only: true };
-            log!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display());
-            let watch = LandmarkWatch::load();
-            let (d, link) = (d, &link);
-            let job = WorkerResources::starting(&d.failed_worker, ENGINE_WORKER, (dec, file, pipe, watch));
-            match thread::Builder::new().name("cv1t-radio".into()).spawn_scoped(scope, move || {
-                job.run_as(RADIO_WORKER, true, |(dec, file, pipe, watch)| {
-                    radio_main(d, link, dec, file, pipe, watch);
-                });
-            }) {
-                Ok(radio) => Some(radio),
-                Err(err) => panic!("could not start the radio thread: {err}"),
-            }
+            })
         });
         engine_loop(d, e, &link, radio.is_some());
         drop(stop);
-        if let Some(Err(_)) = radio.map(|r| r.join()) {
-            log("radio thread panicked");
-        }
+        finish_engine_run(d, reopening_since, || {
+            if let Some(Err(_)) = radio.map(|r| r.join()) {
+                log!("radio thread panicked");
+            }
+        });
     });
     let biases = link.biases.lock().unwrap().take();
     if let Some(f) = biases {
@@ -1429,6 +1578,40 @@ fn engine_scope<'env>(
     thread::scope(|scope| {
         watch_worker(failed, ENGINE_WORKER, true, || run(scope));
     });
+}
+
+/// Native open is not the end of initialization: HID enumeration and files may still block.
+fn start_engine_run<T>(
+    d: &Daemon,
+    revision: u64,
+    reopening_since: &mut Option<std::time::Instant>,
+    initialize: impl FnOnce() -> T,
+) -> T {
+    let initialized = initialize();
+    if d.quit.load(Ordering::Acquire) {
+        return initialized;
+    }
+    if let Some(since) = reopening_since.take() {
+        log!(
+            "engine reopened after {:.2} s",
+            since.elapsed().as_secs_f64()
+        );
+    }
+    d.engine_applied.store(revision, Ordering::Release);
+    d.engine_offline.store(false, Ordering::Release);
+    initialized
+}
+
+/// Stop accepting worker publications before joining the radio, whose pending I/O or file reads
+/// can block. The heartbeat owns both hands throughout that wait and native close/open.
+fn finish_engine_run(
+    d: &Daemon,
+    reopening_since: &mut Option<std::time::Instant>,
+    join_radio: impl FnOnce(),
+) {
+    reopening_since.get_or_insert_with(std::time::Instant::now);
+    engine_unavailable(d, shm::now_ns());
+    join_radio();
 }
 
 /// How long `test-inject on` arms input injection: it disarms itself, so a forgotten test leaves
@@ -2255,15 +2438,6 @@ impl HandOwnership {
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
 /// from OpenHMD. Returns when the engine is to close.
 fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
-    let mut hands = [
-        Hand::new(HAND_LEFT, HandConfig::default()),
-        Hand::new(HAND_RIGHT, HandConfig::default()),
-    ];
-    let mut shapers = [
-        VelocityShaper::new(ShapeParams::default()),
-        VelocityShaper::new(ShapeParams::default()),
-    ];
-    let mut memory: [HandMemory; 2] = Default::default();
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
     let (mut failures, mut next_sensors) = (0u32, 0u64);
@@ -2309,16 +2483,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
                     read_ns: shm::now_ns().saturating_sub(read_from),
                 });
             }
-            publish_hand_state(
-                d,
-                h,
-                &c,
-                now,
-                &mut hands[h],
-                None,
-                &mut shapers[h],
-                &mut memory[h],
-            );
+            publish_hand_state(d, h, &c, shm::now_ns, None);
             published = true;
         }
         if published {
@@ -2445,15 +2610,6 @@ fn radio_main(
     let _exit = RadioExit { d, link };
     let mut biases = BiasMemory::load();
     let mut reposing = Reposing::start();
-    let mut hands = [
-        Hand::new(HAND_LEFT, HandConfig::default()),
-        Hand::new(HAND_RIGHT, HandConfig::default()),
-    ];
-    let mut shapers = [
-        VelocityShaper::new(ShapeParams::default()),
-        VelocityShaper::new(ShapeParams::default()),
-    ];
-    let mut memory: [HandMemory; 2] = Default::default();
     let mut holds = HoldStats::default();
     let mut newest: [Option<engine::Controller>; 2] = [None; 2];
     let mut last_publish = [0u64; 2];
@@ -2506,16 +2662,7 @@ fn radio_main(
                 };
                 let c = radio_sample(&view, s);
                 let now = shm::now_ns();
-                publish_hand_state(
-                    d,
-                    h,
-                    &c,
-                    now,
-                    &mut hands[h],
-                    Some(pipe),
-                    &mut shapers[h],
-                    &mut memory[h],
-                );
+                publish_hand_state(d, h, &c, shm::now_ns, Some(pipe));
                 newest[h] = Some(*s);
                 last_publish[h] = now;
                 arrived[h] = Some(HoldParts {
@@ -2557,34 +2704,13 @@ fn radio_main(
             }
             pipe.frame(&info, &blobs);
         }
-        // a hand whose controller went quiet still gets its state refreshed (it times out)
+        // A handoff can happen after the radio's last report. Persistent publication still
+        // refreshes and expires that hand even before this worker has a sample of its own.
         let now = shm::now_ns();
         if let Some(w) = watch.as_mut() {
             w.poll(d, now);
         }
-        let mut refreshed = false;
-        for h in [HAND_LEFT, HAND_RIGHT] {
-            let (Some(s), Some(view)) = (newest[h], link.engine_view.lock().unwrap()[h]) else {
-                continue;
-            };
-            if link.hands.radio_publishes(h)
-                && now.saturating_sub(last_publish[h]) >= RADIO_REFRESH_NS
-            {
-                publish_hand_state(
-                    d,
-                    h,
-                    &radio_sample(&view, &s),
-                    now,
-                    &mut hands[h],
-                    Some(pipe),
-                    &mut shapers[h],
-                    &mut memory[h],
-                );
-                last_publish[h] = now;
-                refreshed = true;
-            }
-        }
-        if refreshed {
+        if refresh_radio_hands(d, link, &newest, &mut last_publish, pipe, shm::now_ns, log) {
             d.shm.signal();
         }
         for h in [HAND_LEFT, HAND_RIGHT] {
@@ -2622,6 +2748,66 @@ fn radio_main(
     if let Some(f) = biases.take_changed() {
         *link.biases.lock().unwrap() = Some(f);
     }
+}
+
+fn refresh_radio_hands(
+    d: &Daemon,
+    link: &RadioLink,
+    newest: &[Option<engine::Controller>; 2],
+    last_publish: &mut [u64; 2],
+    pipe: &mut Pipeline,
+    clock: impl Fn() -> u64,
+    mut emit: impl FnMut(String),
+) -> bool {
+    let now = clock();
+    let mut refreshed = false;
+    for h in [HAND_LEFT, HAND_RIGHT] {
+        if !link.hands.radio_publishes(h) || now.saturating_sub(last_publish[h]) < RADIO_REFRESH_NS
+        {
+            continue;
+        }
+        let view = link.engine_view.lock().unwrap()[h];
+        if let (Some(s), Some(view)) = (newest[h], view) {
+            publish_hand_state_with_log(
+                d,
+                h,
+                &radio_sample(&view, &s),
+                &clock,
+                Some(&mut *pipe),
+                &mut emit,
+            );
+        } else {
+            let mut publisher = d.hands[h].lock().unwrap();
+            let mut inputs = d.inputs.lock().unwrap();
+            let now = clock();
+            if d.quit.load(Ordering::Acquire) || d.engine_offline.load(Ordering::Acquire) {
+                continue;
+            }
+            // The engine can let go of the hand just before this pass ends, its controller still
+            // reporting. Only once nothing has published the hand for the connect timeout have
+            // its samples stopped, a radio gap like any other. Meanwhile this thread looks after
+            // the hand, which keeps the heartbeat off it, and tries again on its next pass.
+            if now.saturating_sub(publisher.worker_publish_ns)
+                < HandConfig::default().connect_timeout_ns
+            {
+                d.hand_workers[h].store(now, Ordering::Release);
+                continue;
+            }
+            let mut state = publisher.hand.unavailable(now, GapCause::Radio);
+            inputs.apply(h, &mut state);
+            drop(inputs);
+            let notice = publisher.publish_worker(d, h, state, now);
+            drop(publisher);
+            HandNotices {
+                gap: notice,
+                ..Default::default()
+            }
+            .emit(d, h, &mut emit);
+        }
+        last_publish[h] = now;
+        refreshed = true;
+    }
+    refreshed
 }
 
 /// How recent our tracker's last optical fit of a controller must be for OpenHMD's brute-force
@@ -2780,40 +2966,64 @@ fn apply_tracker(
     }
 }
 
-/// Logs a change in a controller's radio gap. The radio's traffic around a gap of at least
-/// `flight::SHORTEST_NS` is recorded (`FlightRecorder`) when it began while the controller was in
-/// use, or when it ended (a controller held still does not turn, but one asleep does not come
-/// back either); a shorter one that ends is a blip, not recorded.
-fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
-    let name = ["left", "right"][h];
-    let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
+/// Record changes in publication order under the hand lock. These operations are atomic and
+/// perform no I/O. A radio gap of at least `flight::SHORTEST_NS` is recorded if it began in use or
+/// ends; a shorter one that ends is a blip and is cancelled. A gap an engine reopen or a stalled
+/// thread began is no radio dropout and is never recorded.
+fn record_gap(d: &Daemon, h: usize, event: GapEvent) {
     match event {
         GapEvent::Began {
             last_sample_host_ns,
             moving: true,
+            cause: GapCause::Radio,
         } => d.flight.dropout(h, last_sample_host_ns, true),
         GapEvent::Ended {
             last_sample_host_ns,
             silent_ns,
+            cause: GapCause::Radio,
         } if silent_ns >= flight::SHORTEST_NS => d.flight.dropout(h, last_sample_host_ns, false),
         GapEvent::Ended {
             last_sample_host_ns,
+            cause: GapCause::Radio,
             ..
         } => d.flight.cancel(h, last_sample_host_ns),
         _ => {}
     }
+}
+
+/// Format a notice after publication, outside the hand lock. It names what began the gap.
+fn gap_notice(h: usize, event: GapEvent) -> String {
+    let name = ["left", "right"][h];
+    let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
     match event {
-        GapEvent::Began { moving, .. } => log!(
-            "{name}: radio silent ({}): holding it as it was, inputs included, for up to {ride_s:.0} s",
-            if moving { "in use" } else { "still" }
+        GapEvent::Began { moving, cause, .. } => format!(
+            "{name}: {}: holding it as it was, inputs included, for up to {ride_s:.0} s",
+            match cause {
+                GapCause::Radio if moving => "radio silent (in use)",
+                GapCause::Radio => "radio silent (still)",
+                GapCause::Reopen => "tracking engine reopening",
+                GapCause::Stall => "tracking thread stalled",
+            }
         ),
-        GapEvent::Ended { silent_ns, .. } => {
-            log!("{name}: radio back after {:.2} s", silent_ns as f64 * 1e-9)
+        GapEvent::Ended {
+            silent_ns, cause, ..
+        } => {
+            let s = silent_ns as f64 * 1e-9;
+            match cause {
+                GapCause::Radio => format!("{name}: radio back after {s:.2} s"),
+                GapCause::Reopen => format!("{name}: back after {s:.2} s (engine reopened)"),
+                GapCause::Stall => format!("{name}: back after {s:.2} s (tracking thread stalled)"),
+            }
         }
-        GapEvent::Expired { silent_ns } => log!(
-            "{name}: radio silent for {:.0} s: standby, inputs released",
-            silent_ns as f64 * 1e-9
-        ),
+        GapEvent::Expired { silent_ns, cause } => {
+            let s = silent_ns as f64 * 1e-9;
+            let why = match cause {
+                GapCause::Radio => format!("radio silent for {s:.0} s"),
+                GapCause::Reopen => format!("no sample for {s:.0} s through the engine reopen"),
+                GapCause::Stall => format!("tracking thread stalled for {s:.0} s"),
+            };
+            format!("{name}: {why}: standby, inputs released")
+        }
     }
 }
 
@@ -2884,39 +3094,105 @@ fn radio_sample(view: &engine::Controller, s: &engine::Controller) -> engine::Co
 
 /// Publishes one hand's state from `c`: the engine's controller, or the radio thread's sample over
 /// the engine's view of it (`radio_sample`), with the tracker's pose when it has the hand's body.
-#[allow(clippy::too_many_arguments)]
 fn publish_hand_state(
     d: &Daemon,
     h: usize,
     c: &engine::Controller,
-    now: u64,
-    hand: &mut Hand,
+    clock: impl FnOnce() -> u64,
     pipe: Option<&mut Pipeline>,
-    shaper: &mut VelocityShaper,
-    memory: &mut HandMemory,
 ) {
-    let mut state = hand.update(c, now);
+    publish_hand_state_with_log(d, h, c, clock, pipe, log);
+}
+
+fn publish_hand_state_with_log(
+    d: &Daemon,
+    h: usize,
+    c: &engine::Controller,
+    clock: impl FnOnce() -> u64,
+    pipe: Option<&mut Pipeline>,
+    emit: impl FnMut(String),
+) {
+    publish_hand_state_with_tracking(
+        d,
+        h,
+        c,
+        clock,
+        || {
+            pipe.filter(|p| p.has_body(h)).map(|p| {
+                let v = |a: [f32; 3]| nalgebra::Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+                p.imu(
+                    h,
+                    c.device_time_ns,
+                    c.received_host_ns,
+                    v(c.imu_gyro),
+                    v(c.imu_accel),
+                );
+                (p.stats(h).wrong_locks, p.latest(h))
+            })
+        },
+        emit,
+    );
+}
+
+fn publish_hand_state_with_tracking(
+    d: &Daemon,
+    h: usize,
+    c: &engine::Controller,
+    clock: impl FnOnce() -> u64,
+    track: impl FnOnce() -> Option<(u64, Option<Stamped>)>,
+    emit: impl FnMut(String),
+) {
+    // IMU processing can fit queued camera frames; no publication lock may span that work.
+    let tracked = track();
+    let mut notices = HandNotices::default();
+    let mut publisher = d.hands[h].lock().unwrap();
+    let mut inputs = d.inputs.lock().unwrap();
+    // Neither tracking nor waiting for a publisher/calibration lock counts as fresh radio data.
+    let now = clock();
+    if d.quit.load(Ordering::Acquire) || d.engine_offline.load(Ordering::Acquire) {
+        return;
+    }
+    let timeout = HandConfig::default().connect_timeout_ns;
+    let stale = c.received_host_ns != 0 && now.saturating_sub(c.received_host_ns) >= timeout;
+    if stale
+        && publisher
+            .memory
+            .last_live
+            .is_some_and(|last| now.saturating_sub(last.received_host_ns) < timeout)
+    {
+        // Another publisher already has newer live data. The delayed result cannot replace it.
+        return;
+    }
+    let delayed = stale
+        && publisher.memory.last_live.is_none_or(|last| {
+            c.received_host_ns > last.received_host_ns
+                || (c.received_host_ns == last.received_host_ns
+                    && c.device_time_ns != last.device_time_ns)
+        });
+    let missing = delayed.then(|| unavailable_cause(d, h, &publisher, now));
+    let HandPublisher {
+        hand,
+        shaper,
+        memory,
+        ..
+    } = &mut *publisher;
+    let mut state = if let Some(cause) = missing {
+        // Keep the last live sample's deadline and the gap the heartbeat already began.
+        hand.unavailable(now, cause)
+    } else {
+        hand.update(c, now)
+    };
     if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
         state.battery_percent = d.battery[h].load(Ordering::Relaxed);
     }
-    if let Some(p) = pipe.filter(|p| p.has_body(h)) {
-        let v = |a: [f32; 3]| nalgebra::Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
-        p.imu(
-            h,
-            c.device_time_ns,
-            c.received_host_ns,
-            v(c.imu_gyro),
-            v(c.imu_accel),
-        );
-        let wl = p.stats(h).wrong_locks;
+    if let Some((wl, latest)) = tracked.filter(|_| !stale) {
         if wl != memory.wrong_locks {
             memory.wrong_locks = wl;
-            log!(
+            notices.messages.push(format!(
                 "{}: dropped a wrong lock (accelerometer bias ran off)",
                 ["left", "right"][h]
-            );
+            ));
         }
-        let latest = p.latest(h);
         apply_tracker(&mut state, latest.as_ref(), memory, |state, s| {
             apply_tracked(
                 state,
@@ -2929,32 +3205,102 @@ fn publish_hand_state(
         let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
         let tracking = latest.is_some_and(|s| s.output.tracking);
         if let Some(change) = memory.observe(connected, tracking, now) {
-            log!("{}: {change}", ["left", "right"][h]);
+            notices
+                .messages
+                .push(format!("{}: {change}", ["left", "right"][h]));
         }
     }
-    d.inputs.lock().unwrap().apply(h, &mut state);
+    inputs.apply(h, &mut state);
+    drop(inputs);
     d.inject.apply(h, now, &mut state);
-    if state.flags & ffi::CV1T_FLAG_RADIO_GAP != 0 {
-        if let Some(last) = &memory.last_live {
-            state = held_through_gap(last, now);
+    notices.gap = publisher.publish_worker(d, h, state, now);
+    drop(publisher);
+    notices.emit(d, h, emit);
+}
+
+#[derive(Default)]
+struct HandNotices {
+    messages: Vec<String>,
+    gap: Option<GapEvent>,
+}
+
+impl HandNotices {
+    fn emit(self, d: &Daemon, h: usize, mut emit: impl FnMut(String)) {
+        let gap = self.gap.map(|event| gap_notice(h, event));
+        if gap.is_some() || !self.messages.is_empty() {
+            d.shm.signal();
         }
-    } else {
-        memory.last_live = (state.flags & ffi::CV1T_FLAG_CONNECTED != 0).then_some(state);
+        for message in self.messages {
+            emit(message);
+        }
+        if let Some(message) = gap {
+            emit(message);
+        }
     }
-    if let Some(event) = hand.take_event() {
-        note_gap(d, h, event);
+}
+
+/// The hand's gap, its last live pose and calibrated inputs survive engine and publisher changes.
+struct HandPublisher {
+    worker_publish_ns: u64,
+    hand: Hand,
+    memory: HandMemory,
+    shaper: VelocityShaper,
+}
+
+impl HandPublisher {
+    fn new(h: usize) -> Self {
+        Self {
+            worker_publish_ns: 0,
+            hand: Hand::new(h, HandConfig::default()),
+            memory: HandMemory::default(),
+            shaper: VelocityShaper::new(ShapeParams::default()),
+        }
     }
-    d.shm.publish_hand(h, &state);
-    if d.rec.active() {
-        d.rec.write(
-            recorder::CONTROLLER_STATE,
-            now,
-            &[
-                &(h as u32).to_le_bytes(),
-                &[0u8; 4],
-                recorder::as_bytes(&state),
-            ],
-        );
+
+    fn publish_worker(
+        &mut self,
+        d: &Daemon,
+        h: usize,
+        state: ControllerState,
+        now: u64,
+    ) -> Option<GapEvent> {
+        let notice = self.publish(d, h, state, now);
+        self.worker_publish_ns = now;
+        d.hand_workers[h].store(now, Ordering::Release);
+        notice
+    }
+
+    fn publish(
+        &mut self,
+        d: &Daemon,
+        h: usize,
+        mut state: ControllerState,
+        now: u64,
+    ) -> Option<GapEvent> {
+        if state.flags & ffi::CV1T_FLAG_RADIO_GAP != 0 {
+            if let Some(last) = &self.memory.last_live {
+                state = held_through_gap(last, now);
+            }
+        } else {
+            self.memory.last_live = (state.flags & ffi::CV1T_FLAG_CONNECTED != 0).then_some(state);
+        }
+        let notice = self.hand.take_event();
+        d.shm.publish_hand(h, &state);
+        if let Some(event) = notice {
+            record_gap(d, h, event);
+        }
+        if d.rec.active() {
+            d.rec.write(
+                recorder::CONTROLLER_STATE,
+                now,
+                &[
+                    &(h as u32).to_le_bytes(),
+                    &[0u8; 4],
+                    recorder::as_bytes(&state),
+                ],
+            );
+        }
+        notice
     }
 }
 
@@ -4318,6 +4664,16 @@ fn main() {
         radio_on: AtomicBool::new(false),
         inject: Injection::default(),
         inputs: Mutex::new(inputs),
+        hands: [
+            Mutex::new(HandPublisher::new(HAND_LEFT)),
+            Mutex::new(HandPublisher::new(HAND_RIGHT)),
+        ],
+        hand_workers: [
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ],
+        engine_offline: AtomicBool::new(true),
+        engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
     });
     let endpoints = ControlEndpoints {
         runtime: sock_path.clone(),
@@ -4364,26 +4720,26 @@ fn main() {
     };
     log_running(&d, &shm_name, &sock_path, daemon_log::line);
 
-    loop {
+    let shutdown_reason = loop {
         exit_on_worker_failure(&d.failed_worker, &d.shm);
-        // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
-        // engine thread for seconds, which must not read as a dead daemon; stale poses are the
-        // driver's own concern (sample age)
+        // Opening the engine can block for seconds. Keep liveness and each held hand's
+        // absolute deadline independent of the engine and radio workers.
         d.shm.heartbeat(shm::now_ns());
+        publish_unavailable(&d, shm::now_ns());
         save_dropouts(&d, dropout_writer.as_ref());
         if let Some(why) = shutdown.wait(Duration::from_millis(200)) {
-            log!("{why}: shutting down");
-            break;
+            break format!("{why}: shutting down");
         }
         if d.stop_requested.load(Ordering::Acquire) {
-            log!("asked to stop: shutting down");
-            break;
+            break "asked to stop: shutting down".to_string();
         }
-    }
+    };
 
-    // nothing a client asks for runs while the daemon stops
-    let _no_more_requests = control.stop();
-    d.quit.store(true, Ordering::Release);
+    // Disconnect before logging or waiting for a control request that may be blocked on I/O.
+    let _no_more_requests = shutdown_and_drain(&d, || {
+        log!("{shutdown_reason}");
+        control.stop()
+    });
     let _ = engine_thread.join();
     let _ = universe_thread.join();
     finish_recording_shutdown(&d.rec);
@@ -5450,20 +5806,22 @@ mod tests {
         let d = status_daemon();
         let last = 1_000_000_000;
         for (hand, moving) in [(0, true), (1, false)] {
-            note_gap(
+            record_gap(
                 &d,
                 hand,
                 GapEvent::Began {
                     last_sample_host_ns: last,
                     moving,
+                    cause: GapCause::Radio,
                 },
             );
-            note_gap(
+            record_gap(
                 &d,
                 hand,
                 GapEvent::Ended {
                     last_sample_host_ns: last,
                     silent_ns: flight::SHORTEST_NS,
+                    cause: GapCause::Radio,
                 },
             );
         }
@@ -5561,6 +5919,16 @@ mod tests {
             radio_on: AtomicBool::new(false),
             inject: Injection::default(),
             inputs: Mutex::new(Default::default()),
+            hands: [
+                Mutex::new(HandPublisher::new(HAND_LEFT)),
+                Mutex::new(HandPublisher::new(HAND_RIGHT)),
+            ],
+            hand_workers: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
+            engine_offline: AtomicBool::new(false),
+            engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -6053,7 +6421,7 @@ mod tests {
             })
             .collect();
         pipe.body(calib::DEVICE_LEFT, leds, nalgebra::Vector3::zeros());
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
+
         let now = shm::now_ns();
         let c = engine::Controller {
             calibrated: true,
@@ -6065,21 +6433,9 @@ mod tests {
             view_ang_vel: [0.0, 2.0, 0.0],
             ..Default::default()
         };
-        let mut memory = HandMemory {
-            last_seen: Some([0.1, 1.0, -0.2]),
-            ..HandMemory::default()
-        };
-        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
-        publish_hand_state(
-            &d,
-            HAND_LEFT,
-            &c,
-            now,
-            &mut hand,
-            Some(&mut pipe),
-            &mut shaper,
-            &mut memory,
-        );
+        d.hands[HAND_LEFT].lock().unwrap().memory.last_seen = Some([0.1, 1.0, -0.2]);
+
+        publish_hand_state(&d, HAND_LEFT, &c, || now, Some(&mut pipe));
         let st = d.shm.hand(HAND_LEFT).unwrap();
         assert_ne!(st.flags & ffi::CV1T_FLAG_CONNECTED, 0);
         assert_eq!(st.flags & ffi::CV1T_FLAG_POSITION, 0);
@@ -6090,17 +6446,7 @@ mod tests {
             "no turn for SteamVR to extrapolate"
         );
 
-        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
-        publish_hand_state(
-            &d,
-            HAND_LEFT,
-            &c,
-            now,
-            &mut hand,
-            None,
-            &mut shaper,
-            &mut memory,
-        );
+        publish_hand_state(&d, HAND_LEFT, &c, || now, None);
         assert_eq!(d.shm.hand(HAND_LEFT).unwrap().pos, c.view_pos);
     }
 
@@ -6111,9 +6457,7 @@ mod tests {
     fn a_dropout_in_use_is_recorded() {
         for (gyro, recorded) in [([0.0, 1.0, 0.0], true), ([0.0, 0.01, 0.0], false)] {
             let d = status_daemon();
-            let mut shaper = VelocityShaper::new(ShapeParams::default());
-            let mut memory = HandMemory::default();
-            let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+
             let now = shm::now_ns();
             let c = engine::Controller {
                 calibrated: true,
@@ -6125,16 +6469,7 @@ mod tests {
             // a radio report the engine read (no radio thread)
             d.report(1, now, &[0x0c; 64]);
             for at in [now, now + 200_000_000] {
-                publish_hand_state(
-                    &d,
-                    HAND_RIGHT,
-                    &c,
-                    at,
-                    &mut hand,
-                    None,
-                    &mut shaper,
-                    &mut memory,
-                );
+                publish_hand_state(&d, HAND_RIGHT, &c, || at, None);
             }
             assert_eq!(handle(&d, "haptic right 0.5 320 1"), "ok");
             let due = d.flight.due(now + flight::AFTER_NS);
@@ -6156,9 +6491,7 @@ mod tests {
     #[test]
     fn a_gap_that_ends_is_recorded() {
         let d = status_daemon();
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
-        let mut memory = HandMemory::default();
-        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+
         let now = shm::now_ns();
         let mut c = engine::Controller {
             calibrated: true,
@@ -6166,18 +6499,8 @@ mod tests {
             received_host_ns: now,
             ..Default::default()
         };
-        let mut publish = |c: &engine::Controller, at: u64| {
-            publish_hand_state(
-                &d,
-                HAND_LEFT,
-                c,
-                at,
-                &mut hand,
-                None,
-                &mut shaper,
-                &mut memory,
-            )
-        };
+        let publish =
+            |c: &engine::Controller, at: u64| publish_hand_state(&d, HAND_LEFT, c, || at, None);
         publish(&c, now);
         publish(&c, now + 300_000_000);
         assert!(d.flight.due(now + flight::AFTER_NS).is_empty(), "still");
@@ -6193,9 +6516,7 @@ mod tests {
     #[test]
     fn a_blip_is_not_recorded() {
         let d = status_daemon();
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
-        let mut memory = HandMemory::default();
-        let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+
         let now = shm::now_ns();
         let mut c = engine::Controller {
             calibrated: true,
@@ -6204,18 +6525,8 @@ mod tests {
             imu_gyro: [2.0, 0.0, 0.0],
             ..Default::default()
         };
-        let mut publish = |c: &engine::Controller, at: u64| {
-            publish_hand_state(
-                &d,
-                HAND_RIGHT,
-                c,
-                at,
-                &mut hand,
-                None,
-                &mut shaper,
-                &mut memory,
-            )
-        };
+        let publish =
+            |c: &engine::Controller, at: u64| publish_hand_state(&d, HAND_RIGHT, c, || at, None);
         publish(&c, now);
         publish(&c, now + 150_000_000);
         c.device_time_ns += 2_000_000;
@@ -6224,15 +6535,1491 @@ mod tests {
         assert!(d.flight.due(now + flight::AFTER_NS).is_empty());
     }
 
+    fn reopen_sample(d: &Daemon, c: &engine::Controller, now: u64) {
+        d.engine_offline.store(false, Ordering::Release);
+
+        publish_hand_state(d, HAND_RIGHT, c, || now, None);
+    }
+
+    fn reopen_controller(now: u64) -> engine::Controller {
+        engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: now,
+            last_pose_fix_device_ns: 1_000_000,
+            view_pos: [0.3, 1.1, -0.5],
+            view_orient: [0.0, 0.6, 0.0, 0.8],
+            trigger: 0.8,
+            grip: 1.0,
+            stick: [0.2, -0.4],
+            buttons: 0x1,
+            cap: [1.0; 5],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_blocked_gap_start_log_cannot_stop_heartbeat_deadlines_or_shutdown() {
+        // The global production logger installs once per process. Each scenario needs its own
+        // subprocess, isolated from the suite's parallel tests.
+        const MARKER: &str = "CV1TOUCH_TEST_BLOCKED_GAP_START";
+        let Some(scenario) = std::env::var_os(MARKER) else {
+            for scenario in ["early-shutdown", "expiry"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::a_blocked_gap_start_log_cannot_stop_heartbeat_deadlines_or_shutdown", "--nocapture"])
+                    .env(MARKER, scenario)
+                    .output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // a renamed or moved test would run nothing and pass
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{scenario}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let stop_early = scenario == "early-shutdown";
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let left = reopen_controller(now);
+        publish_hand_state(&d, HAND_LEFT, &left, || now, None);
+        let right = reopen_controller(now + 3_000_000_000);
+        reopen_sample(&d, &right, right.received_host_ns);
+        d.engine_offline.store(true, Ordering::Release);
+        let (entered, logging) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::channel();
+        struct BlockedSink {
+            entered: Option<std::sync::mpsc::SyncSender<()>>,
+            resumed: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Write for BlockedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).map_err(io::Error::other)?;
+                    self.resumed
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(io::Error::other)?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let previous_hook = std::panic::take_hook();
+        let guard = daemon_log::init_with_writer(BlockedSink {
+            entered: Some(entered),
+            resumed,
+        })
+        .unwrap();
+        let (advance, advancing) = std::sync::mpsc::channel::<Option<u64>>();
+        let (published, publications) = std::sync::mpsc::channel();
+        let snapshots = thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                let reader = shm::ShmReader::open(d.shm.name()).unwrap();
+                while let Ok(step) = advancing.recv() {
+                    if let Some(at) = step {
+                        d.shm.heartbeat(at);
+                        // Exercise the real production log(), bounded ring and writer thread.
+                        publish_unavailable(d, at);
+                    } else {
+                        shutdown_and_drain(d, || {});
+                    }
+                    published
+                        .send((
+                            step,
+                            [HAND_LEFT, HAND_RIGHT].map(|h| reader.hand(h).unwrap()),
+                            reader.heartbeat_ns(),
+                            reader.update_counter(),
+                        ))
+                        .unwrap();
+                    if step.is_none() {
+                        break;
+                    }
+                }
+            });
+            let _ = advance.send(Some(now + 4_000_000_000));
+            let entered = logging.recv_timeout(Duration::from_secs(5));
+            // No fixture log precedes this: the blocked write is the first gap-START notice.
+            let ticks: &[u64] = if stop_early { &[10, 12] } else { &[10, 12, 13] };
+            for seconds in ticks {
+                let _ = advance.send(Some(now + seconds * 1_000_000_000));
+            }
+            let _ = advance.send(None);
+            let mut snapshots = Vec::new();
+            for _ in 0..if stop_early { 4 } else { 5 } {
+                match publications.recv_timeout(Duration::from_secs(1)) {
+                    Ok(snapshot) => snapshots.push(snapshot),
+                    Err(_) => break,
+                }
+            }
+            // Release before asserting or joining, including with synchronous logging.
+            let _ = resume.send(());
+            worker.join().unwrap();
+            assert!(
+                entered.is_ok(),
+                "the gap-START notice never reached the sink"
+            );
+            snapshots
+        });
+        drop(guard);
+        // Restore the harness panic output after the production logger has shut down.
+        std::panic::set_hook(previous_hook);
+        assert_eq!(
+            snapshots.len(),
+            if stop_early { 4 } else { 5 },
+            "logging stopped heartbeat publication or shutdown"
+        );
+        for (at, hands, heartbeat, _) in &snapshots[..snapshots.len() - 1] {
+            assert_eq!(Some(*heartbeat), *at);
+            assert!(hands.iter().all(|hand| Some(hand.publish_host_ns) == *at));
+        }
+        for pair in snapshots.windows(2) {
+            assert_ne!(
+                pair[1].3.wrapping_sub(pair[0].3),
+                0,
+                "readers were not woken"
+            );
+        }
+        let connected = |s: &ControllerState| s.flags & ffi::CV1T_FLAG_CONNECTED != 0;
+        assert!(snapshots[0].1.iter().all(connected));
+        assert!(snapshots[0]
+            .1
+            .iter()
+            .all(|hand| hand.flags & ffi::CV1T_FLAG_RADIO_GAP != 0));
+        let held = snapshots[0].1[HAND_RIGHT];
+        for index in [1, 2] {
+            let hands = &snapshots[index].1;
+            assert!(!connected(&hands[HAND_LEFT]));
+            assert_eq!(
+                (hands[HAND_LEFT].buttons, hands[HAND_LEFT].trigger),
+                (0, 0.0)
+            );
+            assert!(connected(&hands[HAND_RIGHT]));
+            assert_ne!(hands[HAND_RIGHT].flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+            assert_eq!(
+                (
+                    hands[HAND_RIGHT].buttons,
+                    hands[HAND_RIGHT].touches,
+                    hands[HAND_RIGHT].trigger,
+                    hands[HAND_RIGHT].grip,
+                    hands[HAND_RIGHT].stick
+                ),
+                (
+                    held.buttons,
+                    held.touches,
+                    held.trigger,
+                    held.grip,
+                    held.stick
+                )
+            );
+        }
+        for (_, hands, _, _) in &snapshots[3..] {
+            for hand in hands {
+                assert!(!connected(hand));
+                assert_eq!(
+                    (
+                        hand.buttons,
+                        hand.touches,
+                        hand.trigger,
+                        hand.grip,
+                        hand.stick
+                    ),
+                    (0, 0, 0.0, 0.0, [0.0; 2])
+                );
+            }
+        }
+        assert!(d.quit.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn heartbeat_keeps_the_deadline_through_a_blocked_first_native_update() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        engine_unavailable(&d, now + 1);
+        let (entered, updating) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let (held, expired) = thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                start_engine_run(d, 1, &mut None, || {});
+                // The engine is open and initialization returned. Its first native update now
+                // waits on a lazy calibration read, before any hand state has been published.
+                entered.send(()).unwrap();
+                resumed.recv().unwrap();
+                let c = reopen_controller(now + 11_000_000_000);
+                publish_hand_state(d, HAND_RIGHT, &c, || c.received_host_ns, None);
+            });
+            updating.recv().unwrap();
+            publish_unavailable(d, now + 7_000_000_000);
+            let held = d.shm.hand(HAND_RIGHT).unwrap();
+            publish_unavailable(d, now + 10_000_000_000);
+            let expired = d.shm.hand(HAND_RIGHT).unwrap();
+            resume.send(()).unwrap();
+            worker.join().unwrap();
+            (held, expired)
+        });
+        assert_eq!(held.publish_host_ns, now + 7_000_000_000);
+        assert_ne!(held.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        assert_eq!(
+            expired.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            0
+        );
+        assert_eq!(
+            (expired.buttons, expired.trigger, expired.grip),
+            (0, 0.0, 0.0)
+        );
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_ne!(live.flags & ffi::CV1T_FLAG_CONNECTED, 0);
+        assert_eq!(live.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        publish_unavailable(&d, now + 11_020_000_000);
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().publish_host_ns,
+            live.publish_host_ns,
+            "an actual recent worker publication hands the heartbeat over"
+        );
+        // A later lazy retry or file stall also cannot strand the hand after that first write.
+        publish_unavailable(&d, now + 21_000_000_000);
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+    }
+
+    fn while_hand_log_is_blocked(
+        d: &Daemon,
+        publish: impl FnOnce(&mut dyn FnMut(String)) + Send,
+    ) -> ([ControllerState; 2], bool, String) {
+        let (entered, logging) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let mut first = true;
+                publish(&mut |notice| {
+                    if first {
+                        entered.send(notice).unwrap();
+                        resumed.recv().unwrap();
+                        first = false;
+                    }
+                });
+            });
+            let notice = logging.recv().unwrap();
+            let states = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap());
+            let unlocked = d.hands.iter().all(|hand| hand.try_lock().is_ok());
+            if unlocked {
+                // A real shutdown can finish its publication while the log sink still waits.
+                begin_shutdown(d);
+            }
+            resume.send(()).unwrap();
+            worker.join().unwrap();
+            (states, unlocked, notice)
+        })
+    }
+
+    #[test]
+    fn both_hands_are_released_before_a_blocked_heartbeat_expiry_log() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = reopen_controller(now);
+        publish_hand_state(&d, HAND_LEFT, &c, || now, None);
+        reopen_sample(&d, &c, now);
+        engine_unavailable(&d, now + 1);
+        let (states, unlocked, notice) = while_hand_log_is_blocked(&d, |emit| {
+            publish_unavailable_with_log(&d, now + 10_000_000_000, emit);
+        });
+        assert!(unlocked, "a log sink must not own either hand lock");
+        assert!(notice.contains("standby, inputs released"));
+        for state in states {
+            assert_eq!(
+                state.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+                0
+            );
+            assert_eq!(
+                (state.buttons, state.touches, state.trigger, state.grip),
+                (0, 0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_expiry_log_does_not_hold_the_hand_lock() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = reopen_controller(now);
+        reopen_sample(&d, &c, now);
+        publish_hand_state_with_log(&d, HAND_RIGHT, &c, || now + 200_000_000, None, |_| {});
+        let (states, unlocked, notice) = while_hand_log_is_blocked(&d, |emit| {
+            publish_hand_state_with_log(&d, HAND_RIGHT, &c, || now + 10_000_000_000, None, emit);
+        });
+        assert!(
+            unlocked,
+            "the worker must release its hand before emitting notices"
+        );
+        assert!(notice.contains("standby, inputs released"));
+        let state = states[HAND_RIGHT];
+        assert_eq!(
+            state.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            0
+        );
+        assert_eq!(
+            (state.buttons, state.touches, state.trigger, state.grip),
+            (0, 0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn heartbeat_ownership_covers_blocked_initialization_after_native_open() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        engine_unavailable(&d, now + 1);
+        let (entered, initializing) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let (held, expired, applied) = thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                let mut timer = Some(std::time::Instant::now());
+                start_engine_run(d, 1, &mut timer, || {
+                    entered.send(()).unwrap();
+                    resumed.recv().unwrap();
+                });
+            });
+            initializing.recv().unwrap();
+            publish_unavailable(d, now + 7_000_000_000);
+            let held = d.shm.hand(HAND_RIGHT).unwrap();
+            publish_unavailable(d, now + 10_000_000_000);
+            let expired = d.shm.hand(HAND_RIGHT).unwrap();
+            let applied = d.engine_applied.load(Ordering::Acquire);
+            resume.send(()).unwrap();
+            worker.join().unwrap();
+            (held, expired, applied)
+        });
+        assert_eq!(held.publish_host_ns, now + 7_000_000_000);
+        assert_ne!(held.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        assert_eq!(
+            expired.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            0
+        );
+        assert_eq!(
+            (expired.buttons, expired.trigger, expired.grip),
+            (0, 0.0, 0.0)
+        );
+        assert_eq!(
+            applied, 0,
+            "initialization has not handed off publication yet"
+        );
+        assert_eq!(d.engine_applied.load(Ordering::Acquire), 1);
+        assert!(!d.engine_offline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_ownership_precedes_a_blocked_control_request() {
+        // The signal path must disconnect immediately both during ordinary publication and
+        // while the heartbeat holds a hand through a reopen.
+        for reopening in [false, true] {
+            let d = status_daemon();
+            let now = shm::now_ns();
+            reopen_sample(&d, &reopen_controller(now), now);
+            if reopening {
+                engine_unavailable(&d, now + 1);
+            }
+            let control = ControlServer {
+                one_at_a_time: Arc::new(Mutex::new(())),
+                // No request thread exists here to report a release.
+                released: Mutex::new(std::sync::mpsc::channel().1),
+            };
+            let blocked = control.one_at_a_time.lock().unwrap();
+            let (entered, draining) = std::sync::mpsc::channel();
+            let (quitting, state) = thread::scope(|scope| {
+                let (d, control) = (&d, &control);
+                let worker = scope.spawn(move || {
+                    let _no_more_requests = shutdown_and_drain(d, || {
+                        entered.send(()).unwrap();
+                        control.stop()
+                    });
+                });
+                draining.recv().unwrap();
+                let quitting = d.quit.load(Ordering::Acquire);
+                let state = d.shm.hand(HAND_RIGHT).unwrap();
+                drop(blocked);
+                worker.join().unwrap();
+                (quitting, state)
+            });
+            assert!(
+                quitting,
+                "SIGTERM must not wait for the active control request"
+            );
+            assert_eq!(state.flags, 0);
+            assert_eq!(
+                (state.buttons, state.touches, state.trigger, state.grip),
+                (0, 0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_radio_teardown_keeps_the_hold_publishing_and_expiring() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        let (entered, joining) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (held, expired, timer, entered_at) = thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                let mut timer = None;
+                finish_engine_run(d, &mut timer, || {
+                    entered.send(std::time::Instant::now()).unwrap();
+                    released.recv().unwrap();
+                });
+                timer.unwrap()
+            });
+            let entered_at = joining.recv().unwrap();
+            // A radio worker still unwinding may attempt another publication after the handoff.
+            let late = reopen_controller(now + 2_000_000_000);
+            publish_hand_state(d, HAND_RIGHT, &late, || late.received_host_ns, None);
+            publish_unavailable(d, now + 3_000_000_000);
+            let held = d.shm.hand(HAND_RIGHT).unwrap();
+            publish_unavailable(d, now + 10_000_000_000);
+            let expired = d.shm.hand(HAND_RIGHT).unwrap();
+            release.send(()).unwrap();
+            (held, expired, worker.join().unwrap(), entered_at)
+        });
+        assert!(
+            timer <= entered_at,
+            "the reopen timer must include the join"
+        );
+        assert_eq!(
+            held.flags,
+            ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_CALIBRATED | ffi::CV1T_FLAG_RADIO_GAP
+        );
+        assert_eq!(
+            (held.pos, held.buttons, held.received_host_ns),
+            (live.pos, live.buttons, now)
+        );
+        assert_eq!(held.publish_host_ns, now + 3_000_000_000);
+        assert_eq!(
+            expired.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            0
+        );
+        assert_eq!(
+            (expired.buttons, expired.trigger, expired.grip),
+            (0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_radio_handoff_without_a_radio_sample_holds_then_expires() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        let link = RadioLink::default();
+        link.hands.request(HAND_RIGHT);
+        assert!(!link.hands.engine_publishes(HAND_RIGHT));
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut last_publish = [0; 2];
+        assert!(refresh_radio_hands(
+            &d,
+            &link,
+            &[None; 2],
+            &mut last_publish,
+            &mut pipe,
+            || now + 2_000_000_000,
+            log,
+        ));
+        let held = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            held.flags,
+            ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_CALIBRATED | ffi::CV1T_FLAG_RADIO_GAP
+        );
+        assert_eq!(
+            (held.pos, held.buttons, held.received_host_ns),
+            (live.pos, live.buttons, now)
+        );
+        assert_eq!(held.publish_host_ns, now + 2_000_000_000);
+        refresh_radio_hands(
+            &d,
+            &link,
+            &[None; 2],
+            &mut last_publish,
+            &mut pipe,
+            || now + 10_000_000_000,
+            log,
+        );
+        let expired = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(expired.flags & ffi::CV1T_FLAG_CONNECTED, 0);
+        assert_eq!(
+            (expired.buttons, expired.trigger, expired.grip),
+            (0, 0.0, 0.0)
+        );
+        let fresh = reopen_controller(now + 11_000_000_000);
+        refresh_radio_hands(
+            &d,
+            &link,
+            &[None, Some(fresh)],
+            &mut last_publish,
+            &mut pipe,
+            || fresh.received_host_ns,
+            log,
+        );
+        // With no engine view yet it remains safely expired; once there is one, it is live.
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+        link.engine_view.lock().unwrap()[HAND_RIGHT] = Some(fresh);
+        refresh_radio_hands(
+            &d,
+            &link,
+            &[None, Some(fresh)],
+            &mut last_publish,
+            &mut pipe,
+            || fresh.received_host_ns + RADIO_REFRESH_NS,
+            log,
+        );
+        assert_ne!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+    }
+
+    fn moving_controller(now: u64) -> engine::Controller {
+        engine::Controller {
+            imu_gyro: [2.0, 0.0, 0.0],
+            ..reopen_controller(now)
+        }
+    }
+
+    /// An engine reopen is not the radio going silent: the log says what held the controller,
+    /// and no dropout recording is saved, even for one in use.
+    #[test]
+    fn an_engine_reopen_is_neither_logged_nor_recorded_as_a_radio_dropout() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        let left = moving_controller(now - 4_000_000_000);
+        publish_hand_state(&d, HAND_LEFT, &left, || left.received_host_ns, None);
+        reopen_sample(&d, &c, now);
+        let mut notices = Vec::new();
+        d.engine_offline.store(true, Ordering::Release);
+        publish_unavailable_with_log(&d, now + 20_000_000, |n| notices.push(n));
+        publish_unavailable_with_log(&d, now + 6_000_000_000, |n| notices.push(n));
+        d.engine_offline.store(false, Ordering::Release);
+        let back = engine::Controller {
+            received_host_ns: now + 7_000_000_000,
+            device_time_ns: 5_000_000,
+            ..c
+        };
+        publish_hand_state_with_log(
+            &d,
+            HAND_RIGHT,
+            &back,
+            || back.received_host_ns,
+            None,
+            |n| notices.push(n),
+        );
+        assert_eq!(
+            notices,
+            [
+                "left: tracking thread stalled: holding it as it was, inputs included, for up to 10 s",
+                "right: tracking engine reopening: holding it as it was, inputs included, for up to 10 s",
+                "left: tracking thread stalled for 10 s: standby, inputs released",
+                "right: back after 7.00 s (engine reopened)",
+            ]
+        );
+        assert!(
+            d.flight
+                .due(now + 7_000_000_000 + flight::AFTER_NS)
+                .is_empty(),
+            "an engine reopen saved a radio dropout recording"
+        );
+    }
+
+    /// A tracking thread that publishes nothing for longer than the connect timeout holds the
+    /// controller too, but the radio did not go silent: no radio notice, no recording.
+    #[test]
+    fn a_stalled_publisher_is_neither_logged_nor_recorded_as_a_radio_dropout() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        reopen_sample(&d, &c, now);
+        let mut notices = Vec::new();
+        publish_unavailable_with_log(&d, now + 150_000_000, |n| notices.push(n));
+        let back = engine::Controller {
+            received_host_ns: now + 1_000_000_000,
+            device_time_ns: c.device_time_ns + 2_000_000,
+            ..c
+        };
+        publish_hand_state_with_log(
+            &d,
+            HAND_RIGHT,
+            &back,
+            || back.received_host_ns,
+            None,
+            |n| notices.push(n),
+        );
+        assert_eq!(
+            notices,
+            [
+                "right: tracking thread stalled: holding it as it was, inputs included, for up to 10 s",
+                "right: back after 1.00 s (tracking thread stalled)",
+            ]
+        );
+        assert!(d.flight.due(now + flight::AFTER_NS).is_empty());
+    }
+
+    /// A radio dropout under way when the engine reopens stays one: notices and recording as
+    /// for any radio gap.
+    #[test]
+    fn a_radio_dropout_under_way_stays_one_through_an_engine_reopen() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        reopen_sample(&d, &c, now);
+        let mut notices = Vec::new();
+        publish_hand_state_with_log(
+            &d,
+            HAND_RIGHT,
+            &c,
+            || now + 200_000_000,
+            None,
+            |n| notices.push(n),
+        );
+        d.engine_offline.store(true, Ordering::Release);
+        publish_unavailable_with_log(&d, now + 300_000_000, |n| notices.push(n));
+        d.engine_offline.store(false, Ordering::Release);
+        let back = engine::Controller {
+            received_host_ns: now + 7_000_000_000,
+            device_time_ns: 5_000_000,
+            ..c
+        };
+        publish_hand_state_with_log(
+            &d,
+            HAND_RIGHT,
+            &back,
+            || back.received_host_ns,
+            None,
+            |n| notices.push(n),
+        );
+        assert_eq!(
+            notices,
+            [
+                "right: radio silent (in use): holding it as it was, inputs included, for up to 10 s",
+                "right: radio back after 7.00 s",
+            ]
+        );
+        let due = d.flight.due(now + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].hand, due[0].last_report_ns), (HAND_RIGHT, now));
+        assert!(due[0].began_in_use);
+    }
+
+    /// The engine can let go of a hand just before the radio thread's pass ends, before its
+    /// first sample of that hand: no gap while the controller may still be reporting.
+    #[test]
+    fn a_radio_handoff_just_after_an_engine_publication_is_no_gap() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        reopen_sample(&d, &c, now);
+        let link = RadioLink::default();
+        link.hands.request(HAND_RIGHT);
+        assert!(!link.hands.engine_publishes(HAND_RIGHT));
+        link.engine_view.lock().unwrap()[HAND_RIGHT] = Some(c);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut last_publish = [0; 2];
+        let mut notices = Vec::new();
+        refresh_radio_hands(
+            &d,
+            &link,
+            &[None; 2],
+            &mut last_publish,
+            &mut pipe,
+            || now + 5_000_000,
+            |n| notices.push(n),
+        );
+        let state = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(state.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        assert_eq!(state.publish_host_ns, now);
+        // the radio thread's own first sample, on its own device clock
+        let s = engine::Controller {
+            received_host_ns: now + 8_000_000,
+            device_time_ns: 7_000_000_000,
+            ..c
+        };
+        publish_hand_state_with_log(
+            &d,
+            HAND_RIGHT,
+            &radio_sample(&c, &s),
+            || now + 8_000_000,
+            Some(&mut pipe),
+            |n| notices.push(n),
+        );
+        let state = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            state.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            ffi::CV1T_FLAG_CONNECTED
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(d.flight.due(now + flight::AFTER_NS).is_empty());
+    }
+
+    /// A controller whose radio goes silent as the hand passes to the radio thread is a radio
+    /// dropout once nothing has published it for the connect timeout, not a stalled thread: the
+    /// radio thread looks after the hand meanwhile, so the heartbeat leaves it alone.
+    #[test]
+    fn a_radio_silence_from_the_handoff_on_is_a_radio_dropout() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        reopen_sample(&d, &c, now);
+        let link = RadioLink::default();
+        link.hands.request(HAND_RIGHT);
+        assert!(!link.hands.engine_publishes(HAND_RIGHT));
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut last_publish = [0; 2];
+        let mut notices = Vec::new();
+        for at in [5_000_000, 85_000_000] {
+            refresh_radio_hands(
+                &d,
+                &link,
+                &[None; 2],
+                &mut last_publish,
+                &mut pipe,
+                || now + at,
+                |n| notices.push(n),
+            );
+            assert_eq!(
+                d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+                0
+            );
+        }
+        publish_unavailable_with_log(&d, now + 101_000_000, |n| notices.push(n));
+        assert!(refresh_radio_hands(
+            &d,
+            &link,
+            &[None; 2],
+            &mut last_publish,
+            &mut pipe,
+            || now + 102_000_000,
+            |n| notices.push(n),
+        ));
+        assert_ne!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+            0
+        );
+        assert_eq!(
+            notices,
+            ["right: radio silent (in use): holding it as it was, inputs included, for up to 10 s"]
+        );
+        let due = d.flight.due(now + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert!(due[0].began_in_use);
+    }
+
+    /// A worker that panics while it holds a hand poisons that lock before its failure is
+    /// marked. The heartbeat must not panic on it (the next tick exits with the plain reason),
+    /// and shutdown still disconnects both hands.
+    #[test]
+    fn a_poisoned_hand_or_input_lock_does_not_panic_the_heartbeat() {
+        for poisoned in ["hand", "inputs"] {
+            let d = status_daemon();
+            let now = shm::now_ns();
+            reopen_sample(&d, &reopen_controller(now), now);
+            d.engine_offline.store(true, Ordering::Release);
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let _hand = (poisoned == "hand").then(|| d.hands[HAND_RIGHT].lock().unwrap());
+                    let _inputs = (poisoned == "inputs").then(|| d.inputs.lock().unwrap());
+                    panic!("worker test");
+                });
+                assert!(worker.join().is_err());
+            });
+            publish_unavailable(&d, now + 200_000_000);
+            begin_shutdown(&d);
+            for h in [HAND_LEFT, HAND_RIGHT] {
+                assert_eq!(d.shm.hand(h).unwrap().flags, 0, "{poisoned}");
+            }
+        }
+    }
+
+    /// Shutdown disconnects the hands before it clears the sensor snapshot, whose locks the
+    /// engine thread or a status request can hold.
+    #[test]
+    fn shutdown_disconnects_the_hands_before_the_sensor_snapshot() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let sensors = d.sensors.lock().unwrap();
+        let (entered, shutting) = std::sync::mpsc::channel();
+        let state = thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                entered.send(()).unwrap();
+                begin_shutdown(d);
+            });
+            shutting.recv().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut state = d.shm.hand(HAND_RIGHT).unwrap();
+            while state.flags != 0 && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+                state = d.shm.hand(HAND_RIGHT).unwrap();
+            }
+            drop(sensors);
+            worker.join().unwrap();
+            state
+        });
+        assert_eq!(state.flags, 0, "shutdown waited for the sensor snapshot");
+    }
+
+    /// The injected acquisition gate is reached only after the unlocked worker check.
+    #[test]
+    fn a_publication_while_the_heartbeat_waits_keeps_the_hand_live() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = reopen_controller(now);
+        reopen_sample(&d, &c, now);
+        let at = now + 300_000_000;
+        let (checked, checking) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let d = &d;
+            let heartbeat = scope.spawn(move || {
+                publish_unavailable_with_lock(d, at, log, |h| {
+                    if h == HAND_RIGHT {
+                        checked.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }
+                    d.hands[h].lock().ok()
+                });
+            });
+            checking.recv_timeout(Duration::from_secs(1)).unwrap();
+            let fresh = engine::Controller {
+                received_host_ns: at,
+                device_time_ns: c.device_time_ns + 2_000_000,
+                ..c
+            };
+            publish_hand_state(d, HAND_RIGHT, &fresh, || at, None);
+            release.send(()).unwrap();
+            heartbeat.join().unwrap();
+        });
+        let state = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            state.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            ffi::CV1T_FLAG_CONNECTED
+        );
+    }
+
+    /// The radio timed out between refreshes, before teardown began. Losing this boundary
+    /// would turn a real in-use dropout into an unrecorded engine reopen.
+    #[test]
+    fn a_radio_timeout_between_the_last_refresh_and_reopen_is_recorded() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = moving_controller(now);
+        reopen_sample(&d, &c, now);
+        publish_hand_state(&d, HAND_RIGHT, &c, || now + 90_000_000, None);
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+            0
+        );
+        engine_unavailable(&d, now + 105_000_000);
+        let due = d.flight.due(now + flight::AFTER_NS);
+        assert_eq!(due.len(), 1, "the reopen swallowed a real radio dropout");
+        assert!(due[0].began_in_use);
+    }
+
+    /// Before the timeout a reopen caused the missing samples; an overdue worker instead
+    /// explains its own missing publication. Neither may become a radio dropout on a retry.
+    #[test]
+    fn a_reopen_boundary_distinguishes_radio_silence_from_a_stalled_worker() {
+        for (refreshed_ms, stop_ms, recorded) in [(90, 99, false), (90, 100, true), (0, 105, false)]
+        {
+            let d = status_daemon();
+            let now = shm::now_ns();
+            let c = moving_controller(now);
+            reopen_sample(&d, &c, now);
+            publish_hand_state(&d, HAND_RIGHT, &c, || now + refreshed_ms * 1_000_000, None);
+            engine_unavailable(&d, now + stop_ms * 1_000_000);
+            engine_unavailable(&d, now + 1_000_000_000);
+            let due = d.flight.due(now + flight::AFTER_NS);
+            assert_eq!(
+                !due.is_empty(),
+                recorded,
+                "refresh={refreshed_ms} stop={stop_ms}"
+            );
+        }
+    }
+
+    /// A skipped busy hand cannot make a reopen begun before the timeout look like a radio
+    /// dropout when the next heartbeat can acquire it. Retries keep the first stop boundary.
+    #[test]
+    fn a_deferred_reopen_publication_keeps_the_original_cause() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &moving_controller(now), now);
+        {
+            let _busy = d.hands[HAND_RIGHT].lock().unwrap();
+            engine_unavailable(&d, now + 20_000_000);
+        }
+        engine_unavailable(&d, now + 300_000_000);
+        let mut notices = Vec::new();
+        publish_unavailable_with_log(&d, now + 10_000_000_000, |n| notices.push(n));
+        assert!(
+            notices[0].contains("through the engine reopen"),
+            "{notices:?}"
+        );
+        assert!(d.flight.due(now + flight::AFTER_NS).is_empty());
+    }
+
+    #[test]
+    fn an_overdue_busy_hand_cannot_hide_a_failed_worker() {
+        const MARKER: &str = "CV1TOUCH_TEST_BUSY_HEARTBEAT_FAILURE";
+        if std::env::var_os(MARKER).is_some() {
+            let _logging = daemon_log::init().unwrap();
+            let d = status_daemon();
+            let now = shm::now_ns();
+            publish_hand_state(&d, HAND_LEFT, &reopen_controller(now), || now, None);
+            let _busy = d.hands[HAND_LEFT].lock().unwrap();
+            // Failure arrives after main's first failure check, before this heartbeat.
+            d.failed_worker.store(RADIO_WORKER, Ordering::Release);
+            publish_unavailable(&d, now + 200_000_000);
+            exit_on_worker_failure(&d.failed_worker, &d.shm);
+            panic!("main failed to observe its failed worker");
+        }
+        let mut child = process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::an_overdue_busy_hand_cannot_hide_a_failed_worker",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let finished = child.try_wait().unwrap().is_some();
+        if !finished {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(finished, "the heartbeat prevented the failure check");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("radio thread stopped unexpectedly")
+        );
+    }
+
+    /// A busy first hand must not keep the other hand connected beyond its deadline, or
+    /// keep main from observing a stop request / failed worker on the same pass.
+    #[test]
+    fn an_overdue_busy_hand_does_not_block_the_heartbeat() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            publish_hand_state(&d, h, &reopen_controller(now), || now, None);
+        }
+        let busy = d.hands[HAND_LEFT].lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let timely = thread::scope(|scope| {
+            let d = &d;
+            scope.spawn(move || {
+                publish_unavailable(d, now + 10_000_000_000);
+                d.failed_worker.store(RADIO_WORKER, Ordering::Release);
+                d.stop_requested.store(true, Ordering::Release);
+                done.send(d.shm.hand(HAND_RIGHT).unwrap()).unwrap();
+            });
+            let timely = finished.recv_timeout(Duration::from_secs(1));
+            drop(busy);
+            timely
+        });
+        let state = timely.expect("the heartbeat waited for the overdue first hand");
+        assert_eq!(state.flags & ffi::CV1T_FLAG_CONNECTED, 0);
+        assert_eq!((state.buttons, state.trigger, state.grip), (0, 0.0, 0.0));
+        assert!(d.stop_requested.load(Ordering::Acquire));
+        assert_eq!(d.failed_worker.load(Ordering::Acquire), RADIO_WORKER);
+        begin_shutdown(&d);
+        assert_eq!(d.shm.hand(HAND_LEFT).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn a_busy_input_lock_does_not_block_the_heartbeat() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let busy = d.inputs.lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let timely = thread::scope(|scope| {
+            let d = &d;
+            scope.spawn(move || {
+                publish_unavailable(d, now + 200_000_000);
+                done.send(()).unwrap();
+            });
+            let timely = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+            drop(busy);
+            timely
+        });
+        assert!(timely, "the heartbeat waited for input calibration");
+    }
+
+    /// A tracker fit can wait indefinitely. Publication, expiry and shutdown use none of
+    /// the tracker state and must remain available while the fit is blocked.
+    #[test]
+    fn blocked_tracker_work_leaves_publication_and_shutdown_available() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let (entered, tracking) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let d = &d;
+            let worker = scope.spawn(move || {
+                publish_hand_state_with_tracking(
+                    d,
+                    HAND_RIGHT,
+                    &reopen_controller(now),
+                    || now,
+                    || {
+                        let available = d.hands[HAND_RIGHT].try_lock().is_ok();
+                        entered.send(available).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                        None
+                    },
+                    log,
+                );
+            });
+            let available = tracking.recv_timeout(Duration::from_secs(1)).unwrap();
+            if available {
+                publish_unavailable(d, now + 10_000_000_000);
+                assert_eq!(
+                    d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+                    0
+                );
+                begin_shutdown(d);
+                assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().flags, 0);
+            }
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(available, "tracker work held the publication lock");
+        });
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags,
+            0,
+            "a late tracker result republished after shutdown"
+        );
+    }
+
+    /// A late fit is not a new live report. Resume it while the heartbeat's hold is still
+    /// active, then expire at the original deadline rather than at the delayed sample's.
+    #[test]
+    fn a_late_tracker_result_cannot_end_or_extend_the_heartbeat_hold() {
+        for receive_delay_ns in [0, 2_000_000] {
+            use std::sync::atomic::AtomicU64;
+            let d = status_daemon();
+            let start = shm::now_ns();
+            let first = moving_controller(start);
+            reopen_sample(&d, &first, start);
+            let live = d.shm.hand(HAND_RIGHT).unwrap();
+            let sample = engine::Controller {
+                received_host_ns: start + receive_delay_ns,
+                device_time_ns: first.device_time_ns + 2_000_000,
+                trigger: 0.0,
+                buttons: 0,
+                ..first
+            };
+            let clock = AtomicU64::new(start + 2_000_000);
+            let (entered, tracking) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            thread::scope(|scope| {
+                let d = &d;
+                let clock = &clock;
+                let worker = scope.spawn(move || {
+                    publish_hand_state_with_tracking(
+                        d,
+                        HAND_RIGHT,
+                        &sample,
+                        || clock.load(Ordering::Acquire),
+                        || {
+                            entered.send(()).unwrap();
+                            released.recv_timeout(Duration::from_secs(2)).unwrap();
+                            None
+                        },
+                        log,
+                    );
+                });
+                tracking.recv_timeout(Duration::from_secs(1)).unwrap();
+                clock.store(start + 2_000_000_000, Ordering::Release);
+                publish_unavailable(d, clock.load(Ordering::Acquire));
+                assert_ne!(
+                    d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+                    0
+                );
+                release.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            let held = d.shm.hand(HAND_RIGHT).unwrap();
+            assert_ne!(
+                held.flags & ffi::CV1T_FLAG_RADIO_GAP,
+                0,
+                "the old fit ended the hold"
+            );
+            assert_eq!(held.publish_host_ns, start + 2_000_000_000);
+            assert_eq!(
+                held.received_host_ns, start,
+                "a stale sample extended the hold deadline"
+            );
+            assert_eq!(
+                (held.buttons, held.trigger, held.pos),
+                (live.buttons, live.trigger, live.pos)
+            );
+            assert!(
+                d.flight.due(start + flight::AFTER_NS).is_empty(),
+                "the stale fit became a radio dropout"
+            );
+            publish_unavailable(&d, start + 10_000_000_000);
+            let expired = d.shm.hand(HAND_RIGHT).unwrap();
+            assert_eq!(expired.flags & ffi::CV1T_FLAG_CONNECTED, 0);
+            assert_eq!(
+                (expired.buttons, expired.trigger, expired.grip),
+                (0, 0.0, 0.0)
+            );
+            let fresh = moving_controller(start + 11_000_000_000);
+            publish_hand_state(&d, HAND_RIGHT, &fresh, || fresh.received_host_ns, None);
+            let back = d.shm.hand(HAND_RIGHT).unwrap();
+            assert_eq!(
+                back.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+                ffi::CV1T_FLAG_CONNECTED
+            );
+            assert_eq!(back.received_host_ns, fresh.received_host_ns);
+        }
+    }
+
+    #[test]
+    fn the_publication_clock_is_read_after_taking_the_hand_lock() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        publish_hand_state_with_tracking(
+            &d,
+            HAND_RIGHT,
+            &reopen_controller(now),
+            || {
+                assert!(
+                    matches!(
+                        d.hands[HAND_RIGHT].try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the publication clock was read before lock acquisition"
+                );
+                assert!(
+                    matches!(
+                        d.inputs.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the publication clock was read before input-lock acquisition"
+                );
+                now
+            },
+            || None,
+            log,
+        );
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().publish_host_ns, now);
+    }
+
+    #[test]
+    fn a_delayed_old_result_cannot_replace_a_newer_live_sample() {
+        use std::sync::atomic::AtomicU64;
+        let d = status_daemon();
+        let start = shm::now_ns();
+        let first = moving_controller(start);
+        reopen_sample(&d, &first, start);
+        let sample = engine::Controller {
+            received_host_ns: start + 2_000_000,
+            device_time_ns: first.device_time_ns + 2_000_000,
+            trigger: 0.0,
+            buttons: 0,
+            ..first
+        };
+        let clock = AtomicU64::new(start + 2_000_000);
+        let (entered, tracking) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let newer = thread::scope(|scope| {
+            let d = &d;
+            let clock = &clock;
+            let worker = scope.spawn(move || {
+                publish_hand_state_with_tracking(
+                    d,
+                    HAND_RIGHT,
+                    &sample,
+                    || clock.load(Ordering::Acquire),
+                    || {
+                        entered.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                        None
+                    },
+                    log,
+                );
+            });
+            tracking.recv_timeout(Duration::from_secs(1)).unwrap();
+            let fresh = moving_controller(start + 2_000_000_000);
+            publish_hand_state(d, HAND_RIGHT, &fresh, || fresh.received_host_ns, None);
+            let newer = d.shm.hand(HAND_RIGHT).unwrap();
+            clock.store(start + 2_002_000_000, Ordering::Release);
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            newer
+        });
+        let state = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            (state.flags, state.buttons, state.trigger),
+            (newer.flags, newer.buttons, newer.trigger)
+        );
+        assert_eq!(
+            (state.received_host_ns, state.publish_host_ns),
+            (newer.received_host_ns, newer.publish_host_ns)
+        );
+    }
+
+    #[test]
+    fn a_sampleless_handoff_reads_its_clock_under_the_hand_lock() {
+        let d = status_daemon();
+        let start = shm::now_ns();
+        reopen_sample(&d, &moving_controller(start), start);
+        let link = RadioLink::default();
+        link.hands.request(HAND_RIGHT);
+        assert!(!link.hands.engine_publishes(HAND_RIGHT));
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        refresh_radio_hands(
+            &d,
+            &link,
+            &[None; 2],
+            &mut [0; 2],
+            &mut pipe,
+            || {
+                if d.hands[HAND_RIGHT].try_lock().is_ok() {
+                    start + 101_000_000
+                } else {
+                    start + 2_000_000_000
+                }
+            },
+            log,
+        );
+        let held = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_ne!(held.flags & ffi::CV1T_FLAG_RADIO_GAP, 0);
+        assert_eq!(held.publish_host_ns, start + 2_000_000_000);
+        assert_eq!(held.received_host_ns, start);
+    }
+
+    /// While a worker publishes a hand, the heartbeat does not take that hand's lock: a radio
+    /// thread busy in tracker work never makes the main thread wait.
+    #[test]
+    fn a_healthy_heartbeat_does_not_wait_for_a_busy_hand() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        let busy = d.hands[HAND_RIGHT].lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let waited = thread::scope(|scope| {
+            let d = &d;
+            scope.spawn(move || {
+                publish_unavailable(d, now + 50_000_000);
+                done.send(()).unwrap();
+            });
+            let waited = finished.recv_timeout(Duration::from_secs(1)).is_err();
+            drop(busy);
+            waited
+        });
+        assert!(
+            !waited,
+            "the heartbeat waited for a hand a worker publishes"
+        );
+    }
+
+    #[test]
+    fn an_engine_reopen_holds_then_resumes_the_last_live_hand() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let c = reopen_controller(now);
+        reopen_sample(&d, &c, now);
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        // The engine can close before the ordinary 100 ms radio timeout.
+        engine_unavailable(&d, now + 20_000_000);
+        let held = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            held.flags,
+            ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_CALIBRATED | ffi::CV1T_FLAG_RADIO_GAP
+        );
+        assert_eq!((held.pos, held.orient), (live.pos, live.orient));
+        assert_eq!(
+            (
+                held.trigger,
+                held.grip,
+                held.stick,
+                held.buttons,
+                held.touches,
+                held.cap
+            ),
+            (
+                live.trigger,
+                live.grip,
+                live.stick,
+                live.buttons,
+                live.touches,
+                live.cap
+            )
+        );
+        assert_eq!(
+            (held.sample_host_ns, held.received_host_ns),
+            (live.sample_host_ns, live.received_host_ns)
+        );
+        assert_eq!((held.lin_vel, held.ang_vel), ([0.0; 3], held.gyro_bias));
+        publish_unavailable(&d, now + 6_000_000_000);
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().buttons, live.buttons);
+        // A new engine has no calibrated controller until its first radio samples.
+        reopen_sample(&d, &engine::Controller::default(), now + 6_010_000_000);
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().buttons, live.buttons);
+        let stale = engine::Controller {
+            received_host_ns: now - 1,
+            device_time_ns: 500_000,
+            ..c
+        };
+        reopen_sample(&d, &stale, now + 6_015_000_000);
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().buttons, live.buttons);
+        let back = engine::Controller {
+            received_host_ns: now + 6_020_000_000,
+            cap: [0.5; 5],
+            trigger: 0.0,
+            grip: 0.0,
+            buttons: 0,
+            view_pos: [0.6, 1.2, -0.4],
+            ..c
+        };
+        // Even a restarted device clock with the same counter value is a fresh sample.
+        reopen_sample(&d, &back, back.received_host_ns);
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            live.flags & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+            ffi::CV1T_FLAG_CONNECTED
+        );
+        assert_eq!(live.pos, back.view_pos);
+        assert_eq!((live.buttons, live.grip), (0, 0.0));
+        assert_ne!(live.touches, 0, "capacitive hysteresis survives the reopen");
+        publish_unavailable(&d, now + 6_030_000_000);
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().flags, live.flags);
+    }
+
+    #[test]
+    fn engine_reopen_retries_do_not_extend_the_ten_second_deadline() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        for delay in [200_000_000, 2_000_000_000, 9_000_000_000, 9_999_999_999] {
+            engine_unavailable(&d, now + delay);
+            assert_ne!(
+                d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+                0
+            );
+        }
+        // Heartbeats expire a hold even when open/close is blocked inside the native engine.
+        publish_unavailable(&d, now + 10_000_000_000);
+        let expired = d.shm.hand(HAND_RIGHT).unwrap();
+        assert_eq!(
+            expired.flags
+                & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP | ffi::CV1T_FLAG_POSITION),
+            0
+        );
+        assert_eq!(
+            (
+                expired.buttons,
+                expired.touches,
+                expired.trigger,
+                expired.grip,
+                expired.stick,
+                expired.cap
+            ),
+            (0, 0, 0.0, 0.0, [0.0; 2], [0.0; 5])
+        );
+        engine_unavailable(&d, now + 30_000_000_000);
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+        let fresh = reopen_controller(now + 31_000_000_000);
+        reopen_sample(&d, &fresh, fresh.received_host_ns);
+        assert_ne!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+    }
+
+    #[test]
+    fn each_hand_expires_from_its_own_last_sample_during_a_reopen() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        let left = reopen_controller(now - 6_000_000_000);
+        publish_hand_state(&d, HAND_LEFT, &left, || left.received_host_ns, None);
+        reopen_sample(&d, &reopen_controller(now), now);
+        engine_unavailable(&d, now + 5_000_000_000);
+        assert_eq!(
+            d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+        assert_ne!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+            0
+        );
+    }
+
+    #[test]
+    fn engine_reopen_holds_only_a_hand_published_live() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        engine_unavailable(&d, now);
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().flags, 0);
+        let stale = reopen_controller(now);
+        reopen_sample(&d, &stale, now + 1_000_000_000);
+        engine_unavailable(&d, now + 2_000_000_000);
+        assert_eq!(
+            d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_CONNECTED,
+            0
+        );
+    }
+
+    #[test]
+    fn shutdown_disconnects_a_held_hand_before_the_engine_finishes() {
+        let d = status_daemon();
+        let now = shm::now_ns();
+        reopen_sample(&d, &reopen_controller(now), now);
+        engine_unavailable(&d, now + 200_000_000);
+        begin_shutdown(&d);
+        // Neither a late engine sample nor a heartbeat may reconnect it during shutdown.
+        reopen_sample(&d, &reopen_controller(now + 300_000_000), now + 300_000_000);
+        publish_unavailable(&d, now + 400_000_000);
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let state = d.shm.hand(h).unwrap();
+            assert_eq!(state.flags, 0);
+            assert_eq!(
+                (state.buttons, state.touches, state.trigger, state.grip),
+                (0, 0, 0.0, 0.0)
+            );
+        }
+    }
+
     /// Through a radio gap a controller is published as it last was while its samples arrived:
     /// its pose and its inputs (input calibration applied) as they were, connected, in the gap,
     /// without a position or motion; it is published live again when its samples come back.
     #[test]
     fn a_radio_gap_publishes_the_controller_as_it_was() {
         let d = status_daemon();
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
-        let mut memory = HandMemory::default();
-        let mut hand = Hand::new(HAND_RIGHT, HandConfig::default());
+
         let now = shm::now_ns();
         let mut c = engine::Controller {
             calibrated: true,
@@ -6249,17 +8036,8 @@ mod tests {
             buttons: 0x1,
             ..Default::default()
         };
-        let mut publish = |c: &engine::Controller, at: u64| {
-            publish_hand_state(
-                &d,
-                HAND_RIGHT,
-                c,
-                at,
-                &mut hand,
-                None,
-                &mut shaper,
-                &mut memory,
-            );
+        let publish = |c: &engine::Controller, at: u64| {
+            publish_hand_state(&d, HAND_RIGHT, c, || at, None);
             d.shm.hand(HAND_RIGHT).unwrap()
         };
         let live = publish(&c, now);
