@@ -3566,10 +3566,14 @@ fn supervise(args: &[String]) -> i32 {
     let endpoint = runtime.join("control.sock");
     let mut stopping = supervise::Stopping {
         requested: Box::new(|| requests.wait(Duration::ZERO)),
-        ask: Box::new(|| {
-            control::request(&endpoint, "stop", Duration::from_secs(2))
-                .map_err(|e| e.to_string())
-                .and_then(|reply| reply.starts_with("ok").then_some(()).ok_or(reply))
+        ask: Box::new(|until| {
+            control::request_until(
+                &endpoint,
+                "stop",
+                until.min(std::time::Instant::now() + Duration::from_secs(2)),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|reply| reply.starts_with("ok").then_some(()).ok_or(reply))
         }),
         within: Duration::from_secs(10),
     };

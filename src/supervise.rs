@@ -151,7 +151,7 @@ impl Failures {
     }
 }
 
-/// Sends each line `from` gives (lossily decoded, without its end) down `to`.
+/// Sends each line `from` gives (lossily decoded) down `to`.
 fn forward(from: impl Read + Send + 'static, to: mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let mut from = BufReader::new(from);
@@ -183,15 +183,72 @@ const LAST_LINES: Duration = Duration::from_secs(1);
 pub struct Stopping<'a> {
     /// A request to stop, if one came: what it was (polled often, so quick).
     pub requested: Box<dyn FnMut() -> Option<String> + 'a>,
-    /// Asks the running daemon to stop.
-    pub ask: Box<dyn FnMut() -> Result<(), String> + 'a>,
-    /// How long the daemon has to stop once asked; then it is ended. (After its console window
-    /// is closed, Windows ends the supervisor 5 s later whatever this says.)
+    /// Asks the running daemon to stop, returning by the supplied deadline.
+    pub ask: Box<dyn FnMut(Instant) -> Result<(), String> + 'a>,
+    /// How long to try delivering. A success before that deadline starts the same grace for
+    /// the daemon to stop. (After its console window is closed, Windows ends the supervisor
+    /// 5 s later whatever this says.)
     pub within: Duration,
 }
 
 /// How often a daemon not yet taking requests (it is just starting) is asked again.
 const ASK_AGAIN: Duration = Duration::from_millis(250);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopAction {
+    Wait,
+    Deliver(Instant),
+    End,
+}
+
+/// All decisions use the poll's time, so delivery and scheduling delays cannot restart a
+/// failed request's deadline. Only a successful delivery earns the daemon a fresh grace.
+struct Stop {
+    within: Duration,
+    until: Option<Instant>,
+    last_ask: Option<Instant>,
+    accepted: bool,
+}
+
+impl Stop {
+    fn new(within: Duration) -> Stop {
+        Stop {
+            within,
+            until: None,
+            last_ask: None,
+            accepted: false,
+        }
+    }
+
+    fn request(&mut self, now: Instant) {
+        self.until = Some(now + self.within);
+    }
+
+    fn action(&self, now: Instant) -> StopAction {
+        let Some(until) = self.until else {
+            return StopAction::Wait;
+        };
+        if now >= until {
+            StopAction::End
+        } else if !self.accepted
+            && self
+                .last_ask
+                .is_none_or(|at| now.saturating_duration_since(at) >= ASK_AGAIN)
+        {
+            StopAction::Deliver(until)
+        } else {
+            StopAction::Wait
+        }
+    }
+
+    fn delivered(&mut self, now: Instant, accepted: bool) {
+        self.last_ask = Some(now);
+        if accepted && self.until.is_some_and(|until| now < until) {
+            self.accepted = true;
+            self.until = Some(now + self.within);
+        }
+    }
+}
 
 /// A daemon's end: its exit status, and whether the supervisor had asked it to stop.
 struct Ended {
@@ -225,14 +282,12 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
         drop(tx);
     }
     let mut ended: Option<(ExitStatus, Instant)> = None;
-    let mut asked: Option<Instant> = None;
-    let mut last_ask: Option<Instant> = None;
-    let mut accepted = false;
+    let mut stop = Stop::new(stopping.within);
     let mut ending = false;
     loop {
         let wait = match ended {
             Some((status, at)) if at.elapsed() >= LAST_LINES => {
-                let asked = asked.is_some();
+                let asked = stop.until.is_some();
                 return Ok(Ended { status, asked });
             }
             Some((_, at)) => LAST_LINES - at.elapsed(),
@@ -244,7 +299,7 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
             }
             Err(RecvTimeoutError::Disconnected) => match ended {
                 Some((status, _)) => {
-                    let asked = asked.is_some();
+                    let asked = stop.until.is_some();
                     return Ok(Ended { status, asked });
                 }
                 None => std::thread::sleep(Duration::from_millis(100)),
@@ -254,32 +309,44 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
         if ended.is_some() {
             continue;
         }
-        if asked.is_none() {
+        if stop.until.is_none() {
             if let Some(why) = (stopping.requested)() {
+                stop.request(Instant::now());
                 note(log, &format!("{why}: asking the daemon to stop"));
-                asked = Some(Instant::now());
             }
         }
-        if asked.is_some() && !accepted && last_ask.is_none_or(|t| t.elapsed() >= ASK_AGAIN) {
-            match (stopping.ask)() {
-                Ok(()) => accepted = true,
-                Err(e) if last_ask.is_none() => {
-                    note(log, &format!("cannot ask it yet ({e}); asking again"))
+        if !ending {
+            let mut first_error = None;
+            if let StopAction::Deliver(until) = stop.action(Instant::now()) {
+                let first = stop.last_ask.is_none();
+                let result = (stopping.ask)(until);
+                stop.delivered(Instant::now(), result.is_ok());
+                if let Err(e) = result {
+                    if first {
+                        first_error = Some(e);
+                    }
                 }
-                Err(_) => {}
             }
-            last_ask = Some(Instant::now());
-        }
-        if asked.is_some_and(|at| at.elapsed() >= stopping.within) && !ending {
-            note(
-                log,
-                &format!(
-                    "the daemon did not stop within {} s; ending it",
-                    stopping.within.as_secs_f64()
-                ),
-            );
-            let _ = child.kill();
-            ending = true;
+            // Check again after delivery, before any diagnostic I/O. A delivery that runs out
+            // of time must not postpone the kill or start another attempt.
+            if stop.action(Instant::now()) == StopAction::End {
+                let _ = child.kill();
+                ending = true;
+                note(
+                    log,
+                    &format!(
+                        "the daemon did not stop within {} s; ending it",
+                        stopping.within.as_secs_f64()
+                    ),
+                );
+            }
+            if let Some(e) = first_error {
+                if ending {
+                    note(log, &format!("could not ask it to stop ({e})"));
+                } else {
+                    note(log, &format!("cannot ask it yet ({e}); asking again"));
+                }
+            }
         }
         ended = child.try_wait()?.map(|status| (status, Instant::now()));
     }
@@ -465,7 +532,7 @@ mod tests {
     fn never() -> Stopping<'static> {
         Stopping {
             requested: Box::new(|| None),
-            ask: Box::new(|| Ok(())),
+            ask: Box::new(|_| Ok(())),
             within: Duration::from_secs(10),
         }
     }
@@ -474,15 +541,16 @@ mod tests {
     const STAND_IN: &str = "CV1TOUCH_TEST_STAND_IN";
 
     /// Stands in for a daemon in other tests, which run this test binary for it: it ends cleanly
-    /// once the file named by CV1TOUCH_TEST_STAND_IN exists, and runs at most 30 s.
+    /// once the file named by CV1TOUCH_TEST_STAND_IN exists. Its ready file lets a stop request
+    /// wait until it is running; the supervisor ends it if it never stops.
     #[test]
     #[ignore = "run by other tests"]
     fn stand_in_daemon() {
         let Some(file) = std::env::var_os(STAND_IN) else {
             return;
         };
-        let until = Instant::now() + Duration::from_secs(30);
-        while !Path::new(&file).exists() && Instant::now() < until {
+        std::fs::write(Path::new(&file).with_extension("ready"), b"").unwrap();
+        while !Path::new(&file).exists() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -510,7 +578,7 @@ mod tests {
                     "Ctrl+C".to_string()
                 })
             }),
-            ask: Box::new(move || {
+            ask: Box::new(move |_| {
                 ask();
                 Ok(())
             }),
@@ -555,7 +623,7 @@ mod tests {
         let at = Instant::now() + Duration::from_millis(100);
         let mut stopping = Stopping {
             requested: Box::new(move || (Instant::now() >= at).then(|| "Ctrl+C".to_string())),
-            ask: Box::new(move || {
+            ask: Box::new(move |_| {
                 tries += 1;
                 if tries < 3 {
                     return Err("no daemon there yet".into());
@@ -582,23 +650,92 @@ mod tests {
         let d = dir("deaf");
         let mut log = Log::open(&d).unwrap();
         let file = d.join("never");
-        let mut stopping = stop_after(
-            Duration::from_millis(100),
-            || {},
-            Duration::from_millis(300),
-        );
-        let started = Instant::now();
+        let mut stopping = stop_when_ready(&file, || Ok(()), Duration::from_secs(10));
         let code = run(|| stand_in(&file), &mut log, quick(10, 5), &mut stopping);
         assert_eq!(code, 0);
-        assert!(started.elapsed() < Duration::from_secs(10));
         let lines = texts(&log.path());
         assert!(
             lines.contains(
-                &"cv1touchd supervisor: the daemon did not stop within 0.3 s; ending it".into()
+                &"cv1touchd supervisor: the daemon did not stop within 10 s; ending it".into()
             ),
             "{lines:?}"
         );
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A request once the stand-in is running, and the time it has to stop after accepting it.
+    fn stop_when_ready<'a>(
+        file: &Path,
+        mut ask: impl FnMut() -> Result<(), String> + 'a,
+        within: Duration,
+    ) -> Stopping<'a> {
+        let ready = file.with_extension("ready");
+        Stopping {
+            requested: Box::new(move || ready.exists().then(|| "Ctrl+C".to_string())),
+            ask: Box::new(move |_| ask()),
+            within,
+        }
+    }
+
+    #[test]
+    fn an_accepted_stop_gets_the_full_grace_and_ends_at_the_first_eligible_poll() {
+        let at = Instant::now();
+        let mut stop = Stop::new(Duration::from_secs(10));
+        assert_eq!(stop.action(at), StopAction::Wait);
+        stop.request(at);
+        assert_eq!(
+            stop.action(at),
+            StopAction::Deliver(at + Duration::from_secs(10))
+        );
+        // Sending takes two seconds. The daemon then gets ten seconds, not eight or twenty.
+        stop.delivered(at + Duration::from_secs(2), true);
+        assert_eq!(
+            stop.action(at + Duration::from_secs(12) - Duration::from_nanos(1)),
+            StopAction::Wait
+        );
+        assert_eq!(stop.action(at + Duration::from_secs(12)), StopAction::End);
+        assert_eq!(stop.action(at + Duration::from_secs(40)), StopAction::End);
+    }
+
+    #[test]
+    fn failed_stop_deliveries_share_one_deadline_and_do_not_run_past_it() {
+        let at = Instant::now();
+        let mut stop = Stop::new(Duration::from_secs(10));
+        stop.request(at);
+        for seconds in [0, 1, 3, 8] {
+            let now = at + Duration::from_secs(seconds);
+            assert_eq!(
+                stop.action(now),
+                StopAction::Deliver(at + Duration::from_secs(10))
+            );
+            stop.delivered(now, false);
+            assert_eq!(
+                stop.action(now + Duration::from_millis(249)),
+                StopAction::Wait
+            );
+            assert_eq!(
+                stop.action(now + Duration::from_millis(250)),
+                StopAction::Deliver(at + Duration::from_secs(10))
+            );
+        }
+        assert_eq!(stop.action(at + Duration::from_secs(10)), StopAction::End);
+        assert_eq!(stop.action(at + Duration::from_secs(40)), StopAction::End);
+    }
+
+    #[test]
+    fn a_delivery_finishing_at_or_after_the_deadline_cannot_extend_it() {
+        let at = Instant::now();
+        for seconds in [10, 11] {
+            let mut stop = Stop::new(Duration::from_secs(10));
+            stop.request(at);
+            assert_eq!(
+                stop.action(at),
+                StopAction::Deliver(at + Duration::from_secs(10))
+            );
+            let finished = at + Duration::from_secs(seconds);
+            stop.delivered(finished, true);
+            assert_eq!(stop.action(finished), StopAction::End);
+        }
     }
 
     /// A stop request once the log at `path` holds `text`, however long the daemon took to end.
@@ -611,7 +748,7 @@ mod tests {
                     "Ctrl+C".to_string()
                 })
             }),
-            ask: Box::new(|| Ok(())),
+            ask: Box::new(|_| Ok(())),
             within: Duration::from_secs(10),
         }
     }
