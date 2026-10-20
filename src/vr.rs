@@ -33,7 +33,8 @@ pub const CLASS_TRACKING_REFERENCE: DeviceClass =
     sys::ETrackedDeviceClass_TrackedDeviceClass_TrackingReference;
 pub const PROP_CURRENT_UNIVERSE_ID: DeviceProperty =
     sys::ETrackedDeviceProperty_Prop_CurrentUniverseId_Uint64;
-const MAX_DEVICES: usize = 64;
+/// OpenVR device indices are bounded by this count.
+pub const MAX_DEVICES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
@@ -230,31 +231,37 @@ impl Client {
         )
     }
 
-    pub fn devices(&self) -> Vec<Device> {
-        let class_of = self
-            .sys
-            .GetTrackedDeviceClass
-            .expect("GetTrackedDeviceClass");
-        (0..MAX_DEVICES as u32)
-            // SAFETY: as above.
-            .map(|i| (i, unsafe { class_of(i) }))
-            .filter(|&(_, class)| class != sys::ETrackedDeviceClass_TrackedDeviceClass_Invalid)
-            .map(|(index, class)| Device {
+    /// One inventory slot, so callers sampling poses can spread discovery over time.
+    pub fn device(&self, index: u32) -> Option<Device> {
+        if index >= MAX_DEVICES as u32 {
+            return None;
+        }
+        // SAFETY: as above; the index is within OpenVR's tracked-device array.
+        let class = unsafe {
+            self.sys
+                .GetTrackedDeviceClass
+                .expect("GetTrackedDeviceClass")(index)
+        };
+        (class != sys::ETrackedDeviceClass_TrackedDeviceClass_Invalid).then(|| Device {
+            index,
+            class,
+            serial: self
+                .string_property(index, sys::ETrackedDeviceProperty_Prop_SerialNumber_String),
+            model: self.string_property(index, sys::ETrackedDeviceProperty_Prop_ModelNumber_String),
+            tracking_system: self.string_property(
                 index,
-                class,
-                serial: self
-                    .string_property(index, sys::ETrackedDeviceProperty_Prop_SerialNumber_String),
-                model: self
-                    .string_property(index, sys::ETrackedDeviceProperty_Prop_ModelNumber_String),
-                tracking_system: self.string_property(
-                    index,
-                    sys::ETrackedDeviceProperty_Prop_TrackingSystemName_String,
-                ),
-                controller_type: self.string_property(
-                    index,
-                    sys::ETrackedDeviceProperty_Prop_ControllerType_String,
-                ),
-            })
+                sys::ETrackedDeviceProperty_Prop_TrackingSystemName_String,
+            ),
+            controller_type: self.string_property(
+                index,
+                sys::ETrackedDeviceProperty_Prop_ControllerType_String,
+            ),
+        })
+    }
+
+    pub fn devices(&self) -> Vec<Device> {
+        (0..MAX_DEVICES as u32)
+            .filter_map(|index| self.device(index))
             .collect()
     }
 

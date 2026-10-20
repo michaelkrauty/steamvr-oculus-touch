@@ -377,7 +377,7 @@ pub struct TruthFile {
     pub windows: Vec<(String, u64, u64)>,
     /// t_ns, qx, qy, qz, qw, px, py, pz
     pub samples: Vec<[f64; 8]>,
-    /// Further Lighthouse-tracked controllers recorded beside the reference (free-run captures).
+    /// Further tracked devices recorded beside the reference, in paced and free captures.
     #[serde(default)]
     pub others: Vec<RefTrack>,
     /// The daemon's latency adjustment (ms) when this was captured, which the stamps of its

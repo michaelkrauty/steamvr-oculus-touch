@@ -30,6 +30,9 @@ mod guided_setup;
 mod report;
 #[path = "cv1touch/sensors.rs"]
 mod sensors;
+#[path = "cv1touch/truth_capture.rs"]
+mod truth_capture;
+use truth_capture::Sampler as TruthSampler;
 
 fn human_color_enabled(no_color: bool, term_dumb: bool, terminal: bool, forced: bool) -> bool {
     !no_color && !term_dumb && (terminal || forced)
@@ -1407,6 +1410,39 @@ impl Drop for StopRecordingGuard {
     }
 }
 
+fn paced_truth_file(
+    reference: String,
+    universe_id: u64,
+    windows: Vec<(String, u64, u64)>,
+    sampled: TruthSampler,
+    latency_adjustment_ms: Option<f64>,
+    tracking_bases: BTreeMap<String, String>,
+) -> eval::TruthFile {
+    let (samples, others) = sampled.into_paced_tracks(&reference);
+    eval::TruthFile {
+        format: eval::TRUTH_FORMAT.into(),
+        version: 1,
+        reference,
+        universe_id,
+        windows,
+        samples,
+        others,
+        latency_adjustment_ms,
+        tracking_bases,
+    }
+}
+
+fn truth_stations(tf: &eval::TruthFile) -> align::Stations {
+    tf.others
+        .iter()
+        .filter(|o| o.kind == "base")
+        .filter_map(|o| {
+            let samples = eval::truth_samples(&o.samples);
+            Some((o.serial.clone(), samples.get(samples.len() / 2)?.pose))
+        })
+        .collect()
+}
+
 fn eval_capture() -> i32 {
     catch_interrupts();
     let status = status_json();
@@ -1422,7 +1458,8 @@ fn eval_capture() -> i32 {
             return 1;
         }
     };
-    let Some(reference) = vr::find_reference(&client.devices()).cloned() else {
+    let devices = client.devices();
+    let Some(reference) = vr::find_reference(&devices).cloned() else {
         eprintln!(
             "cv1touch: no Lighthouse-tracked Index controller: turn on the left Index controller"
         );
@@ -1449,17 +1486,17 @@ fn eval_capture() -> i32 {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
         let stop = stop.clone();
-        let index = reference.index as usize;
+        let serial = reference.serial.clone();
         std::thread::spawn(move || {
-            let mut out: Vec<[f64; 8]> = Vec::with_capacity(60_000);
+            let mut sampled = TruthSampler::new(devices);
+            sampled
+                .tracks
+                .insert(serial.clone(), Vec::with_capacity(60_000));
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let now = shm::now_ns();
-                if let Some(Some(p)) = client.raw_poses().get(index).copied() {
-                    out.push(eval::truth_row(now, &p));
-                }
+                sampled.poll(&client);
                 std::thread::sleep(Duration::from_millis(2));
             }
-            out
+            sampled.finish(|i| client.device(i))
         })
     };
     let paced = pace_windows(&[
@@ -1468,7 +1505,7 @@ fn eval_capture() -> i32 {
         "still:10".to_string(),
     ]);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let samples = sampler.join().unwrap_or_default();
+    let sampled = sampler.join().unwrap_or_default();
     let tracking_bases = bases.finish();
     guard.0 = false;
     send("record stop");
@@ -1482,17 +1519,14 @@ fn eval_capture() -> i32 {
             return code;
         }
     };
-    let file = eval::TruthFile {
-        format: eval::TRUTH_FORMAT.into(),
-        version: 1,
-        reference: reference.serial.clone(),
-        universe_id: universe,
+    let file = paced_truth_file(
+        reference.serial.clone(),
+        universe,
         windows,
-        samples,
-        others: Vec::new(),
+        sampled,
         latency_adjustment_ms,
         tracking_bases,
-    };
+    );
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
         &truth_path,
@@ -2759,8 +2793,8 @@ fn capture_free_named_with_feedback(
             return Err(1);
         }
     };
-    let universe = client
-        .devices()
+    let devices = client.devices();
+    let universe = devices
         .iter()
         .find_map(|d| {
             client
@@ -2813,53 +2847,16 @@ fn capture_free_named_with_feedback(
     let sampler = {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            let mut tracks: BTreeMap<String, Vec<[f64; 8]>> = BTreeMap::new();
-            let mut kinds: BTreeMap<String, String> = BTreeMap::new();
-            let mut serials: Vec<Option<String>> = Vec::new();
-            let mut hmd_index = None;
-            let mut next_scan = 0u64;
+            let mut sampled = TruthSampler::new(devices);
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let now = shm::now_ns();
-                if now >= next_scan {
-                    let devs = client.devices();
-                    serials = vec![None; 64];
-                    hmd_index = devs
-                        .iter()
-                        .find(|d| d.class == vr::CLASS_HMD)
-                        .map(|d| d.index as usize);
-                    // every Lighthouse device (controllers, the headset, the base stations), and our
-                    // Touches as SteamVR shows them
-                    for d in devs.iter().filter(|d| {
-                        d.tracking_system == "lighthouse"
-                            || d.class == vr::CLASS_HMD
-                            || d.serial.starts_with("CV1T-")
-                    }) {
-                        if let Some(slot) = serials.get_mut(d.index as usize) {
-                            *slot = Some(d.serial.clone());
-                        }
-                        let kind = match d.class {
-                            _ if d.serial.starts_with("CV1T-") => "touch",
-                            vr::CLASS_CONTROLLER => "controller",
-                            vr::CLASS_HMD => "hmd",
-                            vr::CLASS_TRACKING_REFERENCE => "base",
-                            _ => "other",
-                        };
-                        kinds.insert(d.serial.clone(), kind.to_string());
-                    }
-                    next_scan = now + 500_000_000;
-                }
-                let raw = client.raw_poses();
-                for (i, p) in raw.iter().enumerate() {
-                    if let (Some(p), Some(Some(serial))) = (p, serials.get(i)) {
-                        tracks
-                            .entry(serial.clone())
-                            .or_default()
-                            .push(eval::truth_row(now, p));
-                    }
-                }
-                if let (Some(out), Some(reader), Some(Some(hmd))) =
-                    (&frames_out, &reader, hmd_index.and_then(|i| raw.get(i)))
-                {
+                let frame = sampled.poll(&client);
+                let now = frame.t_ns;
+                let raw = frame.poses;
+                if let (Some(out), Some(reader), Some(Some(hmd))) = (
+                    &frames_out,
+                    &reader,
+                    sampled.hmd_index.and_then(|i| raw.get(i)),
+                ) {
                     let touch = [HAND_LEFT, HAND_RIGHT].map(|hand| {
                         reader
                             .hand(hand)
@@ -2874,7 +2871,8 @@ fn capture_free_named_with_feedback(
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            (tracks, kinds)
+            let sampled = sampled.finish(|i| client.device(i));
+            (sampled.tracks, sampled.kinds)
         })
     };
     // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
@@ -4169,15 +4167,7 @@ fn register_from_capture_with(
         let published = capture_poses(base)?;
         // the registration as the daemon applied it during the capture: followed through any
         // re-solve of the universe since it was made
-        let stations: Vec<(String, nalgebra::Isometry3<f64>)> = tf
-            .others
-            .iter()
-            .filter(|o| o.kind == "base")
-            .filter_map(|o| {
-                let s = eval::truth_samples(&o.samples);
-                Some((o.serial.clone(), s.get(s.len() / 2)?.pose))
-            })
-            .collect();
+        let stations = truth_stations(&tf);
         // SteamVR's layouts so far, with those earlier captures and this one saw: they place the
         // stations no registration measured
         let mut history = align::load_layouts(&align::layouts_path());
@@ -6039,6 +6029,224 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_device(index: u32, class: vr::DeviceClass, serial: &str) -> vr::Device {
+        vr::Device {
+            index,
+            class,
+            serial: serial.into(),
+            model: String::new(),
+            tracking_system: "lighthouse".into(),
+            controller_type: "knuckles".into(),
+        }
+    }
+
+    #[test]
+    fn capture_review_inventory_delay_does_not_stamp_the_pose_early() {
+        let clock = std::cell::Cell::new(1);
+        let pose_at = std::cell::Cell::new(0);
+        let reference = capture_device(0, vr::CLASS_CONTROLLER, "REFERENCE");
+        let mut sampled = TruthSampler::new(vec![reference.clone()]);
+        let frame = sampled.sample(
+            || clock.get(),
+            || {
+                clock.set(clock.get() + 1_000_000);
+                pose_at.set(clock.get());
+                vec![Some(nalgebra::Isometry3::identity())]
+            },
+            |i| {
+                clock.set(clock.get() + 250_000);
+                (i == 0).then(|| reference.clone())
+            },
+        );
+        assert_eq!(frame.t_ns, pose_at.get());
+        assert_eq!(clock.get() - frame.t_ns, 250_000);
+        let sampled = sampled.finish(|i| (i == 0).then(|| reference.clone()));
+        assert_eq!(sampled.tracks["REFERENCE"][0][0], pose_at.get() as f64);
+    }
+
+    #[test]
+    fn capture_review_index_reuse_between_scans_drops_the_mixed_interval() {
+        let mut sampled = TruthSampler::new(vec![capture_device(
+            0,
+            vr::CLASS_TRACKING_REFERENCE,
+            "BASE-A",
+        )]);
+        for step in 0..=65 {
+            let serial = if step < 2 { "BASE-A" } else { "BASE-B" };
+            let x = if step < 2 { 1. } else { 99. };
+            sampled.sample(
+                || step * 8_000_000,
+                || vec![Some(nalgebra::Isometry3::translation(x, 0., 0.))],
+                |i| (i == 0).then(|| capture_device(i, vr::CLASS_TRACKING_REFERENCE, serial)),
+            );
+        }
+        let sampled = sampled.finish(|i| {
+            (i == 0).then(|| capture_device(i, vr::CLASS_TRACKING_REFERENCE, "BASE-B"))
+        });
+        assert_eq!(sampled.tracks["BASE-A"].len(), 1);
+        assert!(sampled.tracks["BASE-A"].iter().all(|r| r[5] == 1.));
+        assert_eq!(sampled.tracks["BASE-B"].len(), 1);
+        assert!(sampled.tracks["BASE-B"].iter().all(|r| r[5] == 99.));
+        assert_eq!(sampled.tracks["BASE-B"][0][0], 520_000_000.);
+    }
+
+    #[test]
+    fn capture_review_validity_transition_drops_unconfirmed_poses() {
+        let reference = capture_device(0, vr::CLASS_CONTROLLER, "REFERENCE");
+        let mut sampled = TruthSampler::new(vec![reference.clone()]);
+        for (now, x) in [
+            (0, Some(1.)),
+            (2_000_000, Some(1.)),
+            (4_000_000, None),
+            (6_000_000, Some(99.)),
+        ] {
+            sampled.sample(
+                || now,
+                || vec![x.map(|x| nalgebra::Isometry3::translation(x, 0., 0.))],
+                |i| (i == 0).then(|| reference.clone()),
+            );
+        }
+        let sampled = sampled.finish(|i| (i == 0).then(|| reference.clone()));
+        assert_eq!(sampled.tracks["REFERENCE"].len(), 1);
+        assert_eq!(sampled.tracks["REFERENCE"][0][5], 1.);
+    }
+
+    #[test]
+    fn capture_review_an_unreadable_serial_cannot_confirm_a_track() {
+        let unknown = capture_device(0, vr::CLASS_TRACKING_REFERENCE, "");
+        let mut sampled = TruthSampler::new(vec![unknown.clone()]);
+        sampled.sample(
+            || 0,
+            || vec![Some(nalgebra::Isometry3::identity())],
+            |i| (i == 0).then(|| unknown.clone()),
+        );
+        let sampled = sampled.finish(|i| (i == 0).then(|| unknown.clone()));
+        assert!(sampled.tracks.is_empty());
+    }
+
+    #[test]
+    fn capture_review_paced_truth_file_round_trips_into_registration_readers() {
+        let devices = vec![
+            capture_device(0, vr::CLASS_HMD, "HEADSET"),
+            capture_device(1, vr::CLASS_CONTROLLER, "INDEX-REFERENCE"),
+            capture_device(2, vr::CLASS_CONTROLLER, "OTHER-CONTROLLER"),
+            capture_device(3, vr::CLASS_TRACKING_REFERENCE, "BASE-A"),
+            capture_device(4, vr::CLASS_TRACKING_REFERENCE, "BASE-OFFLINE"),
+        ];
+        let mut sampled = TruthSampler::new(devices.clone());
+        let polls = std::cell::Cell::new(0);
+        let scans = std::cell::Cell::new(0);
+        for (now, valid) in [
+            (0, true),
+            (8_000_000, true),
+            (10_000_000, false),
+            (12_000_000, true),
+        ] {
+            sampled.sample(
+                || now,
+                || {
+                    polls.set(polls.get() + 1);
+                    vec![
+                        Some(nalgebra::Isometry3::identity()),
+                        valid.then(nalgebra::Isometry3::identity),
+                        Some(nalgebra::Isometry3::translation(1., 0., 0.)),
+                        Some(nalgebra::Isometry3::translation(0., 2., 0.)),
+                        None,
+                    ]
+                },
+                |i| {
+                    scans.set(scans.get() + 1);
+                    devices.iter().find(|d| d.index == i).cloned()
+                },
+            );
+        }
+        assert_eq!((polls.get(), scans.get()), (4, 2));
+        let sampled = sampled.finish(|i| devices.iter().find(|d| d.index == i).cloned());
+        let windows = vec![("still".into(), 0, 12_000_000)];
+        let bases = BTreeMap::from([("INDEX-REFERENCE".into(), "BASE-A".into())]);
+        let file = paced_truth_file(
+            "INDEX-REFERENCE".into(),
+            42,
+            windows.clone(),
+            sampled,
+            Some(-2.5),
+            bases.clone(),
+        );
+        let encoded = serde_json::to_vec(&file).unwrap();
+        let decoded: eval::TruthFile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.reference, "INDEX-REFERENCE");
+        assert_eq!(
+            (
+                decoded.format.as_str(),
+                decoded.version,
+                decoded.universe_id
+            ),
+            (eval::TRUTH_FORMAT, 1, 42)
+        );
+        assert_eq!(decoded.windows, windows);
+        assert_eq!(decoded.latency_adjustment_ms, Some(-2.5));
+        assert_eq!(decoded.tracking_bases, bases);
+        let (reference, poses) = truth_track(&decoded, None).unwrap();
+        assert_eq!(reference, "INDEX-REFERENCE");
+        assert_eq!(
+            poses.len(),
+            2,
+            "keep the selected reference despite its tracking gap"
+        );
+        assert_eq!(poses[1].t_ns, 8_000_000);
+        assert_eq!(decoded.others.len(), 3);
+        assert!(decoded.others.iter().any(|t| t.kind == "hmd"));
+        assert!(decoded
+            .others
+            .iter()
+            .any(|t| t.kind == "controller" && t.samples.len() == 4));
+        let stations = truth_stations(&decoded);
+        assert_eq!(stations.len(), 1);
+        assert_eq!(stations[0].0, "BASE-A");
+        assert_eq!(stations[0].1.translation.vector.y, 2.);
+    }
+
+    #[test]
+    fn capture_review_delayed_inventory_is_spread_across_pose_ticks() {
+        let delay = Duration::from_micros(250);
+        let begin = Instant::now();
+        for _ in 0..vr::MAX_DEVICES {
+            thread::sleep(delay);
+        }
+        let full_scan = begin.elapsed();
+        let reference = capture_device(0, vr::CLASS_CONTROLLER, "REFERENCE");
+        let mut sampled = TruthSampler::new(vec![reference.clone()]);
+        let clock = std::cell::Cell::new(0);
+        let probes = std::cell::Cell::new(0);
+        let mut previous = None;
+        let mut max_gap = 0;
+        let mut max_wall_step = Duration::ZERO;
+        for _ in 0..256 {
+            let before = probes.get();
+            let start = Instant::now();
+            let frame = sampled.sample(
+                || clock.get(),
+                || vec![Some(nalgebra::Isometry3::identity())],
+                |i| {
+                    probes.set(probes.get() + 1);
+                    thread::sleep(delay);
+                    clock.set(clock.get() + 250_000);
+                    (i == 0).then(|| reference.clone())
+                },
+            );
+            max_wall_step = max_wall_step.max(start.elapsed());
+            assert!(probes.get() - before <= 1);
+            if let Some(was) = previous {
+                max_gap = max_gap.max(frame.t_ns - was);
+            }
+            previous = Some(frame.t_ns);
+            clock.set(clock.get() + 2_000_000);
+        }
+        assert_eq!(probes.get(), 64);
+        assert_eq!(max_gap, 2_250_000);
+        eprintln!("delayed inventory (250 us/index): full scan {:.3} ms wall / 16.000 ms injected; incremental max {:.3} ms wall work per tick / 0.250 ms injected; max modeled pose gap {:.3} ms", full_scan.as_secs_f64() * 1000., max_wall_step.as_secs_f64() * 1000., max_gap as f64 * 1e-6);
+    }
 
     /// `doctor`'s sensor_poses check reads the daemon's pose watch: moved beats placed, given up
     /// beats moved, and unsure beats all.
