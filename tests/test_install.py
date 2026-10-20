@@ -18,6 +18,15 @@ SPEC.loader.exec_module(INSTALLER)
 
 
 class InstallTests(unittest.TestCase):
+    def test_installed_service_matches_the_checked_in_restart_policy(self):
+        template = (INSTALLER.ROOT / "systemd/cv1touchd.service").read_text()
+        binary = Path('/example path/cv1touchd')
+        service = INSTALLER.service_text(binary)
+        self.assertEqual(service, template.replace('ExecStart=%h/.local/bin/cv1touchd', 'ExecStart=:"/example path/cv1touchd"'))
+        self.assertIn('ExecStart=:"/example path/cv1touchd"\n', service)
+        self.assertIn("Restart=on-failure\nRestartSec=2\n", service)
+        self.assertNotIn("StartLimit", service)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cv1touch-install-test-")
         self.addCleanup(self.temp.cleanup)

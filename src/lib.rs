@@ -12,6 +12,7 @@ pub mod engine;
 pub mod eval;
 pub mod ffi;
 pub mod flight;
+pub mod flight_writer;
 pub mod hand;
 pub mod headset_watch;
 pub mod input_calibration;

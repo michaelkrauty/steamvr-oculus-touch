@@ -6,11 +6,10 @@
 
 use std::fs;
 use std::io;
-use std::io::{Read, Write};
 use std::mem;
 use std::path::PathBuf;
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,6 +17,7 @@ use std::time::Duration;
 use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::flight::{self, FlightRecorder};
+use cv1touch::flight_writer;
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
@@ -38,6 +38,8 @@ const RECORDER_RING_BYTES: usize = 64 << 20;
 /// blobs start at the engine's threshold of 36, so their halos are kept.
 const RAW_FRAME_FLOOR: u8 = 7;
 const MAX_CLIENTS: usize = 16;
+const ENGINE_WORKER: u8 = 1;
+const RADIO_WORKER: u8 = 2;
 
 /// Which pose cv1touchd publishes: its own tracker (OpenHMD only acquires) or OpenHMD's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,6 +142,8 @@ struct Daemon {
     /// The radio's recent traffic, recorded around a controller's dropout.
     flight: FlightRecorder,
     quit: AtomicBool,
+    /// The first critical worker that stopped unexpectedly; read without any worker locks.
+    failed_worker: AtomicU8,
     /// A client asked the daemon to stop (control `stop`).
     stop_requested: AtomicBool,
     haptics: Mutex<[Option<Haptic>; 2]>,
@@ -1209,7 +1213,7 @@ fn engine_main(d: Arc<Daemon>) {
     let mut last_err = String::new();
     while !d.quit.load(Ordering::Acquire) {
         let (opts, revision) = requested_engine_options(&d);
-        let mut e = match Engine::open(&opts, d.clone()) {
+        let e = match Engine::open(&opts, d.clone()) {
             Ok(e) => e,
             Err(err) => {
                 if err != last_err {
@@ -1221,58 +1225,99 @@ fn engine_main(d: Arc<Daemon>) {
                 continue;
             }
         };
-        d.engine_applied.store(revision, Ordering::Release);
         last_err.clear();
-        d.session.lock().unwrap().reset(); // sensors may differ after a reopen
-        d.sensor_poses.lock().unwrap().clear();
-        d.sensor_agreement.lock().unwrap().clear();
-        d.sensors_unsure.store(false, Ordering::Relaxed);
-        log(format!(
-            "engine running with {} sensor(s)",
-            e.sensors().len()
-        ));
-        make_usb_thread_realtime();
-        let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
-        d.track_in.lock().unwrap().register(open.iter().cloned());
-        for serial in modes::unposed_sensors(&opts, &open) {
-            log(format!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)"));
-        }
-        let link = RadioLink::default();
-        // the radio thread holds a decoder pointing into the engine: the scope joins it first
-        thread::scope(|scope| {
-            let radio = new_pipeline(&d, &opts, &e).and_then(|pipe| {
-                let Some(path) = hid::headset_interface(1) else {
-                    log("no HID interface for the headset's radio: publishing OpenHMD poses");
-                    return None;
-                };
-                let file = match hid::Device::open(&path) {
-                    Ok(f) => f,
-                    Err(err) => {
-                        log(format!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display()));
-                        return None;
-                    }
-                };
-                // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
-                let dec = unsafe { e.radio_decoder() }?;
-                log(format!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display()));
-                let watch = LandmarkWatch::load();
-                let (d, link) = (&*d, &link);
-                Some(thread::Builder::new().name("cv1t-radio".into()).spawn_scoped(scope, move || radio_main(d, link, dec, file, pipe, watch)).expect("radio thread"))
-            });
-            {
-                let _stop = StopRadio { d: &d, link: &link };
-                engine_loop(&d, &mut e, &link, radio.is_some());
-            }
-            if let Some(Err(_)) = radio.map(|r| r.join()) {
-                log("radio thread panicked");
-            }
+        watch_worker_resources(&d.failed_worker, ENGINE_WORKER, true, e, |e| {
+            engine_session(&d, &opts, revision, e);
         });
-        if let Some(f) = link.biases.lock().unwrap().take() {
-            save_biases(&f);
-        }
-        drop(e);
         publish_disconnected(&d);
     }
+}
+
+/// A decoder is needed before HID reads can be useful: keep the fallback from starting I/O
+/// that it would immediately have to cancel (Windows cancellation can wait indefinitely).
+fn radio_resources<D, H>(
+    decoder: impl FnOnce() -> Option<D>,
+    open: impl FnOnce() -> Option<H>,
+) -> Option<(D, H)> {
+    let decoder = decoder()?;
+    let device = open()?;
+    Some((decoder, device))
+}
+
+/// One open engine, including setup and the radio scope, borrows its owner's native resources.
+fn engine_session(d: &Daemon, opts: &EngineOptions, revision: u64, e: &mut Engine) {
+    d.engine_applied.store(revision, Ordering::Release);
+    d.session.lock().unwrap().reset(); // sensors may differ after a reopen
+    d.sensor_poses.lock().unwrap().clear();
+    d.sensor_agreement.lock().unwrap().clear();
+    d.sensors_unsure.store(false, Ordering::Relaxed);
+    log(format!(
+        "engine running with {} sensor(s)",
+        e.sensors().len()
+    ));
+    make_usb_thread_realtime();
+    let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
+    d.track_in.lock().unwrap().register(open.iter().cloned());
+    for serial in modes::unposed_sensors(opts, &open) {
+        log(format!(
+            "sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)"
+        ));
+    }
+    let link = RadioLink::default();
+    // the radio thread holds a decoder pointing into the engine: the scope joins it first
+    engine_scope(&d.failed_worker, |scope| {
+        let stop = StopRadio { d, link: &link };
+        let radio = new_pipeline(d, opts, e).and_then(|pipe| {
+            let Some(path) = hid::headset_interface(1) else {
+                log("no HID interface for the headset's radio: publishing OpenHMD poses");
+                return None;
+            };
+            // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
+            let (dec, file) = radio_resources(|| unsafe { e.radio_decoder() }, || {
+                match hid::Device::open(&path) {
+                    Ok(f) => Some(f),
+                    Err(err) => {
+                        log(format!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display()));
+                        None
+                    }
+                }
+            })?;
+            // Opening the HID handle already starts a Windows read: mark a startup panic before
+            // its local handle can wait for cancellation while unwinding.
+            let _startup = WorkerExit { failed: &d.failed_worker, worker: ENGINE_WORKER, panic_only: true };
+            log(format!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display()));
+            let watch = LandmarkWatch::load();
+            let (d, link) = (d, &link);
+            let job = WorkerResources::starting(&d.failed_worker, ENGINE_WORKER, (dec, file, pipe, watch));
+            match thread::Builder::new().name("cv1t-radio".into()).spawn_scoped(scope, move || {
+                job.run_as(RADIO_WORKER, true, |(dec, file, pipe, watch)| {
+                    radio_main(d, link, dec, file, pipe, watch);
+                });
+            }) {
+                Ok(radio) => Some(radio),
+                Err(err) => panic!("could not start the radio thread: {err}"),
+            }
+        });
+        engine_loop(d, e, &link, radio.is_some());
+        drop(stop);
+        if let Some(Err(_)) = radio.map(|r| r.join()) {
+            log("radio thread panicked");
+        }
+    });
+    let biases = link.biases.lock().unwrap().take();
+    if let Some(f) = biases {
+        save_biases(&f);
+    }
+}
+
+/// Mark startup and loop panics before the scope can wait for a radio thread to finish.
+fn engine_scope<'env>(
+    failed: &AtomicU8,
+    run: impl for<'scope> FnOnce(&'scope thread::Scope<'scope, 'env>),
+) {
+    thread::scope(|scope| {
+        watch_worker(failed, ENGINE_WORKER, true, || run(scope));
+    });
 }
 
 /// How long `test-inject on` arms input injection: it disarms itself, so a forgotten test leaves
@@ -1342,6 +1387,79 @@ impl Injection {
     }
 }
 
+/// Marks a critical worker's failure without touching any state its panic could have poisoned.
+struct WorkerExit<'a> {
+    failed: &'a AtomicU8,
+    worker: u8,
+    panic_only: bool,
+}
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        if !self.panic_only || thread::panicking() {
+            let _ =
+                self.failed
+                    .compare_exchange(0, self.worker, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
+fn watch_worker(failed: &AtomicU8, worker: u8, panic_only: bool, run: impl FnOnce()) {
+    watch_worker_resources(failed, worker, panic_only, (), |()| run());
+}
+
+/// The marker is the first field: an abandoned spawn drops it before native resources, even
+/// when no panic has begun. Once running, only a panic (or an unexpected engine exit) is fatal.
+struct WorkerResources<'a, R> {
+    exit: WorkerExit<'a>,
+    resources: R,
+}
+
+impl<'a, R> WorkerResources<'a, R> {
+    fn starting(failed: &'a AtomicU8, worker: u8, resources: R) -> Self {
+        Self {
+            exit: WorkerExit {
+                failed,
+                worker,
+                panic_only: false,
+            },
+            resources,
+        }
+    }
+
+    fn run_as(mut self, worker: u8, panic_only: bool, run: impl FnOnce(&mut R)) {
+        self.exit.worker = worker;
+        self.exit.panic_only = panic_only;
+        run(&mut self.resources);
+    }
+}
+
+/// Callbacks borrow native resources so failure is marked before their teardown can wait.
+fn watch_worker_resources<R>(
+    failed: &AtomicU8,
+    worker: u8,
+    panic_only: bool,
+    resources: R,
+    run: impl FnOnce(&mut R),
+) {
+    WorkerResources::starting(failed, worker, resources).run_as(worker, panic_only, run);
+}
+
+/// A failed tracker cannot be recovered safely by joining through its possibly poisoned locks.
+/// Exit directly so the supervisor can start with fresh state and USB handles.
+fn exit_on_worker_failure(failed: &AtomicU8, shared: &ShmWriter) {
+    let name = match failed.load(Ordering::Acquire) {
+        ENGINE_WORKER => "tracking engine thread",
+        RADIO_WORKER => "radio thread",
+        _ => return,
+    };
+    log(format!(
+        "{name} stopped unexpectedly; exiting so the daemon can restart"
+    ));
+    shared.retire();
+    process::exit(1);
+}
+
 /// Stops the radio thread when the engine loop ends, a panic included (the scope would wait on
 /// the thread forever otherwise).
 struct StopRadio<'a> {
@@ -1398,6 +1516,13 @@ const PROBATION_NS: u64 = 30_000_000_000;
 /// A sensor placed again this many times in `PLACEMENTS_WINDOW_NS` is given up on.
 const MAX_PLACEMENTS: usize = 3;
 const PLACEMENTS_WINDOW_NS: u64 = 1_800_000_000_000;
+
+fn prune_placements(placements: &mut std::collections::BTreeMap<String, Vec<u64>>, now: u64) {
+    placements.retain(|_, times| {
+        times.retain(|t| now.saturating_sub(*t) <= PLACEMENTS_WINDOW_NS);
+        !times.is_empty()
+    });
+}
 /// Releases of a sensor more than this far apart do not count as a run.
 const RELEASE_RUN_NS: u64 = 3_600_000_000_000;
 
@@ -1576,6 +1701,7 @@ impl Reposing {
             return;
         }
         self.next_tick = now + REPOSE_TICK_NS;
+        prune_placements(&mut self.placements, now);
         while let Ok((job, result)) = self.from_solver.try_recv() {
             let camera = job.camera;
             let Some(serial) = pipe.serial_of(camera).map(str::to_string) else {
@@ -1685,11 +1811,7 @@ impl Reposing {
                     let Some(camera) = pipe.camera_id(&serial) else {
                         continue;
                     };
-                    let recent = self.placements.get(&serial).map_or(0, |p| {
-                        p.iter()
-                            .filter(|t| now.saturating_sub(**t) <= PLACEMENTS_WINDOW_NS)
-                            .count()
-                    });
+                    let recent = self.placements.get(&serial).map_or(0, Vec::len);
                     if recent >= MAX_PLACEMENTS {
                         // it keeps moving, or something else is wrong: not again and again
                         pipe.probe(&serial, true);
@@ -2197,10 +2319,10 @@ const RADIO_REFRESH_NS: u64 = 20_000_000;
 fn radio_main(
     d: &Daemon,
     link: &RadioLink,
-    mut dec: engine::RadioDecoder,
-    mut radio: hid::Device,
-    mut pipe: Pipeline,
-    mut watch: Option<LandmarkWatch>,
+    dec: &mut engine::RadioDecoder,
+    radio: &mut hid::Device,
+    pipe: &mut Pipeline,
+    watch: &mut Option<LandmarkWatch>,
 ) {
     let me = system::current_thread();
     if let Err(err) = set_rt_affinity(me) {
@@ -2281,7 +2403,7 @@ fn radio_main(
                     &c,
                     now,
                     &mut hands[h],
-                    Some(&mut pipe),
+                    Some(pipe),
                     &mut shapers[h],
                     &mut memory[h],
                 );
@@ -2308,7 +2430,7 @@ fn radio_main(
                 b.imu.y * 1e3,
                 b.imu.z * 1e3
             ));
-            biases.seed(&mut pipe, b.hand, &b.leds);
+            biases.seed(pipe, b.hand, &b.leds);
             link.hands.request(b.hand);
         }
         // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
@@ -2342,7 +2464,7 @@ fn radio_main(
                     &radio_sample(&view, &s),
                     now,
                     &mut hands[h],
-                    Some(&mut pipe),
+                    Some(pipe),
                     &mut shapers[h],
                     &mut memory[h],
                 );
@@ -2368,10 +2490,10 @@ fn radio_main(
         if let Some(hands) = search_skip.changed() {
             dec.set_search_skip(hands);
         }
-        if let Some(f) = biases.update(&pipe, now) {
+        if let Some(f) = biases.update(pipe, now) {
             *link.biases.lock().unwrap() = Some(f);
         }
-        reposing.tick(d, link, &mut pipe, &mut watch, now);
+        reposing.tick(d, link, pipe, watch, now);
         rest.if_due(now);
         if now >= next_stats {
             d.pending_frames_dropped
@@ -2557,11 +2679,11 @@ fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
         GapEvent::Began {
             last_sample_host_ns,
             moving: true,
-        } => d.flight.dropout(h, last_sample_host_ns),
+        } => d.flight.dropout(h, last_sample_host_ns, true),
         GapEvent::Ended {
             last_sample_host_ns,
             silent_ns,
-        } if silent_ns >= flight::SHORTEST_NS => d.flight.dropout(h, last_sample_host_ns),
+        } if silent_ns >= flight::SHORTEST_NS => d.flight.dropout(h, last_sample_host_ns, false),
         GapEvent::Ended {
             last_sample_host_ns,
             ..
@@ -2583,35 +2705,24 @@ fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
     });
 }
 
-/// Saves the dropout recordings that are due (`FlightRecorder::due`) in the state directory, on
-/// a thread of their own: a slow disk must not hold up the daemon's heartbeat.
-fn save_dropouts(d: &Daemon) {
-    let due = d.flight.due(shm::now_ns());
-    if due.is_empty() {
-        return;
-    }
-    let dir = platform::dirs::get().state;
+/// Hands due dropout recordings to the daemon's single writer without waiting for storage.
+fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
     let unix_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |t| t.as_secs());
-    let spawned = thread::Builder::new()
-        .name("cv1t-dropout".into())
-        .spawn(move || {
-            for dropout in due {
-                let name = ["left", "right"][dropout.hand];
-                match flight::save(&dir, &dropout, unix_s) {
-                    Ok(path) => log(format!(
-                        "{name}: recorded the radio from {} s before its dropout to {} s after: {}",
-                        flight::BEFORE_NS / 1_000_000_000,
-                        flight::AFTER_NS / 1_000_000_000,
-                        path.display()
-                    )),
-                    Err(e) => log(format!("{name}: could not record its dropout: {e}")),
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        log(format!("could not record a dropout: {e}"));
+    for dropout in d.flight.due(shm::now_ns()) {
+        let Some(writer) = writer else {
+            log("could not record a dropout: the recording thread did not start");
+            continue;
+        };
+        match writer.submit(dropout, unix_s) {
+            Ok(Some(dropped)) => log(format!(
+                "{}: dropped a dropout recording because storage fell behind",
+                ["left", "right"][dropped.hand]
+            )),
+            Ok(None) => {}
+            Err(e) => log(format!("could not record a dropout: {e}")),
+        }
     }
 }
 
@@ -3378,32 +3489,12 @@ fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer
     server
 }
 
-/// One client's request lines, each answered with one reply line. A client that stops reading
-/// for a second, or sends 4 KiB without a newline, is dropped.
-fn serve_client(d: &Daemon, mut conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        match conn.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=pos).collect();
-            let reply = {
-                let _turn = one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
-                handle(d, String::from_utf8_lossy(&line).trim())
-            };
-            let _ = conn.set_timeout(Some(Duration::from_secs(1)));
-            if conn.write_all(format!("{reply}\n").as_bytes()).is_err() {
-                return;
-            }
-            let _ = conn.set_timeout(None);
-        }
-        if buf.len() > 4096 {
-            return; // no newline in 4 KiB: not a protocol client
-        }
-    }
+/// Both endpoints use the same bounded reader and serialize complete requests through one lock.
+fn serve_client(d: &Daemon, conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
+    control::serve_client(conn, |line| {
+        let _turn = one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
+        handle(d, line)
+    });
 }
 
 const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --supervise [OPTIONS]   run it as a child process, restarted after a failure, its output in a log file\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
@@ -3719,6 +3810,7 @@ fn main() {
         rec,
         flight: FlightRecorder::new(),
         quit: AtomicBool::new(false),
+        failed_worker: AtomicU8::new(0),
         stop_requested: AtomicBool::new(false),
         haptics: Mutex::new([None; 2]),
         session: Mutex::new(recorder::SessionInfo::default()),
@@ -3762,11 +3854,22 @@ fn main() {
         inject: Injection::default(),
         inputs: Mutex::new(inputs),
     });
+    let dropout_writer = match flight_writer::Writer::start(platform::dirs::get().state, log) {
+        Ok(writer) => Some(writer),
+        Err(e) => {
+            log(format!("could not start the dropout recording thread: {e}"));
+            None
+        }
+    };
     let engine_thread = {
         let d = Arc::clone(&d);
         thread::Builder::new()
             .name("cv1t-engine".into())
-            .spawn(move || engine_main(d))
+            .spawn(move || {
+                watch_worker(&d.failed_worker, ENGINE_WORKER, false, || {
+                    engine_main(Arc::clone(&d));
+                });
+            })
             .expect("engine thread")
     };
     let universe_thread = {
@@ -3790,11 +3893,12 @@ fn main() {
 
     let control = serve_control(Arc::clone(&d), listeners);
     loop {
+        exit_on_worker_failure(&d.failed_worker, &d.shm);
         // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
         // engine thread for seconds, which must not read as a dead daemon; stale poses are the
         // driver's own concern (sample age)
         d.shm.heartbeat(shm::now_ns());
-        save_dropouts(&d);
+        save_dropouts(&d, dropout_writer.as_ref());
         if let Some(why) = shutdown.wait(Duration::from_millis(200)) {
             log(format!("{why}: shutting down"));
             break;
@@ -4210,6 +4314,294 @@ mod tests {
         assert_eq!(messages.len(), 1);
     }
 
+    #[test]
+    fn placement_history_keeps_only_the_window_used_for_retrying() {
+        let mut placements = std::collections::BTreeMap::new();
+        placements.insert("sensor-old".into(), vec![0]);
+        for n in 1..2000 {
+            let now = n * (PLACEMENTS_WINDOW_NS + 1);
+            prune_placements(&mut placements, now);
+            let history = placements.entry("sensor-example".into()).or_default();
+            history.push(now);
+            assert_eq!(history, &[now]);
+            assert!(!placements.contains_key("sensor-old"));
+        }
+        placements.insert("sensor-boundary".into(), vec![0, 1, PLACEMENTS_WINDOW_NS]);
+        prune_placements(&mut placements, PLACEMENTS_WINDOW_NS + 1);
+        assert_eq!(placements["sensor-boundary"], [1, PLACEMENTS_WINDOW_NS]);
+    }
+
+    #[test]
+    fn an_engine_waiting_for_devices_is_live_but_its_exit_is_not() {
+        let failed = Arc::new(AtomicU8::new(0));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (release, done) = std::sync::mpsc::channel();
+        let flag = Arc::clone(&failed);
+        let worker = thread::spawn(move || {
+            watch_worker(&flag, ENGINE_WORKER, false, || {
+                started.send(()).unwrap();
+                done.recv().unwrap();
+            })
+        });
+        waiting.recv().unwrap();
+        assert_eq!(failed.load(Ordering::Acquire), 0);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(failed.load(Ordering::Acquire), ENGINE_WORKER);
+    }
+
+    #[test]
+    fn expected_radio_returns_are_not_failures_but_panics_are() {
+        let failed = AtomicU8::new(0);
+        watch_worker(&failed, RADIO_WORKER, true, || {});
+        assert_eq!(failed.load(Ordering::Acquire), 0);
+        thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| watch_worker(&failed, RADIO_WORKER, true, || panic!("radio test")));
+            assert!(worker.join().is_err());
+        });
+        assert_eq!(failed.load(Ordering::Acquire), RADIO_WORKER);
+    }
+
+    struct BlockingTeardown {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Drop for BlockingTeardown {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+    }
+
+    fn failure_during_teardown(
+        run: impl FnOnce(Arc<AtomicU8>, BlockingTeardown) + Send + 'static,
+    ) -> (u8, bool) {
+        let failed = Arc::new(AtomicU8::new(0));
+        let flag = Arc::clone(&failed);
+        let (entered, dropping) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            run(
+                flag,
+                BlockingTeardown {
+                    entered,
+                    release: blocked,
+                },
+            )
+        });
+        let reached_drop = dropping.recv_timeout(Duration::from_secs(5)).is_ok();
+        let marked = failed.load(Ordering::Acquire);
+        // Always release teardown before asserting, including with the guard moved too late.
+        let _ = release.send(());
+        let panicked = worker.join().is_err();
+        assert!(reached_drop, "native teardown did not start");
+        (marked, panicked)
+    }
+
+    #[test]
+    fn a_radio_panic_is_marked_before_its_owned_device_can_block_in_drop() {
+        let (marked, panicked) = failure_during_teardown(|failed, device| {
+            watch_worker_resources(&failed, RADIO_WORKER, true, device, |_| {
+                panic!("radio test")
+            });
+        });
+        assert!(panicked);
+        assert_eq!(
+            marked, RADIO_WORKER,
+            "panic was not marked before device teardown"
+        );
+    }
+
+    #[test]
+    fn an_engine_startup_panic_is_marked_before_its_owned_engine_can_block_in_drop() {
+        let (marked, panicked) = failure_during_teardown(|failed, engine| {
+            watch_worker_resources(&failed, ENGINE_WORKER, true, engine, |_| {
+                panic!("engine startup test")
+            });
+        });
+        assert!(panicked);
+        assert_eq!(
+            marked, ENGINE_WORKER,
+            "startup panic waited for engine teardown"
+        );
+    }
+
+    #[test]
+    fn a_missing_decoder_never_opens_a_hid_device_that_would_block_on_drop() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let did_open = Arc::clone(&opened);
+        let (entered, dropping) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let resources = radio_resources(
+                || None::<()>,
+                || {
+                    did_open.store(true, Ordering::Release);
+                    Some(BlockingTeardown {
+                        entered,
+                        release: blocked,
+                    })
+                },
+            );
+            completed.send(resources.is_none()).unwrap();
+        });
+        let returned = result.recv_timeout(Duration::from_secs(5)).ok();
+        let opened = opened.load(Ordering::Acquire);
+        let cleanup_started = dropping.try_recv().is_ok();
+        // Release an incorrectly opened device before asserting so the mutation cannot hang.
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert_eq!(returned, Some(true),
+            "decoder failure waited for HID cancellation: opened={opened}, cleanup_started={cleanup_started}");
+        assert!(!opened);
+        assert!(!cleanup_started);
+    }
+
+    #[test]
+    fn radio_resources_open_only_after_the_decoder_is_ready() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let resources = radio_resources(
+            || {
+                order.borrow_mut().push("decoder");
+                Some(1)
+            },
+            || {
+                order.borrow_mut().push("HID");
+                Some(2)
+            },
+        );
+        assert_eq!(resources, Some((1, 2)));
+        assert_eq!(*order.borrow(), ["decoder", "HID"]);
+        assert!(radio_resources(|| Some(1), || None::<()>).is_none());
+    }
+
+    #[test]
+    fn a_failed_spawn_marks_failure_before_its_abandoned_capture_can_block_in_drop() {
+        let (marked, panicked) = failure_during_teardown(|failed, device| {
+            // A failed OS spawn abandons its captured job before returning its error, without
+            // entering the callback or beginning a panic. The job's marker must run first.
+            let job = WorkerResources::starting(&failed, ENGINE_WORKER, device);
+            let start = move || job.run_as(RADIO_WORKER, true, |_| {});
+            let failure = Err::<(), _>((io::Error::other("thread creation failed"), start));
+            drop(failure);
+        });
+        assert!(!panicked);
+        assert_eq!(
+            marked, ENGINE_WORKER,
+            "failed spawn waited for captured device teardown"
+        );
+    }
+
+    #[test]
+    fn an_engine_panic_is_marked_before_its_scope_can_wait_on_teardown() {
+        let failed = Arc::new(AtomicU8::new(0));
+        let flag = Arc::clone(&failed);
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                engine_scope(&flag, |scope| {
+                    scope.spawn(move || blocked.recv().unwrap());
+                    panic!("engine startup test");
+                })
+            });
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while failed.load(Ordering::Acquire) == 0 && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let marked = failed.load(Ordering::Acquire);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(marked, ENGINE_WORKER);
+    }
+
+    // An offline child of the failure-exit regression; it never opens an engine or USB device.
+    #[test]
+    #[ignore = "run by a_failed_worker_exits_nonzero_with_a_plain_reason"]
+    fn failed_worker_exit_child() {
+        let Some(which) = std::env::var_os("CV1TOUCH_TEST_FAILED_WORKER") else {
+            return;
+        };
+        let worker = if which == "radio" {
+            RADIO_WORKER
+        } else {
+            ENGINE_WORKER
+        };
+        let failed = AtomicU8::new(0);
+        let state = Mutex::new(());
+        thread::scope(|scope| {
+            let panicking = scope.spawn(|| {
+                watch_worker(&failed, worker, worker == RADIO_WORKER, || {
+                    let _held = state.lock().unwrap();
+                    panic!("worker test");
+                })
+            });
+            assert!(panicking.join().is_err());
+        });
+        assert!(state.is_poisoned());
+        let shared = ShmWriter::create(&format!("/cv1t-worker-exit-{}", process::id()), 1).unwrap();
+        exit_on_worker_failure(&failed, &shared);
+        panic!("a failed worker was treated as live");
+    }
+
+    #[test]
+    fn a_failed_worker_exits_nonzero_with_a_plain_reason() {
+        for (worker, reason) in [
+            ("engine", "tracking engine thread"),
+            ("radio", "radio thread"),
+        ] {
+            let child = process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::failed_worker_exit_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CV1TOUCH_TEST_FAILED_WORKER", worker)
+                .output()
+                .unwrap();
+            assert_eq!(child.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "{reason} stopped unexpectedly; exiting so the daemon can restart"
+                )),
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_recording_keeps_its_initial_use_priority_when_the_radio_returns() {
+        let d = status_daemon();
+        let last = 1_000_000_000;
+        for (hand, moving) in [(0, true), (1, false)] {
+            note_gap(
+                &d,
+                hand,
+                GapEvent::Began {
+                    last_sample_host_ns: last,
+                    moving,
+                },
+            );
+            note_gap(
+                &d,
+                hand,
+                GapEvent::Ended {
+                    last_sample_host_ns: last,
+                    silent_ns: flight::SHORTEST_NS,
+                },
+            );
+        }
+        let due = d.flight.due(last + flight::AFTER_NS);
+        assert_eq!(due.len(), 2);
+        assert!(due[0].began_in_use);
+        assert!(!due[1].began_in_use);
+    }
+
     fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -4222,6 +4614,7 @@ mod tests {
             rec: Recorder::new(4096),
             flight: FlightRecorder::new(),
             quit: AtomicBool::new(false),
+            failed_worker: AtomicU8::new(0),
             stop_requested: AtomicBool::new(false),
             haptics: Mutex::new([None; 2]),
             session: Mutex::new(Default::default()),
@@ -5024,6 +5417,60 @@ mod tests {
         assert_eq!(skip.changed(), Some([true, false]));
     }
 
+    #[test]
+    fn idle_control_clients_release_all_sixteen_slots() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("cv1t-control-idle-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let endpoint = dir.join("control.sock");
+        let second_endpoint = dir.join("private/control.sock");
+        let listeners = vec![ipc::Listener::bind(&endpoint).unwrap()];
+        #[cfg(unix)]
+        let (listeners, _) = with_container_control(listeners, &second_endpoint);
+        #[cfg(windows)]
+        let listeners = {
+            let mut listeners = listeners;
+            listeners.push(ipc::Listener::bind(&second_endpoint).unwrap());
+            listeners
+        };
+        let _server = serve_control(Arc::new(status_daemon()), listeners);
+        let mut clients = Vec::new();
+        for i in 0..MAX_CLIENTS {
+            let path = if i % 2 == 0 {
+                &endpoint
+            } else {
+                &second_endpoint
+            };
+            let mut conn = ipc::Connection::connect(path).unwrap();
+            conn.set_timeout(Some(Duration::from_secs(5))).unwrap();
+            conn.write_all(b"bogus\n").unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut conn).read_line(&mut line).unwrap();
+            assert_eq!(line, "err unknown command 'bogus'\n");
+            clients.push(conn);
+        }
+        let closed = clients
+            .iter_mut()
+            .all(|conn| matches!(conn.read(&mut [0]), Ok(0)));
+        drop(clients);
+        let served = [&endpoint, &second_endpoint].iter().all(|endpoint| {
+            (0..50).any(|_| {
+                let answered = control::request(endpoint, "status", Duration::from_secs(2))
+                    .is_ok_and(|reply| reply.starts_with("ok {"));
+                if !answered {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                answered
+            })
+        });
+        let _ = fs::remove_dir_all(dir);
+        assert!(closed, "idle clients kept the control slots");
+        assert!(
+            served,
+            "a new request was refused after idle clients expired"
+        );
+    }
+
     /// The control server answers each request line, whether split across reads or several in
     /// one, serves at most MAX_CLIENTS clients, drops one that sends 4 KiB without a newline,
     /// and answers nothing once stopped.
@@ -5119,10 +5566,20 @@ mod tests {
         assert!(served);
         drop(idle);
 
-        let mut flood = connect();
-        let _ = flood.write_all(&[b'x'; 5000]);
-        assert_eq!(reply(&mut flood), Reply::Closed, "4 KiB without a newline");
+        for endpoint in [&endpoint, &second_endpoint] {
+            for terminated in [false, true] {
+                let mut flood = connect_on(endpoint);
+                let mut line = vec![b'x'; 5000];
+                if terminated {
+                    line.push(b'\n');
+                }
+                let _ = flood.write_all(&line);
+                assert_eq!(reply(&mut flood), Reply::Closed, "4 KiB per request");
+            }
+        }
 
+        drop(client);
+        let mut client = connect();
         let _stopped = control.stop();
         client
             .set_timeout(Some(Duration::from_millis(200)))

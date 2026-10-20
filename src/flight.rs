@@ -13,7 +13,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::recorder;
@@ -55,6 +55,8 @@ pub struct FlightRecorder {
     ring: Mutex<Ring>,
     /// Per hand: the last report of a controller that dropped out, until it is recorded; 0: none.
     pending: [AtomicU64; 2],
+    /// Published before `pending` by each hand's sole current publisher.
+    began_in_use: [AtomicBool; 2],
 }
 
 /// One dropout's recording, taken out of the ring.
@@ -63,6 +65,8 @@ pub struct Dropout {
     pub hand: usize,
     /// The controller's last report before it went silent.
     pub last_report_ns: u64,
+    /// Gaps that began in use take priority when the writer falls behind.
+    pub began_in_use: bool,
     /// (type, host ns, payload) in time order.
     pub records: Vec<(u16, u64, Vec<u8>)>,
 }
@@ -81,6 +85,7 @@ impl FlightRecorder {
                 next: 0,
             }),
             pending: [AtomicU64::new(0), AtomicU64::new(0)],
+            began_in_use: [AtomicBool::new(false), AtomicBool::new(false)],
         }
     }
 
@@ -110,7 +115,11 @@ impl FlightRecorder {
     /// The controller of `hand` dropped out, its last report at `last_report_ns` (not 0): its
     /// recording is taken once `AFTER_NS` have passed. A second dropout of the same hand before
     /// then is in that recording.
-    pub fn dropout(&self, hand: usize, last_report_ns: u64) {
+    pub fn dropout(&self, hand: usize, last_report_ns: u64, began_in_use: bool) {
+        if self.pending[hand].load(Ordering::Acquire) != 0 {
+            return;
+        }
+        self.began_in_use[hand].store(began_in_use, Ordering::Relaxed);
         let _ = self.pending[hand].compare_exchange(
             0,
             last_report_ns,
@@ -145,8 +154,15 @@ impl FlightRecorder {
         let mut copy = vec![EMPTY; SLOTS];
         copy.copy_from_slice(&self.ring.lock().unwrap().slots);
         due.into_iter()
-            .map(|(hand, last)| {
-                self.pending[hand].store(0, Ordering::Release);
+            .filter_map(|(hand, last)| {
+                let began_in_use = self.began_in_use[hand].load(Ordering::Relaxed);
+                // A blip may have been cancelled (and another gap begun) while the ring copied.
+                if self.pending[hand]
+                    .compare_exchange(last, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return None;
+                }
                 let (from, to) = (
                     last.saturating_sub(BEFORE_NS),
                     last.saturating_add(AFTER_NS),
@@ -157,11 +173,12 @@ impl FlightRecorder {
                     .map(|s| (s.rtype, s.host_ns, s.data[..s.len as usize].to_vec()))
                     .collect();
                 records.sort_by_key(|r| r.1);
-                Dropout {
+                Some(Dropout {
                     hand,
                     last_report_ns: last,
+                    began_in_use,
                     records,
-                }
+                })
             })
             .collect()
     }
@@ -264,7 +281,7 @@ mod tests {
             );
         }
         f.note(recorder::HAPTIC, 25 * S, &[&[1, 0, 0, 0], &[7; 12]]);
-        f.dropout(1, 25 * S);
+        f.dropout(1, 25 * S, true);
         assert!(f.due(35 * S - 1).is_empty());
         let d = f.due(35 * S);
         assert_eq!(d.len(), 1);
@@ -286,15 +303,34 @@ mod tests {
         assert!(f.due(100 * S).is_empty(), "taken once");
     }
 
+    #[test]
+    fn a_pending_recording_keeps_whether_the_gap_began_in_use() {
+        let f = FlightRecorder::new();
+        f.dropout(0, S, true);
+        f.dropout(0, S, false); // Its Ended event cannot lower its priority.
+        f.dropout(0, 2 * S, false); // Nor can another gap folded into its recording.
+        f.dropout(1, S, false);
+        f.dropout(1, 2 * S, true);
+        let d = f.due(S + AFTER_NS);
+        assert_eq!(d.len(), 2);
+        assert!(d[0].began_in_use);
+        assert!(!d[1].began_in_use);
+        f.dropout(0, 20 * S, false);
+        f.dropout(1, 20 * S, true);
+        let d = f.due(20 * S + AFTER_NS);
+        assert!(!d[0].began_in_use);
+        assert!(d[1].began_in_use);
+    }
+
     /// A blip's cancel takes back its own dropout only, not an earlier one still waiting.
     #[test]
     fn a_cancel_takes_back_only_its_own_dropout() {
         let f = FlightRecorder::new();
-        f.dropout(0, 5 * S);
-        f.dropout(0, 6 * S);
+        f.dropout(0, 5 * S, true);
+        f.dropout(0, 6 * S, true);
         f.cancel(0, 6 * S);
         assert_eq!(f.due(20 * S)[0].last_report_ns, 5 * S);
-        f.dropout(1, 7 * S);
+        f.dropout(1, 7 * S, true);
         f.cancel(1, 7 * S);
         assert!(f.due(20 * S).is_empty());
     }
@@ -312,14 +348,14 @@ mod tests {
             );
         }
         let last = (n - 1) * 1_000_000;
-        f.dropout(0, last);
+        f.dropout(0, last, true);
         let d = f.due(last + AFTER_NS);
         let times: Vec<u64> = d[0].records.iter().map(|r| r.1).collect();
         assert_eq!(times.len(), (BEFORE_NS / 1_000_000 + 1) as usize);
         assert_eq!(times.last(), Some(&last));
         // too large to keep
         f.note(recorder::RAW_REPORT, last, &[&[0u8; 69]]);
-        f.dropout(0, last);
+        f.dropout(0, last, true);
         assert_eq!(f.due(last + AFTER_NS)[0].records.len(), times.len());
     }
 
@@ -331,6 +367,7 @@ mod tests {
         let d = Dropout {
             hand: 1,
             last_report_ns: 5 * S,
+            began_in_use: true,
             records: vec![
                 (
                     recorder::RAW_REPORT,

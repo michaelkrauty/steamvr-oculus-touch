@@ -5,7 +5,7 @@ Documentation=https://github.com/michaelkrauty/steamvr-oculus-touch
 [Service]
 ExecStart=%h/.local/bin/cv1touchd
 Restart=on-failure
-RestartSec=1
+RestartSec=2
 
 [Install]
 WantedBy=default.target

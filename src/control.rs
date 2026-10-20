@@ -5,7 +5,7 @@
 //! gets one reply line starting with "ok" or "err <reason>".
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -372,6 +372,55 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("control.sock")
 }
 
+/// Serves complete requests indefinitely, allowing two seconds to send each next request.
+/// The driver opens a new connection for each haptic or station report; persistent clients
+/// also work while they keep sending complete requests. Partial bytes do not extend a deadline.
+pub fn serve_client(conn: ipc::Connection, handle: impl FnMut(&str) -> String) {
+    serve_client_with_deadline(conn, Duration::from_secs(2), handle);
+}
+
+/// One client's request lines, each answered with one reply line. A client that stops reading
+/// for a second, takes longer than `idle` to send its next request, or sends more than
+/// 4 KiB in one request is dropped. Complete requests may keep a connection open indefinitely.
+fn serve_client_with_deadline(
+    mut conn: ipc::Connection,
+    idle: Duration,
+    mut handle: impl FnMut(&str) -> String,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut deadline = std::time::Instant::now() + idle;
+    loop {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if conn.set_timeout(Some(left)).is_err() {
+            return;
+        }
+        match conn.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            if pos > 4096 {
+                return;
+            }
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let reply = handle(String::from_utf8_lossy(&line).trim());
+            if conn.set_timeout(Some(Duration::from_secs(1))).is_err() {
+                return;
+            }
+            if conn.write_all(format!("{reply}\n").as_bytes()).is_err() {
+                return;
+            }
+            deadline = std::time::Instant::now() + idle;
+        }
+        if buf.len() > 4096 {
+            return; // no newline in 4 KiB: not a protocol client
+        }
+    }
+}
+
 pub fn request(socket: &Path, line: &str, timeout: Duration) -> io::Result<String> {
     let mut stream = ipc::Connection::connect(socket)?;
     stream.set_timeout(Some(timeout))?;
@@ -387,6 +436,98 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::thread;
+
+    fn client_pair(
+        tag: &str,
+        idle: Duration,
+    ) -> (PathBuf, ipc::Connection, thread::JoinHandle<Vec<String>>) {
+        let path =
+            std::env::temp_dir().join(format!("cv1t-deadline-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut listener = ipc::Listener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let conn = listener.accept(true).unwrap();
+            let mut seen = Vec::new();
+            serve_client_with_deadline(conn, idle, |line| {
+                seen.push(line.to_owned());
+                format!("ok {line}")
+            });
+            seen
+        });
+        let mut conn = ipc::Connection::connect(&path).unwrap();
+        conn.set_timeout(Some(Duration::from_secs(5))).unwrap();
+        (path, conn, server)
+    }
+
+    fn reply(conn: &mut ipc::Connection) -> String {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0];
+            conn.read_exact(&mut byte).unwrap();
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                return String::from_utf8(line).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_client_is_closed_without_a_request() {
+        let (path, mut conn, server) = client_pair("idle", Duration::from_millis(50));
+        let closed = matches!(conn.read(&mut [0]), Ok(0));
+        drop(conn); // releases a server with a missing deadline before asserting
+        assert!(server.join().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+        assert!(closed, "an idle client kept its reader thread");
+    }
+
+    #[test]
+    fn partial_bytes_do_not_extend_a_request_deadline() {
+        let (path, mut conn, server) = client_pair("trickle", Duration::from_millis(150));
+        conn.write_all(b"ping\n").unwrap();
+        assert_eq!(reply(&mut conn), "ok ping\n");
+        let mut ended = false;
+        for _ in 0..20 {
+            if server.is_finished() || conn.write_all(b"x").is_err() {
+                ended = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        ended |= server.is_finished();
+        drop(conn);
+        let seen = server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(ended, "partial bytes kept the connection alive");
+        assert_eq!(seen, ["ping"]);
+    }
+
+    #[test]
+    fn complete_requests_keep_a_persistent_connection_alive() {
+        let idle = Duration::from_millis(500);
+        let (path, mut conn, server) = client_pair("persistent", idle);
+        let began = std::time::Instant::now();
+        for _ in 0..8 {
+            conn.write_all(b"ping\n").unwrap();
+            assert_eq!(reply(&mut conn), "ok ping\n");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(began.elapsed() > idle);
+        drop(conn);
+        assert_eq!(server.join().unwrap(), ["ping"; 8]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_overlong_complete_request_is_not_handled() {
+        let (path, mut conn, server) = client_pair("long", Duration::from_secs(2));
+        let bytes = [vec![b'x'; 5000], vec![b'\n']].concat();
+        let _ = conn.write_all(&bytes);
+        let _ = conn.read(&mut [0]);
+        drop(conn);
+        assert!(server.join().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
 
     /// An absolute directory on this platform; `C:/` needs no escaping in the JSON-quoted form.
     const TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };

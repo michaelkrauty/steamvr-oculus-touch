@@ -5,7 +5,6 @@
 //! (driver/tests/test_daemon_contract.cpp) with the daemon's own shared-memory and control code, so
 //! both sides must agree, on this platform, on the object names, the layout, the clock and the
 //! wake-ups. Each "publish" request on the control endpoint bumps the update counter once.
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -17,24 +16,22 @@ use cv1touch::{control, ffi};
 /// Answers control requests until "exit": each "publish" bumps the update counter once.
 fn serve(listener: &mut ipc::Listener, shm: &ShmWriter) {
     while let Ok(conn) = listener.accept(true) {
-        let mut conn = BufReader::new(conn);
-        let mut line = String::new();
-        if conn.read_line(&mut line).is_err() {
-            continue;
-        }
-        let reply: &[u8] = match line.trim() {
+        let mut exit = false;
+        control::serve_client(conn, |line| match line {
             "publish" => {
                 shm.heartbeat(now_ns());
                 shm.signal();
-                b"ok\n"
+                "ok".into()
             }
             "exit" => {
-                let _ = conn.get_mut().write_all(b"ok\n");
-                return;
+                exit = true;
+                "ok".into()
             }
-            _ => b"error unknown\n",
-        };
-        let _ = conn.get_mut().write_all(reply);
+            _ => "error unknown".into(),
+        });
+        if exit {
+            return;
+        }
     }
 }
 
