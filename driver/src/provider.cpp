@@ -77,7 +77,7 @@ void Provider::RunFrame()
  * costs vrserver an app connect, binding load and disconnect). */
 void Provider::station_loop()
 {
-	const std::string path = HapticSender::default_socket_path();
+	ControlClient control;
 	while (running_) {
 		vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 		vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.0f, poses, vr::k_unMaxTrackedDeviceCount);
@@ -93,7 +93,7 @@ void Provider::station_loop()
 			stations.push_back(station_pose(props->GetStringProperty(c, vr::Prop_SerialNumber_String), poses[i].mDeviceToAbsoluteTracking));
 		}
 		if (!stations.empty())
-			send_control_line(path, stations_line(stations));
+			control.send(stations_line(stations));
 		for (int k = 0; k < 20 && running_; k++)
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}

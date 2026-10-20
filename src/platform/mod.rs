@@ -609,6 +609,18 @@ pub mod ipc {
         os::runtime_dir()
     }
 
+    /// A second Linux control socket beside the poses, visible inside Steam's container.
+    #[cfg(unix)]
+    pub fn container_socket_path() -> PathBuf {
+        os::container_socket_path()
+    }
+
+    /// Removes only this user's private socket. Hold the daemon's instance lock until after this.
+    #[cfg(unix)]
+    pub fn unlink_private_socket(endpoint: &Path) -> io::Result<()> {
+        os::unlink_private_socket(endpoint)
+    }
+
     /// An exclusive lock on `path` (created if missing), held until the file is dropped; fails at
     /// once (WouldBlock) while another process holds it.
     pub fn lock_exclusive(path: &Path) -> io::Result<File> {
@@ -649,6 +661,13 @@ pub mod ipc {
     pub struct Listener(pub(super) os::Listener);
 
     impl Listener {
+        /// A 0600 socket in a real directory owned by this user with mode 0700. Hold the daemon's
+        /// instance lock first: only then may a stale socket left by a crash be replaced.
+        #[cfg(unix)]
+        pub fn bind_private(endpoint: &Path) -> io::Result<Listener> {
+            os::Listener::bind_private(endpoint).map(Listener)
+        }
+
         /// Listens at `endpoint`, reachable by this user only. A stale endpoint left by a crashed
         /// owner is replaced: hold the daemon's lock first, so there is no live one.
         pub fn bind(endpoint: &Path) -> io::Result<Listener> {

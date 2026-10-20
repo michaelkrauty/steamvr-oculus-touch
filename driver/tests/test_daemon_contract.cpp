@@ -17,10 +17,17 @@ using namespace cv1t;
 
 int main(int argc, char **argv)
 {
-	if (argc != 3) {
-		fprintf(stderr, "usage: test_daemon_contract SHM_NAME CONTROL_PATH\n");
+	if (argc == 2 && std::string(argv[1]) == "--status") {
+		ControlClient control;
+		const bool ok = control.send("status\n");
+		printf("status %s (%s)\n", ok ? "connected" : "unavailable", control.path().c_str());
+		return ok ? 0 : 1;
+	}
+	if (argc != 3 && argc != 4) {
+		fprintf(stderr, "usage: test_daemon_contract SHM_NAME CONTROL_PATH [FALLBACK_PATH] | --status\n");
 		return 2;
 	}
+	ControlClient control(argv[2], argc == 4 ? argv[3] : "");
 	ShmClient c(argv[1], 2'000'000'000);
 	const uint64_t now = cv1t_now_ns();
 	assert(c.ensure_open(now));
@@ -38,7 +45,7 @@ int main(int argc, char **argv)
 		const auto before = std::chrono::steady_clock::now();
 		std::thread waiter([&] { woke = c.wait(seen, 5'000'000'000); });
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		assert(send_control_line(argv[2], "publish\n"));
+		assert(control.send("publish\n"));
 		waiter.join();
 		assert(std::chrono::steady_clock::now() - before < std::chrono::seconds(2));
 		assert(woke == seen + 1);

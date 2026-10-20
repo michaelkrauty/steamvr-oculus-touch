@@ -41,6 +41,11 @@ if windows
 endif
 test('driver_exports', find_program('tests/check_exports.sh'), args: [driver_lib])
 
+test('test_control_client', executable('test_control_client', 'tests/test_control_client.cpp', driver_common,
+  include_directories: driver_inc,
+  dependencies: [openvr_dep, threads_dep],
+  cpp_args: ['-DCV1T_DRIVER_TEST']))
+
 # A peer closing between connect and write must not signal the vrserver process.
 test('test_control_disconnect', executable('test_control_disconnect',
   'tests/test_control_disconnect.cpp', driver_common,

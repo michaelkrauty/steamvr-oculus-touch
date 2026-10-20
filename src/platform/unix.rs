@@ -358,6 +358,80 @@ pub fn runtime_dir() -> std::path::PathBuf {
         .join("cv1touch")
 }
 
+fn container_socket_path_for(uid: u32) -> std::path::PathBuf {
+    format!("/dev/shm/cv1touch-control-{uid}/control.sock").into()
+}
+
+pub fn container_socket_path() -> std::path::PathBuf {
+    // SAFETY: geteuid has no arguments and cannot fail.
+    container_socket_path_for(unsafe { libc::geteuid() })
+}
+
+fn private_control_directory_metadata(meta: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.is_dir() && meta.uid() == uid && meta.mode() & 0o7777 == 0o700
+}
+
+fn private_control_directory(dir: &Path, create: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let created = if create {
+        match DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e),
+        }
+    } else {
+        false
+    };
+    let mut meta = std::fs::symlink_metadata(dir)?;
+    // SAFETY: geteuid has no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if created && meta.is_dir() && meta.uid() == uid {
+        // mkdir's mode is masked by umask. Change only the directory just created and owned
+        // by us; the sticky /dev/shm parent prevents another user from replacing it.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        meta = std::fs::symlink_metadata(dir)?;
+    }
+    if !private_control_directory_metadata(&meta, uid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control socket directory must be owned by this user with mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+fn owned_control_socket(endpoint: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::symlink_metadata(endpoint)?;
+    // SAFETY: geteuid has no arguments and cannot fail.
+    if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control socket must be a socket owned by this user",
+        ));
+    }
+    Ok(())
+}
+
+pub fn unlink_private_socket(endpoint: &Path) -> io::Result<()> {
+    let remove = || {
+        let dir = endpoint.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control socket needs a directory",
+            )
+        })?;
+        private_control_directory(dir, false)?;
+        owned_control_socket(endpoint)?;
+        std::fs::remove_file(endpoint)
+    };
+    match remove() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 pub fn lock_exclusive(path: &Path) -> io::Result<File> {
     use std::os::fd::AsRawFd;
     let file = OpenOptions::new()
@@ -401,7 +475,83 @@ impl Connection {
 
 pub struct Listener(std::os::unix::net::UnixListener);
 
+fn probe_control_socket(endpoint: &Path) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: all-zero is a valid initial sockaddr_un; fields and pathname are set below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path = endpoint.as_os_str().as_bytes();
+    if path.len() >= addr.sun_path.len() || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid socket path",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(path) {
+        *to = *from as libc::c_char;
+    }
+    // SAFETY: no pointers; a fresh descriptor owned below. A full backlog must not block startup.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the fresh descriptor is owned exactly once.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: addr is initialized and valid for the supplied length.
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(&addr) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl Listener {
+    pub fn bind_private(endpoint: &Path) -> io::Result<Listener> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let dir = endpoint.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control socket needs a directory",
+            )
+        })?;
+        private_control_directory(dir, true)?;
+        let listener = match UnixListener::bind(endpoint) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                owned_control_socket(endpoint)?;
+                match probe_control_socket(endpoint) {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                        // The caller holds the instance lock: this owned socket is stale.
+                        unlink_private_socket(endpoint)?;
+                        UnixListener::bind(endpoint)?
+                    }
+                    Err(e) => return Err(e),
+                    Ok(_) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600)) {
+            let _ = unlink_private_socket(endpoint);
+            return Err(e);
+        }
+        Ok(Listener(listener))
+    }
+
     pub fn bind(endpoint: &Path) -> io::Result<Listener> {
         use std::os::unix::fs::PermissionsExt;
         if endpoint.exists() {
@@ -1331,5 +1481,144 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod container_control_tests {
+    use super::*;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    fn endpoint(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("cv1t-container-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        root.join("private/control.sock")
+    }
+
+    #[test]
+    fn container_control_is_scoped_to_the_effective_user() {
+        assert_eq!(
+            container_socket_path_for(42),
+            Path::new("/dev/shm/cv1touch-control-42/control.sock")
+        );
+        assert_eq!(
+            container_socket_path_for(43),
+            Path::new("/dev/shm/cv1touch-control-43/control.sock")
+        );
+    }
+
+    #[test]
+    fn container_control_creates_a_private_directory_and_socket() {
+        let path = endpoint("create");
+        let listener = Listener::bind_private(&path).unwrap();
+        let dir = std::fs::symlink_metadata(path.parent().unwrap()).unwrap();
+        let socket = std::fs::symlink_metadata(&path).unwrap();
+        assert!(dir.is_dir() && !dir.file_type().is_symlink());
+        assert_eq!(dir.mode() & 0o7777, 0o700);
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.mode() & 0o7777, 0o600);
+        // SAFETY: geteuid has no arguments and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(dir.uid(), uid);
+        assert_eq!(socket.uid(), uid);
+        assert!(!private_control_directory_metadata(
+            &dir,
+            uid.wrapping_add(1)
+        ));
+        drop(listener);
+        unlink_private_socket(&path).unwrap();
+        assert!(!path.exists());
+        assert!(
+            path.parent().unwrap().exists(),
+            "keep the directory for later connections"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn container_control_new_directory_ignores_a_restrictive_umask() {
+        // umask is process-wide: change it only in a child running this test alone.
+        if std::env::var_os("CV1T_TEST_CONTROL_UMASK").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "container_control_new_directory_ignores_a_restrictive_umask",
+                    "--test-threads=1",
+                ])
+                .env("CV1T_TEST_CONTROL_UMASK", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let path = endpoint("umask");
+        // SAFETY: this isolated test process owns its umask; it is restored below.
+        let old = unsafe { libc::umask(0o777) };
+        let result = Listener::bind_private(&path);
+        // SAFETY: restoring this isolated process's original umask.
+        unsafe { libc::umask(old) };
+        let listener = result.unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+        drop(listener);
+        unlink_private_socket(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn container_control_refuses_existing_unsafe_directories_without_changing_them() {
+        let path = endpoint("unsafe");
+        let dir = path.parent().unwrap();
+        std::fs::create_dir(dir).unwrap();
+        for mode in [0o755, 0o770, 0o1700] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(Listener::bind_private(&path).is_err(), "mode {mode:o}");
+            assert_eq!(
+                std::fs::symlink_metadata(dir).unwrap().mode() & 0o7777,
+                mode
+            );
+            assert!(!path.exists());
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = dir.with_file_name("real");
+        std::fs::rename(dir, &real).unwrap();
+        std::os::unix::fs::symlink(&real, dir).unwrap();
+        assert!(Listener::bind_private(&path).is_err());
+        assert!(std::fs::symlink_metadata(dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!real.join("control.sock").exists());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn container_control_replaces_only_its_stale_socket_and_cleans_up_only_a_socket() {
+        let path = endpoint("stale");
+        let first = Listener::bind_private(&path).unwrap();
+        assert!(
+            Listener::bind_private(&path).is_err(),
+            "keep a live listener"
+        );
+        drop(first);
+        let second = Listener::bind_private(&path).unwrap();
+        drop(second);
+        unlink_private_socket(&path).unwrap();
+        std::fs::write(&path, b"keep this file").unwrap();
+        assert!(Listener::bind_private(&path).is_err());
+        assert!(unlink_private_socket(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep this file");
+        std::fs::remove_file(&path).unwrap();
+        let target = path.with_file_name("target");
+        std::fs::write(&target, b"keep this target").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Listener::bind_private(&path).is_err());
+        assert!(unlink_private_socket(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this target");
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

@@ -3,12 +3,14 @@
 
 #include "haptics.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #ifndef _WIN32
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -97,7 +99,43 @@ std::string HapticSender::default_socket_path()
 }
 #endif
 
-HapticSender::HapticSender(std::string socket_path) : path_(std::move(socket_path)) {}
+HapticSender::HapticSender() = default;
+
+HapticSender::HapticSender(std::string socket_path, std::string fallback) : control_(std::move(socket_path), std::move(fallback)) {}
+
+ControlClient::ControlClient() : ControlClient(HapticSender::default_socket_path())
+{
+#ifndef _WIN32
+	paths_[1] = container_socket_path(geteuid());
+#endif
+}
+
+ControlClient::ControlClient(std::string path, std::string fallback) : paths_{std::move(path), std::move(fallback)} {}
+
+#ifndef _WIN32
+std::string container_socket_path(uint32_t uid)
+{
+	const char *base = "/dev/shm";
+#ifdef CV1T_DRIVER_TEST
+	// Default-constructor regressions use their own sockets, never the installed daemon.
+	if (const char *fixture = std::getenv("CV1T_TEST_CONTROL_SHM_DIR"); fixture && *fixture)
+		base = fixture;
+#endif
+	return std::string(base) + "/cv1touch-control-" + std::to_string(uid) + "/control.sock";
+}
+
+bool control_directory_is_private(const std::string &dir, uint32_t uid)
+{
+	struct stat st {};
+	if (lstat(dir.c_str(), &st) != 0)
+		return false;
+	if (!S_ISDIR(st.st_mode) || st.st_uid != uid || (st.st_mode & 07777) != 0700) {
+		errno = EACCES;
+		return false;
+	}
+	return true;
+}
+#endif
 
 HapticSender::~HapticSender() { stop(); }
 
@@ -225,20 +263,34 @@ bool send_control_line(const std::string &path, const std::string &line)
 	return ok;
 }
 #else
-/* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
-bool send_control_line(const std::string &path, const std::string &line)
+/* Only an error from connect may select another endpoint. Once connected, a failed write or
+ * reply does not say whether the command arrived, so it must never be sent a second time. */
+static int connect_control_socket(const std::string &path, int *connect_error)
 {
+	*connect_error = 0;
+	sockaddr_un addr{};
+	if (path.size() >= sizeof addr.sun_path)
+		return -1;
 	const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0)
-		return false;
+		return -1;
 	timeval tv{0, 100'000};
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-	sockaddr_un addr{};
 	addr.sun_family = AF_UNIX;
-	std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
-	bool ok = connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0 &&
-		  send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size());
+	std::strcpy(addr.sun_path, path.c_str());
+	if (connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof addr) != 0) {
+		*connect_error = errno;
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
+static bool exchange_control_line(int fd, const std::string &line)
+{
+	bool ok = send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size());
 	if (ok) {
 		char reply[256];
 		const ssize_t n = read(fd, reply, sizeof reply - 1);
@@ -247,7 +299,43 @@ bool send_control_line(const std::string &path, const std::string &line)
 	close(fd);
 	return ok;
 }
+
+bool send_control_line(const std::string &path, const std::string &line)
+{
+	int error = 0;
+	const int fd = connect_control_socket(path, &error);
+	return fd >= 0 && exchange_control_line(fd, line);
+}
 #endif
+
+bool ControlClient::send(const std::string &line)
+{
+#ifdef _WIN32
+	return send_control_line(paths_[0], line);
+#else
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		const unsigned which = (last_ + attempt) % 2;
+		const auto &path = paths_[which];
+		if (path.empty())
+			return false;
+		int error = 0, fd = -1;
+		if (which == 1 && !control_directory_is_private(path.substr(0, path.rfind('/')), geteuid())) {
+			if (errno != ENOENT)
+				return false;
+			error = ENOENT; // a vanished cached directory can fail back; never connect without validation
+		} else {
+			fd = connect_control_socket(path, &error);
+		}
+		if (fd >= 0) {
+			last_ = which;
+			return exchange_control_line(fd, line);
+		}
+		if (error != ENOENT && error != ECONNREFUSED)
+			return false;
+	}
+	return false;
+#endif
+}
 
 void HapticSender::run()
 {
@@ -262,10 +350,10 @@ void HapticSender::run()
 			HapticCommand c{};
 			if (!take(h, &c))
 				continue;
-			if (!send_control_line(path_, haptic_line(c))) {
+			if (!control_.send(haptic_line(c))) {
 				const uint64_t now = cv1t_now_ns();
 				if (now - last_warn_ns_ > 60'000'000'000ull) {
-					cv1t_log("cv1touch: haptic command not delivered to %s (daemon not running?)", path_.c_str());
+					cv1t_log("cv1touch: haptic command not delivered to %s (daemon not running?)", control_.path().c_str());
 					last_warn_ns_ = now;
 				}
 			}

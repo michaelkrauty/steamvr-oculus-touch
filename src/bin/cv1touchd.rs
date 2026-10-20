@@ -3273,50 +3273,108 @@ impl Drop for ClientSlot {
     }
 }
 
-/// Serves the control endpoint: one thread accepts, one thread per client (at most MAX_CLIENTS)
-/// reads its request lines, and one request is handled at a time; each client's requests are
-/// answered in order.
-fn serve_control(d: Arc<Daemon>, mut listener: ipc::Listener) -> ControlServer {
+#[derive(Default)]
+struct InstanceOptions {
+    shm_name: Option<String>,
+    runtime_dir: Option<PathBuf>,
+}
+
+impl InstanceOptions {
+    fn set_override(&mut self, option: &str, value: String) {
+        match option {
+            "--shm-name" => self.shm_name = Some(value),
+            "--runtime-dir" => self.runtime_dir = Some(PathBuf::from(value)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_container_control(
+        &self,
+        listeners: Vec<ipc::Listener>,
+        endpoint: &std::path::Path,
+    ) -> (Vec<ipc::Listener>, Option<PathBuf>) {
+        if self.shm_name.is_none() && self.runtime_dir.is_none() {
+            with_container_control(listeners, endpoint)
+        } else {
+            // An explicit instance must not receive the default driver's commands.
+            (listeners, None)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn with_container_control(
+    mut listeners: Vec<ipc::Listener>,
+    endpoint: &std::path::Path,
+) -> (Vec<ipc::Listener>, Option<PathBuf>) {
+    let path = match ipc::Listener::bind_private(endpoint) {
+        Ok(listener) => {
+            listeners.push(listener);
+            Some(endpoint.to_path_buf())
+        }
+        Err(e) => {
+            log(format!(
+                "control socket for Steam's container {}: {e}; using the usual socket only",
+                endpoint.display()
+            ));
+            None
+        }
+    };
+    (listeners, path)
+}
+
+/// One accept thread per endpoint and at most MAX_CLIENTS client threads in total. Both
+/// endpoints share the request lock; each client's lines are answered in order.
+fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer {
     let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let one_at_a_time = Arc::new(Mutex::new(()));
     let server = ControlServer {
         one_at_a_time: Arc::clone(&one_at_a_time),
     };
-    thread::Builder::new()
-        .name("cv1t-control".into())
-        .spawn(move || {
-            let mut failing = None;
-            loop {
-                let conn = match listener.accept(true) {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        // once per failure, not at every retry
-                        let why = e.to_string();
-                        if failing.as_ref() != Some(&why) {
-                            log(format!("control endpoint: {why}"));
-                            failing = Some(why);
+    for mut listener in listeners {
+        let (d, clients, one_at_a_time) = (
+            Arc::clone(&d),
+            Arc::clone(&clients),
+            Arc::clone(&one_at_a_time),
+        );
+        thread::Builder::new()
+            .name("cv1t-control".into())
+            .spawn(move || {
+                let mut failing = None;
+                loop {
+                    let conn = match listener.accept(true) {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            // once per failure, not at every retry
+                            let why = e.to_string();
+                            if failing.as_ref() != Some(&why) {
+                                log(format!("control endpoint: {why}"));
+                                failing = Some(why);
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
                         }
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
+                    };
+                    failing = None;
+                    let Some(slot) = ClientSlot::take(&clients) else {
+                        continue; // dropped: closed at once
+                    };
+                    let (d, one_at_a_time) = (Arc::clone(&d), Arc::clone(&one_at_a_time));
+                    let spawned =
+                        thread::Builder::new()
+                            .name("cv1t-client".into())
+                            .spawn(move || {
+                                let _slot = slot;
+                                serve_client(&d, conn, &one_at_a_time);
+                            });
+                    if spawned.is_err() {
+                        log("control endpoint: no thread for a client");
                     }
-                };
-                failing = None;
-                let Some(slot) = ClientSlot::take(&clients) else {
-                    continue; // dropped: closed at once
-                };
-                let (d, one_at_a_time) = (Arc::clone(&d), Arc::clone(&one_at_a_time));
-                let spawned = thread::Builder::new()
-                    .name("cv1t-client".into())
-                    .spawn(move || {
-                        let _slot = slot;
-                        serve_client(&d, conn, &one_at_a_time);
-                    });
-                if spawned.is_err() {
-                    log("control endpoint: no thread for a client");
                 }
-            }
-        })
-        .expect("control thread");
+            })
+            .expect("control thread");
+    }
     server
 }
 
@@ -3496,8 +3554,7 @@ fn main() {
     let mut record: Option<PathBuf> = None;
     let mut calibration: Option<PathBuf> = None;
     let mut provisional = false;
-    let mut shm_name = shm::DEFAULT_NAME.to_string();
-    let mut runtime_dir = control::runtime_dir();
+    let mut instance = InstanceOptions::default();
     let mut tracker = TrackerKind::Rust;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3530,12 +3587,21 @@ fn main() {
                     _ => usage(),
                 }
             }
-            "--shm-name" => shm_name = args.next().unwrap_or_else(|| usage()),
-            "--runtime-dir" => runtime_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            "--shm-name" | "--runtime-dir" => {
+                instance.set_override(&arg, args.next().unwrap_or_else(|| usage()))
+            }
             _ => usage(),
         }
     }
 
+    let shm_name = instance
+        .shm_name
+        .clone()
+        .unwrap_or_else(|| shm::DEFAULT_NAME.to_string());
+    let runtime_dir = instance
+        .runtime_dir
+        .clone()
+        .unwrap_or_else(control::runtime_dir);
     let (opts, mode, calibration_path) = if provisional {
         (modes::provisional(&opts), "provisional".to_string(), None)
     } else {
@@ -3634,6 +3700,12 @@ fn main() {
         process::exit(1);
     });
 
+    let listeners = vec![listener];
+    #[cfg(unix)]
+    // The shared-memory ownership lock above also protects this default driver's endpoint.
+    let (listeners, container_socket) =
+        instance.with_container_control(listeners, &ipc::container_socket_path());
+
     let mut inputs = InputRuntime::default();
     match input_calibration::load(&input_calibration::default_path()) {
         Ok(calibration) => inputs.calibration = calibration,
@@ -3716,7 +3788,7 @@ fn main() {
         d.opts.lock().unwrap().ignore_sensors
     ));
 
-    let control = serve_control(Arc::clone(&d), listener);
+    let control = serve_control(Arc::clone(&d), listeners);
     loop {
         // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
         // engine thread for seconds, which must not read as a dead daemon; stale poses are the
@@ -3740,6 +3812,12 @@ fn main() {
     let _ = universe_thread.join();
     d.rec.stop();
     let _ = fs::remove_file(&sock_path);
+    #[cfg(unix)]
+    if let Some(path) = container_socket {
+        if let Err(e) = ipc::unlink_private_socket(&path) {
+            log(format!("removing control socket {}: {e}", path.display()));
+        }
+    }
     // the control threads still hold `d`, so retire the segment here rather than on its drop
     d.shm.retire();
     log("stopped");
@@ -4933,12 +5011,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let endpoint = dir.join("control.sock");
-        let control = serve_control(
-            Arc::new(status_daemon()),
-            ipc::Listener::bind(&endpoint).unwrap(),
-        );
-        let connect = || {
-            let mut conn = ipc::Connection::connect(&endpoint).unwrap();
+        let second_endpoint = dir.join("private/control.sock");
+        let listeners = vec![ipc::Listener::bind(&endpoint).unwrap()];
+        #[cfg(unix)]
+        let (listeners, _) = with_container_control(listeners, &second_endpoint);
+        #[cfg(windows)]
+        let listeners = {
+            let mut listeners = listeners;
+            listeners.push(ipc::Listener::bind(&second_endpoint).unwrap());
+            listeners
+        };
+        let control = serve_control(Arc::new(status_daemon()), listeners);
+        let connect_on = |endpoint: &std::path::Path| {
+            let mut conn = ipc::Connection::connect(endpoint).unwrap();
             conn.set_timeout(Some(Duration::from_secs(5))).unwrap();
             conn
         };
@@ -4965,6 +5050,7 @@ mod tests {
         let answered =
             |reply: Reply| matches!(reply, Reply::Line(line) if line.starts_with("ok {"));
 
+        let connect = || connect_on(&endpoint);
         let mut client = connect();
         client.write_all(b"sta").unwrap();
         thread::sleep(Duration::from_millis(20));
@@ -4976,8 +5062,21 @@ mod tests {
         );
         assert!(answered(reply(&mut client)));
 
-        let mut idle: Vec<_> = (1..MAX_CLIENTS).map(|_| connect()).collect();
-        let mut refused = connect();
+        let mut second_client = connect_on(&second_endpoint);
+        second_client.write_all(b"status\n").unwrap();
+        assert!(answered(reply(&mut second_client)));
+        let mut idle = Vec::new();
+        for i in 2..MAX_CLIENTS {
+            let mut next = connect_on(if i % 2 == 0 {
+                &endpoint
+            } else {
+                &second_endpoint
+            });
+            next.write_all(b"status\n").unwrap();
+            assert!(answered(reply(&mut next)));
+            idle.push(next);
+        }
+        let mut refused = connect_on(&second_endpoint);
         let _ = refused.write_all(b"status\n");
         assert_eq!(
             reply(&mut refused),
@@ -5007,7 +5106,145 @@ mod tests {
             .unwrap();
         client.write_all(b"status\n").unwrap();
         assert_eq!(reply(&mut client), Reply::Silent, "no answer once stopped");
+        second_client
+            .set_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        second_client.write_all(b"status\n").unwrap();
+        assert_eq!(
+            reply(&mut second_client),
+            Reply::Silent,
+            "both listeners stop"
+        );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_control_is_not_published_after_either_instance_override() {
+        let root = std::env::temp_dir().join(format!("cv1t-instance-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mut cases = vec![("default", InstanceOptions::default(), true)];
+        for (tag, option, value) in [
+            (
+                "runtime",
+                "--runtime-dir",
+                root.join("custom").to_string_lossy().into_owned(),
+            ),
+            ("shm", "--shm-name", "/cv1touch-example".to_string()),
+            (
+                "explicit-default-shm",
+                "--shm-name",
+                shm::DEFAULT_NAME.to_string(),
+            ),
+            (
+                "explicit-default-runtime",
+                "--runtime-dir",
+                control::runtime_dir().to_string_lossy().into_owned(),
+            ),
+        ] {
+            let mut instance = InstanceOptions::default();
+            instance.set_override(option, value.clone());
+            if option == "--runtime-dir" {
+                assert_eq!(
+                    instance.runtime_dir.as_deref(),
+                    Some(std::path::Path::new(&value))
+                );
+                assert!(instance.shm_name.is_none());
+            } else {
+                assert_eq!(instance.shm_name.as_deref(), Some(value.as_str()));
+                assert!(instance.runtime_dir.is_none());
+            }
+            cases.push((tag, instance, false));
+        }
+        for (tag, instance, publish) in cases {
+            let dir = root.join(tag);
+            fs::create_dir(&dir).unwrap();
+            let legacy = dir.join("legacy.sock");
+            let fallback = dir.join("private/control.sock");
+            let (listeners, shared) = instance
+                .with_container_control(vec![ipc::Listener::bind(&legacy).unwrap()], &fallback);
+            assert_eq!(shared.is_some(), publish, "{tag}");
+            assert_eq!(fallback.exists(), publish, "{tag}");
+            let server = serve_control(Arc::new(status_daemon()), listeners);
+            let reply = control::request(&legacy, "status", Duration::from_secs(5)).unwrap();
+            assert!(
+                reply.starts_with("ok {"),
+                "{tag}: keep the instance's own endpoint"
+            );
+            let _stopped = server.stop();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_container_directory_keeps_the_legacy_control_server() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("cv1t-container-server-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let private = dir.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        let legacy = dir.join("legacy.sock");
+        let (listeners, shared) = with_container_control(
+            vec![ipc::Listener::bind(&legacy).unwrap()],
+            &private.join("control.sock"),
+        );
+        assert!(shared.is_none());
+        assert_eq!(
+            fs::symlink_metadata(&private).unwrap().mode() & 0o7777,
+            0o755
+        );
+        let server = serve_control(Arc::new(status_daemon()), listeners);
+        let reply = control::request(&legacy, "status", Duration::from_secs(5)).unwrap();
+        assert!(reply.starts_with("ok {"));
+        let _stopped = server.stop();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_container_control_backlog_keeps_the_legacy_server_available() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = std::env::temp_dir().join(format!("cv1t-busy-control-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let private = dir.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = private.join("control.sock");
+        let busy = UnixListener::bind(&endpoint).unwrap();
+        // SAFETY: a live listening socket; backlog zero admits one pending connection on Linux.
+        assert_eq!(unsafe { libc::listen(busy.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&endpoint).unwrap();
+        let legacy = dir.join("legacy.sock");
+        let listeners = vec![ipc::Listener::bind(&legacy).unwrap()];
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            send.send(with_container_control(listeners, &endpoint))
+                .unwrap();
+        });
+        let result = recv.recv_timeout(Duration::from_secs(2));
+        let did_not_block = result.is_ok();
+        // Release a blocking probe before failing, so the regression leaves no stuck thread.
+        let (listeners, shared) = result.unwrap_or_else(|_| {
+            busy.accept().unwrap();
+            recv.recv_timeout(Duration::from_secs(5)).unwrap()
+        });
+        worker.join().unwrap();
+        assert!(shared.is_none());
+        let server = serve_control(Arc::new(status_daemon()), listeners);
+        let reply = control::request(&legacy, "status", Duration::from_secs(5)).unwrap();
+        assert!(reply.starts_with("ok {"));
+        let _stopped = server.stop();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            did_not_block,
+            "a full secondary backlog blocked daemon startup"
+        );
     }
 
     #[test]
