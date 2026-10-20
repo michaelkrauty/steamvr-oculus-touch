@@ -38,10 +38,18 @@ public:
 	explicit ControlClient(std::string path, std::string fallback = {});
 	bool send(const std::string &line);
 	const std::string &path() const { return paths_[last_]; }
+#ifndef _WIN32
+	/* The last send rejected an overlong address and already logged its cause. */
+	bool path_too_long() const { return path_too_long_; }
+#endif
 
 private:
 	std::string paths_[2];
 	unsigned last_ = 0;
+#ifndef _WIN32
+	unsigned warned_long_paths_ = 0;
+	bool path_too_long_ = false;
+#endif
 };
 #ifdef _WIN32
 /* The daemon's named pipe for a control endpoint path: \\.\pipe\cv1touch- and the path with "\"
@@ -61,6 +69,8 @@ public:
 	void submit(int hand, float duration_s, float frequency_hz, float amplitude);
 	/* Takes the pending command for a hand (tests; the worker uses it too). */
 	bool take(int hand, HapticCommand *out);
+	/* Claims a delivery-failure warning (worker thread only; tests supply the timestamp). */
+	bool take_warning(uint64_t now_ns);
 	static std::string default_socket_path();
 
 private:
@@ -73,6 +83,7 @@ private:
 	bool running_ = false;
 	std::thread worker_;
 	uint64_t last_warn_ns_ = 0;
+	bool warned_ = false;
 };
 
 } // namespace cv1t

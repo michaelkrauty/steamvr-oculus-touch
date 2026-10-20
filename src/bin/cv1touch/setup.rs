@@ -49,14 +49,11 @@ fn artifact(path: &Path, validate: impl FnOnce() -> Result<(), String>) -> Artif
     }
 }
 
-fn read_status() -> Option<serde_json::Value> {
-    control::request(
-        &control::socket_path(),
-        "status",
-        Duration::from_millis(750),
-    )
-    .ok()
-    .and_then(|reply| serde_json::from_str(reply.strip_prefix("ok ")?).ok())
+fn read_status() -> io::Result<Option<serde_json::Value>> {
+    let reply = daemon_request("status", Duration::from_millis(750))?;
+    Ok(reply
+        .strip_prefix("ok ")
+        .and_then(|json| serde_json::from_str(json).ok()))
 }
 
 fn camera_artifact(path: &Path) -> (Artifact, Option<file::CalibrationFile>) {
@@ -144,9 +141,14 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         Ok(()) => Artifact::Valid(format!("{:x}", source_hash.finalize())),
         Err(error) => Artifact::Invalid(error),
     };
-    let first = read_status();
+    let first = read_status().ok().flatten();
     thread::sleep(Duration::from_millis(300));
     let second = read_status();
+    let daemon_detail = second.as_ref().err().map_or_else(
+        || "Start cv1touchd with access to the CV1 USB devices.".to_string(),
+        ToString::to_string,
+    );
+    let second = second.ok().flatten();
     let streaming = first.as_ref().zip(second.as_ref()).is_some_and(|(a, b)| {
         if a["generation"].as_u64().is_none()
             || a["generation"] != b["generation"]
@@ -201,7 +203,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             && v["input_calibration"]["calibrated"] == serde_json::json!([true, true])
     });
     let checks = vec![
-        Check { name: "daemon", ok: second.is_some(), detail: "Start cv1touchd with access to the CV1 USB devices.".into() },
+        Check { name: "daemon", ok: second.is_some(), detail: daemon_detail },
         Check { name: "sensor_streams", ok: streaming, detail: "Every connected sensor must deliver advancing frames; check USB access/bandwidth if stopped.".into() },
         Check { name: "controllers_awake", ok: fresh, detail: "Wake both Touch controllers with a face button before a capture.".into() },
         Check { name: "idle", ok: !recording && normal_mode && second.as_ref().is_none_or(|v| v["engine_ready"] != false), detail: "Wait for engine initialization/reload and finish any active recording or capture before starting the guide.".into() },
@@ -397,7 +399,7 @@ impl StageLog {
 
 /// `send` without echoing the daemon's reply; 0 on "ok".
 fn send_quiet(line: &str) -> i32 {
-    match control::request(&control::socket_path(), line, Duration::from_secs(5)) {
+    match daemon_request(line, Duration::from_secs(5)) {
         Ok(reply) if !reply.starts_with("err") => 0,
         Ok(reply) => {
             eprintln!("cv1touch: {line}: {reply}");
@@ -573,12 +575,8 @@ fn timed_capture(
     } else {
         go_signal(&format!("{CAMERA_MOTION}\n{START}")).and_then(|()| timed_window(60))
     };
-    let stopped = control::request(
-        &control::socket_path(),
-        &guard.command,
-        Duration::from_millis(750),
-    )
-    .map_err(|error| error.to_string());
+    let stopped = daemon_request(&guard.command, Duration::from_millis(750))
+        .map_err(|error| error.to_string());
     let stopped_ok = stopped
         .as_ref()
         .is_ok_and(|reply| reply.starts_with("ok stopped "));
@@ -615,7 +613,7 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     let raw = raw_inputs()?;
     input_identities_match(&raw, ids)?;
     PairedInputPhase::new([0, 0]).observe(&raw, ids, shm::now_ns())?;
-    let status = read_status().ok_or(
+    let status = read_status().map_err(|error| error.to_string())?.ok_or(
         "cv1touchd stopped responding after the recording; check it is running and try again",
     )?;
     if inspection.generation.is_none() || status["generation"].as_u64() != inspection.generation {
@@ -776,7 +774,12 @@ fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
             if interrupted() {
                 return Err("setup interrupted; this step was not saved".into());
             }
-            let status = read_status();
+            let status = match read_status() {
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(error.to_string())
+                }
+                result => result.ok().flatten(),
+            };
             let raw = raw_inputs().ok();
             if interrupted() {
                 return Err("setup interrupted; this step was not saved".into());
@@ -927,19 +930,9 @@ fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
     if interrupted() {
         return Err("interrupted; your previous calibration is unchanged".into());
     }
-    let reply = control::request(
-        &control::socket_path(),
-        "inputs",
-        Duration::from_millis(500),
-    )
-    .map_err(|e| e.to_string())?;
+    let reply = daemon_request("inputs", Duration::from_millis(500)).map_err(|e| e.to_string())?;
     let raw = parse_raw_inputs(&reply)?;
-    let reply = control::request(
-        &control::socket_path(),
-        "status",
-        Duration::from_millis(500),
-    )
-    .map_err(|e| e.to_string())?;
+    let reply = daemon_request("status", Duration::from_millis(500)).map_err(|e| e.to_string())?;
     let status: serde_json::Value = serde_json::from_str(
         reply
             .strip_prefix("ok ")
@@ -1004,12 +997,7 @@ fn registration_haptic(
         "haptic {} {duration} {frequency} {amplitude}",
         ["left", "right"][hand]
     );
-    let reply = control::request(
-        &control::socket_path(),
-        &command,
-        Duration::from_millis(500),
-    )
-    .map_err(|e| {
+    let reply = daemon_request(&command, Duration::from_millis(500)).map_err(|e| {
         format!("a haptic pulse could not be sent ({e}); check both controllers are awake")
     })?;
     if reply.trim() != "ok" {

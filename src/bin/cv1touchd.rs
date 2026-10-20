@@ -11,7 +11,7 @@ mod socket_dir;
 use std::fs;
 use std::io;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3396,6 +3396,70 @@ impl Drop for ClientSlot {
     }
 }
 
+/// What decided the runtime directory, so that a message can name the setting to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSetting {
+    Option,
+    Environment,
+}
+
+impl RuntimeSetting {
+    fn name(self) -> &'static str {
+        match self {
+            RuntimeSetting::Option => "--runtime-dir",
+            RuntimeSetting::Environment => "XDG_RUNTIME_DIR",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControlSocketPathError {
+    path: PathBuf,
+    long: ipc::PathTooLong,
+    setting: RuntimeSetting,
+}
+
+impl ControlSocketPathError {
+    fn log(&self) {
+        log!(
+            "cannot start: the path of its control socket (the file it listens on for commands) is too long ({} bytes; Linux allows at most {} bytes). The path is built from {}: use a shorter one.",
+            self.long.bytes,
+            self.long.limit,
+            self.setting.name()
+        );
+        // Keep the full path even when it is larger than the bounded logger's line buffer.
+        let text = self.path.to_string_lossy();
+        let mut remaining = text.as_ref();
+        let mut continued = "";
+        while !remaining.is_empty() {
+            // Even a maximum-size Linux argument or environment value, expanded by
+            // lossy decoding, fits the queue when split near its 2048-byte line limit.
+            let mut end = remaining.len().min(1900);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            log!("control socket path{continued}: {}", &remaining[..end]);
+            remaining = &remaining[end..];
+            continued = " (continued)";
+        }
+    }
+}
+
+fn control_socket_path(
+    runtime: &Path,
+    setting: RuntimeSetting,
+) -> Result<PathBuf, ControlSocketPathError> {
+    let path = runtime.join("control.sock");
+    match ipc::path_too_long(&path) {
+        Some(long) => Err(ControlSocketPathError {
+            path,
+            long,
+            setting,
+        }),
+        None => Ok(path),
+    }
+}
+
 #[derive(Default)]
 struct InstanceOptions {
     shm_name: Option<String>,
@@ -3531,11 +3595,21 @@ fn supervise(args: &[String]) -> i32 {
         process::exit(1);
     });
     // the last one, as the daemon takes it
-    let runtime = args
+    let option = args
         .iter()
         .rposition(|a| a == "--runtime-dir")
-        .and_then(|i| args.get(i + 1))
-        .map_or_else(control::runtime_dir, PathBuf::from);
+        .and_then(|i| args.get(i + 1));
+    let setting = if option.is_some() {
+        RuntimeSetting::Option
+    } else {
+        RuntimeSetting::Environment
+    };
+    let runtime = option.map_or_else(control::runtime_dir, PathBuf::from);
+    let endpoint = control_socket_path(&runtime, setting).unwrap_or_else(|e| {
+        let _logging = daemon_log::init().unwrap_or_else(|_| process::exit(1));
+        e.log();
+        daemon_log::exit(1);
+    });
     if let Err(e) = platform::fs::create_private_dir_all(&runtime) {
         eprintln!("cv1touchd: {}: {e}", runtime.display());
         return 1;
@@ -3576,7 +3650,6 @@ fn supervise(args: &[String]) -> i32 {
         daemon.args(args);
         daemon
     };
-    let endpoint = runtime.join("control.sock");
     let mut stopping = supervise::Stopping {
         requested: Box::new(|| requests.wait(Duration::ZERO)),
         ask: Box::new(|until| {
@@ -3701,6 +3774,15 @@ fn main() {
         .runtime_dir
         .clone()
         .unwrap_or_else(control::runtime_dir);
+    let setting = if instance.runtime_dir.is_some() {
+        RuntimeSetting::Option
+    } else {
+        RuntimeSetting::Environment
+    };
+    let sock_path = control_socket_path(&runtime_dir, setting).unwrap_or_else(|e| {
+        e.log();
+        daemon_log::exit(1);
+    });
     let (opts, mode, calibration_path) = if provisional {
         (modes::provisional(&opts), "provisional".to_string(), None)
     } else {
@@ -3784,7 +3866,6 @@ fn main() {
             daemon_log::exit(1);
         }
     }
-    let sock_path = runtime_dir.join("control.sock");
     // a stale socket goes (the lock guarantees no live owner); private to this user
     let listener = ipc::Listener::bind(&sock_path).unwrap_or_else(|e| {
         log!("control socket {}: {e}", sock_path.display());
@@ -3930,6 +4011,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_paths_allow_107_bytes_and_reject_108_including_utf8() {
+        for runtime in [
+            format!("/{}", "r".repeat(93)),
+            format!("/{}r", "é".repeat(46)),
+        ] {
+            assert!(control_socket_path(Path::new(&runtime), RuntimeSetting::Option).is_ok());
+        }
+        for runtime in [
+            format!("/{}", "r".repeat(94)),
+            format!("/{}", "é".repeat(47)),
+        ] {
+            let error =
+                control_socket_path(Path::new(&runtime), RuntimeSetting::Environment).unwrap_err();
+            assert_eq!(error.long.bytes, 108);
+            assert_eq!(error.long.limit, 107);
+            assert_eq!(error.setting, RuntimeSetting::Environment);
+            assert_eq!(error.path, PathBuf::from(format!("{runtime}/control.sock")));
+        }
+    }
 
     #[test]
     fn a_superseded_unknown_window_breaks_a_pending_landmark_alert() {

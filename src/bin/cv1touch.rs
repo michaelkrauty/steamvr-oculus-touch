@@ -90,8 +90,45 @@ fn send_path(line: Result<String, String>) -> i32 {
     }
 }
 
+/// Explain a rejected endpoint using the setting available to the CLI and SteamVR. Library
+/// callers may use other paths, so the transport error itself does not prescribe XDG settings.
+fn daemon_error(error: io::Error) -> io::Error {
+    let Some(long) = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<platform::ipc::PathTooLong>())
+    else {
+        return error;
+    };
+    let message = format!(
+        "the path of its control socket is too long ({} bytes; Linux allows at most {} bytes). \
+         Use a shorter XDG_RUNTIME_DIR for cv1touch, cv1touchd and SteamVR. The path is {}",
+        long.bytes,
+        long.limit,
+        long.path.display()
+    );
+    io::Error::new(error.kind(), message)
+}
+
+/// A request from any CLI command, with actionable transport errors.
+fn daemon_request(line: &str, timeout: Duration) -> io::Result<String> {
+    control::request(&control::socket_path(), line, timeout).map_err(daemon_error)
+}
+
+fn socket_path_problem(socket: &Path) -> Option<String> {
+    let long = platform::ipc::path_too_long(socket)?;
+    Some(daemon_error(io::Error::new(io::ErrorKind::InvalidInput, long)).to_string())
+}
+
+/// What is printed when the daemon cannot be reached at `socket`.
+fn cannot_reach(socket: &Path, error: &io::Error) -> String {
+    format!(
+        "cv1touch: cannot reach cv1touchd at {}: {error}",
+        socket.display()
+    )
+}
+
 fn send(line: &str) -> i32 {
-    match control::request(&control::socket_path(), line, Duration::from_secs(5)) {
+    match daemon_request(line, Duration::from_secs(5)) {
         Ok(reply) => {
             println!("{reply}");
             if reply.starts_with("err") {
@@ -101,10 +138,7 @@ fn send(line: &str) -> i32 {
             }
         }
         Err(e) => {
-            eprintln!(
-                "cv1touch: cannot reach cv1touchd at {}: {e}",
-                control::socket_path().display()
-            );
+            eprintln!("{}", cannot_reach(&control::socket_path(), &e));
             1
         }
     }
@@ -137,10 +171,7 @@ fn stop() -> i32 {
             STILL_RUNNING
         }
         Err(e) => {
-            eprintln!(
-                "cv1touch: cannot reach cv1touchd at {}: {e}",
-                control::socket_path().display()
-            );
+            eprintln!("{}", cannot_reach(&control::socket_path(), &e));
             1
         }
         Ok(reply) if reply.starts_with("err") => {
@@ -161,7 +192,7 @@ fn stop() -> i32 {
 }
 
 fn ask_to_stop() -> io::Result<String> {
-    control::request(&control::socket_path(), "stop", Duration::from_secs(5))
+    daemon_request("stop", Duration::from_secs(5))
 }
 
 /// Whether another process holds the lock file `path`.
@@ -184,7 +215,7 @@ fn ended(mut running: impl FnMut() -> bool, timeout: Duration, step: Duration) -
 }
 
 fn json_status() -> i32 {
-    match control::request(&control::socket_path(), "status", Duration::from_secs(5)) {
+    match daemon_request("status", Duration::from_secs(5)) {
         Ok(reply) => match reply
             .strip_prefix("ok ")
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -199,7 +230,7 @@ fn json_status() -> i32 {
             }
         },
         Err(e) => {
-            eprintln!("cv1touch: cannot reach daemon: {e}");
+            eprintln!("{}", cannot_reach(&control::socket_path(), &e));
             1
         }
     }
@@ -271,11 +302,13 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     #[cfg(windows)]
     checks.push(sensors::doctor_check());
     let daemon = status_json();
-    checks.push((
-        "daemon",
-        daemon.is_some(),
-        control::socket_path().display().to_string(),
-    ));
+    let socket = control::socket_path();
+    let detail = daemon
+        .as_ref()
+        .err()
+        .map_or_else(|| socket.display().to_string(), ToString::to_string);
+    let daemon = daemon.ok().flatten();
+    checks.push(("daemon", daemon.is_some(), detail));
     if let Some(d) = &daemon {
         let (ok, detail) = sensor_poses_check(d);
         checks.push(("sensor_poses", ok, detail));
@@ -368,6 +401,10 @@ fn doctor(json: bool) -> i32 {
 }
 
 fn status_board(shm_name: &str) -> i32 {
+    if let Some(problem) = socket_path_problem(&control::socket_path()) {
+        eprintln!("cv1touch: cannot reach cv1touchd: {problem}");
+        return 1;
+    }
     let mut reader: Option<ShmReader> = None;
     let mut trackers: HashMap<String, status::RateTracker> = HashMap::new();
     loop {
@@ -384,16 +421,12 @@ fn status_board(shm_name: &str) -> i32 {
             };
         }
         let r = reader.as_ref().unwrap();
-        let complete = control::request(
-            &control::socket_path(),
-            "status",
-            Duration::from_millis(200),
-        )
-        .ok()
-        .and_then(|reply| {
-            serde_json::from_str::<serde_json::Value>(reply.strip_prefix("ok ")?).ok()
-        })
-        .filter(|v| v["generation"].as_u64() == Some(r.generation()));
+        let complete = daemon_request("status", Duration::from_millis(200))
+            .ok()
+            .and_then(|reply| {
+                serde_json::from_str::<serde_json::Value>(reply.strip_prefix("ok ")?).ok()
+            })
+            .filter(|v| v["generation"].as_u64() == Some(r.generation()));
         let (sensors, sensor_note) = match complete.as_ref().map(status::sensors_from_status) {
             Some(Ok(sensors)) => {
                 let note = if complete.as_ref().unwrap()["sensor_total"].as_u64().is_none() {
@@ -675,9 +708,11 @@ fn state_dir() -> PathBuf {
     cv1touch::platform::dirs::get().state
 }
 
-fn status_json() -> Option<serde_json::Value> {
-    let reply = control::request(&control::socket_path(), "status", Duration::from_secs(5)).ok()?;
-    serde_json::from_str(reply.strip_prefix("ok ")?).ok()
+fn status_json() -> io::Result<Option<serde_json::Value>> {
+    let reply = daemon_request("status", Duration::from_secs(5))?;
+    Ok(reply
+        .strip_prefix("ok ")
+        .and_then(|json| serde_json::from_str(json).ok()))
 }
 
 /// The daemon's latency adjustment from its status, ms (none from a daemon that does not say).
@@ -694,7 +729,13 @@ fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
             return Err("interrupted".into());
         }
         thread::sleep(Duration::from_secs(1));
-        let Some(v) = status_json() else { continue };
+        let status = match status_json() {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                return Err(error.to_string())
+            }
+            result => result.ok().flatten(),
+        };
+        let Some(v) = status else { continue };
         if v["mode"] != mode {
             continue;
         }
@@ -1012,7 +1053,9 @@ Quick Lighthouse registration: about 60 s, paced by beeps (press Enter to start)
 
 /// cv1touchd's shared memory, by the name its status gives (older daemons: the default).
 fn touch_reader() -> Result<ShmReader, String> {
-    let status = status_json().ok_or("cannot read cv1touchd status")?;
+    let status = status_json()
+        .map_err(|e| e.to_string())?
+        .ok_or("cannot read cv1touchd status")?;
     let name = status["shm"].as_str().unwrap_or(shm::DEFAULT_NAME);
     let reader = ShmReader::open(name).map_err(|e| format!("cannot read controller poses: {e}"))?;
     if status["generation"].as_u64() != Some(reader.generation()) {
@@ -1030,7 +1073,14 @@ fn touch_sample(st: &shm::ControllerState, now: u64) -> Option<nalgebra::Isometr
 
 fn register_cmd(check_only: bool, force: bool) -> i32 {
     catch_interrupts();
-    if status_json()
+    let status = match status_json() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{}", cannot_reach(&control::socket_path(), &error));
+            return 1;
+        }
+    };
+    if status
         .and_then(|v| v["mode"].as_str().map(str::to_string))
         .as_deref()
         != Some("calibrated")
@@ -1401,11 +1451,7 @@ struct StopRecordingGuard(bool);
 impl Drop for StopRecordingGuard {
     fn drop(&mut self) {
         if self.0 {
-            let _ = control::request(
-                &control::socket_path(),
-                "record stop",
-                Duration::from_secs(5),
-            );
+            let _ = daemon_request("record stop", Duration::from_secs(5));
         }
     }
 }
@@ -1445,7 +1491,13 @@ fn truth_stations(tf: &eval::TruthFile) -> align::Stations {
 
 fn eval_capture() -> i32 {
     catch_interrupts();
-    let status = status_json();
+    let status = match status_json() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{}", cannot_reach(&control::socket_path(), &error));
+            return 1;
+        }
+    };
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return 1;
@@ -1578,15 +1630,14 @@ fn parse_raw_inputs(reply: &str) -> Result<RawInputs, String> {
 }
 
 fn raw_inputs() -> Result<RawInputs, String> {
-    control::request(&control::socket_path(), "inputs", Duration::from_secs(1))
+    daemon_request("inputs", Duration::from_secs(1))
         .map_err(|e| format!("cannot read raw inputs from cv1touchd: {e}"))
         .and_then(|reply| parse_raw_inputs(&reply))
 }
 
 fn raw_inputs_json() -> i32 {
     let result = (|| -> Result<String, String> {
-        let reply = control::request(&control::socket_path(), "inputs", Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
+        let reply = daemon_request("inputs", Duration::from_secs(5)).map_err(|e| e.to_string())?;
         parse_raw_inputs(&reply)?;
         let value: serde_json::Value =
             serde_json::from_str(reply.strip_prefix("ok ").ok_or("invalid raw input reply")?)
@@ -1912,8 +1963,7 @@ fn input_gate(step: CalStep) -> Result<(), String> {
 fn cue(pulses: usize) {
     for pulse in 0..pulses {
         for hand in ["left", "right"] {
-            let _ = control::request(
-                &control::socket_path(),
+            let _ = daemon_request(
                 &format!("haptic {hand} 0.12 160 0.6"),
                 Duration::from_millis(300),
             );
@@ -2096,12 +2146,8 @@ fn write_input_calibration_with(
 }
 
 fn reload_inputs() -> Result<(), String> {
-    let reply = control::request(
-        &control::socket_path(),
-        "inputs reload",
-        Duration::from_secs(5),
-    )
-    .map_err(|e| e.to_string())?;
+    let reply =
+        daemon_request("inputs reload", Duration::from_secs(5)).map_err(|e| e.to_string())?;
     if reply == "ok" || reply.starts_with("ok ") {
         Ok(())
     } else {
@@ -2661,11 +2707,7 @@ struct ScopedRecordingGuard {
 impl Drop for ScopedRecordingGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = control::request(
-                &control::socket_path(),
-                &self.command,
-                Duration::from_millis(750),
-            );
+            let _ = daemon_request(&self.command, Duration::from_millis(750));
         }
     }
 }
@@ -2675,17 +2717,11 @@ fn scoped_cleanup_reply(reply: &str) -> bool {
 }
 
 fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGuard, String> {
-    let capability = control::request(
-        &control::socket_path(),
-        "status",
-        Duration::from_millis(750),
-    )
-    .ok()
-    .and_then(|reply| {
-        reply
-            .strip_prefix("ok ")
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-    });
+    let reply =
+        daemon_request("status", Duration::from_millis(750)).map_err(|error| error.to_string())?;
+    let capability = reply
+        .strip_prefix("ok ")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
     if capability.as_ref().is_none_or(|status| {
         status["recording_scoped_stop"] != true || status["recording"] != false
     }) {
@@ -2709,22 +2745,14 @@ fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGua
             cancelled
         },
         || {
-            let reply = control::request(
-                &control::socket_path(),
-                &command,
-                Duration::from_millis(750),
-            )
-            .map_err(|error| error.to_string());
+            let reply = daemon_request(&command, Duration::from_millis(750))
+                .map_err(|error| error.to_string());
             rejected.set(reply.as_ref().is_ok_and(|reply| reply.starts_with("err ")));
             reply
         },
         || {
-            let reply = control::request(
-                &control::socket_path(),
-                &scoped.command,
-                Duration::from_millis(750),
-            )
-            .map_err(|error| error.to_string())?;
+            let reply = daemon_request(&scoped.command, Duration::from_millis(750))
+                .map_err(|error| error.to_string())?;
             if !scoped_cleanup_reply(&reply) {
                 return Err(reply);
             }
@@ -2780,7 +2808,13 @@ fn capture_free_named_with_feedback(
     mut feedback: Option<&mut dyn CaptureFeedback>,
 ) -> Result<PathBuf, i32> {
     catch_interrupts();
-    let status = status_json();
+    let status = match status_json() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{}", cannot_reach(&control::socket_path(), &error));
+            return Err(1);
+        }
+    };
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return Err(1);
@@ -2929,11 +2963,7 @@ fn capture_free_named_with_feedback(
     let stop_command = scoped_guard
         .as_ref()
         .map_or("record stop", |guard| guard.command.as_str());
-    let stopped = control::request(
-        &control::socket_path(),
-        stop_command,
-        Duration::from_secs(5),
-    );
+    let stopped = daemon_request(stop_command, Duration::from_secs(5));
     let stopped_ok = stopped.as_ref().is_ok_and(|reply| {
         if scoped_guard.is_some() {
             reply.starts_with("ok stopped ")
@@ -6246,6 +6276,50 @@ mod tests {
         assert_eq!(probes.get(), 64);
         assert_eq!(max_gap, 2_250_000);
         eprintln!("delayed inventory (250 us/index): full scan {:.3} ms wall / 16.000 ms injected; incremental max {:.3} ms wall work per tick / 0.250 ms injected; max modeled pose gap {:.3} ms", full_scan.as_secs_f64() * 1000., max_wall_step.as_secs_f64() * 1000., max_gap as f64 * 1e-6);
+    }
+
+    /// A control socket path Linux cannot address is named as the reason the daemon cannot be
+    /// reached, with the remedy; one it can address keeps the connection error.
+    #[cfg(unix)]
+    #[test]
+    fn a_control_socket_path_over_the_linux_limit_is_explained() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        for socket in [
+            format!("/{}/control.sock", "r".repeat(93)),
+            format!("/{}r/control.sock", "é".repeat(46)),
+        ] {
+            assert_eq!(socket.len(), 107);
+            let socket = Path::new(&socket);
+            assert_eq!(socket_path_problem(socket), None);
+            let line = cannot_reach(socket, &refused);
+            assert!(
+                line.starts_with("cv1touch: cannot reach cv1touchd at /"),
+                "{line}"
+            );
+            assert!(line.contains(&refused.to_string()), "{line}");
+        }
+        for socket in [
+            format!("/{}/control.sock", "r".repeat(94)),
+            format!("/{}/control.sock", "é".repeat(47)),
+        ] {
+            assert_eq!(socket.len(), 108);
+            let socket = Path::new(&socket);
+            let long = platform::ipc::path_too_long(socket).unwrap();
+            let error = daemon_error(io::Error::new(io::ErrorKind::InvalidInput, long));
+            let line = cannot_reach(socket, &error);
+            assert!(
+                line.starts_with("cv1touch: cannot reach cv1touchd at "),
+                "{line}"
+            );
+            assert!(
+                line.contains("too long (108 bytes; Linux allows at most 107 bytes)"),
+                "{line}"
+            );
+            assert!(line.contains("XDG_RUNTIME_DIR"), "{line}");
+            assert!(!line.contains("--runtime-dir"), "{line}");
+            assert!(line.ends_with(&socket.display().to_string()), "{line}");
+            assert!(!line.contains("invalid input"), "{line}");
+        }
     }
 
     /// `doctor`'s sensor_poses check reads the daemon's pose watch: moved beats placed, given up

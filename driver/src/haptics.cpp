@@ -3,6 +3,7 @@
 
 #include "haptics.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -187,6 +188,16 @@ bool HapticSender::take(int hand, HapticCommand *out)
 	return true;
 }
 
+bool HapticSender::take_warning(uint64_t now_ns)
+{
+	if (!warned_ || now_ns - last_warn_ns_ > 60'000'000'000ull) {
+		warned_ = true;
+		last_warn_ns_ = now_ns;
+		return true;
+	}
+	return false;
+}
+
 #ifdef _WIN32
 /* One overlapped read or write on the pipe, given up after ms. */
 static bool pipe_io(HANDLE pipe, HANDLE event, bool write, void *buf, DWORD len, DWORD *moved, DWORD ms)
@@ -263,6 +274,27 @@ bool send_control_line(const std::string &path, const std::string &line)
 	return ok;
 }
 #else
+static void report_long_control_path(const std::string &path, size_t limit)
+{
+	// The driver reads only XDG_RUNTIME_DIR (default_socket_path) and takes no options, so the
+	// daemon's --runtime-dir is no remedy here.
+	cv1t_log("cv1touch: SteamVR cannot reach cv1touchd: the path of its control socket is too long (%zu bytes; Linux allows at most %zu bytes), so haptics and base station updates are not delivered. The path is built from XDG_RUNTIME_DIR: start SteamVR and cv1touchd with a shorter one.",
+		 path.size(), limit);
+	// Bound each log call, without discarding a path larger than the logger's line buffer.
+	for (size_t offset = 0; offset < path.size();) {
+		size_t count = std::min<size_t>(384, path.size() - offset);
+		if (offset + count < path.size()) {
+			while (count && (static_cast<unsigned char>(path[offset + count]) & 0xc0) == 0x80)
+				count--;
+		}
+		if (!count) // arbitrary non-UTF-8 path bytes must still make progress
+			count = std::min<size_t>(384, path.size() - offset);
+		cv1t_log("cv1touch: control socket path%s: %.*s", offset ? " (continued)" : "",
+			 static_cast<int>(count), path.data() + offset);
+		offset += count;
+	}
+}
+
 /* Only an error from connect may select another endpoint. Once connected, a failed write or
  * reply does not say whether the command arrived, so it must never be sent a second time. */
 static int connect_control_socket(const std::string &path, int *connect_error)
@@ -313,11 +345,22 @@ bool ControlClient::send(const std::string &line)
 #ifdef _WIN32
 	return send_control_line(paths_[0], line);
 #else
+	path_too_long_ = false;
 	for (unsigned attempt = 0; attempt < 2; attempt++) {
 		const unsigned which = (last_ + attempt) % 2;
 		const auto &path = paths_[which];
 		if (path.empty())
 			return false;
+		constexpr size_t limit = sizeof(sockaddr_un{}.sun_path) - 1;
+		if (path.size() > limit) {
+			path_too_long_ = true;
+			const unsigned warned = 1u << which;
+			if (!(warned_long_paths_ & warned)) {
+				report_long_control_path(path, limit);
+				warned_long_paths_ |= warned;
+			}
+			return false;
+		}
 		int error = 0, fd = -1;
 		if (which == 1 && !control_directory_is_private(path.substr(0, path.rfind('/')), geteuid())) {
 			if (errno != ENOENT)
@@ -351,10 +394,12 @@ void HapticSender::run()
 			if (!take(h, &c))
 				continue;
 			if (!control_.send(haptic_line(c))) {
-				const uint64_t now = cv1t_now_ns();
-				if (now - last_warn_ns_ > 60'000'000'000ull) {
+#ifndef _WIN32
+				if (control_.path_too_long())
+					continue; // the client already named the rejected endpoint and its remedy
+#endif
+				if (take_warning(cv1t_now_ns())) {
 					cv1t_log("cv1touch: haptic command not delivered to %s (daemon not running?)", control_.path().c_str());
-					last_warn_ns_ = now;
 				}
 			}
 		}

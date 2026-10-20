@@ -350,6 +350,13 @@ impl Drop for OpenedSegment {
     }
 }
 
+/// The most bytes of path a socket address holds: `sun_path` also stores a terminating NUL.
+pub const SOCKET_PATH_LIMIT: usize = {
+    // SAFETY: all-zero is a valid sockaddr_un.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 1
+};
+
 pub fn runtime_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -459,15 +466,18 @@ impl Connection {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::time::Duration;
 
+        if let Some(long) = super::ipc::path_too_long(endpoint) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, long));
+        }
         let bytes = endpoint.as_os_str().as_bytes();
-        // SAFETY: all-zero is a valid initial sockaddr_un, including its terminating NUL.
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        if bytes.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid control socket path",
             ));
         }
+        // SAFETY: all-zero is a valid initial sockaddr_un, including its terminating NUL.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         address.sun_family = libc::AF_UNIX as libc::sa_family_t;
         for (to, from) in address.sun_path.iter_mut().zip(bytes) {
             *to = *from as libc::c_char;

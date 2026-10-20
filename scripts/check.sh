@@ -36,6 +36,7 @@ meson test -C "$native" --no-rebuild --print-errorlogs
 # The SteamVR driver against the daemon's own shared-memory and control code.
 cargo run --locked --release --example driver_contract -- "$native/driver/test_daemon_contract"
 readelf -d "$daemon" | grep -F '$ORIGIN/../lib/cv1touch' >/dev/null
+CV1TOUCH_TEST_DAEMON="$daemon" CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_runtime_dir.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_driver_package.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_setup.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_report.py

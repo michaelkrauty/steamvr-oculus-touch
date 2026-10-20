@@ -609,6 +609,52 @@ pub mod ipc {
         os::runtime_dir()
     }
 
+    /// A control endpoint path that no Linux socket address can hold.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PathTooLong {
+        /// The full endpoint that was rejected.
+        pub path: PathBuf,
+        /// The path's length in bytes.
+        pub bytes: usize,
+        /// The most bytes a socket address holds.
+        pub limit: usize,
+    }
+
+    impl std::fmt::Display for PathTooLong {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "control socket path is too long ({} bytes; limit {} bytes). The path is {}",
+                self.bytes,
+                self.limit,
+                self.path.display()
+            )
+        }
+    }
+
+    impl std::error::Error for PathTooLong {}
+
+    /// Whether `endpoint` is longer than a Linux socket address holds: `sun_path` keeps one of its
+    /// 108 bytes for the terminating NUL. Never on Windows, where the endpoint only names a pipe.
+    pub fn path_too_long(endpoint: &Path) -> Option<PathTooLong> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = endpoint.as_os_str().as_bytes().len();
+            let limit = os::SOCKET_PATH_LIMIT;
+            (bytes > limit).then(|| PathTooLong {
+                path: endpoint.to_owned(),
+                bytes,
+                limit,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let _ = endpoint;
+            None
+        }
+    }
+
     /// A second Linux control socket beside the poses, visible inside Steam's container.
     #[cfg(unix)]
     pub fn container_socket_path() -> PathBuf {
@@ -943,6 +989,60 @@ mod tests {
         let dir = crate::socket_dir::SocketDir::new();
         let path = dir.path().join(format!("{tag}.sock"));
         (dir, path)
+    }
+
+    /// Linux holds 107 bytes of socket path. A longer one is refused with its length before a
+    /// connection is tried; a path with a NUL byte keeps its own error.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_longer_than_linux_holds_is_named_before_connecting() {
+        use super::ipc::{path_too_long, PathTooLong};
+        use std::io::ErrorKind;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let connect = |path: &Path| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            Connection::connect_until(path, until).err().unwrap()
+        };
+        for socket in [
+            format!("/{}/control.sock", "x".repeat(93)),
+            format!("/{}x/control.sock", "é".repeat(46)),
+        ] {
+            assert_eq!(socket.len(), 107);
+            assert_eq!(path_too_long(Path::new(&socket)), None);
+            // the longest path that fits fails as any path nobody listens at does
+            assert_eq!(connect(Path::new(&socket)).kind(), ErrorKind::NotFound);
+        }
+        for socket in [
+            format!("/{}/control.sock", "x".repeat(94)),
+            format!("/{}/control.sock", "é".repeat(47)),
+        ] {
+            assert_eq!(socket.len(), 108);
+            let long = PathTooLong {
+                path: Path::new(&socket).to_owned(),
+                bytes: 108,
+                limit: 107,
+            };
+            assert_eq!(path_too_long(Path::new(&socket)), Some(long.clone()));
+            let error = connect(Path::new(&socket));
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<PathTooLong>()),
+                Some(&long)
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("control socket path is too long (108 bytes; limit 107 bytes). The path is {socket}")
+            );
+            assert!(!error.to_string().contains("XDG_RUNTIME_DIR"));
+        }
+        let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b/control.sock"));
+        let error = connect(nul);
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "invalid control socket path");
     }
 
     #[test]
