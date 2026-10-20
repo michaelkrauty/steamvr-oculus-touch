@@ -13,6 +13,10 @@
 //! FRAME_OBS = ohmd_cv1touch_frame_info, n x ohmd_cv1touch_blob; SENSOR_INFO = ohmd_cv1touch_sensor;
 //! LED_MODEL = u32 device_id, u32 n, n x ohmd_cv1touch_led; HAPTIC = u32 hand, f32 duration_s,
 //! f32 frequency_hz, f32 amplitude (a haptic command as the daemon got it; amplitude 0 is off).
+//! INSPECTION_IDENTITY = ohmd_cv1touch_inspection_identity (start, normal end or retrospective
+//! invalidation). ENGINE_SESSION: no payload (the engine opened; its identity epochs start over).
+//! IDENTITIES_RETIRED = the sensor's serial, UTF-8 (its restored pose was acknowledged and its
+//! invalidated identities retired).
 //! Tracking threads only copy into a ring under a mutex (no I/O); a writer thread does the file I/O.
 
 use std::fs::{File, OpenOptions};
@@ -44,6 +48,19 @@ pub const LED_MODEL: u16 = 6;
 /// A sensor frame's pixels (see `encode_frame`), recorded with `record start PATH --frames`.
 pub const RAW_FRAME: u16 = 7;
 pub const HAPTIC: u16 = 8;
+/// Inspection identity lifetime (48-byte POD); additive to v2, older readers skip it.
+pub const INSPECTION_IDENTITY: u16 = 9;
+/// The engine (re)opened: identity epochs number afresh. Additive to v2.
+pub const ENGINE_SESSION: u16 = 10;
+/// A sensor's invalidated identities retired after its restored pose was acknowledged.
+/// Additive to v2.
+pub const IDENTITIES_RETIRED: u16 = 11;
+
+pub fn decode_inspection_identity(payload: &[u8]) -> Option<crate::engine::InspectionIdentity> {
+    (payload.len() == size_of::<crate::engine::InspectionIdentity>())
+        .then(|| read_pod(payload))
+        .flatten()
+}
 
 /// A HAPTIC record's payload.
 pub fn haptic_payload(hand: usize, duration_s: f32, frequency_hz: f32, amplitude: f32) -> [u8; 16] {
@@ -2011,6 +2028,65 @@ mod tests {
         assert_eq!((device, model.len(), model[1].dir), (2, 2, [0.0, 1.0, 0.0]));
         assert!(decode_frame_obs(&recs[0].payload[..100]).is_none());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn v2_keeps_old_frames_and_new_identity_lifetimes() {
+        let path = tmp("identity-epochs");
+        let r = Recorder::new(1 << 20);
+        r.start(&path, 1).unwrap();
+        let mut info = FrameInfo::default();
+        assert_eq!(size_of::<FrameInfo>(), 248);
+        assert_eq!(std::mem::size_of_val(&info.devices[0]), 64);
+        // Former reserved words remain zero in old v2 recordings.
+        r.write(FRAME_OBS, 2, &[as_bytes(&info)]);
+        info.devices[0].identity_epoch_lo = 7;
+        info.devices[0].identity_epoch_hi = 9;
+        info.devices[0].match_flags = crate::engine::MATCH_INSPECTION_IDENTITY;
+        let mut event = crate::engine::InspectionIdentity {
+            epoch: (9 << 32) | 7,
+            device_id: crate::calib::DEVICE_RIGHT,
+            state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED,
+            ..Default::default()
+        };
+        assert_eq!(std::mem::size_of_val(&event), 48);
+        r.write(INSPECTION_IDENTITY, 3, &[as_bytes(&event)]);
+        r.write(FRAME_OBS, 4, &[as_bytes(&info)]);
+        event.state = crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
+        r.write(INSPECTION_IDENTITY, 5, &[as_bytes(&event)]);
+        r.stop();
+        let records: Vec<_> = Reader::open(&path).unwrap().collect();
+        let old = decode_frame_obs(&records[0].payload).unwrap().0;
+        assert_eq!(
+            (
+                old.devices[0].identity_epoch_lo,
+                old.devices[0].identity_epoch_hi
+            ),
+            (0, 0)
+        );
+        let new = decode_frame_obs(&records[2].payload).unwrap().0;
+        assert_eq!(
+            (
+                new.devices[0].identity_epoch_lo,
+                new.devices[0].identity_epoch_hi
+            ),
+            (7, 9)
+        );
+        let end = decode_inspection_identity(&records[1].payload).unwrap();
+        let invalid = decode_inspection_identity(&records[3].payload).unwrap();
+        assert_eq!(end.epoch, event.epoch);
+        assert_eq!(end.state, crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED);
+        assert_eq!(
+            invalid.state,
+            crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED
+        );
+        assert!(decode_inspection_identity(&records[1].payload[..47]).is_none());
+        assert!(decode_inspection_identity(&[0; 49]).is_none());
+        assert_eq!(
+            records.iter().map(|r| r.host_ns).collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

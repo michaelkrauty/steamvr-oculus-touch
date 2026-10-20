@@ -7,6 +7,7 @@
 
 pub mod biases;
 pub mod clock;
+pub mod epochs;
 pub mod eskf;
 pub mod factory;
 pub mod landmarks;

@@ -419,6 +419,21 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     (checks, daemon)
 }
 
+/// A replayed sensor's agreement with the others, with the observed counts the pose watch
+/// judges by (unlabelled blobs alone can only ask for an inspection).
+fn agreement_line(serial: &str, a: &track::tracker::CameraAgreement) -> String {
+    format!(
+        "sensor {serial}: agrees with the others to {:.2} px median, offset {:.2} px ({} cross-checks); missed {} of {} frames with observed LEDs ({} of {} checks including unlabelled blobs)",
+        a.median_px,
+        a.bias_px.norm(),
+        a.samples,
+        a.observed_misses,
+        a.observed_checks,
+        a.misses,
+        a.checks
+    )
+}
+
 /// Whether the sensors stand where the calibration says (the daemon's pose watch, `status`):
 /// one that moved is being placed again from the others, one that could not be is waiting for
 /// `setup`, and with fewer than two sensors agreeing nothing can be told.
@@ -439,10 +454,7 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
         }
     }
     if status["sensors_unsure"].as_bool() == Some(true) {
-        return (
-            false,
-            "fewer than two sensors agree with each other: run cv1touch setup".to_string(),
-        );
+        return (false, track::repose::UNSURE_ADVICE.to_string());
     }
     if !given_up.is_empty() {
         return (
@@ -664,7 +676,7 @@ fn rec_summary(path: &Path, windows: &[Window]) -> i32 {
         eprintln!("cv1touch: {error}");
         return 1;
     }
-    println!("records by type (1 state, 2 raw report, 4 frame obs, 5 sensor info, 6 LED model, 7 raw frame, 8 haptic): {by_type:?}");
+    println!("records by type (1 state, 2 raw report, 4 frame obs, 5 sensor info, 6 LED model, 7 raw frame, 8 haptic, 9 inspection identity, 10 engine session, 11 identities retired): {by_type:?}");
     if reader.flight_skipped_records == recorder::UNKNOWN_FLIGHT_SKIPS {
         println!("flight recorder: some reports or commands may be missing from the saved window");
     } else if reader.flight_skipped_records != 0 {
@@ -5930,14 +5942,7 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
                 }
             }
             for (serial, a) in &r.agreement {
-                println!(
-                    "sensor {serial}: agrees with the others to {:.2} px median, offset {:.2} px ({} cross-checks); missed {} of {} checks",
-                    a.median_px,
-                    a.bias_px.norm(),
-                    a.samples,
-                    a.misses,
-                    a.checks
-                );
+                println!("{}", agreement_line(serial, a));
             }
             let mut registration = args
                 .iter()
@@ -7215,6 +7220,24 @@ mod tests {
         }
     }
 
+    /// A replay reports the observed counts the pose watch judges by, beside the raw ones.
+    #[test]
+    fn a_replayed_agreement_reports_observed_checks() {
+        let a = track::tracker::CameraAgreement {
+            median_px: 0.5,
+            samples: 30,
+            checks: 100,
+            misses: 70,
+            observed_checks: 40,
+            observed_misses: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            agreement_line("S0", &a),
+            "sensor S0: agrees with the others to 0.50 px median, offset 0.00 px (30 cross-checks); missed 3 of 40 frames with observed LEDs (70 of 100 checks including unlabelled blobs)"
+        );
+    }
+
     /// `doctor`'s sensor_poses check reads the daemon's pose watch: moved beats placed, given up
     /// beats moved, and unsure beats all.
     #[test]
@@ -7243,7 +7266,11 @@ mod tests {
         let (ok, detail) = sensor_poses_check(&status(false, &[Some("moved"), Some("given_up")]));
         assert!(!ok && detail.starts_with("S1 could not"), "{detail}");
         let (ok, detail) = sensor_poses_check(&status(true, &[Some("given_up")]));
-        assert!(!ok && detail.starts_with("fewer than two"), "{detail}");
+        assert!(
+            !ok && detail.starts_with("cv1touch is still checking whether a sensor moved")
+                && detail.ends_with("if it stays unsure for several minutes, run cv1touch setup"),
+            "{detail}"
+        );
     }
 
     /// `stop` waits for the daemon to end: true once it has, false when the time is up while it

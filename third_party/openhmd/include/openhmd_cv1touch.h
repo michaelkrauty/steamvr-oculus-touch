@@ -132,6 +132,14 @@ typedef struct ohmd_cv1touch_led {
 	float dir[3];                      /* unit LED normal */
 } ohmd_cv1touch_led;                   /* 24 bytes */
 
+/* Identity confirmed from camera/IMU relative motion, independently of the calibrated pose.
+ * This permits agreement checks only; it never bypasses the consumer's fusion attitude gate. */
+#define OHMD_CV1TOUCH_MATCH_INSPECTION_IDENTITY (1u << 16)
+/* The inspected hand's own turn on this exposure could establish identity: at least thirty
+ * degrees, clearly different from the other hand's, or an identity already established.
+ * Without it, an inspection that found the hand only shows that the hands were too still. */
+#define OHMD_CV1TOUCH_MATCH_INSPECTION_MOTION (1u << 17)
+
 typedef struct ohmd_cv1touch_frame_device {
 	int32_t device_id;                 /* OpenHMD device id: 0 headset, 1 right, 2 left */
 	uint32_t match_flags;              /* RIFT_POSE_MATCH_* of the final evaluation: 0x1 good, 0x2 strong */
@@ -139,10 +147,10 @@ typedef struct ohmd_cv1touch_frame_device {
 	int32_t matched_blobs;
 	int32_t visible_leds;
 	uint32_t pose_valid;               /* 1: cam_orient/cam_pos hold this frame's pose */
-	uint32_t reserved0;
+	uint32_t identity_epoch_lo;         /* low word of the inspection identity epoch; zero for ordinary matching */
 	float cam_orient[4];               /* object -> camera (OpenCV camera axes), x y z w */
 	float cam_pos[3];
-	float reserved1;
+	uint32_t identity_epoch_hi;         /* high word; the frame layout is unchanged */
 } ohmd_cv1touch_frame_device;          /* 64 bytes */
 
 typedef struct ohmd_cv1touch_frame_info {
@@ -181,6 +189,27 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, c
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_configure_sensors(ohmd_context *ctx,
         const char (*ignored)[32], size_t ignored_count,
         const ohmd_cv1touch_sensor_pose *poses, size_t pose_count);
+/* Normal continuity loss ends an epoch without discrediting its earlier identity. A
+ * retrospective invalidation retracts its earlier evidence. Delivered under the sensor lock,
+ * separately from camera frames so a consumer can retain notices even when it drops frames. */
+#define OHMD_CV1TOUCH_IDENTITY_STARTED 1u
+#define OHMD_CV1TOUCH_IDENTITY_ENDED 2u
+#define OHMD_CV1TOUCH_IDENTITY_INVALIDATED 3u
+typedef struct ohmd_cv1touch_inspection_identity {
+	char serial[32];
+	uint64_t epoch;
+	int32_t device_id;
+	uint32_t state;
+} ohmd_cv1touch_inspection_identity;   /* 48 bytes */
+typedef void (*ohmd_cv1touch_identity_cb)(void *user,
+        const ohmd_cv1touch_inspection_identity *identity, uint64_t host_ns);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_identity_callback(ohmd_context *ctx,
+        ohmd_cv1touch_identity_cb cb, void *user);
+
+/* Called before an inspection frame enters long search, so the consumer can retain its
+ * exposure-time prior. remaining_ns is the search deadline's remaining duration. */
+typedef void (*ohmd_cv1touch_search_cb)(void *user, const ohmd_cv1touch_frame_info *info, uint64_t remaining_ns);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_search_callback(ohmd_context *ctx, ohmd_cv1touch_search_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
@@ -261,6 +290,13 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_set_sensor_pose(ohmd_device *de
  * nothing, until ohmd_cv1touch_set_sensor_pose gives it a pose again. Returns 0, or -1 when no
  * such sensor is open. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_clear_sensor_pose(ohmd_device *device, const char *serial);
+/* Inspect only device_mask (1 << device id), keeping the calibrated pose and the other
+ * devices' fast tracking. Inspected devices export validated labels without fusing poses.
+ * timeout_ns bounds search cooperatively; restoring a pose cancels and drains its old work. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_inspect_sensor(ohmd_device *device, const char *serial, uint32_t device_mask, uint64_t timeout_ns);
+/* 1 once the queued pose is applied and its previous long search has stopped, 0 while pending,
+ * -1 if the sensor is not open. Query after set_sensor_pose before inspecting another sensor. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_sensor_pose_applied(ohmd_device *device, const char *serial);
 
 #ifdef __cplusplus
 }

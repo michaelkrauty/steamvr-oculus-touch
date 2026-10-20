@@ -14,6 +14,12 @@ static void test_pose_init(rift_pose_finder *, rift_sensor_camera_params *);
 #include "rift-sensor.c"
 #include "test_util.h"
 static int calls, fail_at, owned, closed;
+/* No worker runs in this allocation-failure harness. */
+uint64_t ohmd_monotonic_get(ohmd_context *ctx) { (void)ctx; return 0; }
+uint64_t ohmd_monotonic_per_sec(ohmd_context *ctx) { (void)ctx; return 1000000000; }
+uint64_t ohmd_monotonic_conv(uint64_t t, uint64_t src, uint64_t dst) {
+  return t / src * dst + t % src * dst / src;
+}
 static void *allocate(size_t n) {
   if (++calls == fail_at)
     return NULL;
@@ -46,6 +52,7 @@ ohmd_cond *ohmd_create_cond(ohmd_context *ctx) {
 }
 void ohmd_destroy_cond(ohmd_cond *p) { release(p); }
 void ohmd_cond_broadcast(ohmd_cond *p) { CHECK(p); }
+void ohmd_cond_signal(ohmd_cond *p) { CHECK(p); }
 static ohmd_thread *test_thread(ohmd_context *ctx, void *arg) {
   (void)ctx;
   (void)arg;
@@ -60,7 +67,7 @@ void blobwatch_free(blobwatch *p) { release(p); }
 static void test_pose_init(rift_pose_finder *pf,
                            rift_sensor_camera_params *calib) {
   (void)calib;
-  pf->cs = allocate(1);
+  pf->cs = allocate(sizeof *pf->cs);
 }
 void rift_pose_finder_clear(rift_pose_finder *pf) { release(pf->cs); }
 void rift_pose_finder_set_camera_pose(rift_pose_finder *pf, const posef *pose) {
@@ -99,11 +106,13 @@ static void serial_case_matches(void) {
   CHECK(rift_sensor_set_cv1touch_pose(&sensor, &pose));
   CHECK(sensor.have_pending_pose && !sensor.pending_clear);
   CHECK(sensor.pending_pose.pos.x == 1);
-  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera10"));
-  CHECK(rift_sensor_clear_cv1touch_pose(&sensor, "camera1"));
+  CHECK(rift_sensor_cv1touch_pose_applied(&sensor, "camera1") == 0);
+  CHECK(rift_sensor_cv1touch_pose_applied(&sensor, "camera10") == -1);
+  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera10", 0, 0));
+  CHECK(rift_sensor_clear_cv1touch_pose(&sensor, "camera1", 0, 0));
   CHECK(sensor.pending_clear && !sensor.have_pending_pose);
   sensor.pf.cv1touch_allow_placement = true;
-  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera1"));
+  CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera1", 0, 0));
 }
 
 int main(void) {

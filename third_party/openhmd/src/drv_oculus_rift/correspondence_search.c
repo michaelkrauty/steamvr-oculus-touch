@@ -543,6 +543,9 @@ select_k_blobs_from_n (correspondence_search_t *cs, cs_model_info_t *mi, rift_le
     cs_image_point_t **result_list, cs_image_point_t **output_list,
     cs_image_point_t **candidate_list, int k, int n, int depth)
 {
+    if (correspondence_search_should_stop(cs))
+        return;
+
     if (k == 1) {
         output_list[0] = candidate_list[0];
         check_led_against_model_subset (cs, mi, result_list, model_leds, depth);
@@ -614,6 +617,8 @@ check_led_match (correspondence_search_t *cs, cs_model_info_t *mi, rift_led **mo
     mi->led_depth = depth;
 
     for (b = 0; b < cs->num_points; b++) {
+        if (correspondence_search_should_stop(cs))
+            return;
         cs_image_point_t *anchor = cs->points + b;
         mi->blob_index = b;
         check_leds_against_anchor (cs, mi, model_leds, anchor);
@@ -628,6 +633,9 @@ select_k_leds_from_n (correspondence_search_t *cs,
     rift_led **result_list, rift_led **output_list,
     rift_led **candidate_list, int k, int n, int depth)
 {
+    if (correspondence_search_should_stop(cs))
+        return;
+
     if (k == 1) {
         rift_led *swap_list[4];
 
@@ -777,6 +785,8 @@ search_pose_for_model (correspondence_search_t *cs, cs_model_info_t *mi)
   /* Start correspondence search for this model */
   /* At this stage, each image point has a list of the nearest neighbours filtered for this model */
   for (l = 0; l < model->num_points; l++) {
+      if (correspondence_search_should_stop(cs))
+          return false;
       led_search_candidate_t *c = model->points[l];
       mi->led_index = l;
 
@@ -855,7 +865,13 @@ bool correspondence_search_find_one_pose (correspondence_search_t *cs, int model
       oquatf_decompose_swing_twist(&pose->orient, gravity_vector, &mi->gravity_swing, &pose_gravity_twist);
     }
 
-    if (search_pose_for_model (cs, mi) && (mi->match_flags & RIFT_POSE_MATCH_GOOD)) {
+    bool found = search_pose_for_model (cs, mi);
+    if (correspondence_search_should_stop(cs)) {
+      mi->match_flags = 0;
+      score->match_flags = 0;
+      return false;
+    }
+    if (found && (mi->match_flags & RIFT_POSE_MATCH_GOOD)) {
 			*pose = mi->best_pose;
       *score = mi->best_score;
 

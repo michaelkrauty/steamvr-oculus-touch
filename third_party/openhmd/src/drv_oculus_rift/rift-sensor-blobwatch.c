@@ -627,6 +627,22 @@ struct blob *blobwatch_find_blob_at(blobwatch *bw, int x, int y)
 	return NULL;
 }
 
+/* Fast worker only, including when an inspection is cancelled or rejects its candidate. */
+void blobwatch_clear_labels(blobwatch *bw, int device_id)
+{
+	blobservation *ob = bw->last_observation;
+	if (!ob)
+		return;
+	for (int i = 0; i < ob->num_blobs; i++) {
+		struct blob *b = ob->blobs + i;
+		if (LED_OBJECT_ID(b->led_id) == device_id || LED_OBJECT_ID(b->prev_led_id) == device_id) {
+			if (LED_OBJECT_ID(b->led_id) == device_id) b->led_id = LED_INVALID_ID;
+			if (LED_OBJECT_ID(b->prev_led_id) == device_id) b->prev_led_id = LED_INVALID_ID;
+			b->pattern_age = 0;
+		}
+	}
+}
+
 void blobwatch_update_labels(blobwatch *bw, blobservation *ob, int device_id)
 {
 	/* Take the observation in ob and replace any labels for the given device in

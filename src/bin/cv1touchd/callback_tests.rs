@@ -18,6 +18,12 @@ impl EngineSink for PoisonedSink {
     fn frame(&self, _: &engine::FrameInfo, _: &[Blob]) {
         drop(self.0.lock().unwrap());
     }
+    fn inspection_identity(&self, _: &engine::InspectionIdentity, _: u64) {
+        drop(self.0.lock().unwrap());
+    }
+    fn search_started(&self, _: &engine::FrameInfo, _: u64) {
+        drop(self.0.lock().unwrap());
+    }
     fn report(&self, _: i32, _: u64, _: &[u8]) {
         drop(self.0.lock().unwrap());
     }
@@ -46,6 +52,10 @@ fn run(kind: &str, test: &str) {
         unsafe {
             match kind {
                 "frame" => callbacks::frame_cb(user, &info, 0, std::ptr::null()),
+                "search" => callbacks::search_cb(user, &info, 1),
+                "identity" => {
+                    callbacks::identity_cb(user, &engine::InspectionIdentity::default(), 1)
+                }
                 "image" => callbacks::image_cb(user, &info, 1, 1, 1, [0u8].as_ptr()),
                 "report" => callbacks::report_cb(user, 0, 0, std::ptr::null(), 0),
                 "activity" => callbacks::activity_cb(user, 1, 2, 0, 0, false, 0.0),
@@ -121,6 +131,14 @@ fn frame_panic_aborts_with_a_full_pipe() {
 }
 
 #[test]
+fn search_panic_aborts_with_a_full_pipe() {
+    run(
+        "search",
+        "callback_tests::search_panic_aborts_with_a_full_pipe",
+    );
+}
+
+#[test]
 fn image_panic_aborts_with_a_full_pipe() {
     run(
         "image",
@@ -141,5 +159,13 @@ fn activity_panic_aborts_with_a_full_pipe() {
     run(
         "activity",
         "callback_tests::activity_panic_aborts_with_a_full_pipe",
+    );
+}
+
+#[test]
+fn identity_panic_aborts_with_a_full_pipe() {
+    run(
+        "identity",
+        "callback_tests::identity_panic_aborts_with_a_full_pipe",
     );
 }

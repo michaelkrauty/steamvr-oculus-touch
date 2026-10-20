@@ -1,0 +1,543 @@
+{
+  "description": "Window counters from independently moving controllers recorded as LED centres, with one calibrated camera translated by 0.4 m. During inspection all recorded labels were discarded. The actual native fast and asynchronous cold workers supplied identity-checked labels at their measured completion times, while input frames and IMU continued at the recorded pace. Sensor names are fictional; no room poses or device identifiers are retained.",
+  "windows": [
+    {
+      "t_ns": 0,
+      "sightings": []
+    },
+    {
+      "t_ns": 5000309364,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 256,
+          "misses": 0,
+          "observed_checks": 256,
+          "observed_misses": 0,
+          "samples": 256,
+          "median_px": 0.14867202812306848,
+          "bias_px": [
+            0.005247393879049448,
+            0.005544335725409429
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 256,
+          "misses": 0,
+          "observed_checks": 256,
+          "observed_misses": 0,
+          "samples": 256,
+          "median_px": 0.13011859673449816,
+          "bias_px": [
+            0.032433004843665444,
+            0.013528273135357406
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 257,
+          "misses": 0,
+          "observed_checks": 257,
+          "observed_misses": 0,
+          "samples": 257,
+          "median_px": 0.14004857560584605,
+          "bias_px": [
+            -0.0032157314511282935,
+            0.005986557351147237
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 257,
+          "misses": 0,
+          "observed_checks": 257,
+          "observed_misses": 0,
+          "samples": 257,
+          "median_px": 0.13423788199276107,
+          "bias_px": [
+            -0.01451227876256409,
+            0.022234602178260256
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 257,
+          "misses": 257,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 257,
+          "misses": 257,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "t_ns": 10000637722,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 242,
+          "misses": 0,
+          "observed_checks": 242,
+          "observed_misses": 0,
+          "samples": 242,
+          "median_px": 0.14896961150058885,
+          "bias_px": [
+            0.004870984205049093,
+            0.006820584669300942
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 260,
+          "misses": 0,
+          "observed_checks": 260,
+          "observed_misses": 0,
+          "samples": 260,
+          "median_px": 0.12366369320330932,
+          "bias_px": [
+            0.027519918219693747,
+            0.019555267716190546
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 241,
+          "misses": 1,
+          "observed_checks": 235,
+          "observed_misses": 0,
+          "samples": 235,
+          "median_px": 0.13978496987747668,
+          "bias_px": [
+            -0.0034042917535031013,
+            0.006383208933764408
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 259,
+          "misses": 0,
+          "observed_checks": 242,
+          "observed_misses": 0,
+          "samples": 242,
+          "median_px": 0.1356816873493799,
+          "bias_px": [
+            -0.01254154159906459,
+            0.025856920800988222
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 260,
+          "misses": 260,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 260,
+          "misses": 260,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "t_ns": 15001763884,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 244,
+          "misses": 0,
+          "observed_checks": 244,
+          "observed_misses": 0,
+          "samples": 244,
+          "median_px": 0.13753181761589123,
+          "bias_px": [
+            0.01686466424321347,
+            0.004618388661248917
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 240,
+          "misses": 0,
+          "observed_checks": 240,
+          "observed_misses": 0,
+          "samples": 240,
+          "median_px": 0.130141465297377,
+          "bias_px": [
+            0.017674980814559187,
+            0.01895248749097541
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 240,
+          "misses": 0,
+          "observed_checks": 232,
+          "observed_misses": 0,
+          "samples": 232,
+          "median_px": 0.13931253113841277,
+          "bias_px": [
+            0.01384547109393311,
+            0.011854548307841615
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 239,
+          "misses": 0,
+          "observed_checks": 236,
+          "observed_misses": 0,
+          "samples": 236,
+          "median_px": 0.13667361871640218,
+          "bias_px": [
+            -0.021709557165282535,
+            0.022158555400671836
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 207,
+          "misses": 207,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 255,
+          "misses": 255,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "t_ns": 20002299342,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 165,
+          "misses": 4,
+          "observed_checks": 153,
+          "observed_misses": 0,
+          "samples": 153,
+          "median_px": 0.14874169213997637,
+          "bias_px": [
+            0.010427702672896498,
+            -0.007797123201597426
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 189,
+          "misses": 7,
+          "observed_checks": 173,
+          "observed_misses": 0,
+          "samples": 173,
+          "median_px": 0.1482789062818714,
+          "bias_px": [
+            -0.013144774151415744,
+            0.008027179571417152
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 163,
+          "misses": 3,
+          "observed_checks": 152,
+          "observed_misses": 0,
+          "samples": 152,
+          "median_px": 0.15263889967384459,
+          "bias_px": [
+            0.02765661981502943,
+            0.009269649656847916
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 177,
+          "misses": 1,
+          "observed_checks": 165,
+          "observed_misses": 0,
+          "samples": 165,
+          "median_px": 0.15832205995278423,
+          "bias_px": [
+            -0.03140400983327095,
+            0.01830519874549262
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 212,
+          "misses": 212,
+          "observed_checks": 124,
+          "observed_misses": 124,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 206,
+          "misses": 206,
+          "observed_checks": 89,
+          "observed_misses": 89,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "t_ns": 25002586567,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 212,
+          "misses": 35,
+          "observed_checks": 156,
+          "observed_misses": 0,
+          "samples": 156,
+          "median_px": 0.1626447757307089,
+          "bias_px": [
+            0.024003965679862953,
+            -0.011727936422955521
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 240,
+          "misses": 11,
+          "observed_checks": 221,
+          "observed_misses": 0,
+          "samples": 221,
+          "median_px": 0.15627756302863727,
+          "bias_px": [
+            -0.007224404885429238,
+            -0.0004824852434543801
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 140,
+          "misses": 0,
+          "observed_checks": 140,
+          "observed_misses": 0,
+          "samples": 140,
+          "median_px": 0.16276161859134625,
+          "bias_px": [
+            0.02147469112509828,
+            0.014028537326224937
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 174,
+          "misses": 3,
+          "observed_checks": 174,
+          "observed_misses": 3,
+          "samples": 171,
+          "median_px": 0.1657918925553873,
+          "bias_px": [
+            -0.019432441834403756,
+            0.011109833217291936
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 230,
+          "misses": 230,
+          "observed_checks": 58,
+          "observed_misses": 58,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 239,
+          "misses": 239,
+          "observed_checks": 29,
+          "observed_misses": 29,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "t_ns": 30002893678,
+      "sightings": [
+        {
+          "sensor": "A",
+          "hand": 0,
+          "checks": 121,
+          "misses": 0,
+          "observed_checks": 121,
+          "observed_misses": 0,
+          "samples": 121,
+          "median_px": 0.16662406892121676,
+          "bias_px": [
+            0.02967132189645621,
+            -0.008890103091242413
+          ]
+        },
+        {
+          "sensor": "A",
+          "hand": 1,
+          "checks": 49,
+          "misses": 0,
+          "observed_checks": 49,
+          "observed_misses": 0,
+          "samples": 49,
+          "median_px": 0.15444298446112073,
+          "bias_px": [
+            -0.010307952092880565,
+            -0.0021185595723618228
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 0,
+          "checks": 123,
+          "misses": 3,
+          "observed_checks": 111,
+          "observed_misses": 0,
+          "samples": 111,
+          "median_px": 0.19048582343044668,
+          "bias_px": [
+            0.021530006037038724,
+            0.023311757338233575
+          ]
+        },
+        {
+          "sensor": "B",
+          "hand": 1,
+          "checks": 72,
+          "misses": 23,
+          "observed_checks": 48,
+          "observed_misses": 0,
+          "samples": 48,
+          "median_px": 0.163487718720226,
+          "bias_px": [
+            -0.01083520753993229,
+            0.01214499477877872
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 0,
+          "checks": 0,
+          "misses": 0,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "sensor": "C",
+          "hand": 1,
+          "checks": 0,
+          "misses": 0,
+          "observed_checks": 0,
+          "observed_misses": 0,
+          "samples": 0,
+          "median_px": 0.0,
+          "bias_px": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    }
+  ]
+}

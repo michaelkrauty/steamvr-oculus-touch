@@ -185,6 +185,8 @@ struct Daemon {
     reopen: AtomicBool,
     tracker: TrackerKind,
     track_in: Mutex<FrameQueue<QueuedFrame>>,
+    track_searches: Mutex<FrameQueue<(Box<engine::FrameInfo>, u64)>>,
+    track_identities: Mutex<cv1touch::track::epochs::Mailbox>,
     /// Complete sensor diagnostics; the SHM block is only a compatibility prefix.
     sensors: Mutex<Vec<SensorStatus>>,
     /// Last start attempts, published with counters; retained until forgotten or engine close.
@@ -569,6 +571,31 @@ impl EngineSink for Daemon {
         }
     }
 
+    fn inspection_identity(&self, event: &engine::InspectionIdentity, host_ns: u64) {
+        if self.rec.active() {
+            self.rec.write(
+                recorder::INSPECTION_IDENTITY,
+                host_ns,
+                &[recorder::as_bytes(event)],
+            );
+        }
+        if self.tracker == TrackerKind::Rust {
+            self.track_identities.lock().unwrap().note(event);
+            self.wake_radio();
+        }
+    }
+
+    fn search_started(&self, info: &engine::FrameInfo, remaining_ns: u64) {
+        if self.tracker == TrackerKind::Rust {
+            self.track_searches.lock().unwrap().push_frame(
+                &engine::cstr_field(&info.serial),
+                info.frame_start_host_ns,
+                (Box::new(*info), remaining_ns),
+            );
+            self.wake_radio();
+        }
+    }
+
     fn frame(&self, info: &engine::FrameInfo, blobs: &[Blob]) {
         if self.rec.active() {
             self.rec.write(
@@ -657,6 +684,8 @@ fn engine_unavailable(d: &Daemon, now: u64) {
 fn clear_engine_snapshot(d: &Daemon) {
     d.engine_applied.store(0, Ordering::Release);
     d.track_in.lock().unwrap().register([]);
+    d.track_searches.lock().unwrap().register([]);
+    d.track_identities.lock().unwrap().register([]);
     d.pending_frames_dropped.store(0, Ordering::Relaxed);
     publish_sensor_snapshot(d, &[], &[], &[], &[]);
 }
@@ -832,17 +861,13 @@ fn publish_sensor_snapshot_with(
     publish(&snapshot);
 }
 
-fn sensor_status(d: &Daemon, s: &engine::Sensor) -> SensorStatus {
+fn sensor_status(s: &engine::Sensor) -> SensorStatus {
     let mut out = SensorStatus::default();
     let serial = engine::sensor_serial(s);
     shm::set_serial(&mut out, &serial);
-    // a sensor being placed again has no pose in the engine for the while, but a calibrated one
-    // in ours: it counts as placed
-    let placing = matches!(
-        d.sensor_poses.lock().unwrap().get(&serial),
-        Some(PoseNote::Moved { .. })
-    );
-    out.placed = (s.have_camera_pose || placing) as u32;
+    // a sensor being placed again keeps its calibrated pose in the engine, which only stops
+    // tracking with it while it searches for its controllers' LEDs
+    out.placed = s.have_camera_pose as u32;
     out.frames = s.frames;
     out.pose_fixes[HAND_LEFT] = s.pose_fixes[2]; // OpenHMD device id 2 = left
     out.pose_fixes[HAND_RIGHT] = s.pose_fixes[1]; // OpenHMD device id 1 = right
@@ -895,6 +920,8 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
     }
     let p = calibrated_pipeline(opts, &e.sensors());
     d.track_in.lock().unwrap().clear();
+    d.track_searches.lock().unwrap().clear();
+    d.track_identities.lock().unwrap().clear();
     Some(p)
 }
 
@@ -1544,6 +1571,25 @@ fn radio_resources<D, H>(
     Some((decoder, device))
 }
 
+/// What starts over with each open engine: each hand's wrong-lock count and velocity shaping,
+/// the sensors' status, and a recording's session info, with a mark where the engine's identity
+/// epochs number afresh.
+fn begin_engine_session(d: &Daemon) {
+    for hand in &d.hands {
+        let mut publisher = hand.lock().unwrap();
+        // The tracker starts over; only publication and the gap outlive it.
+        publisher.memory.wrong_locks = 0;
+        publisher.shaper = VelocityShaper::new(ShapeParams::default());
+    }
+    // The engine numbers its identities afresh, and only after an inspection request: frames
+    // it delivered before this mark carry none.
+    d.rec.write(recorder::ENGINE_SESSION, shm::now_ns(), &[]);
+    d.session.lock().unwrap().reset(); // sensors may differ after a reopen
+    d.sensor_poses.lock().unwrap().clear();
+    d.sensor_agreement.lock().unwrap().clear();
+    d.sensors_unsure.store(false, Ordering::Relaxed);
+}
+
 /// One open engine, including setup and the radio scope, borrows its owner's native resources.
 fn engine_session(
     d: &Daemon,
@@ -1552,20 +1598,19 @@ fn engine_session(
     e: &mut Engine,
     reopening_since: &mut Option<std::time::Instant>,
 ) {
-    for hand in &d.hands {
-        let mut publisher = hand.lock().unwrap();
-        // The tracker starts over; only publication and the gap outlive it.
-        publisher.memory.wrong_locks = 0;
-        publisher.shaper = VelocityShaper::new(ShapeParams::default());
-    }
-    d.session.lock().unwrap().reset(); // sensors may differ after a reopen
-    d.sensor_poses.lock().unwrap().clear();
-    d.sensor_agreement.lock().unwrap().clear();
-    d.sensors_unsure.store(false, Ordering::Relaxed);
+    begin_engine_session(d);
     log!("engine running with {} sensor(s)", e.sensors().len());
     make_usb_thread_realtime();
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
     d.track_in.lock().unwrap().register(open.iter().cloned());
+    d.track_searches
+        .lock()
+        .unwrap()
+        .register(open.iter().cloned());
+    d.track_identities
+        .lock()
+        .unwrap()
+        .register(open.iter().cloned());
     for serial in modes::unposed_sensors(opts, &open) {
         log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
     }
@@ -1834,6 +1879,8 @@ struct RadioLink {
     /// Sensor pose changes from the radio thread, for the engine thread to give the engine (and
     /// a sensor placed again to write into the calibration).
     reposed: Mutex<Vec<PoseChange>>,
+    /// Native acknowledgements that a restored pose has stopped its previous search.
+    restored: Mutex<Vec<String>>,
 }
 
 /// The calibration file the daemon's sensor poses came from.
@@ -1872,9 +1919,11 @@ const RELEASE_RUN_NS: u64 = 3_600_000_000_000;
 
 /// What the radio thread decided about a sensor's pose in the engine.
 enum PoseChange {
-    /// The sensor moved: the engine should label its blobs by the long search while it is being
-    /// placed, which a sensor without a pose does.
-    Cleared(String),
+    /// A non-demoting label inspection, with a native deadline.
+    Inspect(String, [bool; 2]),
+    /// A sensor judged moved: the engine inspects both hands' labels on it, without tracking
+    /// with it, while it is placed again.
+    Placing(String),
     /// The sensor's pose, placed again from the others (or given back, as calibrated, when it
     /// could not be placed: the engine stops its search then).
     Set(Reposed),
@@ -1891,6 +1940,83 @@ struct Reposed {
     moved_mm: f64,
     turned_deg: f64,
     write: bool,
+}
+
+/// Gives the engine its calibrated pose back without writing the calibration.
+fn restore_engine_pose(link: &RadioLink, pipe: &mut Pipeline, serial: &str) {
+    pipe.cancel_inspection(serial);
+    let Some(cam) = pipe.camera(serial) else {
+        return;
+    };
+    let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
+    link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+        serial: serial.to_string(),
+        orient_xyzw,
+        pos,
+        median_px: 0.0,
+        matches: 0,
+        moved_mm: 0.0,
+        turned_deg: 0.0,
+        write: false,
+    }));
+}
+
+/// The log line for a movement verdict, from the evidence that decided it: the last window's
+/// observed checks with the residual and offset it was judged by, or an inspection's
+/// accumulated checks. A verdict that waited for another sensor's restoration is logged a
+/// second or more after its window, so the line names that window, not the last seconds.
+fn moved_line(serial: &str, by: &repose::MovedBy) -> String {
+    const CONTROLLERS: [&str; 2] = ["the left controller", "the right controller"];
+    let window_s = repose::WINDOW_NS / 1_000_000_000;
+    let said: Vec<String> = match by {
+        repose::MovedBy::Windows(deciding) => deciding
+            .iter()
+            .zip(CONTROLLERS)
+            .filter_map(|(window, controller)| {
+                let window = window.as_ref()?;
+                let matched = match window.residual_px {
+                    Some((median, offset)) => {
+                        format!("residual {median:.2} px, offset {offset:.2} px")
+                    }
+                    None => "no LED matched".to_string(),
+                };
+                Some(format!(
+                    "{controller} missed {} of {} frames with observed LEDs, {matched}",
+                    window.observed.misses, window.observed.checks
+                ))
+            })
+            .collect(),
+        repose::MovedBy::Inspection(deciding) => deciding
+            .iter()
+            .zip(CONTROLLERS)
+            .filter_map(|(total, controller)| {
+                let (checks, windows) = total.as_ref()?;
+                Some(format!(
+                    "{controller} missed {} of {} frames with observed LEDs in {windows} windows of {window_s} s",
+                    checks.misses, checks.checks
+                ))
+            })
+            .collect(),
+    };
+    let said = said.join("; ");
+    match by {
+        repose::MovedBy::Windows(_) => format!(
+            "sensor {serial}: disagrees with the other sensors two windows in a row (in its last {window_s} s window, {said}): it moved; placing it again from them while the controllers are in its view"
+        ),
+        repose::MovedBy::Inspection(_) => format!(
+            "sensor {serial}: its label inspection shows it disagrees with the other sensors ({said}): it moved; placing it again from them while the controllers are in its view"
+        ),
+    }
+}
+
+/// The log line for a movement verdict dropped while it waited for another sensor's
+/// restoration (`repose::Change::Dropped`). Any invalidation or overflow drops it, whichever
+/// sensor or hand it concerns, so the line does not say the verdict rested on what was taken
+/// back.
+fn dropped_line(serial: &str) -> String {
+    format!(
+        "sensor {serial}: the verdict that it moved was dropped before it was acted on, because some controller sightings were taken back, so how well the sensors agree is judged afresh; it stays in tracking as before, and new sightings judge it again"
+    )
 }
 
 /// Where a sensor stands with the pose watch, for `status`.
@@ -1984,7 +2110,9 @@ impl Reposing {
     }
 
     /// Lets a probed sensor go, tracked with again as calibrated: the engine gets its pose back,
-    /// the monitor leaves it alone for a while, and `status` says `why`.
+    /// the monitor leaves it alone for a while, and `status` says `why`. A starved probation is
+    /// no verdict: the sensor is judged again after a short retry, outside the release run.
+    #[allow(clippy::too_many_arguments)]
     fn release(
         &mut self,
         d: &Daemon,
@@ -1993,6 +2121,7 @@ impl Reposing {
         serial: &str,
         now: u64,
         why: &str,
+        starved: bool,
     ) {
         if let Some(camera) = pipe.camera_id(serial) {
             self.reposer.forget(camera);
@@ -2000,27 +2129,19 @@ impl Reposing {
         pipe.probe(serial, false);
         pipe.reset_agreement(serial);
         self.probed_since.remove(serial);
-        let run = self.releases.entry(serial.to_string()).or_insert((0, now));
-        if now.saturating_sub(run.1) > RELEASE_RUN_NS {
-            run.0 = 0;
-        }
-        run.0 += 1;
-        run.1 = now;
-        let cooldown = repose::COOLDOWN_NS << (run.0 - 1).min(4);
+        let cooldown = if starved {
+            self.monitor.starved_retry(serial)
+        } else {
+            let run = self.releases.entry(serial.to_string()).or_insert((0, now));
+            if now.saturating_sub(run.1) > RELEASE_RUN_NS {
+                run.0 = 0;
+            }
+            run.0 += 1;
+            run.1 = now;
+            repose::COOLDOWN_NS << (run.0 - 1).min(4)
+        };
         self.monitor.released_until(serial, now + cooldown);
-        if let Some(cam) = pipe.camera(serial) {
-            let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
-            link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
-                serial: serial.to_string(),
-                orient_xyzw,
-                pos,
-                median_px: 0.0,
-                matches: 0,
-                moved_mm: 0.0,
-                turned_deg: 0.0,
-                write: false,
-            }));
-        }
+        restore_engine_pose(link, pipe, serial);
         d.sensor_poses.lock().unwrap().insert(
             serial.to_string(),
             PoseNote::Released {
@@ -2031,6 +2152,136 @@ impl Reposing {
         log!("sensor {serial}: {why}; tracking with it again as calibrated");
     }
 
+    /// A positive movement verdict hands the sensor to the solver; the placement limit must
+    /// also stop an inspection's engine search when it keeps the sensor out of tracking.
+    /// Returns the line to log.
+    fn moved(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        serial: String,
+        by: repose::MovedBy,
+        now: u64,
+    ) -> Option<String> {
+        let camera = pipe.camera_id(&serial)?;
+        let recent = self.placements.get(&serial).map_or(0, Vec::len);
+        if recent >= MAX_PLACEMENTS {
+            // it keeps moving, or something else is wrong: not again and again
+            pipe.probe(&serial, true);
+            pipe.ignore(&serial, true);
+            restore_engine_pose(link, pipe, &serial);
+            self.monitor.search_finished(&serial);
+            d.sensor_poses.lock().unwrap().insert(
+                serial.clone(),
+                PoseNote::GivenUp {
+                    since_ns: now,
+                    attempts: 0,
+                    reason: format!("placed again {recent} times in half an hour"),
+                },
+            );
+            return Some(format!(
+                "sensor {serial}: judged moved again, after {recent} placements in half an hour: it stays out of tracking until cv1touch setup or a restart"
+            ));
+        }
+        pipe.probe(&serial, true);
+        self.reposer.watch(camera);
+        self.probed_since.insert(serial.clone(), now);
+        link.reposed
+            .lock()
+            .unwrap()
+            .push(PoseChange::Placing(serial.clone()));
+        d.sensor_poses.lock().unwrap().insert(
+            serial.clone(),
+            PoseNote::Moved {
+                since_ns: now,
+                attempts: 0,
+            },
+        );
+        Some(moved_line(&serial, &by))
+    }
+
+    /// Hands the pipeline's lifecycle changes to the monitor and the placement: inside the
+    /// mailbox's critical section, only what changed since the last delivery is copied.
+    fn lifecycle(&mut self, pipe: &mut Pipeline) {
+        for (camera, states) in pipe.take_lifecycle_changes() {
+            if let Some(serial) = pipe.serial_of(camera) {
+                self.monitor.lifecycle(serial, &states);
+            }
+            self.reposer.lifecycle(camera, &states);
+        }
+    }
+
+    /// Carries out what the monitor decided: label requests, ends of inspections, movement
+    /// verdicts and the unsure notice. Returns the lines it logged, in order.
+    fn apply_changes(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        changes: Vec<repose::Change>,
+        now: u64,
+    ) -> Vec<String> {
+        let mut said = Vec::new();
+        let mut say = |line: String| {
+            log!("{line}");
+            said.push(line);
+        };
+        for change in changes {
+            match change {
+                repose::Change::Inspect(serial) => {
+                    pipe.begin_inspection(&serial);
+                    // Missing sightings request labels for these hands without demoting the
+                    // sensor or disturbing the other hand's native fast tracking.
+                    link.reposed.lock().unwrap().push(PoseChange::Inspect(
+                        serial.clone(),
+                        self.monitor.inspection_hands(&serial).unwrap(),
+                    ));
+                }
+                repose::Change::Agreed(serial) => {
+                    restore_engine_pose(link, pipe, &serial);
+                    say(format!(
+                        "sensor {serial}: its LED sightings agree with the other sensors; label inspection finished, tracking kept its calibrated pose"
+                    ));
+                }
+                repose::Change::Unconfirmed(serial) => {
+                    restore_engine_pose(link, pipe, &serial);
+                    say(format!(
+                        "sensor {serial}: label inspection did not confirm movement; tracking kept its calibrated pose"
+                    ));
+                }
+                repose::Change::Starved { serial, retry_ns } => {
+                    restore_engine_pose(link, pipe, &serial);
+                    say(format!(
+                        "sensor {serial}: label inspection saw the controllers, but neither turned enough on its own to be told apart; tracking kept its calibrated pose, and it looks again in {} s",
+                        retry_ns / 1_000_000_000
+                    ));
+                }
+                repose::Change::Interrupted { serial, moved } => {
+                    restore_engine_pose(link, pipe, &serial);
+                    say(format!(
+                        "sensor {serial}: label inspection stopped early, because sensor {moved} was judged moved and is handled first; tracking kept its calibrated pose"
+                    ));
+                }
+                repose::Change::Dropped(serial) => say(dropped_line(&serial)),
+                repose::Change::Moved { serial, by } => {
+                    if let Some(line) = self.moved(d, link, pipe, serial, by, now) {
+                        say(line);
+                    }
+                }
+                repose::Change::Unsure => {
+                    self.unsure_until = now + 2 * repose::WINDOW_NS;
+                    if now.saturating_sub(self.unsure_logged) >= UNSURE_LOG_NS {
+                        self.unsure_logged = now;
+                        say(repose::UNSURE_ADVICE.to_string());
+                    }
+                }
+            }
+        }
+        said
+    }
+
+    /// Returns the lines logged for what the monitor decided (`apply_changes`).
     fn tick(
         &mut self,
         d: &Daemon,
@@ -2038,18 +2289,52 @@ impl Reposing {
         pipe: &mut Pipeline,
         watch: &mut Option<LandmarkWatch>,
         now: u64,
-    ) {
+    ) -> Vec<String> {
         if now < self.next_tick {
-            return;
+            return Vec::new();
         }
         self.next_tick = now + REPOSE_TICK_NS;
         prune_placements(&mut self.placements, now);
+        // An acknowledgement may still be arriving: the radio thread never waits for it.
+        let restored = link
+            .restored
+            .try_lock()
+            .map(|mut restored| mem::take(&mut *restored))
+            .unwrap_or_default();
+        if !restored.is_empty() {
+            // The engine acknowledged only after ending these sensors' identities and delivering
+            // their lifecycle notices and tagged frames: apply the notices, drop the queued
+            // frames they retract, then retire the tombstones. The other queued frames carry
+            // no tombstoned identity and wait for their ordinary pass, one frame per pass.
+            cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| self.lifecycle(pipe));
+            for serial in &restored {
+                let retracted = d
+                    .track_in
+                    .lock()
+                    .unwrap()
+                    .take_sensor_frames(serial, |(info, _)| pipe.retracts(info));
+                // the landmark watch reads unlabelled blobs, which no identity retracts
+                if let Some(w) = watch.as_mut() {
+                    for (info, blobs) in &retracted {
+                        w.frame(info, blobs);
+                    }
+                }
+                pipe.retire_identities(serial);
+                self.monitor.engine_restored(serial);
+                d.rec
+                    .write(recorder::IDENTITIES_RETIRED, now, &[serial.as_bytes()]);
+            }
+        }
         while let Ok((job, result)) = self.from_solver.try_recv() {
             let camera = job.camera;
             let Some(serial) = pipe.serial_of(camera).map(str::to_string) else {
                 continue;
             };
-            match self.reposer.solved(job, result) {
+            let outcome = cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| {
+                self.lifecycle(pipe);
+                self.reposer.solved(job, result)
+            });
+            match outcome {
                 repose::Outcome::Nothing => {
                     if let Some(PoseNote::Moved { attempts, .. }) =
                         d.sensor_poses.lock().unwrap().get_mut(&serial)
@@ -2069,6 +2354,7 @@ impl Reposing {
                             &serial,
                             now,
                             "a false alarm: placed again, it stands where it was calibrated",
+                            false,
                         );
                         continue;
                     }
@@ -2077,6 +2363,7 @@ impl Reposing {
                     let turned_deg = delta.rotation.angle().to_degrees();
                     self.placements.entry(serial.clone()).or_default().push(now);
                     self.releases.remove(&serial);
+                    pipe.cancel_inspection(&serial);
                     pipe.sensor(&serial, cam.model, fit.world_from_cam);
                     pipe.probe(&serial, false);
                     pipe.reset_agreement(&serial);
@@ -2119,19 +2406,8 @@ impl Reposing {
                     // frame; our tracker keeps the sensor out, and its frames are dropped
                     pipe.ignore(&serial, true);
                     self.probed_since.remove(&serial);
-                    if let Some(cam) = pipe.camera(&serial) {
-                        let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
-                        link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
-                            serial: serial.clone(),
-                            orient_xyzw,
-                            pos,
-                            median_px: 0.0,
-                            matches: 0,
-                            moved_mm: 0.0,
-                            turned_deg: 0.0,
-                            write: false,
-                        }));
-                    }
+                    self.monitor.search_finished(&serial);
+                    restore_engine_pose(link, pipe, &serial);
                     d.sensor_poses.lock().unwrap().insert(
                         serial.clone(),
                         PoseNote::GivenUp {
@@ -2146,79 +2422,30 @@ impl Reposing {
                 }
             }
         }
-        let agreement = pipe.camera_agreement();
-        for change in self.monitor.update(now, &agreement) {
-            match change {
-                repose::Change::Moved(serial) => {
-                    let Some(camera) = pipe.camera_id(&serial) else {
-                        continue;
-                    };
-                    let recent = self.placements.get(&serial).map_or(0, Vec::len);
-                    if recent >= MAX_PLACEMENTS {
-                        // it keeps moving, or something else is wrong: not again and again
-                        pipe.probe(&serial, true);
-                        pipe.ignore(&serial, true);
-                        d.sensor_poses.lock().unwrap().insert(
-                            serial.clone(),
-                            PoseNote::GivenUp {
-                                since_ns: now,
-                                attempts: 0,
-                                reason: format!("placed again {recent} times in half an hour"),
-                            },
-                        );
-                        log!(
-                            "sensor {serial}: judged moved again, after {recent} placements in half an hour: it stays out of tracking until cv1touch setup or a restart"
-                        );
-                        continue;
-                    }
-                    pipe.probe(&serial, true);
-                    self.reposer.watch(camera);
-                    self.probed_since.insert(serial.clone(), now);
-                    link.reposed
-                        .lock()
-                        .unwrap()
-                        .push(PoseChange::Cleared(serial.clone()));
-                    d.sensor_poses.lock().unwrap().insert(
-                        serial.clone(),
-                        PoseNote::Moved {
-                            since_ns: now,
-                            attempts: 0,
-                        },
-                    );
-                    let a = agreement
-                        .iter()
-                        .find(|(s, _)| *s == serial)
-                        .map(|(_, a)| *a)
-                        .unwrap_or_default();
-                    let matched = if a.samples == 0 {
-                        "no LED matched".to_string()
-                    } else {
-                        format!(
-                            "residual {:.2} px, offset {:.2} px",
-                            a.median_px,
-                            a.bias_px.norm()
-                        )
-                    };
-                    log!(
-                        "sensor {serial}: disagrees with the other sensors (missed {} of {} checks; {matched}): it moved; placing it again from them while the controllers are in its view",
-                        a.misses, a.checks
-                    );
-                }
-                repose::Change::Unsure => {
-                    self.unsure_until = now + 2 * repose::WINDOW_NS;
-                    if now.saturating_sub(self.unsure_logged) >= UNSURE_LOG_NS {
-                        self.unsure_logged = now;
-                        log!("fewer than two sensors agree with each other: sensors moved, but which cannot be told from here; if tracking is off, run cv1touch setup");
-                    }
-                }
+        let changes = cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| {
+            // Late invalidation and overflow still retract window state after a timeout,
+            // while native restoration is draining frames and inspection counters are gone.
+            self.lifecycle(pipe);
+            let agreement = pipe.camera_agreement_by_hand();
+            let searched: Vec<String> = (self.monitor.inspecting().map(str::to_string).into_iter())
+                .chain(self.probed_since.keys().cloned())
+                .collect();
+            for serial in searched {
+                self.monitor
+                    .identity_evidence(&serial, pipe.identity_evidence(&serial));
+                self.monitor
+                    .observed_evidence(&serial, &pipe.observed_evidence(&serial));
             }
-        }
+            self.monitor.update(now, &agreement)
+        });
+        let agreement = pipe.camera_agreement();
+        let said = self.apply_changes(d, link, pipe, changes, now);
         d.sensors_unsure
             .store(now < self.unsure_until, Ordering::Relaxed);
         *d.sensor_agreement.lock().unwrap() = agreement.into_iter().collect();
         // a probed sensor that gathers no labelled sighting in `PROBATION_NS`, or whose probes
         // bring no pose in `PATIENCE_NS`, is let go, so that the engine's search on it ends
-        let waited_out: Vec<(String, &str)> = self
+        let waited_out: Vec<(String, &str, bool)> = self
             .probed_since
             .iter()
             .filter_map(|(serial, since)| {
@@ -2227,16 +2454,20 @@ impl Reposing {
                     .camera_id(serial)
                     .is_some_and(|c| self.reposer.gathered(c) > 0);
                 if !gathered && waited >= PROBATION_NS {
-                    Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it was not it that moved, or nothing was in its view"))
+                    if repose::IdentityEvidence::starved(&pipe.identity_evidence(serial), [true; 2]) {
+                        Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it saw them, but neither turned enough on its own to be told apart, so it is judged again shortly", true))
+                    } else {
+                        Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it was not it that moved, or nothing was in its view", false))
+                    }
                 } else if waited >= repose::PATIENCE_NS {
-                    Some((serial.clone(), "no pose for it in 3 minutes (too little controller motion in its view, or no pose fits)"))
+                    Some((serial.clone(), "no pose for it in 3 minutes (too little controller motion in its view, or no pose fits)", false))
                 } else {
                     None
                 }
             })
             .collect();
-        for (serial, why) in waited_out {
-            self.release(d, link, pipe, &serial, now, why);
+        for (serial, why, starved) in waited_out {
+            self.release(d, link, pipe, &serial, now, why, starved);
         }
         for probe in std::mem::take(&mut pipe.probes) {
             self.reposer.add(probe);
@@ -2247,7 +2478,7 @@ impl Reposing {
                 .and_then(|serial| pipe.camera(serial))
                 .map(|c| c.model);
             let Some(model) = model else {
-                return;
+                return said;
             };
             let bodies =
                 [HAND_LEFT, HAND_RIGHT].map(|h| pipe.tracker(h).map(|t| t.body.leds.clone()));
@@ -2259,6 +2490,7 @@ impl Reposing {
                 log!("the solver thread for moved sensors is gone");
             }
         }
+        said
     }
 }
 
@@ -2485,6 +2717,35 @@ impl HandOwnership {
     }
 }
 
+/// The engine thread's side of `PoseChange::Set`: the engine takes the pose (`apply`), and the
+/// sensor is polled from now on until the engine has applied it (`acknowledge_restored`).
+fn set_engine_pose(
+    restoring: &mut std::collections::BTreeSet<String>,
+    r: Reposed,
+    apply: impl FnOnce(&Reposed),
+) {
+    apply(&r);
+    restoring.insert(r.serial);
+}
+
+/// The engine thread's side of a restoration: each sensor whose pose was set is polled until
+/// the engine has `applied` it, then handed to the radio thread (`Reposing::tick`), which
+/// retires its tombstones.
+fn acknowledge_restored(
+    restoring: &mut std::collections::BTreeSet<String>,
+    restored: &Mutex<Vec<String>>,
+    applied: impl Fn(&str) -> bool,
+) {
+    restoring.retain(|serial| {
+        if applied(serial) {
+            restored.lock().unwrap().push(serial.clone());
+            false
+        } else {
+            true
+        }
+    });
+}
+
 /// The engine thread's loop for one open engine: OpenHMD's update (its own filter, the acquisition
 /// the tracker relies on, the headset, haptics), each controller's engine view for the radio
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
@@ -2492,6 +2753,7 @@ impl HandOwnership {
 fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
+    let mut restoring = std::collections::BTreeSet::new();
     let (mut failures, mut next_sensors) = (0u32, 0u64);
     while !d.quit.load(Ordering::Acquire) {
         if d.reopen.swap(false, Ordering::AcqRel) {
@@ -2548,15 +2810,30 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         }
         for change in std::mem::take(&mut *link.reposed.lock().unwrap()) {
             match change {
-                PoseChange::Cleared(serial) => match e.clear_sensor_pose(&serial) {
-                    Ok(()) => log!(
-                        "sensor {serial}: the engine labels its blobs by the long search while it is placed"
-                    ),
-                    Err(err) => log!("sensor {serial}: {err}"),
-                },
-                PoseChange::Set(r) => apply_reposed(d, e, &r),
+                PoseChange::Inspect(serial, hands) => {
+                    match e.inspect_sensor(&serial, hands, repose::INSPECTION_NS) {
+                        Ok(()) => {
+                            log!("sensor {serial}: the engine is looking for its controller LEDs")
+                        }
+                        Err(err) => log!("sensor {serial}: {err}"),
+                    }
+                }
+                PoseChange::Placing(serial) => {
+                    match e.inspect_sensor(&serial, [true; 2], repose::PATIENCE_NS) {
+                        Ok(()) => {
+                            log!("sensor {serial}: the engine is looking for its controller LEDs")
+                        }
+                        Err(err) => log!("sensor {serial}: {err}"),
+                    }
+                }
+                PoseChange::Set(r) => {
+                    set_engine_pose(&mut restoring, r, |r| apply_reposed(d, e, r));
+                }
             }
         }
+        acknowledge_restored(&mut restoring, &link.restored, |serial| {
+            e.sensor_pose_applied(serial)
+        });
         if radio {
             if bodies.find(e, link) {
                 d.wake_radio();
@@ -2564,10 +2841,11 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         } else {
             // no tracker reads the frames: keep the queue from growing
             d.track_in.lock().unwrap().clear();
+            d.track_searches.lock().unwrap().clear();
+            d.track_identities.lock().unwrap().clear();
         }
         if now >= next_sensors {
-            let sensors: Vec<SensorStatus> =
-                e.sensors().iter().map(|s| sensor_status(d, s)).collect();
+            let sensors: Vec<SensorStatus> = e.sensors().iter().map(sensor_status).collect();
             publish_sensor_snapshot(
                 d,
                 &sensors,
@@ -2741,6 +3019,10 @@ fn radio_main(
             biases.seed(pipe, b.hand, &b.leds);
             link.hands.request(b.hand);
         }
+        let identities = d.track_identities.lock().unwrap().take();
+        for (serial, evidence) in identities {
+            pipe.inspection_lifecycle(&serial, &evidence);
+        }
         // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
         // consumer's queue. Release the ingress lock before any tracking work.
         let (clocks, frame) = {
@@ -2749,6 +3031,10 @@ fn radio_main(
         };
         for (host, us) in clocks {
             pipe.hmd_clock_sample(host, us);
+        }
+        let search = d.track_searches.lock().unwrap().pop_frame();
+        if let Some((info, remaining_ns)) = search {
+            pipe.hold_inspection(&info, remaining_ns);
         }
         if let Some((info, blobs)) = frame {
             if let Some(w) = watch.as_mut() {
@@ -4039,7 +4325,8 @@ fn status_json(d: &Daemon) -> String {
                 .map(|note| serde_json::to_value(note).unwrap_or_default());
             let agreement = agreements.get(&serial).map(|a| {
                 serde_json::json!({"median_px": a.median_px, "bias_px": a.bias_px.norm(),
-                "samples": a.samples, "checks": a.checks, "misses": a.misses})
+                "samples": a.samples, "checks": a.checks, "misses": a.misses,
+                "observed_checks": a.observed_checks, "observed_misses": a.observed_misses})
             });
             let quality = quality.get(&cv1touch::status::sensor_identity(&serial));
             serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
@@ -5230,6 +5517,8 @@ fn main() {
         reopen: AtomicBool::new(false),
         tracker,
         track_in: Mutex::new(FrameQueue::default()),
+        track_searches: Mutex::new(FrameQueue::default()),
+        track_identities: Mutex::new(Default::default()),
         sensors: Mutex::new(Vec::new()),
         sensor_streams: Mutex::new(Vec::new()),
         sensor_video: Mutex::new(Vec::new()),
@@ -6807,6 +7096,50 @@ mod tests {
         assert!(d.landmark_shifts.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn identity_notices_survive_dropped_camera_frames() {
+        let d = status_daemon();
+        d.track_identities
+            .lock()
+            .unwrap()
+            .register(["camera1".into()]);
+        d.track_in.lock().unwrap().register(["camera1".into()]);
+        let mut event = engine::InspectionIdentity {
+            epoch: 1,
+            device_id: cv1touch::calib::DEVICE_LEFT,
+            state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED,
+            ..Default::default()
+        };
+        for (slot, byte) in event.serial.iter_mut().zip(b"camera1") {
+            *slot = *byte as _;
+        }
+        d.inspection_identity(&event, 1);
+        event.epoch = 2;
+        event.state = cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
+        d.inspection_identity(&event, 2);
+        for t in 0..10 {
+            d.frame(
+                &engine::FrameInfo {
+                    serial: event.serial,
+                    frame_start_host_ns: t,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(d.track_in.lock().unwrap().stats().dropped_frames > 0);
+        let events = d.track_identities.lock().unwrap().take();
+        assert_eq!(events.len(), 1);
+        let left = &events[0].1[HAND_LEFT];
+        // A normal end restricts nothing, so only the invalidation needs delivering.
+        assert_eq!(left.epochs.keys().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            left.epochs[&2].state,
+            cv1touch::track::epochs::State::Invalidated
+        );
+        assert!(events[0].1[HAND_RIGHT].epochs.is_empty());
+    }
+
     fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -6831,6 +7164,8 @@ mod tests {
             reopen: AtomicBool::new(false),
             tracker: TrackerKind::Rust,
             track_in: Mutex::new(FrameQueue::default()),
+            track_searches: Mutex::new(FrameQueue::default()),
+            track_identities: Mutex::new(Default::default()),
             sensors: Mutex::new(Vec::new()),
             sensor_streams: Mutex::new(Vec::new()),
             sensor_video: Mutex::new(Vec::new()),
@@ -6883,6 +7218,1204 @@ mod tests {
             ],
             engine_offline: AtomicBool::new(false),
             engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn an_invalidation_waiting_with_a_solver_result_cannot_install_its_pose() {
+        for hand in 0..2 {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(Default::default());
+            let serial = "CameraA";
+            let original = nalgebra::Isometry3::identity();
+            pipe.sensor(
+                serial,
+                calib::camera::CameraModel {
+                    width: 1280,
+                    height: 960,
+                    fx: 800.0,
+                    fy: 800.0,
+                    cx: 640.0,
+                    cy: 480.0,
+                    k: [0.0; 4],
+                },
+                original,
+            );
+            pipe.probe(serial, true);
+            d.track_identities.lock().unwrap().register([serial.into()]);
+            let mut reposing = Reposing::start();
+            reposing.reposer.watch(0);
+            let batch = || {
+                (0..400).map(|k| cv1touch::track::pipeline::Probe {
+                    camera: 0,
+                    hand,
+                    device_id: if hand == HAND_LEFT {
+                        calib::DEVICE_LEFT
+                    } else {
+                        calib::DEVICE_RIGHT
+                    },
+                    identity_epoch: 9,
+                    world_from_model: nalgebra::Isometry3::new(
+                        nalgebra::Vector3::new(k as f64 * 0.01, (k as f64 * 0.1).sin(), 1.0),
+                        nalgebra::Vector3::new(0.0, k as f64 * 0.03, 0.0),
+                    ),
+                    pos_sd: 0.001,
+                    blobs: vec![nalgebra::Vector2::zeros()],
+                    labels: vec![
+                        (if hand == HAND_LEFT {
+                            calib::DEVICE_LEFT
+                        } else {
+                            calib::DEVICE_RIGHT
+                        }) << 8,
+                    ],
+                })
+            };
+            let fit = repose::Fit {
+                world_from_cam: nalgebra::Isometry3::translation(0.4, 0.0, 0.0),
+                median_px: 0.1,
+                pairs: 3000,
+                frames: 400,
+                label_share: 1.0,
+            };
+            let result = repose::Solved {
+                fresh: fit.clone(),
+                all: fit,
+            };
+            for p in batch() {
+                reposing.reposer.add(p);
+            }
+            let first = reposing.reposer.batch().unwrap();
+            assert_eq!(
+                reposing.reposer.solved(first, Ok(result.clone())),
+                repose::Outcome::Nothing
+            );
+            for p in batch() {
+                reposing.reposer.add(p);
+            }
+            let second = reposing.reposer.batch().unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            reposing.from_solver = receiver;
+            // Both fits agree; the native worker invalidates their identity before completion.
+            assert!(d.track_identities.lock().unwrap().take().is_empty());
+            let mut event = engine::InspectionIdentity {
+                epoch: 9,
+                device_id: if hand == HAND_LEFT {
+                    calib::DEVICE_LEFT
+                } else {
+                    calib::DEVICE_RIGHT
+                },
+                state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+                ..Default::default()
+            };
+            for (dst, byte) in event.serial.iter_mut().zip(serial.bytes()) {
+                *dst = byte as _;
+            }
+            d.track_identities.lock().unwrap().note(&event);
+            sender.send((second, Ok(result))).unwrap();
+            reposing.tick(&d, &link, &mut pipe, &mut None, 1);
+            assert_eq!(pipe.camera(serial).unwrap().world_from_cam, original);
+            assert!(
+                link.reposed.lock().unwrap().is_empty(),
+                "no calibration write can be queued"
+            );
+            assert!(!matches!(
+                d.sensor_poses.lock().unwrap().get(serial),
+                Some(PoseNote::Placed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_late_invalidation_reaches_the_monitor_after_inspection_timeout() {
+        use cv1touch::track::epochs::{Checks, Evidence, State};
+        use cv1touch::track::tracker::CameraAgreement;
+        for hand in 0..2 {
+            for overflow in [false, true] {
+                let d = status_daemon();
+                let link = RadioLink::default();
+                let mut pipe = Pipeline::new(Default::default());
+                for serial in ["A", "B", "C"] {
+                    pipe.sensor(
+                        serial,
+                        calib::camera::CameraModel {
+                            width: 1280,
+                            height: 960,
+                            fx: 800.0,
+                            fy: 800.0,
+                            cx: 640.0,
+                            cy: 480.0,
+                            k: [0.0; 4],
+                        },
+                        nalgebra::Isometry3::identity(),
+                    );
+                }
+                d.track_identities.lock().unwrap().register(["C".into()]);
+                let mut reposing = Reposing::start();
+                let agreement = |w: u64| {
+                    ["A", "B", "C"]
+                        .into_iter()
+                        .map(|serial| {
+                            let c = serial == "C";
+                            let a = CameraAgreement {
+                                checks: 100 * w,
+                                misses: if c { (100 * w).min(700) } else { 0 },
+                                observed_checks: if c {
+                                    100 * w.saturating_sub(7)
+                                } else {
+                                    100 * w
+                                },
+                                observed_misses: 0,
+                                samples: 100,
+                                median_px: if c { 0.9 } else { 0.1 },
+                                bias_px: nalgebra::Vector2::new(if c { 0.9 } else { 0.1 }, 0.0),
+                            };
+                            let mut hands = [CameraAgreement::default(); 2];
+                            hands[hand] = a;
+                            (serial.to_string(), hands)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut states: [Evidence; 2] = Default::default();
+                for w in 0..=8 {
+                    if w == 8 {
+                        states[hand].count(
+                            1,
+                            Checks {
+                                checks: 100,
+                                misses: 0,
+                            },
+                        );
+                    }
+                    reposing.monitor.observed_evidence("C", &states);
+                    let changes = reposing
+                        .monitor
+                        .update(1 + w * repose::WINDOW_NS, &agreement(w));
+                    assert_eq!(
+                        changes,
+                        match w {
+                            2 => vec![repose::Change::Inspect("C".into())],
+                            8 => vec![repose::Change::Unconfirmed("C".into())],
+                            _ => vec![],
+                        }
+                    );
+                }
+                pipe.begin_inspection("C");
+                pipe.inspection_lifecycle("C", &states);
+                restore_engine_pose(&link, &mut pipe, "C");
+                assert!(reposing.monitor.inspecting().is_none());
+                // The radio pass already extracted its mailbox. Native invalidation arrives
+                // during restoration, when no active inspection or probing counter remains.
+                let event = |epoch, state| engine::InspectionIdentity {
+                    serial: serial_field("C"),
+                    epoch,
+                    device_id: if hand == HAND_LEFT {
+                        calib::DEVICE_LEFT
+                    } else {
+                        calib::DEVICE_RIGHT
+                    },
+                    state,
+                };
+                d.track_identities
+                    .lock()
+                    .unwrap()
+                    .note(&event(1, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED));
+                if overflow {
+                    // A stalled mailbox: only invalidations are kept, so they fill it.
+                    for epoch in 2..=2048 {
+                        d.track_identities.lock().unwrap().note(&event(
+                            epoch,
+                            cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+                        ));
+                    }
+                }
+                reposing.tick(&d, &link, &mut pipe, &mut None, 1 + 41_000_000_000);
+                assert!(!pipe.identity_lifetimes(2)[hand].permits(1));
+                assert!(
+                    pipe.take_lifecycle_changes().is_empty(),
+                    "the tick hands over each change, and no history"
+                );
+                reposing.monitor.engine_restored("C");
+                for w in 9..=11 {
+                    assert_eq!(
+                        reposing
+                            .monitor
+                            .update(1 + w * repose::WINDOW_NS, &agreement(w + 10)),
+                        if w == 11 {
+                            // the small offset of fresh windows, with no misses
+                            let mut decided = [None; 2];
+                            decided[hand] = Some(repose::LastWindow {
+                                observed: Checks {
+                                    checks: 100,
+                                    misses: 0,
+                                },
+                                residual_px: Some((0.9, 0.9)),
+                            });
+                            vec![repose::Change::Moved {
+                                serial: "C".into(),
+                                by: repose::MovedBy::Windows(decided),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        "hand {hand}, overflow {overflow}, window {w}"
+                    );
+                }
+                assert!(link.reposed.lock().unwrap().iter().all(|p| !matches!(
+                    p,
+                    PoseChange::Placing(_) | PoseChange::Set(Reposed { write: true, .. })
+                )));
+                assert_eq!(states[hand].epochs[&1].state, State::Started);
+            }
+        }
+    }
+
+    /// Through the radio thread's mailbox and tick, a long session's normally ended epochs
+    /// leave no lifecycle state behind: a knocked sensor whose identity starts afresh in each
+    /// window is still judged moved, without an overflow.
+    #[test]
+    fn a_long_session_of_normally_ended_epochs_still_lets_an_inspection_move() {
+        use cv1touch::track::epochs::{Checks, Evidence};
+        use cv1touch::track::tracker::CameraAgreement;
+        for hand in 0..2 {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(Default::default());
+            for serial in ["A", "B", "C"] {
+                pipe.sensor(
+                    serial,
+                    calib::camera::CameraModel {
+                        width: 1280,
+                        height: 960,
+                        fx: 800.0,
+                        fy: 800.0,
+                        cx: 640.0,
+                        cy: 480.0,
+                        k: [0.0; 4],
+                    },
+                    nalgebra::Isometry3::identity(),
+                );
+            }
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register(["A".into(), "B".into(), "C".into()]);
+            let mut reposing = Reposing::start();
+            let note = |epoch, state| {
+                d.track_identities
+                    .lock()
+                    .unwrap()
+                    .note(&engine::InspectionIdentity {
+                        serial: serial_field("C"),
+                        epoch,
+                        device_id: if hand == HAND_LEFT {
+                            calib::DEVICE_LEFT
+                        } else {
+                            calib::DEVICE_RIGHT
+                        },
+                        state,
+                    });
+            };
+            // Earlier inspections and placements: every break started and ended an epoch,
+            // and the tick took the mailbox once a second.
+            let mut now = 1;
+            for epoch in 1..=1100 {
+                note(epoch, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED);
+                note(epoch, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED);
+                if epoch % 100 == 0 {
+                    reposing.tick(&d, &link, &mut pipe, &mut None, now);
+                    now += 1_000_000_000;
+                }
+            }
+            let agreement = |w: u64, observed: u64| {
+                ["A", "B", "C"]
+                    .into_iter()
+                    .map(|serial| {
+                        let c = serial == "C";
+                        let mut hands = [CameraAgreement::default(); 2];
+                        hands[hand] = CameraAgreement {
+                            checks: 100 * w,
+                            misses: if c { 100 * w } else { 0 },
+                            observed_checks: if c { observed } else { 100 * w },
+                            observed_misses: if c { observed } else { 0 },
+                            samples: if c { 0 } else { 100 * w },
+                            median_px: 0.1,
+                            bias_px: nalgebra::Vector2::zeros(),
+                        };
+                        (serial.to_string(), hands)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut states: [Evidence; 2] = Default::default();
+            let base = 100_000_000_000;
+            for w in 0..=4 {
+                if w == 3 {
+                    note(1101, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED);
+                    states[hand].count(
+                        1101,
+                        Checks {
+                            checks: 50,
+                            misses: 50,
+                        },
+                    );
+                } else if w == 4 {
+                    note(1101, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED);
+                    note(1102, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED);
+                    states[hand].count(
+                        1102,
+                        Checks {
+                            checks: 30,
+                            misses: 30,
+                        },
+                    );
+                }
+                if w > 0 {
+                    // The tick delivers the window's notices one second before its decision.
+                    reposing.tick(
+                        &d,
+                        &link,
+                        &mut pipe,
+                        &mut None,
+                        base + w * repose::WINDOW_NS - 1_000_000_000,
+                    );
+                }
+                reposing.monitor.observed_evidence("C", &states);
+                let observed = states[hand].epochs.values().map(|e| e.observed.checks);
+                let changes = reposing
+                    .monitor
+                    .update(base + w * repose::WINDOW_NS, &agreement(w, observed.sum()));
+                assert_eq!(
+                    changes,
+                    match w {
+                        2 => vec![repose::Change::Inspect("C".into())],
+                        4 => {
+                            let mut decided = [None; 2];
+                            decided[hand] = Some((
+                                Checks {
+                                    checks: 80,
+                                    misses: 80,
+                                },
+                                2,
+                            ));
+                            vec![repose::Change::Moved {
+                                serial: "C".into(),
+                                by: repose::MovedBy::Inspection(decided),
+                            }]
+                        }
+                        _ => vec![],
+                    },
+                    "hand {hand}, window {w}"
+                );
+                if w == 2 {
+                    pipe.begin_inspection("C");
+                }
+            }
+            assert_eq!(pipe.lifecycle_overflows, 0, "hand {hand}");
+            assert_eq!(pipe.identity_lifetimes(2), <[Evidence; 2]>::default());
+        }
+    }
+
+    /// The engine acknowledges a restored pose only after delivering the sensor's last notices
+    /// and tagged frames. The tick applies those notices and drops the queued frames they
+    /// retract before it retires the tombstones, so searches that each end with an invalidation
+    /// never fill the bound, and the monitor is given only changes. It does no tracking work
+    /// for the radio thread: a frame of an identity still valid waits for its ordinary pass.
+    /// A recording marks each retirement after that search's notices and frames, so that a
+    /// replay retires the tombstones where the daemon did.
+    #[test]
+    fn restoration_retires_tombstones_after_the_last_notices_and_frames() {
+        use cv1touch::track::epochs::Evidence;
+        const RECORDED: u64 = 3;
+        for hand in 0..2 {
+            let d = status_daemon();
+            let dir = socket_dir::SocketDir::new();
+            let path = dir.path().join("restorations.rec");
+            d.rec.start(&path, 1).unwrap();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(Default::default());
+            pipe.sensor(
+                "C",
+                calib::camera::CameraModel {
+                    width: 1280,
+                    height: 960,
+                    fx: 800.0,
+                    fy: 800.0,
+                    cx: 640.0,
+                    cy: 480.0,
+                    k: [0.0; 4],
+                },
+                nalgebra::Isometry3::identity(),
+            );
+            d.track_identities.lock().unwrap().register(["C".into()]);
+            d.track_in.lock().unwrap().register(["C".into()]);
+            let mut reposing = Reposing::start();
+            let device_id = if hand == HAND_LEFT {
+                calib::DEVICE_LEFT
+            } else {
+                calib::DEVICE_RIGHT
+            };
+            let frame = |epoch: u64, at: u64| {
+                let mut info = engine::FrameInfo {
+                    serial: serial_field("C"),
+                    frame_start_host_ns: at,
+                    n_devices: 1,
+                    ..Default::default()
+                };
+                info.devices[0].device_id = device_id;
+                info.devices[0].match_flags = engine::MATCH_INSPECTION_IDENTITY;
+                info.devices[0].identity_epoch_lo = epoch as u32;
+                info.devices[0].identity_epoch_hi = (epoch >> 32) as u32;
+                info
+            };
+            let mut now = 1;
+            for search in 1..=1100u64 {
+                d.inspection_identity(
+                    &engine::InspectionIdentity {
+                        serial: serial_field("C"),
+                        epoch: search,
+                        device_id,
+                        state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+                    },
+                    now,
+                );
+                // the invalidated search's last frame, and a later one that ended normally
+                d.frame(&frame(search, now), &[]);
+                d.frame(&frame(search + 10_000, now + 1), &[]);
+                link.restored.lock().unwrap().push("C".into());
+                reposing.tick(&d, &link, &mut pipe, &mut None, now);
+                assert_eq!(pipe.frames_skipped, search - 1, "no frame work at the ack");
+                let left = d.track_in.lock().unwrap().pop_frame();
+                let (info, blobs) = left.expect("the valid frame stays queued");
+                assert_eq!(info.devices[0].identity_epoch_lo, (search + 10_000) as u32);
+                assert!(!pipe.retracts(&info));
+                pipe.frame(&info, &blobs);
+                now += 1_000_000_000;
+                assert_eq!(d.track_in.lock().unwrap().stats().queued_frames, 0);
+                assert!(pipe.take_lifecycle_changes().is_empty());
+                if search == RECORDED {
+                    d.rec.stop();
+                }
+            }
+            assert_eq!(
+                pipe.frames_skipped, 1100,
+                "only the valid frames reached the pipeline, in their ordinary pass"
+            );
+            assert_eq!(pipe.lifecycle_overflows, 0, "hand {hand}");
+            assert_eq!(pipe.identity_lifetimes(0), <[Evidence; 2]>::default());
+            let mut reader = recorder::Reader::open(&path).unwrap();
+            let records: Vec<_> = reader.by_ref().collect();
+            assert_eq!(reader.error(), None);
+            assert_eq!(d.rec.stats().dropped, 0);
+            // Each search: its invalidation, its last frame and the later valid one, then the
+            // acknowledgement's retirement of that sensor.
+            let expected = [
+                recorder::INSPECTION_IDENTITY,
+                recorder::FRAME_OBS,
+                recorder::FRAME_OBS,
+                recorder::IDENTITIES_RETIRED,
+            ];
+            assert_eq!(
+                records.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+                expected.repeat(RECORDED as usize),
+                "hand {hand}"
+            );
+            for (search, records) in (1..).zip(records.chunks(expected.len())) {
+                let notice = recorder::decode_inspection_identity(&records[0].payload).unwrap();
+                assert_eq!(notice.epoch, search);
+                assert_eq!(records[3].payload, b"C");
+            }
+        }
+    }
+
+    /// An inspection's outcome holds the search slot until the engine acknowledges the
+    /// restored pose; the tick's acknowledgement frees it and retires the sensor's tombstones,
+    /// and the next sensor missing its sightings is inspected.
+    #[test]
+    fn an_acknowledged_restoration_frees_the_search_slot() {
+        use cv1touch::track::epochs::Evidence;
+        use cv1touch::track::tracker::CameraAgreement;
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut pipe = Pipeline::new(Default::default());
+        let sensors = ["A", "B", "C", "D"];
+        for serial in sensors {
+            pipe.sensor(
+                serial,
+                calib::camera::CameraModel {
+                    width: 1280,
+                    height: 960,
+                    fx: 800.0,
+                    fy: 800.0,
+                    cx: 640.0,
+                    cy: 480.0,
+                    k: [0.0; 4],
+                },
+                nalgebra::Isometry3::identity(),
+            );
+        }
+        d.track_identities
+            .lock()
+            .unwrap()
+            .register(sensors.map(String::from));
+        d.track_in
+            .lock()
+            .unwrap()
+            .register(sensors.map(String::from));
+        let mut reposing = Reposing::start();
+        // A and B see the left controller; C and D miss it among unlabelled blobs.
+        let agreement = |w: u64| {
+            sensors
+                .map(|serial| {
+                    let seen = serial == "A" || serial == "B";
+                    let a = CameraAgreement {
+                        checks: 100 * w,
+                        misses: if seen { 0 } else { 100 * w },
+                        observed_checks: if seen { 100 * w } else { 0 },
+                        observed_misses: 0,
+                        samples: if seen { 100 * w } else { 0 },
+                        median_px: 0.1,
+                        bias_px: nalgebra::Vector2::new(0.1, 0.0),
+                    };
+                    (serial.to_string(), [a, CameraAgreement::default()])
+                })
+                .to_vec()
+        };
+        // From the fourth window on, the windows end half a second late, as the one-second
+        // tick does: the inspection's deadline then falls between two window ends.
+        let at = |w: u64| 1 + w * repose::WINDOW_NS + if w >= 3 { 500_000_000 } else { 0 };
+        let update =
+            |reposing: &mut Reposing, w: u64| reposing.monitor.update(at(w), &agreement(w));
+        for w in 0..=7 {
+            let inspect = vec![repose::Change::Inspect("C".into())];
+            assert_eq!(
+                update(&mut reposing, w),
+                if w == 2 { inspect } else { vec![] },
+                "window {w}"
+            );
+        }
+        d.inspection_identity(
+            &engine::InspectionIdentity {
+                serial: serial_field("C"),
+                epoch: 1,
+                device_id: calib::DEVICE_LEFT,
+                state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+            },
+            at(7),
+        );
+        // The deadline passes in the tick: the engine gets C's pose back, and C holds the slot.
+        reposing.tick(
+            &d,
+            &link,
+            &mut pipe,
+            &mut None,
+            at(2) + repose::INSPECTION_NS + 250_000_000,
+        );
+        assert!(reposing.monitor.inspecting().is_none());
+        assert!(matches!(
+            link.reposed.lock().unwrap().as_slice(),
+            [PoseChange::Set(Reposed { serial, write: false, .. })] if serial == "C"
+        ));
+        assert!(reposing.monitor.restoring().contains("C"));
+        assert!(!reposing.monitor.identity_lifetimes("C")[HAND_LEFT].permits(1));
+        assert!(!pipe.identity_lifetimes(2)[HAND_LEFT].permits(1));
+        // The invalidation restarted D's streak; two windows of missed sightings make it due,
+        // but no search starts while C's restoration is unacknowledged.
+        for w in 8..=10 {
+            assert_eq!(update(&mut reposing, w), vec![], "window {w}");
+        }
+        link.restored.lock().unwrap().push("C".into());
+        reposing.tick(&d, &link, &mut pipe, &mut None, at(10) + 250_000_000);
+        assert!(reposing.monitor.restoring().is_empty());
+        assert_eq!(
+            reposing.monitor.identity_lifetimes("C"),
+            <[Evidence; 2]>::default()
+        );
+        assert_eq!(pipe.identity_lifetimes(2), <[Evidence; 2]>::default());
+        assert_eq!(
+            update(&mut reposing, 11),
+            vec![repose::Change::Inspect("D".into())]
+        );
+    }
+
+    /// Through the radio thread: D is judged moved while C is inspected. The engine gets C's
+    /// pose back at once, with no outcome for C, and D waits for that restoration. The tick
+    /// that brings its acknowledgement hands D over: D is probed and searched for. If C's last
+    /// notices before it invalidate an identity, that tick drops D's verdict instead. The log
+    /// says each once: the stopped inspection, then the verdict or its drop.
+    #[test]
+    fn a_move_during_an_inspection_is_searched_for_once_its_restoration_is_acknowledged() {
+        use cv1touch::track::tracker::CameraAgreement;
+        for invalidated in [false, true] {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(Default::default());
+            let sensors = ["A", "B", "C", "D"];
+            for serial in sensors {
+                pipe.sensor(
+                    serial,
+                    calib::camera::CameraModel {
+                        width: 1280,
+                        height: 960,
+                        fx: 800.0,
+                        fy: 800.0,
+                        cx: 640.0,
+                        cy: 480.0,
+                        k: [0.0; 4],
+                    },
+                    nalgebra::Isometry3::identity(),
+                );
+            }
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register(sensors.map(String::from));
+            d.track_in
+                .lock()
+                .unwrap()
+                .register(sensors.map(String::from));
+            let mut reposing = Reposing::start();
+            // A and B see the left controller; C misses it among unlabelled blobs; D misses 80 of
+            // its 100 observed LED checks in windows 3 and 4.
+            let agreement = |w: u64| {
+                sensors
+                    .map(|serial| {
+                        let c = serial == "C";
+                        let misses = match serial {
+                            "C" => 100 * w,
+                            "D" => 80 * w.min(4).saturating_sub(2),
+                            _ => 0,
+                        };
+                        let a = CameraAgreement {
+                            checks: 100 * w,
+                            misses,
+                            observed_checks: if c { 0 } else { 100 * w },
+                            observed_misses: if c { 0 } else { misses },
+                            samples: if c { 0 } else { 100 * w - misses },
+                            median_px: 0.1,
+                            bias_px: nalgebra::Vector2::new(0.1, 0.0),
+                        };
+                        (serial.to_string(), [a, CameraAgreement::default()])
+                    })
+                    .to_vec()
+            };
+            let at = |w: u64| 1 + w * repose::WINDOW_NS;
+            for w in 0..=4 {
+                let changes = reposing.monitor.update(at(w), &agreement(w));
+                assert_eq!(
+                    changes,
+                    match w {
+                        2 => vec![repose::Change::Inspect("C".into())],
+                        4 => vec![repose::Change::Interrupted {
+                            serial: "C".into(),
+                            moved: "D".into(),
+                        }],
+                        _ => vec![],
+                    },
+                    "window {w}"
+                );
+                assert_eq!(
+                    reposing.apply_changes(&d, &link, &mut pipe, changes, at(w)),
+                    if w == 4 {
+                        vec!["sensor C: label inspection stopped early, because sensor D was judged moved and is handled first; tracking kept its calibrated pose".to_string()]
+                    } else {
+                        vec![]
+                    },
+                    "window {w}"
+                );
+            }
+            assert!(matches!(
+                mem::take(&mut *link.reposed.lock().unwrap()).as_slice(),
+                [
+                    PoseChange::Inspect(inspected, _),
+                    PoseChange::Set(Reposed { serial, write: false, .. }),
+                ] if inspected == "C" && serial == "C"
+            ));
+            assert!(d.sensor_poses.lock().unwrap().is_empty());
+            assert!(reposing
+                .tick(&d, &link, &mut pipe, &mut None, at(4) + 250_000_000)
+                .is_empty());
+            assert!(link.reposed.lock().unwrap().is_empty());
+            assert!(!reposing.probed_since.contains_key("D"));
+            if invalidated {
+                d.inspection_identity(
+                    &engine::InspectionIdentity {
+                        serial: serial_field("C"),
+                        epoch: 1,
+                        device_id: calib::DEVICE_LEFT,
+                        state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+                    },
+                    at(4) + 500_000_000,
+                );
+            }
+            link.restored.lock().unwrap().push("C".into());
+            let said = reposing.tick(&d, &link, &mut pipe, &mut None, at(4) + 1_250_000_000);
+            assert!(reposing.monitor.restoring().is_empty());
+            if invalidated {
+                assert_eq!(said, [dropped_line("D")]);
+                // nothing is searched for, and a later tick hands nothing over or logs it again
+                assert!(reposing
+                    .tick(&d, &link, &mut pipe, &mut None, at(4) + 2_250_000_000)
+                    .is_empty());
+                assert!(link.reposed.lock().unwrap().is_empty());
+                assert!(!reposing.probed_since.contains_key("D"));
+                assert!(!reposing.monitor.handed_over("D"));
+                assert!(d.sensor_poses.lock().unwrap().is_empty());
+                continue;
+            }
+            assert_eq!(
+                said,
+                ["sensor D: disagrees with the other sensors two windows in a row (in its last 5 s window, the left controller missed 80 of 100 frames with observed LEDs, residual 0.10 px, offset 0.10 px): it moved; placing it again from them while the controllers are in its view"]
+            );
+            assert!(matches!(
+                link.reposed.lock().unwrap().as_slice(),
+                [PoseChange::Placing(serial)] if serial == "D"
+            ));
+            assert!(reposing.probed_since.contains_key("D"));
+            assert!(matches!(
+                d.sensor_poses.lock().unwrap().get("D"),
+                Some(PoseNote::Moved { .. })
+            ));
+            assert!(!d.sensor_poses.lock().unwrap().contains_key("C"));
+        }
+    }
+
+    /// Through the radio thread's tick, from tracked frames: two sensors track the right
+    /// controller, and a third shows only background blobs where it should be. After two such
+    /// windows the tick asks the engine to inspect that sensor for the right hand only, and the
+    /// pipeline counts the inspection's sightings as its evidence.
+    #[test]
+    fn the_tick_inspects_a_sensor_missing_a_tracked_hand() {
+        use nalgebra::{Isometry3, Matrix3, Point3, Rotation3, UnitQuaternion, Vector3};
+        const H0: u64 = 5_000_000_000_000; // host clock at the start
+        const C0: u64 = 4_000_000_000_000; // controller clock = host - C0
+        const HMD_DELAY: u64 = 300_000;
+        const IMU_DELAY: u64 = 1_000_000;
+        enum Ev {
+            Hmd(u64),
+            Imu(u64),
+            Frame(usize, u64, u32),
+            Tick,
+        }
+        let hmd_us = |host: u64| ((host - H0) / 1000 + 77_000) as u32;
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut pipe = Pipeline::new(pipeline::Options {
+            exposure_offset_ns: IMU_DELAY as i64 - HMD_DELAY as i64,
+            ..Default::default()
+        });
+        // A Touch-like ring of 24 LEDs, lying still, and three sensors near the ceiling.
+        let leds: Vec<calib::capture::Led> = (0..24)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 24.0;
+                calib::capture::Led {
+                    pos: Vector3::new(
+                        0.045 * a.cos(),
+                        [-0.012, 0.0, 0.012][i % 3],
+                        0.045 * a.sin(),
+                    ),
+                    dir: Vector3::new(a.cos(), 0.35, a.sin()).normalize(),
+                }
+            })
+            .collect();
+        let target = Vector3::new(0.0, 1.0, 0.0);
+        let pose = Isometry3::translation(target.x, target.y, target.z);
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 800.0,
+            fy: 800.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        // OpenCV axes, looking at the controller; world +Y up
+        let look_at = |pos: Vector3<f64>| {
+            let z = (target - pos).normalize();
+            let y = (-Vector3::y() + z * z.y).normalize();
+            let r = Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[y.cross(&z), y, z]));
+            Isometry3::from_parts(pos.into(), UnitQuaternion::from_rotation_matrix(&r))
+        };
+        let sensors = ["A", "B", "C"];
+        let cams = [
+            look_at(Vector3::new(-2.0, 2.3, 1.8)),
+            look_at(Vector3::new(2.0, 2.3, 1.8)),
+            look_at(Vector3::new(0.3, 2.4, -2.2)),
+        ];
+        for (serial, w) in sensors.iter().zip(&cams) {
+            pipe.sensor(serial, model, *w);
+        }
+        pipe.body(calib::DEVICE_RIGHT, leds.clone(), Vector3::zeros());
+        let mut reposing = Reposing::start();
+        let end = H0 + 15_000_000_000;
+        let mut evs: Vec<(u64, Ev)> = (H0..end)
+            .step_by(1_000_000)
+            .map(|h| (h + HMD_DELAY, Ev::Hmd(h)))
+            .chain(
+                (H0 + 2_000_000..end)
+                    .step_by(2_000_000)
+                    .map(|h| (h + IMU_DELAY, Ev::Imu(h))),
+            )
+            .chain((2..15).map(|s| (H0 + s * 1_000_000_000, Ev::Tick)))
+            .collect();
+        let (mut e, mut k) = (H0 + 10_000_000, 0);
+        while e < end {
+            for c in 0..cams.len() {
+                evs.push((e + 25_000_000 + c as u64 * 1_000_000, Ev::Frame(c, e, k)));
+            }
+            k += 1;
+            e += 1_000_000_000 / 52;
+        }
+        evs.sort_by_key(|e| e.0);
+        let mut inspected = false;
+        for (at, ev) in evs {
+            match ev {
+                Ev::Hmd(h) => pipe.hmd_clock_sample(at, hmd_us(h)),
+                Ev::Imu(h) => {
+                    pipe.imu(
+                        HAND_RIGHT,
+                        h - C0,
+                        at,
+                        Vector3::zeros(),
+                        Vector3::new(0.0, 9.80665, 0.0),
+                    );
+                }
+                Ev::Frame(c, e, k) => {
+                    let cam_from_obj = cams[c].inverse() * pose;
+                    // Until the inspection, the third sensor sees only background blobs, well
+                    // away from the right controller's LEDs; then the engine identifies them.
+                    let background = c == 2 && !inspected;
+                    // a fixed sub-pixel jitter, different for each blob and frame
+                    let jitter =
+                        |n: u64| (n.wrapping_mul(2_654_435_761) % 1000) as f64 / 2500.0 - 0.2;
+                    let blobs: Vec<Blob> = leds
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, l)| {
+                            let pc = cam_from_obj * Point3::from(l.pos);
+                            if (cam_from_obj.rotation * l.dir).dot(&(-pc.coords)) / pc.coords.norm()
+                                < 0.3
+                            {
+                                return None;
+                            }
+                            let uv = model.project(&pc.coords)?;
+                            let off = if background { 150.0 } else { 0.0 };
+                            let n = u64::from(k) * 64 + i as u64 * 2;
+                            Some(Blob {
+                                x: (uv.x + off + jitter(n)) as f32,
+                                y: (uv.y + off + jitter(n + 1)) as f32,
+                                width: 3,
+                                height: 3,
+                                area: 9,
+                                led_id: if background {
+                                    -1
+                                } else {
+                                    (calib::DEVICE_RIGHT << 8) | i as i32
+                                },
+                            })
+                        })
+                        .collect();
+                    let mut info = engine::FrameInfo {
+                        serial: serial_field(sensors[c]),
+                        frame_start_host_ns: e,
+                        exposure_valid: 1,
+                        exposure_count: k,
+                        exposure_hmd_ts: hmd_us(e),
+                        n_devices: 1,
+                        ..Default::default()
+                    };
+                    let (o, q) = calib::iso_to_xyzw(&cam_from_obj);
+                    let device = &mut info.devices[0];
+                    device.device_id = calib::DEVICE_RIGHT;
+                    if !background {
+                        device.match_flags =
+                            calib::capture::MATCH_GOOD | calib::capture::MATCH_STRONG;
+                        device.pose_valid = 1;
+                        device.cam_orient = o;
+                        device.cam_pos = q;
+                    }
+                    if c == 2 && inspected {
+                        device.match_flags |= engine::MATCH_INSPECTION_IDENTITY;
+                        device.identity_epoch_lo = 1;
+                    }
+                    pipe.frame(&info, &blobs);
+                }
+                Ev::Tick => {
+                    reposing.tick(&d, &link, &mut pipe, &mut None, at);
+                    let reposed = mem::take(&mut *link.reposed.lock().unwrap());
+                    if reposed.is_empty() {
+                        continue;
+                    }
+                    assert!(!inspected, "one inspection");
+                    let mut hands = [false; 2];
+                    hands[HAND_RIGHT] = true;
+                    assert!(
+                        matches!(
+                            reposed.as_slice(),
+                            [PoseChange::Inspect(serial, h)] if serial == "C" && *h == hands
+                        ),
+                        "at {} s",
+                        (at - H0) / 1_000_000_000
+                    );
+                    assert_eq!(reposing.monitor.inspecting(), Some("C"));
+                    assert!(pipe.observed_evidence("C")[HAND_RIGHT].epochs.is_empty());
+                    inspected = true;
+                }
+            }
+        }
+        assert!(inspected, "two windows of missed sightings");
+        assert!(d.sensor_poses.lock().unwrap().is_empty(), "no verdict yet");
+        let evidence = &pipe.observed_evidence("C")[HAND_RIGHT].epochs;
+        let identified = evidence.get(&1).map(|e| e.observed);
+        assert!(
+            identified.is_some_and(|c| c.checks >= repose::MIN_CHECKS && c.misses == 0),
+            "{evidence:?}"
+        );
+    }
+
+    /// The engine thread hands the radio thread each restoration once the engine has applied it,
+    /// and keeps polling the others.
+    #[test]
+    fn applied_restorations_are_acknowledged_once() {
+        use std::collections::BTreeSet;
+        let restored = Mutex::new(Vec::new());
+        let mut restoring: BTreeSet<String> = ["A", "B"].map(String::from).into();
+        acknowledge_restored(&mut restoring, &restored, |serial| serial == "B");
+        assert_eq!(*restored.lock().unwrap(), ["B"]);
+        assert_eq!(restoring, BTreeSet::from(["A".to_string()]));
+        acknowledge_restored(&mut restoring, &restored, |_| false);
+        assert_eq!(*restored.lock().unwrap(), ["B"]);
+        acknowledge_restored(&mut restoring, &restored, |_| true);
+        assert_eq!(*restored.lock().unwrap(), ["B", "A"]);
+        assert!(restoring.is_empty());
+    }
+
+    /// A pose given to the engine is polled from then on: without that, its restoration would
+    /// never be acknowledged and the search slot it holds would stay taken.
+    #[test]
+    fn a_pose_given_to_the_engine_is_acknowledged_once_applied() {
+        use std::collections::BTreeSet;
+        let restored = Mutex::new(Vec::new());
+        let mut restoring = BTreeSet::new();
+        let mut given = Vec::new();
+        set_engine_pose(
+            &mut restoring,
+            Reposed {
+                serial: "C".into(),
+                orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                pos: [0.0; 3],
+                median_px: 0.0,
+                matches: 0,
+                moved_mm: 0.0,
+                turned_deg: 0.0,
+                write: false,
+            },
+            |r| given.push(r.serial.clone()),
+        );
+        assert_eq!(given, ["C"]);
+        acknowledge_restored(&mut restoring, &restored, |_| false);
+        assert!(restored.lock().unwrap().is_empty(), "not applied yet");
+        acknowledge_restored(&mut restoring, &restored, |serial| serial == "C");
+        acknowledge_restored(&mut restoring, &restored, |_| true);
+        assert_eq!(*restored.lock().unwrap(), ["C"]);
+    }
+
+    /// Each engine open is marked in a recording before the new engine's identity notices,
+    /// whose epochs number from one again, and its sensors and LED models are recorded again.
+    #[test]
+    fn each_engine_session_is_marked_in_the_recording() {
+        let d = status_daemon();
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("sessions.rec");
+        d.rec.start(&path, 1).unwrap();
+        let started = |at| {
+            d.inspection_identity(
+                &engine::InspectionIdentity {
+                    serial: serial_field("C"),
+                    epoch: 1,
+                    device_id: calib::DEVICE_LEFT,
+                    state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED,
+                },
+                at,
+            )
+        };
+        for at in [2, 3] {
+            assert_eq!(
+                d.session.lock().unwrap().plan(true, &[(7, true)]),
+                (true, vec![7])
+            );
+            started(at);
+            begin_engine_session(&d);
+        }
+        d.rec.stop();
+        let mut reader = recorder::Reader::open(&path).unwrap();
+        let records: Vec<_> = reader.by_ref().map(|r| r.rtype).collect();
+        assert_eq!(reader.error(), None);
+        assert_eq!(
+            records,
+            [
+                recorder::INSPECTION_IDENTITY,
+                recorder::ENGINE_SESSION,
+                recorder::INSPECTION_IDENTITY,
+                recorder::ENGINE_SESSION,
+            ]
+        );
+    }
+
+    /// The log names the evidence that decided: a window's own observed checks with the
+    /// residual and offset it was judged by, or an inspection's accumulated checks; not the
+    /// tracker's counters since its last reset, nor its residual when the line is written.
+    #[test]
+    fn a_movement_verdict_logs_the_evidence_that_decided_it() {
+        use cv1touch::track::epochs::Checks;
+        let window = repose::MovedBy::Windows([
+            Some(repose::LastWindow {
+                observed: Checks {
+                    checks: 100,
+                    misses: 2,
+                },
+                residual_px: Some((0.15, 1.0)),
+            }),
+            Some(repose::LastWindow {
+                observed: Checks {
+                    checks: 90,
+                    misses: 70,
+                },
+                residual_px: None,
+            }),
+        ]);
+        assert_eq!(
+            moved_line("C", &window),
+            "sensor C: disagrees with the other sensors two windows in a row (in its last 5 s window, the left controller missed 2 of 100 frames with observed LEDs, residual 0.15 px, offset 1.00 px; the right controller missed 70 of 90 frames with observed LEDs, no LED matched): it moved; placing it again from them while the controllers are in its view"
+        );
+        let inspection = repose::MovedBy::Inspection([
+            None,
+            Some((
+                Checks {
+                    checks: 80,
+                    misses: 60,
+                },
+                3,
+            )),
+        ]);
+        assert_eq!(
+            moved_line("C", &inspection),
+            "sensor C: its label inspection shows it disagrees with the other sensors (the right controller missed 60 of 80 frames with observed LEDs in 3 windows of 5 s): it moved; placing it again from them while the controllers are in its view"
+        );
+        assert_eq!(
+            dropped_line("D"),
+            "sensor D: the verdict that it moved was dropped before it was acted on, because some controller sightings were taken back, so how well the sensors agree is judged afresh; it stays in tracking as before, and new sightings judge it again"
+        );
+    }
+
+    #[test]
+    fn a_placement_limit_restores_the_engine_pose_after_inspection() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut pipe = Pipeline::new(Default::default());
+        let serial = "CameraA";
+        pipe.sensor(
+            serial,
+            calib::camera::CameraModel {
+                width: 1280,
+                height: 960,
+                fx: 800.0,
+                fy: 800.0,
+                cx: 640.0,
+                cy: 480.0,
+                k: [0.0; 4],
+            },
+            nalgebra::Isometry3::translation(1.0, 2.0, 3.0),
+        );
+        let mut reposing = Reposing::start();
+        let now = 1_000_000_000;
+        reposing
+            .placements
+            .insert(serial.to_string(), vec![now; MAX_PLACEMENTS]);
+        link.reposed
+            .lock()
+            .unwrap()
+            .push(PoseChange::Placing(serial.to_string()));
+        let said = reposing.moved(
+            &d,
+            &link,
+            &mut pipe,
+            serial.to_string(),
+            repose::MovedBy::Windows([None; 2]),
+            now,
+        );
+        assert!(said.is_some_and(|line| line.contains("judged moved again")));
+        let changes = mem::take(&mut *link.reposed.lock().unwrap());
+        assert_eq!(changes.len(), 2, "the inspection's engine search must end");
+        assert!(matches!(&changes[0], PoseChange::Placing(s) if s == serial));
+        let PoseChange::Set(pose) = &changes[1] else {
+            panic!("the engine must get its pose back")
+        };
+        assert_eq!(pose.serial, serial);
+        assert_eq!(pose.pos, [1.0, 2.0, 3.0]);
+        assert!(!pose.write);
+        assert!(matches!(
+            d.sensor_poses.lock().unwrap().get(serial),
+            Some(PoseNote::GivenUp { .. })
+        ));
+    }
+
+    /// A moved sensor's probation that gathers no labelled sighting in 30 s is let go. When
+    /// the engine found the controllers in its view but neither turned enough on its own to be
+    /// identified, that is no verdict: the sensor is judged again after a short retry and the
+    /// release back-off is not charged. A probation that saw nothing is charged as before.
+    #[test]
+    fn a_starved_probation_is_retried_soon_outside_the_release_back_off() {
+        for seen in [true, false] {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(Default::default());
+            let serial = "CameraA";
+            pipe.sensor(
+                serial,
+                calib::camera::CameraModel {
+                    width: 1280,
+                    height: 960,
+                    fx: 800.0,
+                    fy: 800.0,
+                    cx: 640.0,
+                    cy: 480.0,
+                    k: [0.0; 4],
+                },
+                nalgebra::Isometry3::translation(1.0, 2.0, 3.0),
+            );
+            let mut reposing = Reposing::start();
+            let start = 1_000_000_000;
+            reposing.probed_since.insert(serial.to_string(), start);
+            pipe.probe(serial, true);
+            let mut info = engine::FrameInfo {
+                n_devices: 1,
+                ..Default::default()
+            };
+            for (d, b) in info.serial.iter_mut().zip(serial.bytes()) {
+                *d = b as std::ffi::c_char;
+            }
+            info.devices[0].device_id = calib::DEVICE_RIGHT;
+            info.devices[0].match_flags = if seen { calib::capture::MATCH_GOOD } else { 0 };
+            pipe.frame(&info, &[]);
+            reposing.tick(&d, &link, &mut pipe, &mut None, start + PROBATION_NS);
+            assert!(!reposing.probed_since.contains_key(serial), "seen {seen}");
+            let Some(PoseNote::Released { why, .. }) =
+                d.sensor_poses.lock().unwrap().get(serial).cloned()
+            else {
+                panic!("seen {seen}: the sensor must be released")
+            };
+            assert_eq!(why.contains("judged again shortly"), seen, "{why}");
+            assert_eq!(reposing.releases.contains_key(serial), !seen);
+            // The starved retry counts on: the next one would wait twice as long.
+            let s = 1_000_000_000;
+            assert_eq!(
+                reposing.monitor.starved_retry(serial),
+                if seen { 120 * s } else { 60 * s }
+            );
+            assert!(matches!(
+                mem::take(&mut *link.reposed.lock().unwrap()).as_slice(),
+                [PoseChange::Set(r)] if r.serial == serial && !r.write
+            ));
         }
     }
 

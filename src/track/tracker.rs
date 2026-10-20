@@ -188,6 +188,9 @@ pub struct EnginePose {
     /// `Tracker::provisional`). A good one is right most of the time, but on some recordings
     /// mostly wrong.
     pub strong: bool,
+    /// Native camera/IMU relative motion identified this hand independently of calibration.
+    /// Agreement may use it through a disputed camera pose; fusion still checks its attitude.
+    pub identified: bool,
 }
 
 impl EnginePose {
@@ -195,6 +198,7 @@ impl EnginePose {
         EnginePose {
             world_from_model,
             strong: true,
+            identified: false,
         }
     }
 
@@ -202,6 +206,7 @@ impl EnginePose {
         EnginePose {
             world_from_model,
             strong: false,
+            identified: false,
         }
     }
 }
@@ -245,8 +250,9 @@ pub enum Outcome {
 /// pixel residual of its matched LEDs under a prior the other sensors set (another sensor updated
 /// the track within `CROSS_CHECK_NS`). A sensor that moved since calibration stands out: a little,
 /// and its residual and bias grow; a lot, and it matches nothing under that prior although the
-/// controller is in its frame (by the engine's labels, or by a frame full of blobs where the
-/// track puts it), which `checks` and `misses` count.
+/// controller is in its frame. `observed_checks` and `observed_misses` need matched LEDs or the
+/// engine's labels to establish that presence. Unlabelled blobs where the track predicts LEDs
+/// add only to `checks` and `misses`: a reason to ask for labels, not evidence of movement.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CameraAgreement {
     pub median_px: f64,
@@ -254,16 +260,21 @@ pub struct CameraAgreement {
     /// sensor's consistent offset does not.
     pub bias_px: Vector2<f64>,
     pub samples: u64,
-    /// Frames in which the controller was in the sensor's frame while the other sensors had just
-    /// set the prior, and of those, the frames that matched nothing under it.
+    /// Frames in which the controller was seen or predicted in view among enough blobs while
+    /// the other sensors had just set the prior, and of those, the frames that matched nothing.
     pub checks: u64,
     pub misses: u64,
+    /// Checks supported by actual LED correspondences: an accepted fit, or the engine's labels
+    /// showing this controller even though its LEDs did not fit the prior. A frame full of
+    /// unlabelled blobs alone is not evidence that the controller was visible.
+    pub observed_checks: u64,
+    pub observed_misses: u64,
 }
 
 pub const CROSS_CHECK_NS: u64 = 25_000_000;
 const AGREEMENT_WEIGHT: f64 = 1.0 / 500.0;
-/// A frame with this many blobs, where the track puts this many LEDs in view, holds the
-/// controller even without the engine's labels.
+/// A frame with this many blobs where the track puts this many LEDs in view may hold the
+/// controller. Without matches or engine labels it warrants inspection, not a movement verdict.
 const CHECK_MIN_BLOBS: usize = 5;
 /// A controller nearer the sensor than this (metres) is no check of its pose: that close, blobs
 /// merge and a millimetre of the prior is pixels.
@@ -328,8 +339,10 @@ pub struct Tracker {
     /// hints until an engine pose agrees again. Its labels carry on from its own pose in frames
     /// where it shows none.
     engine_labels_off: bool,
-    /// Controller time of each sensor's newest update.
-    camera_last: Vec<u64>,
+    /// Accepted exposure times per sensor within the filter history. Long-search frames may
+    /// arrive after newer peer frames, so the newest timestamp alone cannot check their prior.
+    camera_updates: Vec<VecDeque<u64>>,
+    inspection_frames: VecDeque<InspectionFrame>,
     /// Per registered camera, the exposure of its last frame searched with a kept orientation.
     searched_at: Vec<u64>,
     pub agreement: Vec<CameraAgreement>,
@@ -340,6 +353,17 @@ pub struct Tracker {
     pub misses: Vec<(usize, usize, usize, usize)>,
     /// When `debug`: (matched, unexplained) of every accepted update.
     pub fits: Vec<(usize, usize)>,
+}
+
+/// Only native searches retain an exposure beyond the ordinary filter history. The native
+/// sensor has four capture buffers; keeping four snapshots per camera bounds dropped callbacks.
+#[derive(Debug, Clone)]
+struct InspectionFrame {
+    camera: usize,
+    exposure: u64,
+    until: u64,
+    prior: Filter,
+    peers: bool,
 }
 
 impl Tracker {
@@ -368,7 +392,8 @@ impl Tracker {
             refusing_since: 0,
             provisional: None,
             held: None,
-            camera_last: vec![0; camera_count],
+            camera_updates: vec![VecDeque::new(); camera_count],
+            inspection_frames: VecDeque::new(),
             searched_at: vec![0; camera_count],
             agreement: vec![CameraAgreement::default(); camera_count],
             stats: Stats::default(),
@@ -380,7 +405,7 @@ impl Tracker {
 
     /// Adds one camera admitted by the owning pipeline; arbitrary frame IDs never grow storage.
     pub(super) fn register_camera(&mut self) {
-        self.camera_last.push(0);
+        self.camera_updates.push(VecDeque::new());
         self.searched_at.push(0);
         self.agreement.push(CameraAgreement::default());
     }
@@ -428,6 +453,8 @@ impl Tracker {
             .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
         {
             self.stats.imu_gaps += 1;
+            self.camera_updates.iter_mut().for_each(VecDeque::clear);
+            self.inspection_frames.clear();
             self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
             self.history.clear();
             self.imu.clear();
@@ -470,7 +497,16 @@ impl Tracker {
             self.zupt(&mut f, t, s.t, still);
             self.history.push_back((s.t, f));
         }
+        self.inspection_frames.retain(|f| f.until > s.t);
         let cutoff = s.t.saturating_sub(self.params.history_ns);
+        for updates in &mut self.camera_updates {
+            while updates
+                .front()
+                .is_some_and(|t| *t < cutoff.saturating_sub(CROSS_CHECK_NS))
+            {
+                updates.pop_front();
+            }
+        }
         while self.history.len() > 1 && self.history[1].0 <= cutoff {
             self.history.pop_front();
         }
@@ -588,6 +624,8 @@ impl Tracker {
     /// Gives up an unconfirmed track's fix but keeps what it carries (its orientation, its biases
     /// and the orientation memory): the next acquisition starts from it.
     fn give_up_fix(&mut self) {
+        self.camera_updates.iter_mut().for_each(VecDeque::clear);
+        self.inspection_frames.clear();
         self.provisional = None;
         self.last_fix = 0;
         self.track_camera = None;
@@ -597,6 +635,8 @@ impl Tracker {
     /// Drops the track, and the orientation memory with it; the biases go back to what the track
     /// started from.
     fn forget_track(&mut self) {
+        self.camera_updates.iter_mut().for_each(VecDeque::clear);
+        self.inspection_frames.clear();
         self.saved_bias = self.acquired_bias.or(self.saved_bias);
         self.history.clear();
         self.applied.clear();
@@ -741,6 +781,63 @@ impl Tracker {
         }
     }
 
+    /// Save the prior and peer confirmation before an outstanding native search outlives the
+    /// ordinary 400 ms history. A cancellation calls `cancel_inspection`; frames release their
+    /// snapshot on completion, and the native deadline also bounds lost callbacks.
+    pub fn hold_inspection(&mut self, camera: usize, t_e: u64, remaining_ns: u64) {
+        if camera >= self.camera_updates.len() || remaining_ns == 0 {
+            return;
+        }
+        if let Some((_, prior)) = self.state_at(t_e) {
+            self.inspection_frames
+                .retain(|f| f.camera != camera || f.exposure != t_e);
+            if self
+                .inspection_frames
+                .iter()
+                .filter(|f| f.camera == camera)
+                .count()
+                >= 4
+            {
+                let oldest = self
+                    .inspection_frames
+                    .iter()
+                    .position(|f| f.camera == camera)
+                    .unwrap();
+                self.inspection_frames.remove(oldest);
+            }
+            self.inspection_frames.push_back(InspectionFrame {
+                camera,
+                exposure: t_e,
+                until: self
+                    .newest_imu()
+                    .unwrap_or(t_e)
+                    .saturating_add(remaining_ns),
+                prior,
+                peers: self.provisional.is_none() && self.others_set_prior(camera, t_e),
+            });
+        }
+    }
+
+    /// A probed camera also needs the exposure's saved prior if its labels arrive late: only
+    /// one its peers confirmed then, as `frame` requires of held evidence.
+    pub fn take_inspection_prior(&mut self, camera: usize, t_e: u64) -> Option<Filter> {
+        let k = self
+            .inspection_frames
+            .iter()
+            .position(|f| f.camera == camera && f.exposure == t_e)?;
+        let held = self.inspection_frames.remove(k)?;
+        (held.peers && self.newest_imu()? < held.until).then_some(held.prior)
+    }
+
+    /// Whether controller time `t` is older than the filter history.
+    pub fn before_history(&self, t: u64) -> bool {
+        self.history.front().is_some_and(|&(oldest, _)| t < oldest)
+    }
+
+    pub fn cancel_inspection(&mut self, camera: usize) {
+        self.inspection_frames.retain(|f| f.camera != camera);
+    }
+
     /// One sensor frame whose exposure was at controller time `t_e`. `engine` is the engine's
     /// world_from_model for this controller in this frame, when it found one it rates good or
     /// strong.
@@ -754,12 +851,17 @@ impl Tracker {
         engine: Option<EnginePose>,
         foreign: &[Vector2<f64>],
     ) -> Outcome {
-        if camera >= self.camera_last.len() {
+        if camera >= self.camera_updates.len() {
             return Outcome::UnknownCamera;
         }
         if self.newest_imu().is_none_or(|n| t_e > n) {
             return Outcome::Early;
         }
+        let held = self
+            .inspection_frames
+            .iter()
+            .position(|f| f.camera == camera && f.exposure == t_e)
+            .and_then(|k| self.inspection_frames.remove(k));
         self.stats.frames += 1;
         if self
             .provisional
@@ -792,6 +894,38 @@ impl Tracker {
             })
             .map(|(i, b)| ((b.led_id & 0xff) as usize, i))
             .collect();
+        // Old search results can judge the camera, but can never rewind the live filter or
+        // acquire a controller from a stale pose. Use exactly the prior its peers set then.
+        if held.is_some() && self.state_at(t_e).is_none() {
+            if let Some(held) = held.filter(|f| self.newest_imu().is_some_and(|t| t < f.until)) {
+                let depth = (cam.world_from_cam.inverse()
+                    * self.body.world_from_model(&held.prior.x))
+                .translation
+                .vector
+                .z;
+                let comparable = held.peers && depth >= CHECK_MIN_DEPTH_M;
+                let labels_off = engine.is_some_and(|e| {
+                    e.world_from_model.rotation.angle_to(&held.prior.x.q)
+                        > self.params.acquire_max_turn_rad
+                });
+                let hints = if labels_off { &[][..] } else { &labelled };
+                let fit =
+                    vision::fit_frame(cam, &self.body, &held.prior, blobs, hints, &self.params.fit);
+                let observed = comparable
+                    && (engine.is_some()
+                        && (engine.is_some_and(|e| e.identified) || !labels_off)
+                        && labelled.len() >= self.params.acquire_min_leds
+                        || fit.as_ref().is_ok_and(|f| f.pairs.len() >= 4));
+                if observed {
+                    self.check_camera(camera, fit.is_err(), true);
+                    if let Ok(fit) = fit {
+                        self.cross_check(camera, cam, blobs, &fit.pairs, &held.prior, comparable);
+                    }
+                }
+            }
+            self.stats.too_old += 1;
+            return Outcome::TooOld;
+        }
         // a strong engine pose with labels enough to acquire from settles a track no second
         // sensor has confirmed: one that agrees with it confirms it, and one that does not
         // replaces it (taken below, from the orientation and biases the track carries), unless the
@@ -834,38 +968,41 @@ impl Tracker {
             } else {
                 &labelled
             };
-            // the controller is in this frame, by the engine's labels or by a frame full of blobs
-            // where the track puts it, and the others have just said where it is (a track they
-            // have confirmed): whatever happens next checks this sensor's pose. The engine
-            // searches no further for a controller our tracker holds, so a sensor that moved a
-            // lot gets no labels.
-            let depth = || {
-                (cam.world_from_cam.inverse() * self.body.world_from_model(&prior.x))
-                    .translation
-                    .vector
-                    .z
-            };
-            let checked = camera < self.camera_last.len()
+            let depth = (cam.world_from_cam.inverse() * self.body.world_from_model(&prior.x))
+                .translation
+                .vector
+                .z;
+            let comparable = camera < self.camera_updates.len()
                 && self.provisional.is_none()
                 && self.others_set_prior(camera, t_e)
-                && ((engine.is_some() && labelled.len() >= self.params.acquire_min_leds)
+                && depth >= CHECK_MIN_DEPTH_M;
+            // Native relative motion can identify a hand through a rotated calibration.
+            // Only camera evidence uses that identity; hints and fusion keep the attitude check.
+            let labelled_here = engine.is_some()
+                && (engine.is_some_and(|e| e.identified) || !self.engine_labels_off)
+                && labelled.len() >= self.params.acquire_min_leds;
+            let checked = comparable
+                && (labelled_here
                     || (blobs.len() >= CHECK_MIN_BLOBS
                         && vision::visible_leds(
                             cam,
                             &self.body,
                             &prior.x,
                             &self.params.fit.assoc,
-                        ) >= CHECK_MIN_BLOBS))
-                && depth() >= CHECK_MIN_DEPTH_M;
-            match vision::fit_frame(cam, &self.body, &prior, blobs, hints, &self.params.fit) {
+                        ) >= CHECK_MIN_BLOBS));
+            let fit = vision::fit_frame(cam, &self.body, &prior, blobs, hints, &self.params.fit);
+            let observed =
+                comparable && (labelled_here || fit.as_ref().is_ok_and(|f| f.pairs.len() >= 4));
+            if checked || observed {
+                self.check_camera(camera, fit.is_err(), observed);
+            }
+            match fit {
                 Ok(fit) => {
                     if self.debug {
                         self.fits.push((fit.pairs.len(), fit.unexplained));
                     }
-                    if checked {
-                        self.check_camera(camera, false);
-                    }
-                    self.cross_check(t_e, camera, cam, blobs, &fit.pairs, &prior);
+                    self.note_camera_update(camera, t_e);
+                    self.cross_check(camera, cam, blobs, &fit.pairs, &prior, comparable);
                     if self.applied.back().is_some_and(|a| a.t > t_e) {
                         self.stats.out_of_order += 1;
                     }
@@ -915,9 +1052,6 @@ impl Tracker {
                     return Outcome::NotVisible;
                 }
                 Err(miss) => {
-                    if checked {
-                        self.check_camera(camera, true);
-                    }
                     if self.debug {
                         let (v, n, a) = vision::association_report(
                             cam,
@@ -1218,19 +1352,14 @@ impl Tracker {
     /// when another sensor set that prior moments ago.
     fn cross_check(
         &mut self,
-        t_e: u64,
         camera: usize,
         cam: &Camera,
         blobs: &[Blob],
         pairs: &[(usize, usize)],
         prior: &Filter,
+        comparable: bool,
     ) {
-        if camera >= self.camera_last.len() {
-            return;
-        }
-        let others = self.others_set_prior(camera, t_e);
-        self.camera_last[camera] = self.camera_last[camera].max(t_e);
-        if !others || pairs.len() < 4 {
+        if !comparable || pairs.len() < 4 {
             return;
         }
         let res = vision::residuals(cam, &self.body, blobs, pairs, &prior.x);
@@ -1252,20 +1381,32 @@ impl Tracker {
     /// Whether another sensor updated the track within `CROSS_CHECK_NS` before `t_e`: the prior
     /// at `t_e` is then the other sensors' word, which this one can agree with or not.
     fn others_set_prior(&self, camera: usize, t_e: u64) -> bool {
-        (0..self.camera_last.len()).any(|c| {
+        self.camera_updates.iter().enumerate().any(|(c, updates)| {
             c != camera
-                && self.camera_last[c] != 0
-                && t_e.saturating_sub(self.camera_last[c]) <= CROSS_CHECK_NS
-                && self.camera_last[c] <= t_e
+                && updates
+                    .iter()
+                    .rev()
+                    .any(|&t| t <= t_e && t_e - t <= CROSS_CHECK_NS)
         })
     }
 
-    /// A frame in which the engine saw this controller in the sensor while the other sensors had
-    /// just set the prior: a check of the sensor's pose, `missed` when nothing matched under it.
-    fn check_camera(&mut self, camera: usize, missed: bool) {
+    fn note_camera_update(&mut self, camera: usize, t_e: u64) {
+        if let Some(updates) = self.camera_updates.get_mut(camera) {
+            let k = updates.partition_point(|&t| t < t_e);
+            if updates.get(k) != Some(&t_e) {
+                updates.insert(k, t_e);
+            }
+        }
+    }
+
+    /// Counts the possible sighting, and separately the actual correspondences that can judge
+    /// the sensor's pose. Missing an unlabelled hand may be occlusion or background blobs.
+    fn check_camera(&mut self, camera: usize, missed: bool, observed: bool) {
         if let Some(a) = self.agreement.get_mut(camera) {
             a.checks += 1;
             a.misses += u64::from(missed);
+            a.observed_checks += u64::from(observed);
+            a.observed_misses += u64::from(observed && missed);
         }
     }
 
@@ -1557,6 +1698,7 @@ mod tests {
                     &blobs,
                     engine.map(|e| EnginePose {
                         world_from_model: e,
+                        identified: false,
                         strong: !opts.engine_good
                             || opts.strong_every.is_some_and(|n| {
                                 ((te - 0.01) * 52.0).round() as usize % n == n - 1
@@ -1950,6 +2092,7 @@ mod tests {
             let engine = EnginePose {
                 world_from_model: w.motion.pose(te),
                 strong,
+                identified: false,
             };
             tr.frame(
                 (1e9 + te * 1e9) as u64,
@@ -2652,7 +2795,14 @@ mod tests {
                 for camera in 0..3 {
                     let seen_from = if camera == 2 { truly } else { &w.cams[camera] };
                     let mut blobs = sight(&w, seen_from, t, &mut rng, 0.1);
-                    let mut engine = Some(EnginePose::strong(w.motion.pose(t)));
+                    let mut engine = Some(EnginePose::strong(
+                        w.cams[camera].world_from_cam
+                            * seen_from.world_from_cam.inverse()
+                            * w.motion.pose(t),
+                    ));
+                    if camera == 2 && labelled {
+                        engine.as_mut().unwrap().identified = true;
+                    }
                     if camera == 2 && !labelled {
                         for b in &mut blobs {
                             b.led_id = -1;
@@ -2713,6 +2863,12 @@ mod tests {
             ..w.cams[2]
         };
         let a = agreement_with_third_sensor_at(&moved, 6.0);
+        assert!(a[2].observed_checks > 20, "{:?}", a[2]);
+        assert!(
+            a[2].observed_misses as f64 >= 0.8 * a[2].observed_checks as f64,
+            "{:?}",
+            a[2]
+        );
         assert!(a[2].checks > 20, "{:?}", a[2]);
         assert!(a[2].misses as f64 >= 0.8 * a[2].checks as f64, "{:?}", a[2]);
         for stayed in &a[..2] {
@@ -2720,6 +2876,301 @@ mod tests {
             assert!(
                 (stayed.misses as f64) < 0.1 * stayed.checks as f64,
                 "{stayed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_rotations_are_checked_through_the_disputed_calibration() {
+        let w = world(11);
+        for degrees in [5f64, 10.0, 20.0, 45.0] {
+            let mut moved = w.cams[2];
+            moved.world_from_cam.rotation *=
+                UnitQuaternion::from_axis_angle(&Vector3::y_axis(), degrees.to_radians());
+            let a = agreement_with_third_sensor_at(&moved, 6.0);
+            assert!(a[2].observed_checks > 40, "{degrees} degrees: {:?}", a[2]);
+            assert!(
+                a[2].observed_misses > a[2].observed_checks * 3 / 5,
+                "{degrees} degrees: {:?}",
+                a[2]
+            );
+        }
+    }
+
+    /// The opposite hand's mirrored LED model can receive this hand's labels from a strong
+    /// cold search. Its pose still disagrees with this hand's independent attitude.
+    #[test]
+    fn mirrored_controller_labels_are_unknown_for_the_other_hand() {
+        for device in [1, 2] {
+            for delay_s in [0, 1, 5, 20] {
+                let mut w = touch_world(11);
+                w.motion = Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.3, -0.5, 0.2]);
+                let mut other = touch_world(11);
+                for led in &mut other.body.leds {
+                    led.pos.x = -led.pos.x;
+                    led.dir.x = -led.dir.x;
+                }
+                other.motion = Motion::still(
+                    Vector3::new(0.24, 1.0, 0.0),
+                    [0.3, -0.5 + 120f64.to_radians(), 0.2],
+                );
+                let mut tr = Tracker::new(device, w.body.clone(), Params::default(), 3);
+                let mut rng = Rng::new(5);
+                let mut delayed = Vec::new();
+                let exposure = 3_000_000_000;
+                for tick in 1..=1000 + delay_s * 500 {
+                    let t = tick as f64 * 0.002;
+                    tr.imu(imu(&w, t));
+                    if tick % 10 == 0 {
+                        for camera in 0..2 {
+                            let mut blobs = sight(&w, &w.cams[camera], t, &mut rng, 0.1);
+                            for b in &mut blobs {
+                                b.led_id = (device << 8) | (b.led_id & 0xff);
+                            }
+                            tr.frame(
+                                (1e9 + t * 1e9) as u64,
+                                camera,
+                                &w.cams[camera],
+                                &blobs,
+                                Some(EnginePose::strong(w.motion.pose(t))),
+                                &[],
+                            );
+                        }
+                    }
+                    if tick == 1000 {
+                        tr.hold_inspection(2, exposure, 30_000_000_000);
+                        delayed = sight(&other, &w.cams[2], t, &mut rng, 0.1);
+                        for b in &mut delayed {
+                            b.led_id = (device << 8) | (b.led_id & 0xff);
+                        }
+                    }
+                }
+                assert!(delayed.len() >= tr.params.acquire_min_leds);
+                assert!(tr
+                    .inspection_frames
+                    .iter()
+                    .any(|f| f.camera == 2 && f.peers));
+                tr.frame(
+                    exposure,
+                    2,
+                    &w.cams[2],
+                    &delayed,
+                    Some(EnginePose::strong(other.motion.pose(2.0))),
+                    &[],
+                );
+                let a = tr.agreement[2];
+                assert_eq!(
+                    a.observed_checks, 0,
+                    "device {device}, delay {delay_s}s: {a:?}"
+                );
+                assert_eq!(
+                    a.observed_misses, 0,
+                    "device {device}, delay {delay_s}s: {a:?}"
+                );
+                assert_eq!(a.samples, 0, "a wrong hand is no matched evidence");
+            }
+        }
+    }
+
+    /// A recorded native search labelled the right hand while only the left was seen:
+    /// 253 then 249 misses, with a 119.47--120.04 degree attitude error (first: 119.67375).
+    /// Rebuild those windows with synthetic geometry: no room poses or raw captures are kept.
+    #[test]
+    fn a_replayed_wrong_hand_inspection_does_not_report_movement() {
+        use crate::track::repose::{Change, Monitor, WINDOW_NS};
+        let mut w = world(11);
+        w.motion = Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.3, -0.5, 0.2]);
+        let other = Camera {
+            world_from_cam: Translation3::new(0.238, 0.0, 0.0) * w.cams[2].world_from_cam,
+            ..w.cams[2]
+        };
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 3);
+        let mut rng = Rng::new(5);
+        let mut m = Monitor::new(WINDOW_NS);
+        let mut changes = Vec::new();
+        for window in 0..=4 {
+            let count = [50, 250, 250, 253, 249][window];
+            for i in 1..=count {
+                let t = window as f64 * 5.0 + i as f64 * 5.0 / count as f64;
+                // All cameras see the same exposure; peers confirm this hand first.
+                tr.imu(imu(&w, t));
+                for camera in 0..3 {
+                    let mut blobs = sight(
+                        &w,
+                        if camera == 2 { &other } else { &w.cams[camera] },
+                        t,
+                        &mut rng,
+                        0.1,
+                    );
+                    let mut engine = Some(EnginePose::strong(w.motion.pose(t)));
+                    if camera == 2 {
+                        if window < 3 {
+                            engine = None;
+                            for b in &mut blobs {
+                                b.led_id = -1;
+                            }
+                        } else {
+                            let mut pose = w.motion.pose(t);
+                            pose.rotation *= UnitQuaternion::from_axis_angle(
+                                &Vector3::y_axis(),
+                                119.67375f64.to_radians(),
+                            );
+                            engine = Some(EnginePose::strong(pose));
+                        }
+                    }
+                    tr.frame(
+                        (1e9 + t * 1e9) as u64,
+                        camera,
+                        &w.cams[camera],
+                        &blobs,
+                        engine,
+                        &[],
+                    );
+                }
+            }
+            let agreement: Vec<_> = tr
+                .agreement
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (format!("sensor-{i}"), [*a, CameraAgreement::default()]))
+                .collect();
+            changes.extend(m.update(1_000 + window as u64 * WINDOW_NS, &agreement));
+        }
+        assert_eq!(changes, [Change::Inspect("sensor-2".into())]);
+        assert_eq!(tr.agreement[2].observed_misses, 0);
+    }
+
+    /// A labelled long-search frame arrives 100 ms after exposure, after both peers have
+    /// delivered newer frames. The peer updates just before that exposure still check its pose.
+    #[test]
+    fn delayed_labelled_frames_use_peer_confirmation_at_exposure() {
+        let w = world(11);
+        let moved = Camera {
+            world_from_cam: Translation3::new(0.4, 0.0, 0.0) * w.cams[2].world_from_cam,
+            ..w.cams[2]
+        };
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 3);
+        let mut rng = Rng::new(5);
+        let mut delayed = VecDeque::new();
+        for tick in 1..3000 {
+            let t = tick as f64 * 0.002;
+            tr.imu(imu(&w, t));
+            if tick % 10 == 0 {
+                for camera in 0..2 {
+                    let blobs = sight(&w, &w.cams[camera], t, &mut rng, 0.1);
+                    tr.frame(
+                        (1e9 + t * 1e9) as u64,
+                        camera,
+                        &w.cams[camera],
+                        &blobs,
+                        Some(EnginePose::strong(w.motion.pose(t))),
+                        &[],
+                    );
+                }
+                delayed.push_back((tick, t, sight(&w, &moved, t, &mut rng, 0.1)));
+            }
+            if delayed
+                .front()
+                .is_some_and(|(captured, _, _)| tick >= captured + 50)
+            {
+                let (_, exposure, blobs) = delayed.pop_front().unwrap();
+                tr.frame(
+                    (1e9 + exposure * 1e9) as u64,
+                    2,
+                    &w.cams[2],
+                    &blobs,
+                    Some(EnginePose::strong(w.motion.pose(exposure))),
+                    &[],
+                );
+            }
+        }
+        let a = tr.agreement[2];
+        assert!(a.observed_checks > 100, "{a:?}");
+        assert!(
+            a.observed_misses as f64 > 0.8 * a.observed_checks as f64,
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn inspection_labels_delivered_seconds_late_still_check_the_exposure() {
+        for delay_s in [1, 5, 20] {
+            let w = world(11);
+            let moved = Camera {
+                world_from_cam: Translation3::new(0.4, 0.0, 0.0) * w.cams[2].world_from_cam,
+                ..w.cams[2]
+            };
+            let mut tr = Tracker::new(1, w.body.clone(), Params::default(), 3);
+            let mut rng = Rng::new(5);
+            let exposure = 3_000_000_000;
+            let mut delayed = Vec::new();
+            for tick in 1..=1000 + delay_s * 500 {
+                let t = tick as f64 * 0.002;
+                tr.imu(imu(&w, t));
+                if tick % 10 == 0 {
+                    for camera in 0..2 {
+                        let blobs = sight(&w, &w.cams[camera], t, &mut rng, 0.1);
+                        tr.frame(
+                            (1e9 + t * 1e9) as u64,
+                            camera,
+                            &w.cams[camera],
+                            &blobs,
+                            Some(EnginePose::strong(w.motion.pose(t))),
+                            &[],
+                        );
+                    }
+                }
+                if tick == 1000 {
+                    tr.hold_inspection(2, exposure, 30_000_000_000);
+                    delayed = sight(&w, &moved, t, &mut rng, 0.1);
+                }
+            }
+            assert!(
+                tr.state_at(exposure).is_none(),
+                "normal history stays short"
+            );
+            let last_fix = tr.last_fix;
+            tr.frame(
+                exposure,
+                2,
+                &w.cams[2],
+                &delayed,
+                Some(EnginePose::strong(w.motion.pose(2.0))),
+                &[],
+            );
+            assert_eq!(tr.agreement[2].observed_checks, 1, "{delay_s}s delivery");
+            assert_eq!(tr.agreement[2].observed_misses, 1, "{delay_s}s delivery");
+            assert_eq!(
+                tr.last_fix, last_fix,
+                "old labels cannot rewind the live filter"
+            );
+            assert!(
+                tr.inspection_frames.is_empty(),
+                "completion releases its snapshot"
+            );
+            let newest = tr.newest_imu().unwrap();
+            for _ in 0..8 {
+                tr.hold_inspection(2, newest, 30_000_000_000);
+            }
+            assert_eq!(
+                tr.inspection_frames.len(),
+                1,
+                "repeated notification is bounded"
+            );
+            for back in (0..8).rev() {
+                tr.hold_inspection(2, newest - back * 2_000_000, 30_000_000_000);
+            }
+            assert_eq!(tr.inspection_frames.len(), 4, "native capture-buffer bound");
+            tr.cancel_inspection(2);
+            assert!(
+                tr.inspection_frames.is_empty(),
+                "cancellation releases its snapshots"
+            );
+            tr.hold_inspection(2, newest, 1);
+            tr.imu(imu(&w, 2.0 + delay_s as f64 + 0.002));
+            assert!(
+                tr.inspection_frames.is_empty(),
+                "deadline releases lost completions"
             );
         }
     }
@@ -2770,7 +3221,7 @@ mod tests {
 
     /// The engine labels nothing in a sensor that moved a lot (it searches no further for a
     /// controller our tracker holds): a frame full of blobs where the track puts the controller
-    /// is a check all the same, and it misses.
+    /// requests an inspection, but its misses alone do not establish movement.
     #[test]
     fn a_sensor_moved_a_lot_misses_without_the_engines_labels() {
         let w = world(11);
@@ -2779,6 +3230,7 @@ mod tests {
             ..w.cams[2]
         };
         let a = agreement_with_third_sensor(&moved, 6.0, false);
+        assert_eq!(a[2].observed_misses, 0, "{:?}", a[2]);
         assert!(a[2].checks > 20, "{:?}", a[2]);
         assert!(a[2].misses as f64 >= 0.8 * a[2].checks as f64, "{:?}", a[2]);
     }

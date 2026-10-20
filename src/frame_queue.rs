@@ -95,6 +95,18 @@ impl<F> FrameQueue<F> {
         self.clocks.drain(..).collect()
     }
 
+    /// Takes the admitted sensor's queued frames that `take` selects, oldest exposure first;
+    /// the others stay queued in order.
+    pub fn take_sensor_frames(&mut self, serial: &str, mut take: impl FnMut(&F) -> bool) -> Vec<F> {
+        let Some(queue) = self.frames.get_mut(serial) else {
+            return Vec::new();
+        };
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) =
+            queue.drain(..).partition(|(_, frame)| take(frame));
+        *queue = kept;
+        taken.into_iter().map(|(_, frame)| frame).collect()
+    }
+
     pub fn pop_frame(&mut self) -> Option<F> {
         for _ in 0..self.roster.len() {
             let serial = &self.roster[self.next];
@@ -153,6 +165,22 @@ mod tests {
         assert_eq!(q.pop_frame(), Some(("fast", 98)));
         assert_eq!(q.pop_frame(), Some(("slow", 1)));
         assert_eq!(q.pop_frame(), Some(("fast", 99)));
+        assert_eq!(q.pop_frame(), None);
+    }
+
+    #[test]
+    fn a_sensors_selected_frames_are_taken_and_the_rest_keep_their_turn() {
+        let mut q = FrameQueue::default();
+        q.register(["a".into(), "b".into()]);
+        q.push_frame("a", 20, ("a", 20));
+        q.push_frame("a", 10, ("a", 10));
+        q.push_frame("b", 15, ("b", 15));
+        assert_eq!(q.take_sensor_frames("a", |f| f.1 == 10), [("a", 10)]);
+        assert!(q.take_sensor_frames("unregistered", |_| true).is_empty());
+        assert_eq!(q.stats().queued_frames, 2);
+        assert_eq!(q.stats().dropped_frames, 0);
+        assert_eq!(q.pop_frame(), Some(("a", 20)));
+        assert_eq!(q.pop_frame(), Some(("b", 15)));
         assert_eq!(q.pop_frame(), None);
     }
 

@@ -1281,11 +1281,21 @@ int rift_tracker_set_sensor_pose(rift_tracker_ctx *ctx, const ohmd_cv1touch_sens
 	return -1;
 }
 
-int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial)
+int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask)
 {
 	for (int i = 0; i < ctx->n_sensors; i++) {
-		if (rift_sensor_clear_cv1touch_pose(ctx->sensors[i], serial))
+		if (rift_sensor_clear_cv1touch_pose(ctx->sensors[i], serial, timeout_ns, inspection_mask))
 			return 0;
+	}
+	return -1;
+}
+
+int rift_tracker_sensor_pose_applied(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (int i = 0; i < ctx->n_sensors; i++) {
+		int applied = rift_sensor_cv1touch_pose_applied(ctx->sensors[i], serial);
+		if (applied >= 0)
+			return applied;
 	}
 	return -1;
 }

@@ -157,6 +157,26 @@ test_search_skip = executable('test_search_skip', 'test_search_skip.c',
     '-Wno-sign-compare'],
   link_args: ['-Wl,--gc-sections', '-lm'])
 test('search_skip', test_search_skip)
+# Identity-checked cold correspondences feed fast PnP at frame rate, without recorded labels.
+test_inspection_tracking = executable('test_inspection_tracking',
+  ['test_inspection_tracking.c', 'test_inspection_opencv.cpp'],
+  c_args: ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-Wno-sign-compare'],
+  cpp_args: ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
+  dependencies: [openhmd_proj.get_variable('dep_opencv')], link_args: ['-lm'])
+test('inspection_tracking', test_inspection_tracking)
+
+# An inspection's timeout cancels an active correspondence search; restoration is acknowledged
+# only after the search exits and the fast worker installs the pose.
+test_search_cancel = executable('test_search_cancel', 'test_search_cancel.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),
+    '-ffunction-sections', '-fdata-sections', '-Wno-sign-compare'],
+  dependencies: [openhmd_dep, threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('search_cancel', test_search_cancel, timeout: 10)
+test_inspection_handoff = executable('test_inspection_handoff', 'test_inspection_handoff.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),
+    '-ffunction-sections', '-fdata-sections', '-Wno-sign-compare'],
+  dependencies: [openhmd_dep, threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('inspection_handoff', test_inspection_handoff)
 test_sensor_lifetime = executable('test_sensor_lifetime', 'test_sensor_lifetime.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])

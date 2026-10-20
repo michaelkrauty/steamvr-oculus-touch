@@ -100,11 +100,29 @@ struct rift_sensor_ctx_s
 
 	bool long_analysis_busy;
 
+	/* Atomic requests, observed without sensor_lock inside correspondence search. */
+	bool search_cancelled;
+	bool search_stopping;
+	uint64_t search_deadline;
+	/* Only the long worker increments this; clock reads are amortised across its loops. */
+	unsigned int search_polls;
+
 	/* cv1touch: a camera pose given (or taken away: pending_clear) at runtime, applied by the
 	 * fast analysis thread */
 	bool have_pending_pose;
 	bool pending_clear;
+	bool pending_inspection_extension;
+	uint32_t pending_inspection;
 	posef pending_pose;
+	uint32_t pending_candidate;
+	uint64_t candidate_epoch[RIFT_MAX_TRACKED_DEVICES];
+	uint64_t candidate_tracks[RIFT_MAX_TRACKED_DEVICES][MAX_BLOBS_PER_FRAME];
+	uint32_t pending_label_pose;
+	uint32_t pending_label_updates;
+	uint32_t pending_label_revoke;
+	blobservation label_updates[RIFT_MAX_TRACKED_DEVICES];
+	posef label_world_pose[RIFT_MAX_TRACKED_DEVICES];
+	posef label_cam_pose[RIFT_MAX_TRACKED_DEVICES];
 
 	/* End protected by sensor_lock */
 
@@ -223,6 +241,8 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 			od->device_id = sensor->devices[d]->id;
 			od->device_time_ns = frame->exposure_info.devices[d].device_time_ns;
 			od->match_flags = ds->score.match_flags;
+			od->identity_epoch_lo = (uint32_t)ds->identity_epoch;
+			od->identity_epoch_hi = (uint32_t)(ds->identity_epoch >> 32);
 			od->matched_blobs = ds->score.matched_blobs;
 			od->visible_leds = ds->score.visible_leds;
 			if (ds->cv1touch_pose_valid) {
@@ -240,7 +260,7 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 			n = MAX_BLOBS_PER_FRAME;
 		for (int i = 0; i < n; i++) {
 			const struct blob *b = frame->bwobs->blobs + i;
-			blobs[i] = (ohmd_cv1touch_blob) { b->x, b->y, b->width, b->height, b->area, b->led_id };
+			blobs[i] = (ohmd_cv1touch_blob) { b->x, b->y, b->width, b->height, b->area, rift_sensor_frame_blob_label(frame, b) };
 		}
 		if (sensor->ohmd_ctx->cv1touch_image_cb && frame->vframe->data && frame->vframe->format == OHMD_VIDEO_FRAME_FORMAT_GRAY8)
 			sensor->ohmd_ctx->cv1touch_image_cb(sensor->ohmd_ctx->cv1touch_image_user, &info, frame->vframe->width,
@@ -248,8 +268,10 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 		sensor->ohmd_ctx->cv1touch_frame_cb(sensor->ohmd_ctx->cv1touch_frame_user, &info, n, blobs);
 	}
 	if (frame->bwobs) {
-		blobwatch_release_observation(sensor->bw, frame->bwobs);
+		if (!frame->detached_observation)
+			blobwatch_release_observation(sensor->bw, frame->bwobs);
 		frame->bwobs = NULL;
+		frame->detached_observation = false;
 	}
 
 	ohmd_video_frame_release(frame->vframe);
@@ -354,7 +376,7 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 
 	frame->blob_extract_finish_ts = ohmd_monotonic_get(sensor->ohmd_ctx);
 
-	if (frame->bwobs && frame->bwobs->num_blobs > 0) {
+	if (frame->bwobs) {
 		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices,
 			rift_tracker_get_search_skip(sensor->tracker));
 #if 0
@@ -387,7 +409,167 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 	}
 }
 
+/* Called with sensor_lock held, before long search can outlive the consumer's pose history. */
+static void hold_inspection_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
+{
+	if (!sensor->pf.inspection_mask || !sensor->ohmd_ctx->cv1touch_search_cb)
+		return;
+	ohmd_cv1touch_frame_info info = {0};
+	snprintf(info.serial, sizeof info.serial, "%s", sensor->serial_no);
+	info.frame_start_host_ns = frame->vframe->start_ts;
+	info.exposure_valid = frame->exposure_info_valid;
+	info.exposure_hmd_ts = frame->exposure_info.hmd_ts;
+	info.exposure_count = frame->exposure_info.count;
+	uint64_t deadline = __atomic_load_n(&sensor->search_deadline, __ATOMIC_RELAXED);
+	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
+	uint64_t remaining = deadline > now ? ohmd_monotonic_conv(deadline - now,
+		ohmd_monotonic_per_sec(sensor->ohmd_ctx), 1000000000) : 0;
+	sensor->ohmd_ctx->cv1touch_search_cb(sensor->ohmd_ctx->cv1touch_search_user, &info, remaining);
+}
+
 static unsigned int fast_analysis_thread(void *arg);
+static bool search_deadline_expired(rift_sensor_ctx *sensor)
+{
+	uint64_t deadline = __atomic_load_n(&sensor->search_deadline, __ATOMIC_RELAXED);
+	return deadline && ohmd_monotonic_get(sensor->ohmd_ctx) >= deadline;
+}
+
+static bool sensor_search_should_stop(void *data)
+{
+	rift_sensor_ctx *sensor = data;
+	if (__atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED) ||
+	    __atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED))
+		return true;
+	/* A cancellation is checked every loop; the deadline every 64 loops. */
+	if ((sensor->search_polls++ & 63) == 0 && search_deadline_expired(sensor)) {
+		__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
+		return true;
+	}
+	return false;
+}
+
+/* sensor_lock serializes lifecycle notices with labels and their epoch tags. A consumer may
+ * discard a camera frame, but must retain a retrospective invalidation until it judges the
+ * inspection. Ordinary loss only ends future use of that correspondence. */
+static void report_inspection_identity(rift_sensor_ctx *sensor, int device_id, uint32_t state)
+{
+	uint64_t epoch = sensor->pf.inspection_identity[device_id].evidence_epoch;
+	if (!epoch || !sensor->ohmd_ctx->cv1touch_identity_cb)
+		return;
+	ohmd_cv1touch_inspection_identity event = {0};
+	snprintf(event.serial, sizeof event.serial, "%s", sensor->serial_no);
+	event.epoch = epoch;
+	event.device_id = device_id;
+	event.state = state;
+	uint64_t now = ohmd_monotonic_conv(ohmd_monotonic_get(sensor->ohmd_ctx),
+	    ohmd_monotonic_per_sec(sensor->ohmd_ctx), 1000000000);
+	sensor->ohmd_ctx->cv1touch_identity_cb(sensor->ohmd_ctx->cv1touch_identity_user, &event, now);
+}
+
+static void end_inspection_identity(rift_sensor_ctx *sensor, int device_id, uint32_t state)
+{
+	report_inspection_identity(sensor, device_id, state);
+	sensor->pf.inspection_identity[device_id].evidence_epoch = 0;
+}
+
+/* Called by the fast worker between frames, with sensor_lock held. The long worker only
+ * queues copies; it never changes blobwatch or the fast worker's private camera priors. */
+static void apply_pending_labels(rift_sensor_ctx *sensor)
+{
+	uint32_t revoke = sensor->pending_label_revoke;
+	if (sensor->have_pending_pose || (!sensor->pending_inspection_extension &&
+	    (sensor->pending_clear || __atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED)))) {
+		revoke |= sensor->pf.inspection_mask | sensor->pending_inspection;
+		for (int id = 0; id < RIFT_MAX_TRACKED_DEVICES; id++) {
+			if (revoke & (1u << id))
+				end_inspection_identity(sensor, id, OHMD_CV1TOUCH_IDENTITY_ENDED);
+		}
+		sensor->pending_candidate = sensor->pending_label_updates = sensor->pending_label_pose = 0;
+	}
+	for (int id = 0; id < RIFT_MAX_TRACKED_DEVICES; id++) {
+		if ((sensor->pending_label_updates & sensor->pf.inspection_mask & (1u << id)) &&
+		    (sensor->candidate_epoch[id] != sensor->pf.inspection_epoch ||
+		     !rift_pose_finder_filter_inspection_labels(&sensor->pf, id, &sensor->label_updates[id],
+		         sensor->candidate_tracks[id]))) {
+			/* A jump after capture cannot inherit the cold result's labels or prior. */
+			end_inspection_identity(sensor, id, OHMD_CV1TOUCH_IDENTITY_ENDED);
+			revoke |= 1u << id;
+			sensor->pending_label_updates &= ~(1u << id);
+			sensor->pending_label_pose &= ~(1u << id);
+			sensor->pf.inspection_identity[id].first_ns = 0;
+			sensor->pf.inspection_identity[id].validated = false;
+			sensor->pf.inspection_identity[id].agreeing = 0;
+			sensor->pf.inspection_identity[id].contradicting = 0;
+		}
+		if (revoke & (1u << id)) {
+			blobwatch_clear_labels(sensor->bw, id);
+			sensor->pf.inspection_pose_mask &= ~(1u << id);
+			sensor->pf.inspection_candidate[id].active = false;
+		}
+		if (sensor->pending_candidate & (1u << id))
+			rift_pose_finder_set_inspection_candidate(&sensor->pf, id, &sensor->label_updates[id],
+				sensor->candidate_epoch[id], sensor->candidate_tracks[id], &sensor->label_world_pose[id], &sensor->label_cam_pose[id]);
+		if (sensor->pending_label_updates & (1u << id)) {
+			blobwatch_update_labels(sensor->bw, &sensor->label_updates[id], id);
+			if (sensor->pending_label_pose & (1u << id))
+				rift_pose_finder_set_inspection_pose(&sensor->pf, id,
+					&sensor->label_world_pose[id], &sensor->label_cam_pose[id]);
+		}
+	}
+	sensor->pending_candidate = sensor->pending_label_revoke = sensor->pending_label_updates = sensor->pending_label_pose = 0;
+}
+
+/* Only the fast worker changes the pose finder, between its own frames and long searches. */
+static void apply_pending_pose(rift_sensor_ctx *sensor)
+{
+	if (sensor->shutdown || __atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED))
+		return;
+	apply_pending_labels(sensor);
+	if (sensor->long_analysis_busy || (!sensor->have_pending_pose && !sensor->pending_clear))
+		return;
+	/* A cancelled queued frame must not start after the restoration acknowledgement. */
+	rift_sensor_analysis_frame *queued;
+	while ((queued = POP_QUEUE(&sensor->long_analysis_q)) != NULL)
+		release_capture_frame(sensor, queued);
+	/* Placement extends this inspection. The already identified tracks remain subject to
+	 * the same continuity checks; newly requested hands must identify themselves. */
+	uint32_t keep = sensor->pending_inspection_extension ? sensor->pf.inspection_mask : 0;
+	sensor->pf.inspection_mask = sensor->pending_inspection;
+	sensor->pf.inspection_pose_mask &= keep;
+	for (int id = 0; id < RIFT_MAX_TRACKED_DEVICES; id++) {
+		if (!(keep & (1u << id))) {
+			end_inspection_identity(sensor, id, OHMD_CV1TOUCH_IDENTITY_ENDED);
+			memset(&sensor->pf.inspection_candidate[id], 0, sizeof sensor->pf.inspection_candidate[id]);
+			memset(&sensor->pf.inspection_identity[id], 0, sizeof sensor->pf.inspection_identity[id]);
+		}
+	}
+	if (sensor->pending_clear && !sensor->pending_inspection) {
+		sensor->pf.have_camera_pose = false;
+		LOGI("Sensor %d (%s) has no pose for now: it labels blobs only", sensor->id, sensor->serial_no);
+	} else if (sensor->have_pending_pose) {
+		rift_pose_finder_set_camera_pose(&sensor->pf, &sensor->pending_pose);
+		LOGI("Sensor %d (%s) uses a new pose", sensor->id, sensor->serial_no);
+	}
+	sensor->have_pending_pose = false;
+	sensor->pending_clear = false;
+	sensor->pending_inspection_extension = false;
+	__atomic_store_n(&sensor->search_cancelled, false, __ATOMIC_RELAXED);
+}
+
+/* A pose command can wake the fast worker even if this camera supplies no new frames. */
+static rift_sensor_analysis_frame *next_fast_frame(rift_sensor_ctx *sensor)
+{
+	apply_pending_pose(sensor);
+	return POP_QUEUE(&sensor->fast_analysis_q);
+}
+
+static void long_analysis_finished(rift_sensor_ctx *sensor)
+{
+	sensor->long_analysis_busy = false;
+	if ((sensor->have_pending_pose || sensor->pending_clear || sensor->pending_candidate || sensor->pending_label_updates || sensor->pending_label_revoke) && sensor->fast_analysis_q_cond)
+		ohmd_cond_signal(sensor->fast_analysis_q_cond);
+}
+
 static unsigned int long_analysis_thread(void *arg);
 static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
@@ -447,6 +629,8 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 
 	rift_pose_finder_init(&sensor_ctx->pf, calib, (rift_pose_finder_cb) handle_found_pose, sensor_ctx);
 	if (!sensor_ctx->pf.cs) goto fail;
+	sensor_ctx->pf.cs->should_stop = sensor_search_should_stop;
+	sensor_ctx->pf.cs->stop_data = sensor_ctx;
 
 	/* cv1touch: a calibrated sensor starts with its fixed pose; with fixed_poses_only, the others
 	 * never place themselves and only observe (calibration capture). */
@@ -497,6 +681,7 @@ rift_sensor_start(rift_sensor_ctx *sensor)
 
 void rift_sensor_request_stop(rift_sensor_ctx *sensor)
 {
+	__atomic_store_n(&sensor->search_stopping, true, __ATOMIC_RELAXED);
 	rift_sensor_device_request_stop(sensor->dev);
 }
 
@@ -511,6 +696,7 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 	if (sensor_ctx == NULL)
 		return;
 
+	__atomic_store_n(&sensor_ctx->search_stopping, true, __ATOMIC_RELAXED);
 	if (sensor_ctx->dev)
 		rift_sensor_device_stop_video(sensor_ctx->dev);
 
@@ -599,7 +785,7 @@ static unsigned int long_analysis_thread(void *arg)
 				frame->long_analysis_finish_ts = ohmd_monotonic_get(ctx->ohmd_ctx);
 
 				ohmd_lock_mutex (ctx->sensor_lock);
-				ctx->long_analysis_busy = false;
+				long_analysis_finished(ctx);
 
 				/* Done with this frame - send it back to the capture thread */
 				release_capture_frame(ctx, frame);
@@ -687,6 +873,7 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 	int d;
 	const rift_tracker_exposure_info *exposure_info = &frame->exposure_info;
 
+	frame->rejected_inspection_mask = 0;
 	frame->need_long_analysis = false;
 	frame->long_analysis_found_new_blobs = false;
 	frame->long_analysis_start_ts = frame->long_analysis_finish_ts = 0;
@@ -699,6 +886,7 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 		dev_state->score.match_flags = 0;
 		dev_state->found_device_pose = false;
 		dev_state->cv1touch_pose_valid = false;
+		dev_state->identity_epoch = 0;
 
 		rift_pose_finder_exp_info_to_dev_state (&sensor->pf, exp_dev_info, dev_state);
 	}
@@ -720,6 +908,31 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 	return true;
 }
 
+/* Called with sensor_lock held. There is at most one queued long frame. */
+static void queue_long_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
+{
+	/* If there is an un-fetched frame in the long analysis
+	 * queue, steal it back and return that to the capture thread,
+	 * then replace it with the new one */
+	rift_sensor_analysis_frame *old_frame = REWIND_QUEUE(&sensor->long_analysis_q);
+	if (old_frame) {
+		uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
+		LOGD("Sensor %d reclaimed frame %d from long analysis queue",
+			sensor->id, old_frame->id);
+		old_frame->long_analysis_start_ts = old_frame->long_analysis_finish_ts = now;
+		release_capture_frame(sensor, old_frame);
+	}
+
+	/* Do not let search label an observation that blobwatch still reads as its last frame. */
+	frame->long_observation = *frame->bwobs;
+	blobwatch_release_observation(sensor->bw, frame->bwobs);
+	frame->bwobs = &frame->long_observation;
+	frame->detached_observation = true;
+	hold_inspection_frame(sensor, frame);
+	PUSH_QUEUE(&sensor->long_analysis_q, frame);
+	ohmd_cond_signal(sensor->long_analysis_q_cond);
+}
+
 static unsigned int fast_analysis_thread(void *arg)
 {
 	rift_sensor_ctx *sensor = arg;
@@ -733,17 +946,7 @@ static unsigned int fast_analysis_thread(void *arg)
 			if (frame != NULL) {
 				/* cv1touch: a pose given at runtime, taken between frames while the long
 				 * analysis is not reading the pose finder */
-				if ((sensor->have_pending_pose || sensor->pending_clear) && !sensor->long_analysis_busy) {
-					if (sensor->pending_clear) {
-						sensor->pf.have_camera_pose = false;
-						LOGI("Sensor %d (%s) has no pose for now: it labels blobs only", sensor->id, sensor->serial_no);
-					} else {
-						rift_pose_finder_set_camera_pose(&sensor->pf, &sensor->pending_pose);
-						LOGI("Sensor %d (%s) uses a new pose", sensor->id, sensor->serial_no);
-					}
-					sensor->have_pending_pose = false;
-					sensor->pending_clear = false;
-				}
+				apply_pending_pose(sensor);
 				ohmd_unlock_mutex (sensor->sensor_lock);
 				if (init_frame_analyse(sensor, frame))
 					analyse_frame_fast(sensor, frame);
@@ -753,21 +956,11 @@ static unsigned int fast_analysis_thread(void *arg)
 				 * or to the long analysis thread (unless the thread is still busy
 				 * processing something else
 				 */
-				if (frame->need_long_analysis && !sensor->long_analysis_busy) {
-					/* If there is an un-fetched frame in the long analysis
-					 * queue, steal it back and return that to the capture thread,
-					 * then replace it with the new one */
-					rift_sensor_analysis_frame *old_frame = REWIND_QUEUE(&sensor->long_analysis_q);
-					if (old_frame) {
-						uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
-						LOGD("Sensor %d reclaimed frame %d from long analysis queue",
-							sensor->id, old_frame->id);
-						old_frame->long_analysis_start_ts = old_frame->long_analysis_finish_ts = now;
-						release_capture_frame(sensor, old_frame);
-					}
-
-					PUSH_QUEUE(&sensor->long_analysis_q, frame);
-					ohmd_cond_signal(sensor->long_analysis_q_cond);
+				if (frame->need_long_analysis && !sensor->long_analysis_busy &&
+				    !__atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED) &&
+				    !__atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED) &&
+				    !search_deadline_expired(sensor)) {
+					queue_long_frame(sensor, frame);
 				} else {
 					frame->long_analysis_start_ts = frame->long_analysis_finish_ts = frame->image_analysis_finish_ts;
 					release_capture_frame(sensor, frame);
@@ -778,7 +971,7 @@ static unsigned int fast_analysis_thread(void *arg)
 
 			while (!sensor->shutdown && frame == NULL) {
 				/* Try and fetch another frame, otherwise sleep */
-				if ((frame = POP_QUEUE(&sensor->fast_analysis_q)) != NULL)
+				if ((frame = next_fast_frame(sensor)) != NULL)
 					break;
 				ohmd_cond_wait(sensor->fast_analysis_q_cond, sensor->sensor_lock);
 			}
@@ -798,19 +991,114 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 		dev->id, obj_world_pose->orient.x, obj_world_pose->orient.y, obj_world_pose->orient.z, obj_world_pose->orient.w,
 		obj_world_pose->pos.x, obj_world_pose->pos.y, obj_world_pose->pos.z);
 
-	bool ret = rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
-	       score, obj_world_pose, sensor_ctx->serial_no);
-
-	if (ret) {
-		if (dev->id >= 0 && dev->id < 3)
-			__atomic_fetch_add(&sensor_ctx->cv1touch_pose_fixes[dev->id], 1, __ATOMIC_RELAXED);
-		/* If this pose was accepted by the tracker, transfer these blob labels to the blobwatch object */
-		ohmd_lock_mutex(sensor_ctx->sensor_lock);
-		blobwatch_update_labels (sensor_ctx->bw, frame->bwobs, dev->id);
-		ohmd_unlock_mutex(sensor_ctx->sensor_lock);
-	} else { /* FIXME: Only do this after a few failures? */
-		rift_clear_blob_labels (frame->bwobs->blobs, frame->bwobs->num_blobs, dev->id);
+	bool inspected = sensor_ctx->pf.inspection_mask & (1u << dev->id);
+	bool ret = false;
+	if (!inspected)
+		ret = rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
+			score, obj_world_pose, sensor_ctx->serial_no);
+	ohmd_lock_mutex(sensor_ctx->sensor_lock);
+	int slot = -1, other_slot = -1;
+	for (int d = 0; d < frame->n_devices; d++) {
+		int id = sensor_ctx->devices[d]->id;
+		if (id == dev->id) slot = d;
+		if (id == 3 - dev->id && frame->exposure_info.devices[d].device_time_ns) other_slot = d;
 	}
+	if (slot >= 0) frame->capture_state[slot].identity_epoch = 0;
+	bool stale = inspected && slot >= 0 &&
+		frame->exposure_info.devices[slot].device_time_ns <= sensor_ctx->pf.inspection_identity[dev->id].last_ns;
+	rift_identity_verdict identity = RIFT_IDENTITY_UNKNOWN;
+	bool judgeable = false;
+	if (inspected && slot >= 0 && !stale &&
+	    !__atomic_load_n(&sensor_ctx->search_cancelled, __ATOMIC_RELAXED)) {
+		const rift_tracked_device_exposure_info *own = &frame->exposure_info.devices[slot];
+		const quatf *other = other_slot >= 0 ? &frame->exposure_info.devices[other_slot].capture_pose.orient : NULL;
+		rift_correspondence_verdict correspondence = rift_pose_finder_check_inspection_blobs(&sensor_ctx->pf, dev->id, frame);
+		if (correspondence == RIFT_CORRESPONDENCE_BROKEN) {
+			end_inspection_identity(sensor_ctx, dev->id, OHMD_CV1TOUCH_IDENTITY_ENDED);
+			sensor_ctx->pending_label_revoke |= 1u << dev->id;
+			sensor_ctx->pending_label_updates &= ~(1u << dev->id);
+			sensor_ctx->pending_label_pose &= ~(1u << dev->id);
+		}
+		if (correspondence == RIFT_CORRESPONDENCE_UNRELATED)
+			sensor_ctx->pf.inspection_identity[dev->id].last_ns = own->device_time_ns;
+		else
+			identity = rift_pose_finder_identify_inspection(&sensor_ctx->pf, dev->id, own->device_time_ns,
+			&own->capture_pose.orient, other, &frame->capture_state[slot].final_cam_pose.orient,
+			!frame->detached_observation, &judgeable);
+		ret = identity == RIFT_IDENTITY_AGREES;
+		if (identity == RIFT_IDENTITY_CONTRADICTS)
+			end_inspection_identity(sensor_ctx, dev->id, OHMD_CV1TOUCH_IDENTITY_INVALIDATED);
+		if (ret) {
+			rift_inspection_identity *id = &sensor_ctx->pf.inspection_identity[dev->id];
+			if (!id->evidence_epoch) {
+				id->evidence_epoch = ++sensor_ctx->pf.next_identity_epoch;
+				report_inspection_identity(sensor_ctx, dev->id, OHMD_CV1TOUCH_IDENTITY_STARTED);
+			}
+			frame->capture_state[slot].identity_epoch = id->evidence_epoch;
+		}
+	}
+	if (judgeable)
+		score->match_flags |= OHMD_CV1TOUCH_MATCH_INSPECTION_MOTION;
+	if (ret) {
+		sensor_ctx->pending_candidate &= ~(1u << dev->id);
+		frame->rejected_inspection_mask &= ~(1u << dev->id);
+		if (inspected) score->match_flags |= OHMD_CV1TOUCH_MATCH_INSPECTION_IDENTITY;
+		else if (dev->id >= 0 && dev->id < 3)
+			__atomic_fetch_add(&sensor_ctx->cv1touch_pose_fixes[dev->id], 1, __ATOMIC_RELAXED);
+		if (frame->detached_observation) {
+			sensor_ctx->label_updates[dev->id] = *frame->bwobs;
+			sensor_ctx->candidate_epoch[dev->id] = frame->inspection_epoch;
+			memcpy(sensor_ctx->candidate_tracks[dev->id], frame->inspection_tracks, sizeof frame->inspection_tracks);
+			sensor_ctx->pending_label_updates |= 1u << dev->id;
+			if (inspected) {
+				sensor_ctx->label_world_pose[dev->id] = frame->exposure_info.devices[slot].capture_pose;
+				sensor_ctx->label_cam_pose[dev->id] = frame->capture_state[slot].final_cam_pose;
+				sensor_ctx->pending_label_pose |= 1u << dev->id;
+			}
+		} else {
+			if (inspected && frame->quarantined_observation) {
+				rift_pose_finder_set_inspection_pose(&sensor_ctx->pf, dev->id,
+					&frame->exposure_info.devices[slot].capture_pose, &frame->capture_state[slot].final_cam_pose);
+				sensor_ctx->pf.inspection_candidate[dev->id].active = false;
+			}
+			blobwatch_update_labels(sensor_ctx->bw, frame->bwobs, dev->id);
+			/* Anything still queued for this device came from an older, detached exposure:
+			 * it must neither overwrite nor revoke these labels at the next fast frame. */
+			sensor_ctx->pending_label_revoke &= ~(1u << dev->id);
+			sensor_ctx->pending_label_updates &= ~(1u << dev->id);
+			sensor_ctx->pending_label_pose &= ~(1u << dev->id);
+		}
+	} else {
+		if (inspected && !stale && slot >= 0 && frame->detached_observation &&
+		    !sensor_ctx->pf.inspection_identity[dev->id].validated &&
+		    !__atomic_load_n(&sensor_ctx->search_cancelled, __ATOMIC_RELAXED)) {
+			/* Retain a cold fit only in the fast worker's private quarantine. */
+			sensor_ctx->label_updates[dev->id] = *frame->bwobs;
+			sensor_ctx->label_world_pose[dev->id] = frame->exposure_info.devices[slot].capture_pose;
+			sensor_ctx->label_cam_pose[dev->id] = frame->capture_state[slot].final_cam_pose;
+			sensor_ctx->candidate_epoch[dev->id] = frame->inspection_epoch;
+			memcpy(sensor_ctx->candidate_tracks[dev->id], frame->inspection_tracks, sizeof frame->inspection_tracks);
+			sensor_ctx->pending_candidate |= 1u << dev->id;
+		}
+		/* A fast observation is blobwatch's live last frame. UNKNOWN suppresses output,
+		 * but must preserve its trusted labels until a confirmed revocation. */
+		if (!inspected || frame->detached_observation)
+			rift_clear_blob_labels(frame->bwobs->blobs, frame->bwobs->num_blobs, dev->id);
+		if (inspected) {
+			frame->rejected_inspection_mask |= 1u << dev->id;
+			if (slot >= 0) frame->capture_state[slot].cv1touch_pose_valid = false;
+			score->match_flags &= ~OHMD_CV1TOUCH_MATCH_INSPECTION_IDENTITY;
+			/* Only a contradicted identity revokes. A late search, a still hand or a single
+			 * outlier is no evidence against newer validated labels. */
+			if (identity == RIFT_IDENTITY_CONTRADICTS) {
+				sensor_ctx->pending_candidate &= ~(1u << dev->id);
+				sensor_ctx->pending_label_revoke |= 1u << dev->id;
+				sensor_ctx->pending_label_updates &= ~(1u << dev->id);
+				sensor_ctx->pending_label_pose &= ~(1u << dev->id);
+			}
+		}
+	}
+	ohmd_unlock_mutex(sensor_ctx->sensor_lock);
 
 	rift_tracked_device_frame_release(dev, &frame->exposure_info);
 
@@ -829,14 +1117,19 @@ bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_
 	if (!cv1touch_fixed_pose_lookup_list(pose, 1, sensor->serial_no, &fixed))
 		return false;
 	ohmd_lock_mutex(sensor->sensor_lock);
+	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
+	__atomic_store_n(&sensor->search_deadline, 0, __ATOMIC_RELAXED);
 	sensor->pending_pose = fixed;
 	sensor->have_pending_pose = true;
 	sensor->pending_clear = false;
+	sensor->pending_inspection_extension = false;
+	sensor->pending_inspection = 0;
+	if (sensor->fast_analysis_q_cond) ohmd_cond_signal(sensor->fast_analysis_q_cond);
 	ohmd_unlock_mutex(sensor->sensor_lock);
 	return true;
 }
 
-bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial)
+bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask)
 {
 	if (!cv1touch_sensor_serial_equal(sensor->serial_no, serial))
 		return false;
@@ -844,8 +1137,18 @@ bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial
 	if (sensor->pf.cv1touch_allow_placement)
 		return false;
 	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->pending_inspection_extension = sensor->pf.inspection_mask &&
+		(inspection_mask & sensor->pf.inspection_mask) == sensor->pf.inspection_mask &&
+		!sensor->have_pending_pose && !sensor->pending_clear && !search_deadline_expired(sensor) &&
+		!__atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED);
+	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
+	uint64_t deadline = timeout_ns ? ohmd_monotonic_get(sensor->ohmd_ctx) +
+		ohmd_monotonic_conv(timeout_ns, 1000000000, ohmd_monotonic_per_sec(sensor->ohmd_ctx)) : 0;
+	__atomic_store_n(&sensor->search_deadline, deadline, __ATOMIC_RELAXED);
 	sensor->pending_clear = true;
+	sensor->pending_inspection = inspection_mask;
 	sensor->have_pending_pose = false;
+	if (sensor->fast_analysis_q_cond) ohmd_cond_signal(sensor->fast_analysis_q_cond);
 	ohmd_unlock_mutex(sensor->sensor_lock);
 	return true;
 }
@@ -864,6 +1167,18 @@ void rift_sensor_get_video_quality(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor
 	out->video_format = sensor->dev->cv1touch_video_format;
 	out->frames_decoded = __atomic_load_n(&sensor->dev->cv1touch_frames_decoded, __ATOMIC_RELAXED);
 	out->frames_dropped = __atomic_load_n(&sensor->dev->cv1touch_frames_dropped, __ATOMIC_RELAXED);
+}
+
+int rift_sensor_cv1touch_pose_applied(rift_sensor_ctx *sensor, const char *serial)
+{
+	if (!cv1touch_sensor_serial_equal(sensor->serial_no, serial))
+		return -1;
+	ohmd_lock_mutex(sensor->sensor_lock);
+	bool applied = !sensor->have_pending_pose && !sensor->pending_clear &&
+		!sensor->long_analysis_busy && !sensor->pf.inspection_mask &&
+		sensor->long_analysis_q.head == sensor->long_analysis_q.tail && sensor->pf.have_camera_pose;
+	ohmd_unlock_mutex(sensor->sensor_lock);
+	return applied;
 }
 
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out)

@@ -143,6 +143,10 @@ struct ohmd_context {
 	/* cv1touch extensions (zero-initialised by ohmd_ctx_create) */
 	ohmd_cv1touch_config cv1touch_config;
 	cv1touch_sensor_config cv1touch_sensors;
+	ohmd_cv1touch_identity_cb cv1touch_identity_cb;
+	void *cv1touch_identity_user;
+	ohmd_cv1touch_search_cb cv1touch_search_cb;
+	void *cv1touch_search_user;
 	ohmd_cv1touch_frame_cb cv1touch_frame_cb;
 	void *cv1touch_frame_user;
 	ohmd_cv1touch_image_cb cv1touch_image_cb;

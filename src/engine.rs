@@ -38,6 +38,7 @@ pub fn with_radio_sample(last: &Controller, fast: &Controller) -> Controller {
     }
 }
 pub use ffi::ohmd_cv1touch_frame_info as FrameInfo;
+pub use ffi::ohmd_cv1touch_inspection_identity as InspectionIdentity;
 pub use ffi::ohmd_cv1touch_led as LedEntry;
 pub use ffi::ohmd_cv1touch_sensor as Sensor;
 
@@ -237,10 +238,19 @@ pub enum RadioReader {
     Radio = 1,
 }
 
+/// Native identity evidence from relative motion, never a waiver of the fusion attitude gate.
+pub const MATCH_INSPECTION_IDENTITY: u32 = ffi::OHMD_CV1TOUCH_MATCH_INSPECTION_IDENTITY;
+/// The inspected hand turned enough, on its own, for that identity to be judged.
+pub const MATCH_INSPECTION_MOTION: u32 = ffi::OHMD_CV1TOUCH_MATCH_INSPECTION_MOTION;
+
 /// Engine callbacks. `frame` runs on sensor analysis threads with the sensor lock held and
 /// `report` on the engine thread: both must only copy data.
 pub trait EngineSink: Send + Sync {
     fn frame(&self, info: &FrameInfo, blobs: &[Blob]);
+    /// A native label search is about to start; retain its exposure until its deadline.
+    fn search_started(&self, _info: &FrameInfo, _remaining_ns: u64) {}
+    /// Identity lifetimes are control evidence; retain invalidations even when dropping frames.
+    fn inspection_identity(&self, _event: &InspectionIdentity, _host_ns: u64) {}
     fn report(&self, source: i32, host_ns: u64, data: &[u8]);
     /// Runs in decoded message order on the named reader. Copy and return without waiting.
     #[allow(clippy::too_many_arguments)]
@@ -277,7 +287,7 @@ pub struct Engine {
 #[cfg(feature = "engine")]
 mod callbacks;
 #[cfg(feature = "engine")]
-use callbacks::{activity_cb, frame_cb, image_cb, report_cb};
+use callbacks::{activity_cb, frame_cb, identity_cb, image_cb, report_cb, search_cb};
 
 /// Run Rust entered from C. A panic must not reach Rust's non-unwinding ABI diagnostic,
 /// which writes directly to stderr. The daemon installs its nonblocking panic hook first.
@@ -337,6 +347,8 @@ impl Engine {
                 return Err("native sensor configuration rejected (invalid/duplicate entry or allocation failure)".into());
             }
             ffi::ohmd_cv1touch_set_frame_callback(ctx, Some(frame_cb), sink as *mut c_void);
+            ffi::ohmd_cv1touch_set_search_callback(ctx, Some(search_cb), sink as *mut c_void);
+            ffi::ohmd_cv1touch_set_identity_callback(ctx, Some(identity_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_image_callback(ctx, Some(image_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_report_callback(ctx, Some(report_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_activity_callback(ctx, Some(activity_cb), sink as *mut c_void);
@@ -523,21 +535,39 @@ impl Engine {
         }
     }
 
-    /// Takes the open sensor `serial`'s pose away: it then labels blobs in every frame by the long
-    /// search, as a sensor with no pose yet does, and tracks with nothing, until
-    /// `set_sensor_pose` gives it one. Err when no such sensor is open.
-    pub fn clear_sensor_pose(&self, serial: &str) -> Result<(), String> {
+    /// Requests labels with a native deadline, independently of the daemon's inspection timer.
+    pub fn inspect_sensor(
+        &self,
+        serial: &str,
+        hands: [bool; 2],
+        timeout_ns: u64,
+    ) -> Result<(), String> {
         let serial_c = self::serial(serial)?;
-        // SAFETY: valid device and a NUL-terminated serial.
+        // SAFETY: owned device and a complete, NUL-terminated serial.
         if unsafe {
-            ffi::ohmd_cv1touch_clear_sensor_pose(self.hands[HAND_RIGHT], serial_c.as_ptr())
+            ffi::ohmd_cv1touch_inspect_sensor(
+                self.hands[HAND_RIGHT],
+                serial_c.as_ptr(),
+                device_mask(hands),
+                timeout_ns,
+            )
         } == 0
         {
             Ok(())
         } else {
-            Err(format!(
-                "the engine has no open sensor {serial}, or it may place itself (provisional mode)"
-            ))
+            Err(format!("the engine cannot inspect sensor {serial}"))
+        }
+    }
+
+    /// Whether a queued restoration has reached the sensor and its preceding search stopped.
+    /// A sensor no longer open has no search to wait for.
+    pub fn sensor_pose_applied(&self, serial: &str) -> bool {
+        let Ok(serial_c) = self::serial(serial) else {
+            return false;
+        };
+        // SAFETY: owned device and a complete, NUL-terminated serial.
+        unsafe {
+            ffi::ohmd_cv1touch_sensor_pose_applied(self.hands[HAND_RIGHT], serial_c.as_ptr()) != 0
         }
     }
 
@@ -621,13 +651,14 @@ impl RadioDecoder {
     /// are asleep. The engine still matches them against its own priors.
     pub fn set_search_skip(&mut self, hands: [bool; 2]) {
         // SAFETY: valid decoder.
-        unsafe { ffi::ohmd_cv1touch_radio_decoder_set_search_skip(self.0, search_skip_mask(hands)) }
+        unsafe { ffi::ohmd_cv1touch_radio_decoder_set_search_skip(self.0, device_mask(hands)) }
     }
 }
 
-/// The engine's device mask for hands (bit 1 << OpenHMD device id; the headset, 0, never).
+/// The engine's device mask for hands (bit 1 << OpenHMD device id; the headset, 0, never), as
+/// its search skip and inspection requests take it.
 #[cfg_attr(not(feature = "engine"), allow(dead_code))]
-fn search_skip_mask(hands: [bool; 2]) -> u32 {
+fn device_mask(hands: [bool; 2]) -> u32 {
     let mut mask = 0u32;
     if hands[crate::shm::HAND_LEFT] {
         mask |= 1 << crate::calib::DEVICE_LEFT;
@@ -684,11 +715,11 @@ mod tests {
     }
 
     #[test]
-    fn the_search_skip_mask_names_controllers_by_engine_device_id() {
-        assert_eq!(search_skip_mask([false, false]), 0);
-        assert_eq!(search_skip_mask([true, false]), 1 << 2, "left is device 2");
-        assert_eq!(search_skip_mask([false, true]), 1 << 1, "right is device 1");
-        assert_eq!(search_skip_mask([true, true]), 0b110, "never the headset");
+    fn the_device_mask_names_controllers_by_engine_device_id() {
+        assert_eq!(device_mask([false, false]), 0);
+        assert_eq!(device_mask([true, false]), 1 << 2, "left is device 2");
+        assert_eq!(device_mask([false, true]), 1 << 1, "right is device 1");
+        assert_eq!(device_mask([true, true]), 0b110, "never the headset");
     }
 
     #[test]

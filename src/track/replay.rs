@@ -132,6 +132,23 @@ pub fn replay(
                     }
                 }
             }
+            recorder::INSPECTION_IDENTITY => {
+                if let Some(event) = recorder::decode_inspection_identity(&rec.payload) {
+                    p.inspection_identity(&event);
+                }
+            }
+            // As live, where each engine gets a new pipeline and the restored pose's
+            // acknowledgement retires the sensor's tombstones: the frames before these
+            // records were the engine's last for them.
+            recorder::ENGINE_SESSION => {
+                out.probes.append(&mut p.probes);
+                p.new_engine_session();
+            }
+            recorder::IDENTITIES_RETIRED => {
+                if let Ok(serial) = std::str::from_utf8(&rec.payload) {
+                    p.retire_identities(serial);
+                }
+            }
             recorder::FRAME_OBS => {
                 if let Some((info, blobs)) = recorder::decode_frame_obs(&rec.payload) {
                     p.frame(&info, &blobs);
@@ -149,6 +166,6 @@ pub fn replay(
     out.frames_dropped = p.frames_dropped;
     out.agreement = p.camera_agreement();
     out.events = std::mem::take(&mut p.events);
-    out.probes = std::mem::take(&mut p.probes);
+    out.probes.append(&mut p.probes);
     Ok(out)
 }

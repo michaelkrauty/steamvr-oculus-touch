@@ -744,6 +744,19 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_unbuffer_log(void)
 	setvbuf(stdout, NULL, _IONBF, 0);
 }
 
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_identity_callback(ohmd_context *ctx,
+        ohmd_cv1touch_identity_cb cb, void *user)
+{
+	ctx->cv1touch_identity_cb = cb;
+	ctx->cv1touch_identity_user = user;
+}
+
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_search_callback(ohmd_context *ctx, ohmd_cv1touch_search_cb cb, void *user)
+{
+	ctx->cv1touch_search_cb = cb;
+	ctx->cv1touch_search_user = user;
+}
+
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user)
 {
 	ctx->cv1touch_frame_cb = cb;

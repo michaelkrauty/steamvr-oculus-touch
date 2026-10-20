@@ -86,6 +86,10 @@ struct correspondence_search_s
     int num_models;
     cs_model_info_t models[CS_MAX_MODELS];
 
+    /* Optional cooperative stop, owned by the sensor; only the long worker calls it. */
+    bool (*should_stop)(void *data);
+    void *stop_data;
+
     unsigned int num_trials;
     unsigned int num_pose_checks;
 
@@ -94,6 +98,11 @@ struct correspondence_search_s
     /* List of the nearest blobs for each blob */
     cs_image_point_t *blob_neighbours[MAX_BLOBS_PER_FRAME][MAX_BLOBS_PER_FRAME];
 };
+
+static inline bool correspondence_search_should_stop(correspondence_search_t *cs)
+{
+    return cs && cs->should_stop && cs->should_stop(cs->stop_data);
+}
 
 correspondence_search_t *correspondence_search_new(rift_sensor_camera_params *camera_calib);
 void correspondence_search_set_blobs (correspondence_search_t *cs, struct blob *blobs, int num_blobs);

@@ -29,6 +29,7 @@ struct rift_sensor_frame_device_state {
 	bool found_device_pose; /* Set to true when the device was found in this exposure */
 	posef final_cam_pose;
 	rift_pose_metrics score;
+	uint64_t identity_epoch; /* the identity under which this exposure was labelled */
 	bool cv1touch_pose_valid; /* final_cam_pose was computed for this frame and matched (cv1touch export) */
 };
 
@@ -45,6 +46,15 @@ struct rift_sensor_analysis_frame {
 	rift_tracker_exposure_info exposure_info;
 
 	blobservation* bwobs;
+	/* The long worker owns its copy; blobwatch remains exclusively on the fast worker. */
+	blobservation long_observation;
+	blobservation inspection_raw; /* raw labels before any candidate can relabel them */
+	bool inspection_raw_valid;
+	bool detached_observation;
+	bool quarantined_observation; /* private candidate copy, never shared before identity */
+	uint32_t rejected_inspection_mask; /* suppress output without changing live tracking labels */
+	uint64_t inspection_epoch; /* raw-frame continuity, retained across a long search */
+	uint64_t inspection_tracks[MAX_BLOBS_PER_FRAME]; /* bounded image-motion lineage */
 
 	/* Device poses at capture time */
 	rift_sensor_frame_device_state capture_state[RIFT_MAX_TRACKED_DEVICES];
@@ -72,6 +82,12 @@ struct rift_sensor_analysis_frame {
 	uint64_t long_analysis_finish_ts;
 };
 
+static inline int rift_sensor_frame_blob_label(const rift_sensor_analysis_frame *frame, const struct blob *blob)
+{
+	int device = LED_OBJECT_ID(blob->led_id);
+	return device >= 0 && (frame->rejected_inspection_mask & (1u << device)) ? LED_INVALID_ID : blob->led_id;
+}
+
 /* Consumes dev on success and failure. */
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_device *dev, rift_tracker_ctx *tracker);
@@ -86,7 +102,8 @@ void rift_sensor_get_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_s
 /* True when pose->serial is this sensor: it tracks with that camera -> world pose from its next frame on. */
 bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_pose *pose);
 /* True when serial is this sensor: from its next frame on it has no pose, and labels blobs by the long search. */
-bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial);
+bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask);
+int rift_sensor_cv1touch_pose_applied(rift_sensor_ctx *sensor, const char *serial);
 bool rift_sensor_add_device (rift_sensor_ctx *ctx, rift_tracked_device *device);
 bool rift_sensor_start(rift_sensor_ctx *sensor);
 

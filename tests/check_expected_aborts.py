@@ -22,8 +22,10 @@ import time
 CALLBACK_TESTS = (
     "callback_tests::activity_panic_aborts_with_a_full_pipe",
     "callback_tests::frame_panic_aborts_with_a_full_pipe",
+    "callback_tests::identity_panic_aborts_with_a_full_pipe",
     "callback_tests::image_panic_aborts_with_a_full_pipe",
     "callback_tests::report_panic_aborts_with_a_full_pipe",
+    "callback_tests::search_panic_aborts_with_a_full_pipe",
 )
 ASSERTION_TESTS = (
     "daemon_log::assertion_tests::a_native_assertion_aborts_with_a_full_stderr_pipe",

@@ -77,6 +77,271 @@ void rift_pose_finder_set_camera_pose(rift_pose_finder *pf, const posef *camera_
 	pf->have_camera_pose = true;
 }
 
+static float inspection_turn(quatf rotation)
+{
+	oquatf_normalize_me(&rotation);
+	return 2.0f * acosf(OHMD_MIN(1.0f, fabsf(rotation.w)));
+}
+
+/* A thirty-degree turn leaves headroom for PnP noise. Three exposures within three seconds
+ * must each follow this hand's IMU to a tenth of its turn. */
+#define IDENTITY_WINDOW_NS 3000000000ULL
+#define IDENTITY_MIN_TURN DEG_TO_RAD(30)
+#define IDENTITY_AGREEING 3
+#define IDENTITY_TOLERANCE 0.1f
+/* A fixed alias of the other hand, at whatever offset, turns by exactly the other hand's
+ * angle. Its turn must differ from this hand's by half of this hand's turn, which leaves
+ * at least four tenths of it between the agreeing camera turn and any such alias. */
+#define IDENTITY_DISTINCT 0.5f
+/* In replay, genuine exposures followed their hand's IMU to 9.4 degrees at most (4,989 of
+ * them, 1,410 on identified streams), and beyond 7 degrees at most twice in a row. A mirror
+ * alias is about 120 degrees off. */
+#define IDENTITY_CONTRADICTION_FLOOR DEG_TO_RAD(10)
+#define IDENTITY_CONTRADICTIONS 3
+
+/* Blobwatch may transfer an ID across any distance. Inspection lineage also requires every
+ * raw-frame step to stay within 32 px: 99.84% of 3.16 million same-labelled replay pairs did.
+ * This rejects jumps, not physical swaps at an image overlap. Those are caught only once
+ * the hands' rotations diverge; identical motion can preserve the swap until it diverges.
+ * A frame gap over three nominal camera periods starts a new epoch. */
+#define INSPECTION_FRAME_GAP_NS 60000000ULL
+#define INSPECTION_STEP_PX 32.0f
+
+static void inspection_raw_tracks(rift_pose_finder *pf, rift_sensor_analysis_frame *frame)
+{
+	const blobservation *raw = frame->bwobs;
+	for (int b = 0; b < raw->num_blobs; b++) {
+		const struct blob *blob = &raw->blobs[b];
+		uint64_t track = 0;
+		for (int p = 0; p < pf->inspection_previous_raw.num_blobs; p++) {
+			const struct blob *previous = &pf->inspection_previous_raw.blobs[p];
+			if (blob->blob_id != previous->blob_id) continue;
+			float dx = blob->x - previous->x, dy = blob->y - previous->y;
+			if (dx * dx + dy * dy <= INSPECTION_STEP_PX * INSPECTION_STEP_PX)
+				track = pf->inspection_tracks[p];
+			break;
+		}
+		frame->inspection_tracks[b] = track ? track : ++pf->inspection_next_track;
+	}
+	pf->inspection_previous_raw = *raw;
+	memcpy(pf->inspection_tracks, frame->inspection_tracks, sizeof pf->inspection_tracks);
+}
+
+rift_correspondence_verdict rift_pose_finder_check_inspection_blobs(rift_pose_finder *pf, int device_id,
+    const rift_sensor_analysis_frame *frame)
+{
+	rift_inspection_identity *id = &pf->inspection_identity[device_id];
+	unsigned common = 0, n = 0;
+	uint32_t blobs[MAX_BLOBS_PER_FRAME];
+	int leds[MAX_BLOBS_PER_FRAME];
+	uint64_t tracks[MAX_BLOBS_PER_FRAME];
+	for (int b = 0; b < frame->bwobs->num_blobs; b++) {
+		const struct blob *blob = &frame->bwobs->blobs[b];
+		if (LED_OBJECT_ID(blob->led_id) != device_id)
+			continue;
+		blobs[n] = blob->blob_id;
+		tracks[n] = frame->inspection_tracks[b];
+		leds[n++] = blob->led_id;
+		for (unsigned prev = 0; prev < id->n_blobs; prev++) {
+			if (blob->blob_id == id->blob_ids[prev] && blob->led_id == id->led_ids[prev] &&
+			    frame->inspection_tracks[b] == id->tracks[prev]) {
+				common++;
+				break;
+			}
+		}
+	}
+	/* A failed fit or a cold search can propose the other hand while this hand's trusted
+	 * blob tracks are still present. Reject that alternative without replacing the stream.
+	 * Once those raw tracks are lost, any reacquisition must identify itself from scratch. */
+	if (id->validated && common < 5 && id->epoch == frame->inspection_epoch && frame->inspection_raw_valid) {
+		unsigned trusted = 0;
+		for (int b = 0; b < frame->inspection_raw.num_blobs; b++) {
+			const struct blob *blob = &frame->inspection_raw.blobs[b];
+			for (unsigned prev = 0; prev < id->n_blobs; prev++) {
+				if (blob->blob_id == id->blob_ids[prev] && blob->led_id == id->led_ids[prev] &&
+				    frame->inspection_tracks[b] == id->tracks[prev]) {
+					trusted++;
+					break;
+				}
+			}
+		}
+		if (trusted >= 5)
+			return RIFT_CORRESPONDENCE_UNRELATED;
+	}
+	bool broken = id->first_ns && (common < 5 || id->epoch != frame->inspection_epoch);
+	if (broken) {
+		/* Preserve last_ns: an older in-flight search still cannot replace this stream. */
+		id->first_ns = 0;
+		id->validated = false;
+		id->agreeing = id->contradicting = 0;
+	}
+	id->epoch = frame->inspection_epoch;
+	id->n_blobs = n;
+	memcpy(id->blob_ids, blobs, n * sizeof blobs[0]);
+	memcpy(id->led_ids, leds, n * sizeof leds[0]);
+	memcpy(id->tracks, tracks, n * sizeof tracks[0]);
+	return broken ? RIFT_CORRESPONDENCE_BROKEN : RIFT_CORRESPONDENCE_CONTINUOUS;
+}
+
+/* Called under the sensor lock by either analysis worker, before exporting or transferring
+ * labels. Both IMU poses refer to this same exposure, not the time the search completed.
+ * Every call consumes its exposure, so a later search of the same exposure is stale. */
+rift_identity_verdict rift_pose_finder_identify_inspection(rift_pose_finder *pf, int device_id,
+    uint64_t exposure_ns, const quatf *own, const quatf *other, const quatf *camera, bool tracked,
+    bool *judgeable)
+{
+	rift_inspection_identity *id = &pf->inspection_identity[device_id];
+	rift_identity_verdict verdict = RIFT_IDENTITY_UNKNOWN;
+	*judgeable = false;
+	if (!exposure_ns || exposure_ns <= id->last_ns)
+		return RIFT_IDENTITY_UNKNOWN;
+	id->last_ns = exposure_ns;
+	float own_norm = oquatf_get_dot(own, own), seen_norm = oquatf_get_dot(camera, camera);
+	float other_norm = other ? oquatf_get_dot(other, other) : 1.0f;
+	if (!isfinite(own_norm) || !isfinite(seen_norm) || !isfinite(other_norm) ||
+	    own_norm < 0.5f || seen_norm < 0.5f || other_norm < 0.5f)
+		return RIFT_IDENTITY_UNKNOWN;
+	if (!id->first_ns)
+		goto anchor;
+	quatf own_delta, seen_delta, error;
+	oquatf_diff(&id->own, own, &own_delta);
+	oquatf_diff(&id->camera, camera, &seen_delta);
+	oquatf_diff(&own_delta, &seen_delta, &error);
+	float span = inspection_turn(own_delta);
+	float own_error = inspection_turn(error);
+	bool tight = own_error <= IDENTITY_TOLERANCE * OHMD_MAX(span, IDENTITY_MIN_TURN);
+	if (id->validated) {
+		/* Stillness, a slow turn or a return toward the anchor is no new evidence. Only
+		 * the tracked correspondences disagreeing with this hand's IMU, repeatedly, revoke
+		 * the identity: a cold search finding the other hand while this one is out of view
+		 * says nothing about them. */
+		*judgeable = true;
+		if (own_error > OHMD_MAX(IDENTITY_TOLERANCE * span, IDENTITY_CONTRADICTION_FLOOR)) {
+			if (!tracked || ++id->contradicting < IDENTITY_CONTRADICTIONS)
+				return RIFT_IDENTITY_UNKNOWN;
+			verdict = RIFT_IDENTITY_CONTRADICTS;
+			goto anchor;
+		}
+		id->contradicting = 0;
+		/* Bound IMU drift: roll the anchor onto an exposure that agrees as tightly as a
+		 * validating one. An outlier never becomes the anchor. */
+		if (tight && exposure_ns - id->first_ns > IDENTITY_WINDOW_NS) {
+			id->first_ns = exposure_ns;
+			id->own = *own;
+			id->camera = *camera;
+		}
+		return RIFT_IDENTITY_AGREES;
+	}
+	if (exposure_ns - id->first_ns > IDENTITY_WINDOW_NS || id->have_other != (other != NULL))
+		goto anchor;
+	bool distinct = true;
+	if (other) {
+		quatf other_delta;
+		oquatf_diff(&id->other, other, &other_delta);
+		distinct = fabsf(span - inspection_turn(other_delta)) >= IDENTITY_DISTINCT * span;
+	}
+	*judgeable = span >= IDENTITY_MIN_TURN && distinct;
+	if (!tight) {
+		/* An untrusted fast track that fails the motion check must make room for another
+		 * cold candidate. Otherwise a persistent alias can occupy the whole inspection.
+		 * Only the fast worker owns this private track; cold results cannot stop it. */
+		if (tracked) pf->inspection_candidate[device_id].active = false;
+		goto anchor;
+	}
+	if (span < IDENTITY_MIN_TURN)
+		return RIFT_IDENTITY_UNKNOWN;
+	/* Even in a rigid rifle grip, the other hand must have turned clearly differently. */
+	if (!distinct)
+		goto anchor;
+	if (++id->agreeing < IDENTITY_AGREEING)
+		return RIFT_IDENTITY_UNKNOWN;
+	id->validated = true;
+	id->contradicting = 0;
+	return RIFT_IDENTITY_AGREES;
+anchor:
+	id->first_ns = exposure_ns;
+	id->own = *own;
+	id->camera = *camera;
+	id->have_other = other != NULL;
+	if (other) id->other = *other;
+	id->validated = false;
+	id->agreeing = id->contradicting = 0;
+	return verdict;
+}
+
+void rift_pose_finder_set_inspection_pose(rift_pose_finder *pf, int device_id,
+	const posef *capture_world_pose, const posef *observed_cam_pose)
+{
+	if (!(pf->inspection_mask & (1u << device_id)))
+		return;
+	posef camera_object_pose = *observed_cam_pose;
+	oposef_inverse(&camera_object_pose);
+	oposef_apply(&camera_object_pose, capture_world_pose, &pf->inspection_poses[device_id]);
+	pf->inspection_pose_mask |= 1u << device_id;
+}
+
+void rift_pose_finder_set_inspection_candidate(rift_pose_finder *pf, int device_id,
+    const blobservation *labels, uint64_t epoch, const uint64_t *tracks,
+    const posef *capture_world_pose, const posef *observed_cam_pose)
+{
+	if (!(pf->inspection_mask & (1u << device_id)))
+		return;
+	rift_inspection_candidate *candidate = &pf->inspection_candidate[device_id];
+	candidate->labels = *labels;
+	memcpy(candidate->tracks, tracks, sizeof candidate->tracks);
+	candidate->epoch = epoch;
+	posef camera_object_pose = *observed_cam_pose;
+	oposef_inverse(&camera_object_pose);
+	oposef_apply(&camera_object_pose, capture_world_pose, &candidate->world_from_cam);
+	candidate->active = true;
+}
+
+/* A quarantined track is usable only while five of its exact blob/LED pairs persist. Blob
+ * IDs are propagated by consecutive raw observations; a new camera epoch breaks the chain. */
+static bool inspection_candidate_labels(rift_inspection_candidate *candidate,
+    const blobservation *raw, uint64_t epoch, const uint64_t *tracks, int device_id, blobservation *out)
+{
+	if (candidate->epoch != epoch)
+		return false;
+	*out = *raw;
+	rift_clear_blob_labels(out->blobs, out->num_blobs, device_id);
+	unsigned common = 0;
+	for (int b = 0; b < out->num_blobs; b++) {
+		struct blob *blob = &out->blobs[b];
+		if (blob->led_id >= 0) continue; /* another hand's live labels take precedence */
+		for (int prev = 0; prev < candidate->labels.num_blobs; prev++) {
+			const struct blob *old = &candidate->labels.blobs[prev];
+			if (blob->blob_id == old->blob_id && LED_OBJECT_ID(old->led_id) == device_id &&
+			    tracks[b] == candidate->tracks[prev]) {
+				blob->led_id = old->led_id;
+				common++;
+				break;
+			}
+		}
+	}
+	return common >= 5;
+}
+
+bool rift_pose_finder_filter_inspection_labels(rift_pose_finder *pf, int device_id,
+    blobservation *labels, const uint64_t *tracks)
+{
+	unsigned common = 0;
+	for (int b = 0; b < labels->num_blobs; b++) {
+		struct blob *blob = &labels->blobs[b];
+		if (LED_OBJECT_ID(blob->led_id) != device_id) continue;
+		bool survives = false;
+		for (int p = 0; p < pf->inspection_previous_raw.num_blobs; p++)
+			if (blob->blob_id == pf->inspection_previous_raw.blobs[p].blob_id &&
+			    tracks[b] == pf->inspection_tracks[p]) {
+				survives = true;
+				break;
+			}
+		if (survives) common++;
+		else blob->led_id = LED_INVALID_ID;
+	}
+	return common >= 5;
+}
+
 void rift_pose_finder_clear(rift_pose_finder *pf)
 {
 	if (pf->cs != NULL)
@@ -119,6 +384,23 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 {
 	rift_tracker_exposure_info *exposure_info = &frame->exposure_info;
 	blobservation* bwobs = frame->bwobs;
+	if (pf->inspection_mask) {
+		/* Include empty observations: a later reacquisition cannot bridge a camera outage. */
+		uint64_t at = frame->vframe ? frame->vframe->start_ts : 0;
+		if (at && (at <= pf->inspection_frame_ns || at - pf->inspection_frame_ns > INSPECTION_FRAME_GAP_NS))
+			pf->inspection_epoch++;
+		pf->inspection_frame_ns = at;
+		frame->inspection_epoch = pf->inspection_epoch;
+		frame->inspection_raw_valid = bwobs != NULL;
+		if (bwobs) {
+			inspection_raw_tracks(pf, frame);
+			frame->inspection_raw = *bwobs;
+		}
+	} else {
+		frame->inspection_raw_valid = false;
+	}
+	if (!bwobs || bwobs->num_blobs == 0)
+		return;
 	bool have_unfound_devices = false;
 	int used_blobs = 0; /* Track how many blobs were matched to devices */
 	int d;
@@ -146,7 +428,23 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 			LOGV ("Sensor %d Skipping fast analysis of device %d. No fusion slot assigned", pf->sensor_id, dev->id);
 			continue;
 		}
+		blobservation quarantined;
+		blobservation *raw = frame->bwobs;
+		rift_inspection_candidate *candidate = &pf->inspection_candidate[dev->id];
+		if ((pf->inspection_mask & (1u << dev->id)) && candidate->active) {
+			if (inspection_candidate_labels(candidate, raw, frame->inspection_epoch, frame->inspection_tracks, dev->id, &quarantined)) {
+				frame->bwobs = bwobs = &quarantined;
+				frame->quarantined_observation = true;
+			} else {
+				candidate->active = false;
+			}
+		}
 		rift_pose_finder_exp_info_to_dev_state (pf, exp_dev_info, dev_state);
+		if (pf->inspection_pose_mask & pf->inspection_mask & (1u << dev->id))
+			oposef_apply_inverse(&exp_dev_info->capture_pose, &pf->inspection_poses[dev->id], &dev_state->capture_cam_pose);
+
+		if (frame->quarantined_observation)
+			oposef_apply_inverse(&exp_dev_info->capture_pose, &candidate->world_from_cam, &dev_state->capture_cam_pose);
 
 		/* Start from the capture_cam_pose */
 		posef obj_cam_pose = dev_state->capture_cam_pose;
@@ -203,11 +501,15 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 					dev->id, dev->leds->points, dev->leds->num_points, pf->calib,
 					&obj_cam_pose, NULL, NULL, true);
 
-				rift_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose,
-					true, &dev_state->capture_cam_pose, &dev_state->obj_cam_pos_error, &dev_state->obj_cam_rot_error,
-					bwobs->blobs, bwobs->num_blobs,
-					dev->id, dev->leds, pf->calib,
-					NULL);
+				if (pf->inspection_mask & (1u << dev->id))
+					rift_evaluate_pose(&dev_state->score, &obj_cam_pose,
+						bwobs->blobs, bwobs->num_blobs, dev->id, dev->leds, pf->calib, NULL);
+				else
+					rift_evaluate_pose_with_prior(&dev_state->score, &obj_cam_pose,
+						true, &dev_state->capture_cam_pose, &dev_state->obj_cam_pos_error, &dev_state->obj_cam_rot_error,
+						bwobs->blobs, bwobs->num_blobs,
+						dev->id, dev->leds, pf->calib,
+						NULL);
 
 				if (POSE_HAS_FLAGS(&dev_state->score, RIFT_POSE_MATCH_GOOD)) {
 					LOGD("Sensor %d re-acquired match for device %d matched %u blobs of %u - quat %f %f %f %f pos %f %f %f",
@@ -242,7 +544,19 @@ void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf,
 			used_blobs += update_device_and_blobs (pf, frame, dev, dev_state, exp_dev_info, &obj_cam_pose);
 		}
 
-		if (!dev_state->found_device_pose && !(skip_mask & (1u << dev->id)))
+		if (frame->quarantined_observation) {
+			if (dev_state->found_device_pose) {
+				candidate->labels = quarantined;
+				memcpy(candidate->tracks, frame->inspection_tracks, sizeof candidate->tracks);
+			}
+			else candidate->active = false;
+			frame->bwobs = bwobs = raw;
+			frame->quarantined_observation = false;
+		}
+
+		if (!dev_state->found_device_pose &&
+		    (!pf->inspection_mask || (pf->inspection_mask & (1u << dev->id))) &&
+		    (!(skip_mask & (1u << dev->id)) || (pf->inspection_mask & (1u << dev->id))))
 			have_unfound_devices = true;
 	}
 
@@ -291,6 +605,8 @@ void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analy
 	for (pass = 0; pass < 2; pass++) {
 		/* Only process the devices that were available when this frame was captured */
 		for (d = 0; d < frame->n_devices; d++) {
+			if (correspondence_search_should_stop(pf->cs))
+				return;
 			rift_tracked_device *dev = devs[d];
 			rift_sensor_frame_device_state *dev_state = frame->capture_state + d;
 			rift_tracked_device_exposure_info *exp_dev_info = exposure_info->devices + d;
@@ -300,9 +616,12 @@ void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analy
 
 			if (dev_state->found_device_pose)
 				continue; /* We already found a pose for this device */
+			if (pf->inspection_mask && !(pf->inspection_mask & (1u << dev->id)))
+				continue;
 			/* held by cv1touch's tracker, or asleep; but a sensor with no pose yet labels blobs only
 			 * here (calibrate place), so it searches for every device */
-			if (pf->have_camera_pose && (skip_mask & (1u << dev->id)))
+			if (pf->have_camera_pose && (skip_mask & (1u << dev->id)) &&
+			    !(pf->inspection_mask & (1u << dev->id)))
 				continue;
 
 			LOGV("*** Starting long search for device %d pass %d", dev->id, pass);
@@ -332,7 +651,7 @@ void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analy
 
 			/* If the gravity vector error standard deviation is small enough, try for an
 			 * aligned pose from the prior, within 2 standard deviation */
-			if (pf->have_camera_pose) {
+			if (pf->have_camera_pose && !(pf->inspection_mask & (1u << dev->id))) {
 				if (dev_state->gravity_error_rad < DEG_TO_RAD(30)) {
 					search_flags |= CS_FLAG_MATCH_GRAVITY;
 					do_aligned_checks = true;
@@ -383,6 +702,9 @@ void rift_pose_finder_process_blobs_long(rift_pose_finder *pf, rift_sensor_analy
 				LOGD("No aligned pose for device %d with tolerance %f deg", d, RAD_TO_DEG(pose_tolerance));
 			}
 
+			if (correspondence_search_should_stop(pf->cs))
+				return;
+
 			LOGV("Sensor %d Frame %d - doing long search with flags 0x%x for device %d match_flags 0x%x matched %u blobs of %u from %d (%s match)",
 				pf->sensor_id, frame->id, search_flags, dev->id, dev_state->score.match_flags,
 				dev_state->score.matched_blobs, dev_state->score.visible_leds, bwobs->num_blobs,
@@ -410,6 +732,11 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 {
 	blobservation* bwobs = frame->bwobs;
 	int ret = 0;
+	bool preserve_labels = (pf->inspection_mask & (1u << dev->id)) && !frame->detached_observation &&
+		!frame->quarantined_observation;
+	int previous_labels[MAX_BLOBS_PER_FRAME];
+	if (preserve_labels)
+		for (int b = 0; b < bwobs->num_blobs; b++) previous_labels[b] = bwobs->blobs[b].led_id;
 
 	/* Clear existing blob IDs for this device, then
 	 * back project LED ids into blobs if we find them and the dot product
@@ -438,7 +765,7 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	posef pose = dev_state->final_cam_pose;
 	rift_pose_metrics *score = &dev_state->score;
 
-	if (pf->have_camera_pose) {
+	if (pf->have_camera_pose && !(pf->inspection_mask & (1u << dev->id))) {
 		rift_evaluate_pose_with_prior(&dev_state->score, &pose,
 			false, &dev_state->capture_cam_pose, &dev_state->obj_cam_pos_error, &dev_state->obj_cam_rot_error,
 			frame->bwobs->blobs, frame->bwobs->num_blobs,
@@ -452,7 +779,10 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	if (!POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_GOOD)) {
 		LOGV("Sensor %d Failed pose match for dev %d with match_flags 0x%x - only %u LEDs matched %u visible ones",
 			pf->sensor_id, dev->id, score->match_flags, score->matched_blobs, score->visible_leds);
-		rift_clear_blob_labels (bwobs->blobs, bwobs->num_blobs, dev->id);
+		if (preserve_labels)
+			for (int b = 0; b < bwobs->num_blobs; b++) bwobs->blobs[b].led_id = previous_labels[b];
+		else
+			rift_clear_blob_labels (bwobs->blobs, bwobs->num_blobs, dev->id);
 		return 0;
 	}
 
@@ -520,6 +850,12 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	if (pf->pose_cb (pf->pose_cb_data, dev, frame, &pose, score)) {
 		dev_state->found_device_pose = true;
 		ret = score->matched_blobs;
+	} else if (pf->inspection_mask & (1u << dev->id)) {
+		/* The identity check consumed this exposure: a cold search of it, on the long path
+		 * or after this fast match, could only be discarded as stale. */
+		dev_state->found_device_pose = true;
+		if (preserve_labels)
+			for (int b = 0; b < bwobs->num_blobs; b++) bwobs->blobs[b].led_id = previous_labels[b];
 	}
 
 	return ret;
