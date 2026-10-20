@@ -3832,12 +3832,158 @@ fn random_u64() -> u64 {
         .unwrap_or_else(shm::now_ns)
 }
 
+#[derive(Clone)]
+struct ControlEndpoints {
+    runtime: PathBuf,
+    #[cfg(unix)]
+    container: Option<PathBuf>,
+}
+
+impl ControlEndpoints {
+    fn remove(&self) {
+        let _ = fs::remove_file(&self.runtime);
+        #[cfg(unix)]
+        if let Some(path) = &self.container {
+            if let Err(e) = ipc::unlink_private_socket(path) {
+                log(format!("removing control socket {}: {e}", path.display()));
+            }
+        }
+    }
+}
+
+/// How often the startup wait looks at the recording header, so tracking starts within this of
+/// the header being written rather than a whole heartbeat interval later.
+const STARTUP_POLL: Duration = Duration::from_millis(10);
+/// How often the startup wait refreshes the heartbeat the driver reads.
+const STARTUP_HEARTBEAT: Duration = Duration::from_millis(200);
+
+/// Keep control and the heartbeat available before opening hardware, even if startup storage
+/// never responds. A header failure is fatal, including one a client has already acknowledged.
+fn wait_for_recording_start(
+    d: &Daemon,
+    starting: &mut Option<recorder::Starting>,
+    mut shutdown: impl FnMut(Duration) -> Option<String>,
+) -> Result<bool, String> {
+    let mut last_heartbeat: Option<std::time::Instant> = None;
+    loop {
+        let Some(pending) = starting.as_ref() else {
+            return Ok(true);
+        };
+        if let Some(result) = pending.poll() {
+            if result.is_ok() && !d.stop_requested.load(Ordering::Acquire) {
+                *starting = None;
+                return Ok(true);
+            }
+            return result.map(|()| false);
+        }
+        if last_heartbeat.is_none_or(|at| at.elapsed() >= STARTUP_HEARTBEAT) {
+            d.shm.heartbeat(shm::now_ns());
+            last_heartbeat = Some(std::time::Instant::now());
+        }
+        let why = shutdown(STARTUP_POLL);
+        if why.is_some() || d.stop_requested.load(Ordering::Acquire) {
+            // Cleanup owns the pending outcome after a shutdown request, including if another
+            // client acknowledges and replaces this session before the final storage wait.
+            log(format!(
+                "{}: shutting down",
+                why.as_deref().unwrap_or("asked to stop")
+            ));
+            return Ok(false);
+        }
+    }
+}
+
+/// Reserve before serving, then keep control available while the initial header is pending.
+/// This owns the startup exit path too: main cannot accidentally ignore a fatal header result.
+fn serve_with_startup_recording(
+    d: Arc<Daemon>,
+    listeners: Vec<ipc::Listener>,
+    endpoints: &ControlEndpoints,
+    start: impl FnOnce(&Recorder) -> Result<Option<recorder::Starting>, String>,
+    shutdown: impl FnMut(Duration) -> Option<String>,
+) -> ControlServer {
+    let recording = start(&d.rec);
+    if let Err(error) = &recording {
+        log(error); // Reservation/thread-creation failures have no writer to report them.
+    }
+    let control = serve_control(Arc::clone(&d), listeners);
+    let mut starting = None;
+    let ready = recording.and_then(|recording| {
+        starting = recording;
+        wait_for_recording_start(&d, &mut starting, shutdown)
+    });
+    if ready != Ok(true) {
+        daemon_log::exit(finish_recording_startup(
+            &d,
+            &control,
+            endpoints,
+            starting.as_ref(),
+            ready.err(),
+        ));
+    }
+    control
+}
+
+/// No engine threads exist yet. Retire explicitly: control threads still own the daemon, and
+/// process exit cannot wait for a file that may be blocked even while closing after an error.
+fn finish_recording_startup(
+    d: &Daemon,
+    control: &ControlServer,
+    endpoints: &ControlEndpoints,
+    starting: Option<&recorder::Starting>,
+    error: Option<String>,
+) -> i32 {
+    let _no_more_requests = control.stop();
+    d.quit.store(true, Ordering::Release);
+    let status = d
+        .rec
+        .stop_timeout(None, RECORD_SHUTDOWN_WAIT)
+        .unwrap_or_else(|| d.rec.status());
+    // A pending header can fail during the final drain, including before a blocked close.
+    // Retain its separate outcome and inspect the drain for later write or sync errors too.
+    let late_error = starting
+        .and_then(recorder::Starting::poll)
+        .and_then(Result::err);
+    let final_error = starting
+        .and_then(recorder::Starting::final_status)
+        .and_then(|status| status.error);
+    let error = error.or(late_error).or(final_error);
+    if status.path.is_some() && !status.finished {
+        log("startup recording is still waiting for storage; file may be incomplete");
+    }
+    endpoints.remove();
+    d.shm.retire();
+    log("stopped");
+    i32::from(error.is_some() || status.error.is_some())
+}
+
 fn finish_recording_shutdown(rec: &Recorder) {
     if let Some(status) = rec.stop_timeout(None, RECORD_SHUTDOWN_WAIT) {
         if !status.finished {
             log("recording is still waiting for storage; file may be incomplete");
         }
     }
+}
+
+fn log_running(
+    d: &Daemon,
+    shm_name: &str,
+    socket: &Path,
+    emit: impl FnOnce(std::fmt::Arguments<'_>),
+) {
+    // Control already serves status; do not nest its configuration locks or log with them held.
+    let mode = d.mode.lock().unwrap().clone();
+    let (hmd_leds_off, ignore_sensors) = {
+        let opts = d.opts.lock().unwrap();
+        (opts.hmd_leds_off, opts.ignore_sensors.clone())
+    };
+    emit(format_args!(
+        "running: shm {shm_name}, control {}, {} mode, hmd leds {}, ignoring sensors {:?}",
+        socket.display(),
+        mode,
+        if hmd_leds_off { "off" } else { "on" },
+        ignore_sensors
+    ));
 }
 
 fn main() {
@@ -4031,12 +4177,6 @@ fn main() {
         start_prediction(&settings),
     ));
     let rec = Recorder::with_diagnostics(RECORDER_RING_BYTES, |message| log(message));
-    if let Some(path) = &record {
-        if let Err(e) = rec.start(path, shm::now_ns()) {
-            log(e);
-            daemon_log::exit(1);
-        }
-    }
     // a stale socket goes (the lock guarantees no live owner); private to this user
     let listener = ipc::Listener::bind(&sock_path).unwrap_or_else(|e| {
         log!("control socket {}: {e}", sock_path.display());
@@ -4109,6 +4249,24 @@ fn main() {
         inject: Injection::default(),
         inputs: Mutex::new(inputs),
     });
+    let endpoints = ControlEndpoints {
+        runtime: sock_path.clone(),
+        #[cfg(unix)]
+        container: container_socket,
+    };
+    let control = serve_with_startup_recording(
+        Arc::clone(&d),
+        listeners,
+        &endpoints,
+        |rec| {
+            record
+                .as_deref()
+                .map(|path| rec.start_in_background(path, shm::now_ns()))
+                .transpose()
+        },
+        |within| shutdown.wait(within),
+    );
+
     let dropout_writer = match flight_writer::Writer::start(platform::dirs::get().state, log) {
         Ok(writer) => Some(writer),
         Err(e) => {
@@ -4134,19 +4292,8 @@ fn main() {
             .spawn(move || universe_watch(d))
             .expect("universe thread")
     };
-    log!(
-        "running: shm {shm_name}, control {}, {} mode, hmd leds {}, ignoring sensors {:?}",
-        sock_path.display(),
-        d.mode.lock().unwrap(),
-        if d.opts.lock().unwrap().hmd_leds_off {
-            "off"
-        } else {
-            "on"
-        },
-        d.opts.lock().unwrap().ignore_sensors
-    );
+    log_running(&d, &shm_name, &sock_path, daemon_log::line);
 
-    let control = serve_control(Arc::clone(&d), listeners);
     loop {
         exit_on_worker_failure(&d.failed_worker, &d.shm);
         // the daemon's liveness for the driver: opening the engine (the radio wait) blocks the
@@ -4170,13 +4317,7 @@ fn main() {
     let _ = engine_thread.join();
     let _ = universe_thread.join();
     finish_recording_shutdown(&d.rec);
-    let _ = fs::remove_file(&sock_path);
-    #[cfg(unix)]
-    if let Some(path) = container_socket {
-        if let Err(e) = ipc::unlink_private_socket(&path) {
-            log!("removing control socket {}: {e}", path.display());
-        }
-    }
+    endpoints.remove();
     // the control threads still hold `d`, so retire the segment here rather than on its drop
     d.shm.retire();
     log!("stopped");
@@ -6709,6 +6850,104 @@ mod tests {
     }
 
     #[test]
+    fn startup_recording_failure_finishes_when_stderr_is_closed() {
+        const CHILD: &str = "CV1TOUCH_TEST_RECORD_CLOSED_STDERR";
+        if let Some(gate) = std::env::var_os(CHILD) {
+            let _logging = daemon_log::init().unwrap();
+            let gate = PathBuf::from(gate);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !gate.exists() {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            for panicking in [false, true] {
+                let mut d = status_daemon();
+                if panicking {
+                    d.rec = Recorder::with_diagnostics(4096, |message| {
+                        log(message);
+                        panic!("test diagnostic failed");
+                    });
+                }
+                let starting = d
+                    .rec
+                    .start_in_background_with(&gate.with_extension("rec"), 1, || {
+                        Err(io::Error::other(
+                            "test recording open failed with closed stderr",
+                        ))
+                    })
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let outcome = loop {
+                    if let Some(outcome) = starting.poll() {
+                        break outcome;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let status = d
+                    .rec
+                    .stop_timeout(None, Duration::from_millis(100))
+                    .unwrap();
+                println!("finished={} outcome={outcome:?}", status.finished);
+                assert!(
+                    status.finished,
+                    "a diagnostic failure left the recording unfinished"
+                );
+                assert!(outcome
+                    .unwrap_err()
+                    .contains("test recording open failed with closed stderr"));
+                assert_eq!(status.stats.write_errors, 1);
+            }
+            return;
+        }
+        let gate = std::env::temp_dir().join(format!(
+            "cv1t-rec-stderr-{}-{}",
+            std::process::id(),
+            shm::now_ns()
+        ));
+        let mut child = process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::startup_recording_failure_finishes_when_stderr_is_closed",
+                "--nocapture",
+            ])
+            .env(CHILD, &gate)
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Gate the failure until the pipe reader is closed, rather than racing process startup.
+        drop(child.stderr.take());
+        fs::write(&gate, b"closed").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let timely = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        fs::remove_file(gate).unwrap();
+        assert!(timely, "recording did not finish with closed stderr");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .matches("finished=true")
+                .count(),
+            2,
+            "the ordinary and panicking diagnostic sinks must both finish"
+        );
+    }
+
+    #[test]
     fn a_dispatched_recording_is_reserved_before_shutdown_can_pass_it() {
         let d = Arc::new(status_daemon());
         let fixture = socket_dir::SocketDir::new();
@@ -6896,6 +7135,640 @@ mod tests {
                 assert!(diagnostics[0].contains("file may be incomplete"), "{text}");
             }
         }
+    }
+
+    struct BlockedCloseSink {
+        inner: FailedSink,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Write for BlockedCloseSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl recorder::RecordingSink for BlockedCloseSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            self.inner.sync_all()
+        }
+        fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+            self.inner.disk_space()
+        }
+    }
+    impl Drop for BlockedCloseSink {
+        fn drop(&mut self) {
+            let _ = self.release.recv();
+        }
+    }
+
+    fn startup_test_listeners(dir: &std::path::Path) -> (Vec<ipc::Listener>, ControlEndpoints) {
+        let runtime = dir.join("control.sock");
+        let listeners = vec![ipc::Listener::bind(&runtime).unwrap()];
+        #[cfg(unix)]
+        let (listeners, container) =
+            with_container_control(listeners, &dir.join("container/control.sock"));
+        #[cfg(unix)]
+        assert!(container.is_some());
+        (
+            listeners,
+            ControlEndpoints {
+                runtime,
+                #[cfg(unix)]
+                container,
+            },
+        )
+    }
+
+    /// Production startup serves status while its reserved open/header waits, and refuses a
+    /// second start. No engine or USB device is opened by this orchestration.
+    #[test]
+    fn a_blocked_startup_recording_open_or_header_leaves_control_available() {
+        for block_header in [false, true] {
+            let d = Arc::new(status_daemon());
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let path = dir.join("capture.rec");
+            let (listeners, endpoints) = startup_test_listeners(dir);
+            let endpoint = endpoints.runtime.clone();
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let start_daemon = Arc::clone(&d);
+            let start_endpoints = endpoints.clone();
+            let creator = thread::spawn(move || {
+                serve_with_startup_recording(
+                    start_daemon,
+                    listeners,
+                    &start_endpoints,
+                    |rec| {
+                        rec.start_in_background_with(&path, 1, move || {
+                            if !block_header {
+                                let _ = entered_tx.send(());
+                                let _ = release_rx.recv();
+                                return Ok(Box::new(FailedSink {
+                                    sync: false,
+                                    header_written: false,
+                                })
+                                    as Box<dyn recorder::RecordingSink>);
+                            }
+                            Ok(Box::new(BlockedSink {
+                                entered: Some(entered_tx),
+                                release: release_rx,
+                                sync: false,
+                                header_written: false,
+                                block_header: true,
+                            })
+                                as Box<dyn recorder::RecordingSink>)
+                        })
+                        .map(Some)
+                    },
+                    |within| {
+                        thread::sleep(within);
+                        None
+                    },
+                )
+            });
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            let request =
+                |line: &str| control::request(&endpoint, line, Duration::from_millis(200));
+            let status = request("status");
+            #[cfg(unix)]
+            let container_status = control::request(
+                endpoints.container.as_ref().unwrap(),
+                "status",
+                Duration::from_millis(200),
+            );
+            let replacement =
+                request(&control::record_start_line(&dir.join("other.rec"), false).unwrap());
+            let haptic = request("haptic left 0.1 80 0.5");
+            // Release before asserting, including when a mutation puts I/O before control.
+            let _ = release.send(());
+            let server = creator.join().unwrap();
+            let value: serde_json::Value = serde_json::from_str(
+                status
+                    .expect("startup storage blocked status")
+                    .strip_prefix("ok ")
+                    .unwrap(),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            assert!(container_status.unwrap().contains("\"state\":\"starting\""));
+            assert_eq!(value["recording_status"]["state"], "starting");
+            assert_eq!(value["recording_status"]["byte_limit"], 8u64 << 30);
+            assert_eq!(replacement.unwrap(), "err already recording");
+            assert!(!dir.join("other.rec").exists());
+            assert_eq!(haptic.unwrap(), "ok");
+            assert_eq!(
+                finish_recording_startup(&d, &server, &endpoints, None, None),
+                0
+            );
+        }
+    }
+
+    /// The child calls the production startup function, which owns its fatal exit and cleanup.
+    /// An actual failed open and an injected failed header must both exit 1 and retire IPC.
+    #[test]
+    fn a_startup_recording_open_or_header_error_is_fatal_and_retires_ipc() {
+        const CHILD: &str = "CV1TOUCH_TEST_RECORD_START_ERROR";
+        if let Some(kind) = std::env::var_os(CHILD) {
+            let _logging = recording_test_logger();
+            let dir = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_RECORD_START_DIR").unwrap());
+            let d = Arc::new(status_daemon());
+            fs::write(dir.join("shm-name"), d.shm.name()).unwrap();
+            let (listeners, endpoints) = startup_test_listeners(&dir);
+            let path = dir.join("missing").join("capture.rec");
+            let _server = serve_with_startup_recording(
+                d,
+                listeners,
+                &endpoints,
+                |rec| {
+                    if kind == "open" {
+                        rec.start_in_background(&path, 1)
+                    } else {
+                        rec.start_in_background_with(&path, 1, || {
+                            Ok(Box::new(FailedSink {
+                                sync: false,
+                                header_written: true,
+                            }))
+                        })
+                    }
+                    .map(Some)
+                },
+                |within| {
+                    thread::sleep(within);
+                    None
+                },
+            );
+            panic!("production startup accepted a fatal recording error");
+        }
+        for kind in ["open", "header"] {
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let mut child = process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::a_startup_recording_open_or_header_error_is_fatal_and_retires_ipc",
+                    "--nocapture",
+                ])
+                .env(CHILD, kind)
+                .env("CV1TOUCH_TEST_RECORD_START_DIR", dir)
+                .stdout(process::Stdio::piped())
+                .stderr(process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let timely = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let name = fs::read_to_string(dir.join("shm-name")).unwrap();
+            #[cfg(unix)]
+            assert!(
+                !dir.join("container/control.sock").exists(),
+                "startup left its private socket behind"
+            );
+            assert!(
+                !dir.join("control.sock").exists(),
+                "startup left its socket behind"
+            );
+            assert!(
+                shm::ShmReader::open(&name).is_err(),
+                "startup left shared memory live"
+            );
+            assert!(
+                timely,
+                "startup did not report its failure promptly: {text}"
+            );
+            assert_eq!(output.status.code(), Some(1), "{text}");
+            let diagnostics: Vec<_> = text
+                .lines()
+                .filter(|line| {
+                    line.contains("recording failed:")
+                        || line.starts_with("cv1touchd: open ")
+                        || line.starts_with("cv1touchd: write ")
+                })
+                .collect();
+            assert_eq!(diagnostics.len(), 1, "duplicate startup error: {text}");
+            assert!(
+                diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                "writer must own its diagnostic: {text}"
+            );
+            assert!(
+                text.contains(if kind == "open" { "open " } else { "write " }),
+                "{text}"
+            );
+            if kind == "header" {
+                assert!(text.contains("test storage write failed"), "{text}");
+            }
+        }
+    }
+
+    /// Open is released only after production cleanup has requested the recorder drain.
+    /// Its final storage wait must retain header errors, inspect sync failures and report a
+    /// still-blocked open, while allowing a successful drain to exit cleanly.
+    #[test]
+    fn startup_recording_cleanup_reports_its_final_storage_outcome() {
+        const CHILD: &str = "CV1TOUCH_TEST_RECORD_CLEANUP";
+        if let Some(kind) = std::env::var_os(CHILD) {
+            let _logging = recording_test_logger();
+            let dir = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_RECORD_CLEANUP_DIR").unwrap());
+            let d = Arc::new(status_daemon());
+            fs::write(dir.join("shm-name"), d.shm.name()).unwrap();
+            let (listeners, endpoints) = startup_test_listeners(&dir);
+            let path = dir.join("capture.rec");
+            let (hold_open, released) = std::sync::mpsc::channel::<()>();
+            let opening_daemon = Arc::clone(&d);
+            let stopping_daemon = Arc::clone(&d);
+            let replacing =
+                kind == "replaced" || kind == "sync-replaced" || kind == "replacement-sync";
+            let replacement_sync = kind == "replacement-sync";
+            let replacement = dir.join("replacement.rec");
+            let replacement_marker = dir.join("replacement-installed");
+            let _server = serve_with_startup_recording(
+                d,
+                listeners,
+                &endpoints,
+                |rec| {
+                    rec.start_in_background_with(&path, 1, move || {
+                        if kind == "sync-replaced" || kind == "replacement-sync" {
+                            let _ = released.recv();
+                            return Ok(Box::new(FailedSink {
+                                sync: kind == "sync-replaced",
+                                header_written: false,
+                            })
+                                as Box<dyn recorder::RecordingSink>);
+                        }
+                        if kind == "pending" || kind == "replaced" {
+                            let _ = released.recv();
+                        }
+                        if kind == "replaced" {
+                            return Err(io::Error::other(
+                                "test startup open failed before replacement",
+                            ));
+                        }
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while !opening_daemon.quit.load(Ordering::Acquire)
+                            || opening_daemon.rec.status().state != recorder::State::Finishing
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "cleanup never requested a drain"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        fs::write(dir.join("cleanup-wait-reached"), b"yes").unwrap();
+                        if kind == "open" {
+                            return Err(io::Error::other(
+                                "test startup open failed during cleanup",
+                            ));
+                        }
+                        if kind == "header-close" {
+                            return Ok(Box::new(BlockedCloseSink {
+                                inner: FailedSink {
+                                    sync: false,
+                                    header_written: true,
+                                },
+                                release: released,
+                            })
+                                as Box<dyn recorder::RecordingSink>);
+                        }
+                        Ok(Box::new(FailedSink {
+                            sync: kind == "sync",
+                            header_written: kind == "header",
+                        })
+                            as Box<dyn recorder::RecordingSink>)
+                    })
+                    .map(Some)
+                },
+                |_| {
+                    if replacing {
+                        if stopping_daemon.rec.status().state == recorder::State::Starting {
+                            hold_open.send(()).unwrap();
+                            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                            while stopping_daemon.rec.status().state == recorder::State::Starting {
+                                assert!(std::time::Instant::now() < deadline);
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            stopping_daemon.rec.request_stop(None);
+                        } else {
+                            stopping_daemon.rec.request_stop(None);
+                        }
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while !stopping_daemon.rec.status().finished {
+                            assert!(std::time::Instant::now() < deadline);
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        let original = stopping_daemon
+                            .rec
+                            .stop_timeout(None, Duration::from_secs(2))
+                            .unwrap();
+                        assert_eq!(original.error.is_none(), replacement_sync);
+                        stopping_daemon
+                            .rec
+                            .start_with_sink(
+                                &replacement,
+                                2,
+                                false,
+                                Box::new(FailedSink {
+                                    sync: replacement_sync,
+                                    header_written: false,
+                                }),
+                            )
+                            .unwrap();
+                        assert!(stopping_daemon.rec.status().error.is_none());
+                        fs::write(&replacement_marker, b"yes").unwrap();
+                    }
+                    Some("test shutdown request".into())
+                },
+            );
+            drop(hold_open);
+            panic!("production startup returned after a shutdown request");
+        }
+        for (kind, expected_code, message) in [
+            ("open", 1, "test startup open failed during cleanup"),
+            ("header", 1, "test storage write failed"),
+            ("header-close", 1, "test storage write failed"),
+            ("replaced", 1, "test startup open failed before replacement"),
+            ("sync-replaced", 1, "test storage sync failed"),
+            ("replacement-sync", 1, "test storage sync failed"),
+            ("sync", 1, "test storage sync failed"),
+            (
+                "pending",
+                0,
+                "startup recording is still waiting for storage; file may be incomplete",
+            ),
+            ("complete", 0, "cv1touchd: stopped"),
+        ] {
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let mut child = process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::startup_recording_cleanup_reports_its_final_storage_outcome",
+                    "--nocapture",
+                ])
+                .env(CHILD, kind)
+                .env("CV1TOUCH_TEST_RECORD_CLEANUP_DIR", dir)
+                .stdout(process::Stdio::piped())
+                .stderr(process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let timely = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let name = fs::read_to_string(dir.join("shm-name")).unwrap();
+            #[cfg(unix)]
+            assert!(
+                !dir.join("container/control.sock").exists(),
+                "startup left its private socket behind"
+            );
+            assert!(
+                timely,
+                "startup cleanup did not finish promptly for {kind}: {text}"
+            );
+            assert!(
+                !dir.join("control.sock").exists(),
+                "startup cleanup left its socket behind"
+            );
+            assert!(
+                shm::ShmReader::open(&name).is_err(),
+                "startup cleanup left shared memory live"
+            );
+            if kind == "replaced" || kind == "sync-replaced" || kind == "replacement-sync" {
+                assert!(
+                    dir.join("replacement-installed").exists(),
+                    "failed session was not replaced: {text}"
+                );
+            } else if kind != "pending" {
+                assert!(
+                    dir.join("cleanup-wait-reached").exists(),
+                    "open did not wait for cleanup: {text}"
+                );
+            }
+            assert_eq!(output.status.code(), Some(expected_code), "{kind}: {text}");
+            let diagnostics: Vec<_> = text.lines().filter(|line| line.contains(message)).collect();
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "{kind}: expected one diagnostic: {text}"
+            );
+            if expected_code == 1 {
+                assert!(
+                    diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                    "{kind}: writer must report before close: {text}"
+                );
+            }
+            if kind == "complete" {
+                assert!(
+                    !text.contains("file may be incomplete") && !text.contains("recording failed"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_startup_error_queued_during_the_shutdown_wait_remains_fatal() {
+        for signal in [false, true] {
+            let d = Arc::new(status_daemon());
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let (listeners, endpoints) = startup_test_listeners(dir);
+            let control = serve_control(Arc::clone(&d), listeners);
+            let (fail, fail_rx) = std::sync::mpsc::channel();
+            let starting = d
+                .rec
+                .start_in_background_with(
+                    &std::env::temp_dir().join("cv1t-startup-race.rec"),
+                    1,
+                    move || {
+                        let _ = fail_rx.recv();
+                        Err(io::Error::other("test startup open failed during shutdown"))
+                    },
+                )
+                .unwrap();
+            let mut starting = Some(starting);
+            let mut fail = Some(fail);
+            let result = wait_for_recording_start(&d, &mut starting, |_| {
+                fail.take().unwrap().send(()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !d.rec.status().finished {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if signal {
+                    Some("test shutdown request".into())
+                } else {
+                    d.stop_requested.store(true, Ordering::Release);
+                    None
+                }
+            });
+            assert!(!result.unwrap());
+            assert!(starting.is_some(), "shutdown dropped its startup outcome");
+            assert_eq!(
+                finish_recording_startup(&d, &control, &endpoints, starting.as_ref(), None),
+                1
+            );
+            assert!(!endpoints.runtime.exists());
+            #[cfg(unix)]
+            assert!(!endpoints.container.as_ref().unwrap().exists());
+        }
+    }
+
+    /// Hardware opens only after the startup header lands, so the wait must notice the header
+    /// within a short poll, not after sleeping out a whole heartbeat interval.
+    #[test]
+    fn tracking_starts_within_one_poll_of_the_startup_header() {
+        let d = Arc::new(status_daemon());
+        let path = std::env::temp_dir().join("cv1t-startup-poll.rec");
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let (_unused, unused_rx) = std::sync::mpsc::channel::<()>();
+        let mut starting = Some(
+            d.rec
+                .start_in_background_with(&path, 1, move || {
+                    // Dropping the test's sender also releases the open on assertion failure.
+                    let _ = release_rx.recv();
+                    Ok(Box::new(BlockedSink {
+                        entered: None,
+                        release: unused_rx,
+                        sync: false,
+                        header_written: false,
+                        block_header: false,
+                    }) as Box<dyn recorder::RecordingSink>)
+                })
+                .unwrap(),
+        );
+        let mut waits = Vec::new();
+        let mut release = Some(release);
+        let ready = wait_for_recording_start(&d, &mut starting, |within| {
+            waits.push(within);
+            if let Some(release) = release.take() {
+                release.send(()).unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while d.rec.status().state != recorder::State::Recording {
+                assert!(std::time::Instant::now() < deadline, "no header");
+                thread::sleep(Duration::from_millis(1));
+            }
+            None
+        });
+        let _ = d.rec.stop_timeout(None, Duration::from_secs(2));
+        d.shm.retire();
+        assert_eq!(ready, Ok(true));
+        assert!(starting.is_none());
+        assert!(
+            waits
+                .iter()
+                .all(|within| *within <= Duration::from_millis(50)),
+            "waited {waits:?} for a header that was already written"
+        );
+    }
+
+    /// The running message used to hold mode while taking opts, reversing status's order.
+    /// Check at the real emission boundary before reading status, so a regression fails
+    /// immediately rather than leaving a deadlocked test thread behind.
+    #[test]
+    fn startup_logging_releases_configuration_locks_before_emitting() {
+        let d = status_daemon();
+        *d.mode.lock().unwrap() = "calibrated".into();
+        {
+            let mut opts = d.opts.lock().unwrap();
+            opts.hmd_leds_off = false;
+            opts.ignore_sensors = vec!["camera1".into(), "camera2".into()];
+        }
+        let mut emitted = false;
+        log_running(&d, "test-segment", Path::new("control.sock"), |message| {
+            emitted = true;
+            assert!(
+                d.mode.try_lock().is_ok(),
+                "startup logging still holds the mode lock"
+            );
+            assert!(
+                d.opts.try_lock().is_ok(),
+                "startup logging still holds the engine-options lock"
+            );
+            let message = message.to_string();
+            assert!(message.contains("calibrated mode, hmd leds on"));
+            assert!(message.contains("ignoring sensors [\"camera1\", \"camera2\"]"));
+            let status: serde_json::Value =
+                serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+            assert_eq!(status["mode"], "calibrated");
+            assert_eq!(
+                status["ignored_sensors"],
+                serde_json::json!(["camera1", "camera2"])
+            );
+        });
+        assert!(emitted, "startup message was not logged");
+    }
+
+    /// The driver reads the heartbeat while startup storage is still opening the file.
+    #[test]
+    fn the_heartbeat_keeps_beating_while_the_startup_header_is_pending() {
+        let d = Arc::new(status_daemon());
+        let path = std::env::temp_dir().join("cv1t-startup-beat.rec");
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let (_unused, unused_rx) = std::sync::mpsc::channel::<()>();
+        let mut starting = Some(
+            d.rec
+                .start_in_background_with(&path, 1, move || {
+                    let _ = release_rx.recv();
+                    Ok(Box::new(BlockedSink {
+                        entered: None,
+                        release: unused_rx,
+                        sync: false,
+                        header_written: false,
+                        block_header: false,
+                    }) as Box<dyn recorder::RecordingSink>)
+                })
+                .unwrap(),
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        let reader = shm::ShmReader::open(status["shm"].as_str().unwrap()).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ready = wait_for_recording_start(&d, &mut starting, |within| {
+            thread::sleep(within);
+            seen.insert(reader.heartbeat_ns());
+            (seen.len() >= 3 || std::time::Instant::now() >= deadline)
+                .then(|| "test shutdown request".to_string())
+        });
+        drop(release);
+        let _ = d.rec.stop_timeout(None, Duration::from_secs(2));
+        d.shm.retire();
+        assert_eq!(ready, Ok(false));
+        assert!(
+            seen.len() >= 3,
+            "the heartbeat changed only {} times while the header was pending",
+            seen.len()
+        );
     }
 
     struct FailedSink {

@@ -114,6 +114,10 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `tests/test_setup.py` | `SetupTests.test_pending_recording_blocks_idle_and_stages_with_other_checks_ready` | T + R + 46 = 134 | 55 |
 | `tests/test_setup.py` | `SetupTests.test_pending_recording_offers_retry_without_stage_mutations` | T + R + 46 = 134 | 55 |
 | `tests/test_setup.py` | `SetupTests.test_a_second_setup_names_the_running_guide_not_a_recording_to_stop` | T + R + 46 = 134 | 55 |
+| `src/bin/cv1touchd.rs` | `a_blocked_startup_recording_open_or_header_leaves_control_available` | T + N + 45 = 145 | 52 |
+| `src/bin/cv1touchd.rs` | `a_startup_recording_open_or_header_error_is_fatal_and_retires_ipc` | T + N + 50 = 150 | 52 |
+| `src/bin/cv1touchd.rs` | `startup_recording_cleanup_reports_its_final_storage_outcome` | T + N + 62 = 162 | 52 |
+| `src/bin/cv1touchd.rs` | `a_startup_error_queued_during_the_shutdown_wait_remains_fatal` | T + N + 42 = 142 | 52 |
 
 `test_control_client.cpp` uses its legacy/shared fixture from
 `runtime_is_tried_first_and_an_explicit_path_stays_exact`,

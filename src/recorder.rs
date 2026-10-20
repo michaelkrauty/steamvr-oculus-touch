@@ -16,7 +16,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub use crate::platform::fs::DiskSpace;
@@ -139,6 +139,36 @@ fn space_reason(available: u64, reserve: u64) -> String {
 pub trait RecordingSink: Write + Send {
     fn sync_all(&mut self) -> io::Result<()>;
     fn disk_space(&self) -> io::Result<DiskSpace>;
+}
+
+type FinalRecordingStatus = Arc<Mutex<Option<Status>>>;
+
+/// The header and final outcome of a background start, independent of later control commands.
+pub struct Starting {
+    ready: mpsc::Receiver<Result<(), String>>,
+    header: Mutex<Option<Result<(), String>>>,
+    finished: FinalRecordingStatus,
+}
+
+impl Starting {
+    pub fn poll(&self) -> Option<Result<(), String>> {
+        let mut header = self.header.lock().unwrap();
+        if header.is_none() {
+            *header = match self.ready.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "recording writer stopped before opening its file".into(),
+                )),
+            };
+        }
+        header.clone()
+    }
+
+    /// Published after close, before a stop can acknowledge and replace this session.
+    pub fn final_status(&self) -> Option<Status> {
+        self.finished.lock().unwrap().clone()
+    }
 }
 
 struct FileSink {
@@ -377,6 +407,38 @@ impl Drop for ReservedRecording<'_> {
     }
 }
 
+fn write_header(
+    shared: &Shared,
+    file: &mut dyn RecordingSink,
+    path: &Path,
+    start_host_ns: u64,
+) -> Result<(), String> {
+    let space = file
+        .disk_space()
+        .map_err(|e| format!("cannot check free disk space: {e}"))?;
+    let reserve = disk_reserve(space);
+    {
+        let mut ring = shared.ring.lock().unwrap();
+        ring.free_bytes = Some(space.available);
+        ring.reserve_bytes = Some(reserve);
+    }
+    if space.available.saturating_sub(reserve) < FILE_HEADER_LEN as u64 {
+        return Err(space_reason(space.available, reserve));
+    }
+    let mut header = [0u8; FILE_HEADER_LEN];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&(FILE_HEADER_LEN as u32).to_le_bytes());
+    header[16..24].copy_from_slice(&start_host_ns.to_le_bytes());
+    file.write_all(&header)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    let mut ring = shared.ring.lock().unwrap();
+    ring.stats.bytes = FILE_HEADER_LEN as u64;
+    ring.opening = false;
+    shared.active.store(!ring.stop, Ordering::Release);
+    Ok(())
+}
+
 // Avoid a filesystem query for each small radio batch. A fresh query also checks what other
 // disk users consumed; our own writes spend the cached allowance between those observations.
 #[derive(Default)]
@@ -590,72 +652,56 @@ impl Recorder {
         }
         let start = || -> Result<(), String> {
             let mut file = open().map_err(|e| format!("open {}: {e}", path.display()))?;
-            let space = file
-                .disk_space()
-                .map_err(|e| format!("cannot check free disk space: {e}"))?;
-            let reserve = disk_reserve(space);
-            {
-                let mut ring = self.shared.ring.lock().unwrap();
-                ring.free_bytes = Some(space.available);
-                ring.reserve_bytes = Some(reserve);
-            }
-            if space.available.saturating_sub(reserve) < FILE_HEADER_LEN as u64 {
-                return Err(space_reason(space.available, reserve));
-            }
-            let mut header = [0u8; FILE_HEADER_LEN];
-            header[..8].copy_from_slice(MAGIC);
-            header[8..12].copy_from_slice(&VERSION.to_le_bytes());
-            header[12..16].copy_from_slice(&(FILE_HEADER_LEN as u32).to_le_bytes());
-            header[16..24].copy_from_slice(&start_host_ns.to_le_bytes());
-            file.write_all(&header)
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-            {
-                let mut ring = self.shared.ring.lock().unwrap();
-                ring.stats.bytes = FILE_HEADER_LEN as u64;
-                ring.opening = false;
-                self.shared.active.store(!ring.stop, Ordering::Release);
-            }
-            let shared = Arc::clone(&self.shared);
-            let _writer = std::thread::Builder::new()
-                .name("cv1t-recorder".into())
-                .spawn(move || {
-                    // A panicking sink must not leave a session waiting forever. File close happens
-                    // before `finished`, too, and never under a ring or control lock.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        writer_main(&shared, &mut *file)
-                    }));
-                    drop(file);
-                    let mut ring = shared.ring.lock().unwrap();
-                    if result.is_err() {
-                        ring.fail("recording writer stopped unexpectedly".into());
-                    }
-                    shared.active.store(false, Ordering::Release);
-                    let note = (ring.error.is_some() || ring.reason.is_some()).then(|| {
-                        let mut status = ring.status();
-                        status.finished = true;
-                        status.message()
-                    });
-                    drop(ring);
-                    if let Some(note) = note {
-                        shared.report_diagnostic(&note);
-                    }
-                    shared.ring.lock().unwrap().finished = true;
-                    shared.cond.notify_all();
-                })
-                .map_err(|e| format!("cannot start recorder thread: {e}"))?;
-            Ok(())
+            write_header(&self.shared, &mut *file, path, start_host_ns)?;
+            self.spawn_writer(path.to_path_buf(), || Ok(file), None, None)
         };
         if let Err(error) = start() {
-            self.shared.active.store(false, Ordering::Release);
-            let mut ring = self.shared.ring.lock().unwrap();
-            ring.fail(error.clone());
-            ring.session = false;
-            ring.finished = true;
-            drop(ring);
-            self.shared.cond.notify_all();
+            self.start_failed(&error);
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Reserves the session before returning; opening and the header run on its writer.
+    /// Unlike `start`, the caller must check the returned header outcome before proceeding.
+    pub fn start_in_background(&self, path: &Path, start_host_ns: u64) -> Result<Starting, String> {
+        let file_path = path.to_path_buf();
+        self.start_in_background_with(path, start_host_ns, move || {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file_path)?;
+            Ok(Box::new(FileSink {
+                file,
+                path: file_path,
+            }))
+        })
+    }
+
+    /// Injected storage uses the same reservation, header and writer as a background file start.
+    pub fn start_in_background_with(
+        &self,
+        path: &Path,
+        start_host_ns: u64,
+        open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>> + Send + 'static,
+    ) -> Result<Starting, String> {
+        self.reserve_session(path, RECORDING_BYTES)?;
+        let (ready, result) = mpsc::channel();
+        let finished = Arc::new(Mutex::new(None));
+        if let Err(error) = self.spawn_writer(
+            path.to_path_buf(),
+            open,
+            Some((start_host_ns, ready)),
+            Some(Arc::clone(&finished)),
+        ) {
+            self.start_failed(&error);
+            return Err(error);
+        }
+        Ok(Starting {
+            ready: result,
+            header: Mutex::new(None),
+            finished,
+        })
     }
 
     fn reserve_session(&self, path: &Path, byte_limit: u64) -> Result<(), String> {
@@ -700,6 +746,84 @@ impl Recorder {
         ring.error = Some("recording start was cancelled before its file was opened".into());
         drop(ring);
         self.shared.cond.notify_all();
+    }
+
+    fn start_failed(&self, error: &str) {
+        self.shared.active.store(false, Ordering::Release);
+        let mut ring = self.shared.ring.lock().unwrap();
+        ring.fail(error.into());
+        ring.session = false;
+        ring.finished = true;
+        drop(ring);
+        self.shared.cond.notify_all();
+    }
+
+    fn spawn_writer(
+        &self,
+        path: PathBuf,
+        open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>> + Send + 'static,
+        mut starting: Option<(u64, mpsc::Sender<Result<(), String>>)>,
+        finished: Option<FinalRecordingStatus>,
+    ) -> Result<(), String> {
+        let shared = Arc::clone(&self.shared);
+        std::thread::Builder::new()
+            .name("cv1t-recorder".into())
+            .spawn(move || {
+                let mut file = None;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    file = Some(open().map_err(|e| format!("open {}: {e}", path.display()))?);
+                    let sink = file.as_deref_mut().unwrap();
+                    if let Some((start_host_ns, _)) = &starting {
+                        write_header(&shared, sink, &path, *start_host_ns)?;
+                    }
+                    if let Some((_, ready)) = starting.take() {
+                        let _ = ready.send(Ok(()));
+                    }
+                    writer_main(&shared, sink);
+                    Ok::<(), String>(())
+                }));
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some("recording writer stopped unexpectedly".into()),
+                };
+                if let Some(error) = error {
+                    shared.active.store(false, Ordering::Release);
+                    shared.ring.lock().unwrap().fail(error);
+                }
+                let failure = shared.ring.lock().unwrap().error.clone();
+                if let Some(error) = failure {
+                    // The writer owns its diagnostic, including if closing the file stalls.
+                    // Report a header failure before publishing its outcome to startup.
+                    shared.report_diagnostic(&format!("recording failed: {error}"));
+                    if let Some((_, ready)) = starting.take() {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+                // Closing also happens before `finished`, without a ring or control lock.
+                drop(file);
+                shared.active.store(false, Ordering::Release);
+                let note = {
+                    let ring = shared.ring.lock().unwrap();
+                    (ring.error.is_none() && ring.reason.is_some()).then(|| {
+                        let mut status = ring.status();
+                        status.finished = true;
+                        status.message()
+                    })
+                };
+                if let Some(note) = note {
+                    shared.report_diagnostic(&note);
+                }
+                let mut ring = shared.ring.lock().unwrap();
+                ring.finished = true;
+                if let Some(finished) = finished {
+                    *finished.lock().unwrap() = Some(ring.status());
+                }
+                drop(ring);
+                shared.cond.notify_all();
+            })
+            .map(|_| ())
+            .map_err(|e| format!("cannot start recorder thread: {e}"))
     }
 
     pub fn has_session(&self) -> bool {
@@ -1188,6 +1312,109 @@ mod tests {
         );
         assert_eq!(count, 1);
         assert!(reader.error().is_none());
+    }
+
+    #[test]
+    fn startup_final_status_survives_acknowledgement_and_replacement() {
+        struct FailedFinalSync;
+        impl Write for FailedFinalSync {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordingSink for FailedFinalSync {
+            fn sync_all(&mut self) -> io::Result<()> {
+                Err(io::Error::other("test original sync failed"))
+            }
+            fn disk_space(&self) -> io::Result<DiskSpace> {
+                Ok(DiskSpace {
+                    available: 100 << 30,
+                    capacity: 200 << 30,
+                })
+            }
+        }
+        let r = Recorder::new(4096);
+        let starting = r
+            .start_in_background_with(Path::new("unused-original.rec"), 1, || {
+                Ok(Box::new(FailedFinalSync))
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(header) = starting.poll() {
+                header.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(r
+            .stop_timeout(None, Duration::from_secs(2))
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("test original sync failed"));
+        // Completion must already be published when stop acknowledges and releases the slot.
+        assert!(starting
+            .final_status()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("test original sync failed"));
+        assert_eq!(starting.poll(), Some(Ok(())));
+        r.start_with_sink(
+            Path::new("unused-replacement.rec"),
+            2,
+            false,
+            Box::new(CountingSpace {
+                queries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                available: Arc::new(std::sync::atomic::AtomicU64::new(100 << 30)),
+            }),
+        )
+        .unwrap();
+        assert!(r.status().error.is_none());
+        assert!(starting
+            .final_status()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("test original sync failed"));
+        assert!(r
+            .stop_timeout(None, Duration::from_secs(2))
+            .unwrap()
+            .error
+            .is_none());
+    }
+
+    #[test]
+    fn a_panicking_diagnostic_keeps_the_startup_error_and_finishes() {
+        let r = Recorder::with_diagnostics(4096, |_| panic!("test diagnostic failed"));
+        let starting = r
+            .start_in_background_with(Path::new("unused.rec"), 1, || {
+                Err(io::Error::other("test recording open failed"))
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            if let Some(outcome) = starting.poll() {
+                break outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup did not report its outcome"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let status = r.stop_timeout(None, Duration::from_millis(100)).unwrap();
+        assert!(
+            status.finished,
+            "a diagnostic failure left the recording unfinished"
+        );
+        assert!(outcome.unwrap_err().contains("test recording open failed"));
+        assert_eq!(status.stats.write_errors, 1);
     }
 
     struct CountingSpace {
