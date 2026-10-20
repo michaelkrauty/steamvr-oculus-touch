@@ -387,8 +387,7 @@ impl LandmarkAlert {
 
 /// Watches the landmarks (static infrared sources such as the base stations) for a moved sensor.
 struct LandmarkWatch {
-    monitor: track::landmarks::Monitor,
-    sensors: std::collections::BTreeSet<String>,
+    monitor: track::landmarks::BackgroundMonitor,
     /// Per sensor: whether its movement has been reported, and the consecutive windows over
     /// the alert threshold.
     alerts: std::collections::BTreeMap<String, LandmarkAlert>,
@@ -401,15 +400,23 @@ impl LandmarkWatch {
         let path = track::landmarks::default_path();
         match track::landmarks::load(&path) {
             Ok(f) if !f.landmarks.is_empty() => {
-                let sensors = f.landmarks.iter().map(|l| l.serial.clone()).collect();
                 log!(
                     "watching {} landmarks from {} for moved sensors",
                     f.landmarks.len(),
                     path.display()
                 );
                 Some(LandmarkWatch {
-                    monitor: track::landmarks::Monitor::new(f.landmarks, LANDMARK_WINDOW_NS),
-                    sensors,
+                    monitor: match track::landmarks::BackgroundMonitor::new(
+                        f.landmarks,
+                        LANDMARK_WINDOW_NS,
+                        20,
+                    ) {
+                        Ok(monitor) => monitor,
+                        Err(e) => {
+                            log!("could not start the landmark worker: {e}");
+                            return None;
+                        }
+                    },
                     alerts: Default::default(),
                     missing: Default::default(),
                 })
@@ -427,37 +434,40 @@ impl LandmarkWatch {
     /// Stops watching the sensor `serial`: its landmarks were learned where it stood.
     fn forget(&mut self, d: &Daemon, serial: &str) {
         self.monitor.forget(serial);
-        self.sensors.remove(serial);
         self.alerts.remove(serial);
         self.missing.remove(serial);
         d.landmark_shifts.lock().unwrap().remove(serial);
     }
 
-    fn frame(&mut self, d: &Daemon, info: &engine::FrameInfo, blobs: &[Blob]) {
-        let serial = engine::cstr_field(&info.serial);
-        let unlabelled: Vec<nalgebra::Vector2<f64>> = blobs
-            .iter()
-            .filter(|b| b.led_id < 0)
-            .map(|b| nalgebra::Vector2::new(b.x as f64, b.y as f64))
-            .collect();
-        let Some(shifts) = self
-            .monitor
-            .frame(&serial, info.frame_start_host_ns, &unlabelled, 20)
-        else {
+    fn frame(&mut self, info: &engine::FrameInfo, blobs: &[Blob]) {
+        let bytes = info.serial.map(|c| c as u8);
+        let end = bytes.iter().position(|c| *c == 0).unwrap_or(bytes.len());
+        let Ok(serial) = std::str::from_utf8(&bytes[..end]) else {
             return;
         };
-        let mut out = d.landmark_shifts.lock().unwrap();
-        for sensor in &self.sensors {
-            let shift = shifts.iter().find(|s| &s.serial == sensor);
-            let notice = self
-                .alerts
-                .entry(sensor.clone())
-                .or_default()
-                .update(shift.map(|s| (s.shift.norm(), s.landmarks)));
+        self.monitor.frame(
+            serial,
+            info.frame_start_host_ns,
+            blobs
+                .iter()
+                .filter(|b| b.led_id < 0)
+                .map(|b| nalgebra::Vector2::new(b.x as f64, b.y as f64)),
+        );
+        // Capture timestamps can lag the radio loop. Publication uses its current
+        // clock in poll(), after overdue windows have been advanced.
+    }
+
+    fn poll(&mut self, d: &Daemon, now: u64) {
+        let alerts = &mut self.alerts;
+        let missing = &mut self.missing;
+        let receive = |sensor: &str, shift: Option<track::landmarks::Shift>| {
+            let mut out = d.landmark_shifts.lock().unwrap();
+            let alert = alerts.entry(sensor.to_owned()).or_default();
+            let notice = alert.update(shift.as_ref().map(|s| (s.shift.norm(), s.landmarks)));
             match shift {
                 Some(s) => {
-                    self.missing.remove(sensor);
-                    out.insert(sensor.clone(), (s.shift.x, s.shift.y, s.landmarks));
+                    missing.remove(sensor);
+                    out.insert(sensor.to_owned(), (s.shift.x, s.shift.y, s.landmarks));
                     match notice {
                         Some(LandmarkNotice::Moved) => log!("sensor {sensor}: its landmarks moved ({:+.2}, {:+.2}) px: it may have been knocked (cv1touch calibrate refine REC)", s.shift.x, s.shift.y),
                         Some(LandmarkNotice::Back) => log!("sensor {sensor}: landmarks back in place"),
@@ -465,13 +475,23 @@ impl LandmarkWatch {
                     }
                 }
                 None => {
-                    let n = self.missing.entry(sensor.clone()).or_default();
+                    out.remove(sensor);
+                    let n = missing.entry(sensor.to_owned()).or_default();
                     *n += 1;
                     if *n == 3 {
-                        log!("sensor {sensor}: none of its landmarks seen for 3 minutes (moved more than a pixel, or the base stations are off)");
+                        log!("sensor {sensor}: its landmarks could not be matched safely for 3 minutes (the spots may be hidden, off, or beyond this check's range)");
                     }
                 }
             }
+        };
+        // Reclaim buffers without accepting results, then invalidate overdue sequences.
+        // An older recovery must not clear an alert before a newer unknown is reported.
+        // All exchanges use try_lock; analysis never holds a lock needed by radio.
+        self.monitor.recycle();
+        self.monitor.tick(now);
+        self.monitor.poll(receive);
+        if self.monitor.take_first_fault() {
+            log!("the landmark check gave up on one window after an internal error; it carries on with the next window");
         }
     }
 }
@@ -2441,12 +2461,15 @@ fn radio_main(
         }
         if let Some((info, blobs)) = frame {
             if let Some(w) = watch.as_mut() {
-                w.frame(d, &info, &blobs);
+                w.frame(&info, &blobs);
             }
             pipe.frame(&info, &blobs);
         }
         // a hand whose controller went quiet still gets its state refreshed (it times out)
         let now = shm::now_ns();
+        if let Some(w) = watch.as_mut() {
+            w.poll(d, now);
+        }
         let mut refreshed = false;
         for h in [HAND_LEFT, HAND_RIGHT] {
             let (Some(s), Some(view)) = (newest[h], link.engine_view.lock().unwrap()[h]) else {
@@ -3903,6 +3926,227 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_superseded_unknown_window_breaks_a_pending_landmark_alert() {
+        let d = status_daemon();
+        let reference = [100.0, 500.0].map(|x| track::landmarks::Landmark {
+            serial: "A".into(),
+            x,
+            y: 300.0,
+            seen: 0.1,
+        });
+        let mut watch = LandmarkWatch {
+            monitor: track::landmarks::BackgroundMonitor::new(
+                reference.into(),
+                LANDMARK_WINDOW_NS,
+                20,
+            )
+            .unwrap(),
+            alerts: Default::default(),
+            missing: Default::default(),
+        };
+        for (window, shift) in [0.7, 0.0, 0.9, 1.1].into_iter().enumerate() {
+            let window = window as u64;
+            if window != 1 {
+                for k in 0..100 {
+                    watch.monitor.frame(
+                        "A",
+                        1 + window * LANDMARK_WINDOW_NS + k * LANDMARK_WINDOW_NS / 100,
+                        [
+                            nalgebra::Vector2::new(100.0 + shift, 300.0),
+                            nalgebra::Vector2::new(500.0 + shift, 300.0),
+                        ],
+                    );
+                }
+            }
+            let now = 1 + (window + 1) * LANDMARK_WINDOW_NS;
+            if window == 2 {
+                // Production ordering must supersede the held unknown before accepting
+                // this movement, even if the worker completes it immediately.
+                watch.poll(&d, now);
+            } else {
+                watch.monitor.tick(now);
+            }
+            // Gate publication after the real worker finishes. The second window has
+            // no samples: hold its unknown until the following window is overdue.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            if window == 2 {
+                while !d
+                    .landmark_shifts
+                    .lock()
+                    .unwrap()
+                    .get("A")
+                    .is_some_and(|s| (s.0 - 0.9).abs() < 1e-8)
+                {
+                    watch.poll(&d, now);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "landmark worker timed out"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                while watch.monitor.recycle() == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "landmark worker timed out"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if window == 1 {
+                assert_eq!(watch.alerts["A"].over, 1);
+                assert!(!watch.missing.contains_key("A"));
+                assert!(d.landmark_shifts.lock().unwrap().contains_key("A"));
+                continue;
+            }
+            watch.poll(&d, now);
+            if window < 3 {
+                assert!(
+                    watch.alerts["A"].active.is_none(),
+                    "a movement alert crossed the unpublished unknown window"
+                );
+                assert_eq!(watch.alerts["A"].over, 1);
+            } else {
+                assert!(watch.alerts["A"].active.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn an_overdue_unknown_window_prevents_a_delayed_recovery() {
+        for delayed_frame in [false, true] {
+            let d = status_daemon();
+            let reference = [100.0, 500.0].map(|x| track::landmarks::Landmark {
+                serial: "A".into(),
+                x,
+                y: 300.0,
+                seen: 0.1,
+            });
+            let mut watch = LandmarkWatch {
+                monitor: track::landmarks::BackgroundMonitor::new(
+                    reference.into(),
+                    LANDMARK_WINDOW_NS,
+                    20,
+                )
+                .unwrap(),
+                alerts: Default::default(),
+                missing: Default::default(),
+            };
+            let alert = watch.alerts.entry("A".into()).or_default();
+            alert.update(Some((1.2, 2)));
+            alert.update(Some((1.2, 2)));
+            d.landmark_shifts
+                .lock()
+                .unwrap()
+                .insert("A".into(), (1.2, 0.0, 2));
+            for k in 0..100 {
+                watch.monitor.frame(
+                    "A",
+                    1 + k * LANDMARK_WINDOW_NS / 100,
+                    [
+                        nalgebra::Vector2::new(100.0, 300.0),
+                        nalgebra::Vector2::new(500.0, 300.0),
+                    ],
+                );
+            }
+            watch.monitor.tick(1 + LANDMARK_WINDOW_NS);
+            // Hold a completed zero-shift result without publishing it. This reclaims the
+            // buffer only; LandmarkWatch's production poll controls result acceptance.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while watch.monitor.recycle() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "landmark worker timed out"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The following window exceeds the documented 65,536-sample capacity.
+            watch.monitor.frame(
+                "A",
+                2 + LANDMARK_WINDOW_NS,
+                std::iter::repeat_n(nalgebra::Vector2::new(100.0, 300.0), 65_537),
+            );
+            if delayed_frame {
+                let mut info = engine::FrameInfo::default();
+                info.serial[0] = b'A' as _;
+                info.frame_start_host_ns = 2 + LANDMARK_WINDOW_NS;
+                watch.frame(&info, &[]);
+                assert!(
+                    watch.alerts["A"].active.is_some(),
+                    "a delayed frame used its old timestamp to publish a recovery"
+                );
+            }
+            watch.poll(&d, 1 + 2 * LANDMARK_WINDOW_NS);
+            assert!(!d.landmark_shifts.lock().unwrap().contains_key("A"));
+            assert!(
+                watch.alerts["A"].active.is_some(),
+                "stale recovery cleared the alert before the overdue unknown window"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_landmark_matches_clear_status_without_clearing_an_alert() {
+        let d = status_daemon();
+        let reference = track::landmarks::Landmark {
+            serial: "A".into(),
+            x: 100.0,
+            y: 300.0,
+            seen: 0.1,
+        };
+        let mut watch = LandmarkWatch {
+            monitor: track::landmarks::BackgroundMonitor::new(
+                vec![reference],
+                LANDMARK_WINDOW_NS,
+                20,
+            )
+            .unwrap(),
+            alerts: Default::default(),
+            missing: Default::default(),
+        };
+        let alert = watch.alerts.entry("A".into()).or_default();
+        alert.update(Some((1.2, 1)));
+        alert.update(Some((1.2, 1)));
+        let mut info = engine::FrameInfo::default();
+        info.serial[0] = b'A' as _;
+        for (window, xs) in [(0, vec![101.2]), (1, vec![99.4, 101.2])] {
+            let blobs: Vec<_> = xs
+                .into_iter()
+                .map(|x| Blob {
+                    x,
+                    y: 300.0,
+                    led_id: -1,
+                    ..Default::default()
+                })
+                .collect();
+            for k in 0..=100 {
+                info.frame_start_host_ns =
+                    1 + window * LANDMARK_WINDOW_NS + k * LANDMARK_WINDOW_NS / 100;
+                watch.frame(&info, &blobs);
+                watch.poll(&d, info.frame_start_host_ns);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while if window == 0 {
+                !d.landmark_shifts.lock().unwrap().contains_key("A")
+            } else {
+                !watch.missing.contains_key("A")
+            } {
+                watch.poll(&d, info.frame_start_host_ns);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "landmark worker timed out"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                d.landmark_shifts.lock().unwrap().contains_key("A"),
+                window == 0
+            );
+            assert!(watch.alerts["A"].active.is_some());
+        }
+    }
 
     #[test]
     fn landmark_visibility_changes_do_not_report_recovery() {
