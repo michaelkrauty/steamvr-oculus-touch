@@ -11,7 +11,9 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::platform::{self, fs};
@@ -152,7 +154,7 @@ impl Failures {
 }
 
 /// Sends each line `from` gives (lossily decoded) down `to`.
-fn forward(from: impl Read + Send + 'static, to: mpsc::Sender<String>) {
+fn forward(from: impl Read + Send + 'static, to: Output) {
     std::thread::spawn(move || {
         let mut from = BufReader::new(from);
         let mut line = Vec::new();
@@ -178,6 +180,66 @@ fn note(log: &mut Log, text: &str) {
 /// How long the lines a daemon wrote just before it ended may take to arrive; after that its
 /// output is left to whatever it started that still holds it.
 const LAST_LINES: Duration = Duration::from_secs(1);
+
+/// One reader's output. The cutoff flag never needs room in the output queue.
+#[derive(Clone)]
+struct Output {
+    to: mpsc::Sender<String>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Output {
+    fn send(&self, text: String) -> Result<(), mpsc::SendError<String>> {
+        if self.stopped.load(Ordering::Acquire) {
+            Err(mpsc::SendError(text))
+        } else {
+            self.to.send(text)
+        }
+    }
+}
+
+/// Output from both readers. Once the deadline passes, stop forwarding new lines and drain
+/// those already queued. The consumer owns no sender, so EOF still disconnects it immediately.
+struct Lines {
+    from: mpsc::Receiver<String>,
+    stop_readers: Arc<AtomicBool>,
+    cutoff: bool,
+}
+
+impl Lines {
+    fn channel() -> (Output, Lines) {
+        let (to, from) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let lines = Lines {
+            from,
+            stop_readers: stopped.clone(),
+            cutoff: false,
+        };
+        (Output { to, stopped }, lines)
+    }
+
+    fn next_line(
+        &mut self,
+        ended: Option<Instant>,
+        clock: &dyn Fn() -> Instant,
+    ) -> Result<String, RecvTimeoutError> {
+        loop {
+            let wait = ended.map_or(Duration::from_millis(100), |at| {
+                LAST_LINES.saturating_sub(clock().saturating_duration_since(at))
+            });
+            if ended.is_some() && wait.is_zero() && !self.cutoff {
+                self.stop_readers.store(true, Ordering::Release);
+                self.cutoff = true;
+            }
+            match self.from.recv_timeout(wait) {
+                Ok(line) => return Ok(line),
+                // The deadline passed while waiting. Stop the readers before leaving the queue.
+                Err(RecvTimeoutError::Timeout) if ended.is_some() && !self.cutoff => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
 
 /// How the supervisor learns that it is to stop, and how it asks the daemon to.
 pub struct Stopping<'a> {
@@ -257,7 +319,12 @@ struct Ended {
 }
 
 /// Runs one daemon to its end, its output to `log`.
-fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io::Result<Ended> {
+fn run_once(
+    command: &mut Command,
+    log: &mut Log,
+    stopping: &mut Stopping,
+    clock: &dyn Fn() -> Instant,
+) -> io::Result<Ended> {
     if let Err(e) = platform::process::end_with_this_process(command) {
         note(
             log,
@@ -272,28 +339,19 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
         .spawn()?;
     note(log, &format!("started the daemon (process {})", child.id()));
     // its standard output and error are read apart, so their lines are logged as they arrive
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut lines) = Lines::channel();
     if let Some(out) = child.stdout.take() {
         forward(out, tx.clone());
     }
     if let Some(err) = child.stderr.take() {
-        forward(err, tx);
-    } else {
-        drop(tx);
+        forward(err, tx.clone());
     }
+    drop(tx);
     let mut ended: Option<(ExitStatus, Instant)> = None;
     let mut stop = Stop::new(stopping.within);
     let mut ending = false;
     loop {
-        let wait = match ended {
-            Some((status, at)) if at.elapsed() >= LAST_LINES => {
-                let asked = stop.until.is_some();
-                return Ok(Ended { status, asked });
-            }
-            Some((_, at)) => LAST_LINES - at.elapsed(),
-            None => Duration::from_millis(100),
-        };
-        match rx.recv_timeout(wait) {
+        match lines.next_line(ended.map(|(_, at)| at), clock) {
             Ok(line) => {
                 let _ = log.line(SystemTime::now(), &line);
             }
@@ -304,23 +362,28 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
                 }
                 None => std::thread::sleep(Duration::from_millis(100)),
             },
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some((status, _)) = ended {
+                    let asked = stop.until.is_some();
+                    return Ok(Ended { status, asked });
+                }
+            }
         }
         if ended.is_some() {
             continue;
         }
         if stop.until.is_none() {
             if let Some(why) = (stopping.requested)() {
-                stop.request(Instant::now());
+                stop.request(clock());
                 note(log, &format!("{why}: asking the daemon to stop"));
             }
         }
         if !ending {
             let mut first_error = None;
-            if let StopAction::Deliver(until) = stop.action(Instant::now()) {
+            if let StopAction::Deliver(until) = stop.action(clock()) {
                 let first = stop.last_ask.is_none();
                 let result = (stopping.ask)(until);
-                stop.delivered(Instant::now(), result.is_ok());
+                stop.delivered(clock(), result.is_ok());
                 if let Err(e) = result {
                     if first {
                         first_error = Some(e);
@@ -329,7 +392,7 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
             }
             // Check again after delivery, before any diagnostic I/O. A delivery that runs out
             // of time must not postpone the kill or start another attempt.
-            if stop.action(Instant::now()) == StopAction::End {
+            if stop.action(clock()) == StopAction::End {
                 let _ = child.kill();
                 ending = true;
                 note(
@@ -348,7 +411,7 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
                 }
             }
         }
-        ended = child.try_wait()?.map(|status| (status, Instant::now()));
+        ended = child.try_wait()?.map(|status| (status, clock()));
     }
 }
 
@@ -360,16 +423,27 @@ fn run_once(command: &mut Command, log: &mut Log, stopping: &mut Stopping) -> io
 /// to say goes to the log as "cv1touchd supervisor: ...". The exit code for the supervisor: 0
 /// once the daemon stopped, 1 when it gave up.
 pub fn run(
-    mut command: impl FnMut() -> Command,
+    command: impl FnMut() -> Command,
     log: &mut Log,
     policy: Policy,
     stopping: &mut Stopping,
 ) -> i32 {
+    run_with_clock(command, log, policy, stopping, Instant::now)
+}
+
+/// The daemon's run time and deadlines use `clock`; restart delays use elapsed real time.
+fn run_with_clock(
+    mut command: impl FnMut() -> Command,
+    log: &mut Log,
+    policy: Policy,
+    stopping: &mut Stopping,
+    clock: impl Fn() -> Instant,
+) -> i32 {
     let mut failures = Failures::new(policy);
     let delay = policy.delay.as_secs_f64();
     loop {
-        let started = Instant::now();
-        match run_once(&mut command(), log, stopping) {
+        let started = clock();
+        match run_once(&mut command(), log, stopping, &clock) {
             Ok(Ended { status, asked }) if asked || status.success() => {
                 note(log, &format!("the daemon stopped ({status})"));
                 return 0;
@@ -384,7 +458,7 @@ pub fn run(
             Ok(Ended { status, .. }) => note(log, &format!("the daemon ended ({status})")),
             Err(e) => note(log, &format!("cannot start the daemon ({e})")),
         }
-        if !failures.failed(started.elapsed()) {
+        if !failures.failed(clock().saturating_duration_since(started)) {
             note(
                 log,
                 &format!(
@@ -420,6 +494,106 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn queued_lines_are_read_even_after_the_last_line_deadline() {
+        let (tx, mut lines) = Lines::channel();
+        for text in ["out\n", "err\n", "last"] {
+            tx.send(text.to_string()).unwrap();
+        }
+        // Keep the sender open, as something the daemon started could still hold its pipes.
+        let now = Instant::now();
+        let ended = Some(now - LAST_LINES - Duration::from_secs(1));
+        for text in ["out\n", "err\n", "last"] {
+            assert_eq!(lines.next_line(ended, &|| now), Ok(text.to_string()));
+        }
+        assert_eq!(
+            lines.next_line(ended, &|| now),
+            Err(RecvTimeoutError::Timeout)
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn new_output_cannot_hold_the_supervisor_past_the_last_line_deadline() {
+        let (tx, mut lines) = Lines::channel();
+        let other_reader = tx.clone();
+        tx.send("out\n".to_string()).unwrap();
+        other_reader.send("err\n".to_string()).unwrap();
+        let now = Instant::now();
+        let ended = Some(now - LAST_LINES);
+        assert_eq!(lines.next_line(ended, &|| now), Ok("out\n".to_string()));
+        // Both readers see the cutoff, whatever their scheduling order.
+        let _ = tx.send("still writing\n".to_string());
+        let _ = other_reader.send("also writing\n".to_string());
+        assert_eq!(lines.next_line(ended, &|| now), Ok("err\n".to_string()));
+        assert_eq!(
+            lines.next_line(ended, &|| now),
+            Err(RecvTimeoutError::Timeout)
+        );
+        drop(tx);
+        drop(other_reader);
+    }
+
+    #[test]
+    fn the_output_cutoff_starts_at_the_first_eligible_poll() {
+        let (tx, mut lines) = Lines::channel();
+        let at = Instant::now();
+        tx.send("before".to_string()).unwrap();
+        let before = at + LAST_LINES - Duration::from_nanos(1);
+        assert_eq!(
+            lines.next_line(Some(at), &|| before),
+            Ok("before".to_string())
+        );
+        assert!(!lines.stop_readers.load(Ordering::Acquire));
+        tx.send("last".to_string()).unwrap();
+        assert_eq!(
+            lines.next_line(Some(at), &|| at + LAST_LINES),
+            Ok("last".to_string())
+        );
+        assert!(lines.stop_readers.load(Ordering::Acquire));
+        assert_eq!(
+            lines.next_line(Some(at), &|| at + LAST_LINES),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn the_cutoff_needs_no_room_in_a_full_bounded_output_queue() {
+        let (tx, from) = mpsc::sync_channel(2);
+        for text in ["out\n", "err\n"] {
+            tx.try_send(text.to_string()).unwrap();
+        }
+        let stop_readers = Arc::new(AtomicBool::new(false));
+        let mut lines = Lines {
+            from,
+            stop_readers: stop_readers.clone(),
+            cutoff: false,
+        };
+        let now = Instant::now();
+        let ended = Some(now - LAST_LINES);
+        for text in ["out\n", "err\n"] {
+            assert_eq!(lines.next_line(ended, &|| now), Ok(text.to_string()));
+        }
+        assert!(stop_readers.load(Ordering::Acquire));
+        assert_eq!(
+            lines.next_line(ended, &|| now),
+            Err(RecvTimeoutError::Timeout)
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn the_readers_ending_disconnects_the_output_without_the_last_line_deadline() {
+        let (tx, mut lines) = Lines::channel();
+        tx.send("last".to_string()).unwrap();
+        drop(tx);
+        assert_eq!(lines.next_line(None, &Instant::now), Ok("last".to_string()));
+        assert_eq!(
+            lines.next_line(None, &Instant::now),
+            Err(RecvTimeoutError::Disconnected)
+        );
     }
 
     /// The text of each line, without its stamp.
@@ -795,7 +969,10 @@ mod tests {
         } else {
             "echo out && echo err 1>&2 && printf last && exit 3"
         };
-        let code = run(
+        let at = Instant::now();
+        // Hold the drain clock still until both pipe readers reach EOF. Their scheduling
+        // cannot discard output; separate clock-controlled tests exercise the cutoff.
+        let code = run_with_clock(
             || {
                 runs += 1;
                 shell(script)
@@ -803,6 +980,7 @@ mod tests {
             &mut log,
             quick(150, 3),
             &mut never(),
+            || at,
         );
         assert_eq!((code, runs), (1, 3));
         // two waits between three runs
