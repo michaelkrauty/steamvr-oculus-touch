@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 #include <stdlib.h>
+#include <errno.h>
 static int realloc_calls, fail_realloc;
 static void *test_realloc(void *p, size_t n) {
   if (++realloc_calls == fail_realloc)
@@ -27,6 +28,7 @@ static void *test_realloc(void *p, size_t n) {
 #define rift_sensor_request_stop fake_sensor_request_stop
 #define rift_sensor_retry fake_sensor_retry
 #define rift_sensor_get_cv1touch_info fake_sensor_info
+#define rift_sensor_get_stream_info fake_sensor_stream_info
 #define rift_sensor_serial_no fake_sensor_serial
 #include "rift-tracker.c"
 #include "test_util.h"
@@ -162,6 +164,15 @@ void fake_sensor_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out) {
   memset(out, 0, sizeof *out);
   snprintf(out->serial, sizeof out->serial, "%s", fake_sensor_serial(sensor));
 }
+void fake_sensor_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_stream *out) {
+  memset(out, 0, sizeof *out);
+  snprintf(out->serial, sizeof out->serial, "%s", fake_sensor_serial(sensor));
+  if (((struct fake_sensor *)sensor)->id == fail_start - 1) {
+    out->error_kind = OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH;
+    out->error_code = LIBUSB_ERROR_OTHER;
+    out->os_error = ENOSPC;
+  } else out->alt_setting = 2;
+}
 void *ohmd_allocfn(ohmd_context *ctx, const char *message, size_t size) {
   (void)ctx;
   (void)message;
@@ -226,6 +237,30 @@ int main(void) {
     rift_tracker_ctx *tr = rift_tracker_new(ctx, radio);
     CHECK(tr);
     CHECK(rift_tracker_get_sensor_count(tr) == 8);
+    if (failures[k] == &fail_start) {
+      ohmd_cv1touch_sensor_stream stream;
+      CHECK(rift_tracker_get_sensor_stream(tr, 4, &stream) == 0);
+      CHECK(strcmp(stream.serial, "TEST000005") == 0);
+      CHECK(stream.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH);
+      CHECK(stream.error_code == LIBUSB_ERROR_OTHER && stream.os_error == ENOSPC);
+      CHECK(rift_tracker_get_sensor_stream(tr, 9, &stream) == -1);
+      /* A successful reconnect/fallback replaces this serial's failure; it
+       * does not append another record or leave a stale bandwidth diagnosis. */
+      memset(&stream, 0, sizeof stream);
+      snprintf(stream.serial, sizeof stream.serial, "test000005");
+      stream.alt_setting = 1;
+      CHECK(rift_tracker_record_sensor_stream(tr, &stream));
+      CHECK(rift_tracker_get_sensor_stream(tr, 4, &stream) == 0);
+      CHECK(stream.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_NONE && stream.alt_setting == 1);
+      CHECK(rift_tracker_get_sensor_stream(tr, 9, &stream) == -1);
+      rift_tracker_forget_sensor_stream(tr, "TeSt000005");
+      rift_tracker_forget_sensor_stream(tr, "TEST000005");
+      CHECK(rift_tracker_get_sensor_stream(tr, 8, &stream) == -1);
+      CHECK(rift_tracker_record_sensor_stream(tr, &(ohmd_cv1touch_sensor_stream){
+        .serial = "RECONNECTED", .alt_setting = 1}));
+      CHECK(rift_tracker_get_sensor_stream(tr, 8, &stream) == 0);
+      CHECK(strcmp(stream.serial, "RECONNECTED") == 0 && stream.alt_setting == 1);
+    }
     rift_tracker_free(tr);
     CHECK(live == 0 && handles == 0);
     *failures[k] = 0;
@@ -237,6 +272,15 @@ int main(void) {
   fail_realloc = 2;
   CHECK(rift_tracker_new(ctx, radio) == NULL);
   CHECK(live == 0 && handles == 0);
+  fail_realloc = 0;
+  /* The stream table grows after the three sensor-pointer allocations. An
+   * allocation failure must unwind started and not-yet-started sensors too. */
+  for (int failure = 4; failure <= 6; failure++) {
+    realloc_calls = 0;
+    fail_realloc = failure;
+    CHECK(rift_tracker_new(ctx, radio) == NULL);
+    CHECK(live == 0 && handles == 0);
+  }
   fail_realloc = 0;
   alloc_calls = 0;
   fail_alloc = 1;

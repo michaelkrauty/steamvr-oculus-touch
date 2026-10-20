@@ -879,3 +879,10 @@ void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor
 	for (int i = 0; i < 3; i++)
 		out->pose_fixes[i] = __atomic_load_n(&sensor->cv1touch_pose_fixes[i], __ATOMIC_RELAXED);
 }
+
+void rift_sensor_get_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_stream *out)
+{
+	/* Starts and diagnostic reads both run on the engine thread. */
+	*out = sensor->dev->stream_status;
+	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);
+}

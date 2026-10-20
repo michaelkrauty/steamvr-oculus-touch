@@ -5,6 +5,7 @@
  */
 
 #include <stdbool.h>
+#include "openhmd_cv1touch.h"
 
 #include "ohmd-video.h"
 #include "rift-tracker-common.h"
@@ -44,6 +45,7 @@ struct rift_sensor_device_funcs {
 struct rift_sensor_device {
 	rift_sensor_device_funcs *funcs;
 	rift_sensor_camera_params calib;
+	ohmd_cv1touch_sensor_stream stream_status;
 };
 
 #define rift_sensor_device_start_video(d,min_frames,frame_cb,frame_cb_data) \

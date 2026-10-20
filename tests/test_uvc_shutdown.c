@@ -15,6 +15,8 @@
 static pthread_mutex_t waiters = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int submissions;
 static atomic_bool submit_ok;
+static int alt_result, alt_errno, submit_errno;
+static bool alt_logging;
 static struct rift_sensor_uvc_stream stream;
 static struct libusb_transfer transfers[6];
 
@@ -22,13 +24,23 @@ int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *transfer)
 {
 	(void)transfer;
 	atomic_fetch_add(&submissions, 1);
-	return submit_ok ? 0 : LIBUSB_ERROR_IO;
+	if (!submit_ok) {
+		errno = submit_errno;
+		return LIBUSB_ERROR_IO;
+	}
+	return 0;
 }
 
 int LIBUSB_CALL libusb_set_interface_alt_setting(libusb_device_handle *dev, int interface, int alt)
 {
 	(void)dev;
 	CHECK(interface == 1 && (alt == 0 || alt == 1));
+	if (alt != 0) {
+		if (alt_errno >= 0) errno = alt_errno;
+		/* Model libusb's log output replacing an ioctl error before returning. */
+		if (alt_logging) errno = ENOSPC;
+		return alt_result;
+	}
 	return 0;
 }
 
@@ -110,11 +122,76 @@ static void startup_allocation_failures(void)
         s.alt_setting = 1; s.frame_size = 16;
         allocation_count = 0; fail_allocation = fail;
         CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == -ENOMEM);
+        CHECK(s.start_status.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_OTHER);
+        CHECK(s.start_status.error_code == -ENOMEM && s.start_status.os_error == ENOMEM);
         CHECK(!s.video_running && s.active_transfers == 0);
         CHECK(rift_sensor_uvc_stream_clear(&s) == 0);
         CHECK(!s.alloced_frames && !s.free_frames);
         CHECK(s.n_alloced_frames == 0 && s.active_transfers == 0);
     }
+}
+
+static void startup_error_diagnostics(void)
+{
+	struct rift_sensor_uvc_stream s = {0};
+	s.alt_setting = 1;
+	alt_result = LIBUSB_ERROR_OTHER;
+	/* Quiet and logging-enabled system libraries get the same qualified
+	 * result. Even EIO followed by logging's ENOSPC must never claim proof. */
+	for (int logging = 0; logging < 2; logging++) {
+		alt_logging = logging;
+		alt_errno = ENOSPC;
+		CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == LIBUSB_ERROR_OTHER);
+		CHECK(s.start_status.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH);
+		CHECK(s.start_status.error_code == LIBUSB_ERROR_OTHER && s.start_status.os_error == ENOSPC);
+		CHECK(s.start_status.alt_setting == 0);
+		alt_errno = EIO;
+		CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == LIBUSB_ERROR_OTHER);
+		CHECK(s.start_status.error_kind == (logging ? OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH : OHMD_CV1TOUCH_STREAM_ERROR_OTHER));
+		CHECK(s.start_status.os_error == (logging ? ENOSPC : EIO));
+	}
+	alt_logging = false;
+	alt_errno = EACCES;
+	CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == LIBUSB_ERROR_OTHER);
+	CHECK(s.start_status.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_OTHER);
+	CHECK(s.start_status.os_error == EACCES);
+	/* An error which supplies no errno must not inherit a preceding ENOSPC. */
+	errno = ENOSPC;
+	alt_errno = -1;
+	CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == LIBUSB_ERROR_OTHER);
+	CHECK(s.start_status.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_OTHER);
+	CHECK(s.start_status.os_error == 0);
+	alt_result = alt_errno = 0;
+}
+
+static void startup_submission_failures(void)
+{
+	/* usbfs can reject the first iso URB for bandwidth after the alternate
+	 * setting succeeded. Exercise the real start/stop path, not the helper. */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		const int errors[] = {ENOSPC, EACCES, 0};
+		struct rift_sensor_uvc_stream s = {0};
+		s.alt_setting = 1; s.frame_size = 16;
+		s.num_transfers = 1;
+		s.transfer = calloc(1, sizeof *s.transfer);
+		CHECK(s.transfer != NULL);
+		s.transfer[0] = libusb_alloc_transfer(0);
+		CHECK(s.transfer[0] != NULL);
+		allocation_count = fail_allocation = 0;
+		submit_ok = false;
+		submit_errno = errors[attempt];
+		CHECK(rift_sensor_uvc_stream_start(&s, 5, NULL, NULL) == LIBUSB_ERROR_IO);
+		CHECK(s.start_status.error_kind == (attempt == 0
+			? OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH
+			: OHMD_CV1TOUCH_STREAM_ERROR_OTHER));
+		CHECK(s.start_status.error_code == LIBUSB_ERROR_IO);
+		CHECK(s.start_status.os_error == errors[attempt] && s.start_status.alt_setting == 0);
+		CHECK(!s.video_running && s.active_transfers == 0);
+		CHECK(rift_sensor_uvc_stream_clear(&s) == 0);
+		CHECK(!s.alloced_frames && !s.free_frames && !s.transfer);
+	}
+	submit_errno = 0;
+	submit_ok = true;
 }
 
 int main(void)
@@ -168,6 +245,8 @@ int main(void)
 	CHECK(stream.active_transfers == 0);
 	outstanding_frame_lifetime();
 	startup_allocation_failures();
+	startup_error_diagnostics();
+	startup_submission_failures();
 	alarm(0);
 	puts("test_uvc_shutdown: ok");
 	return 0;

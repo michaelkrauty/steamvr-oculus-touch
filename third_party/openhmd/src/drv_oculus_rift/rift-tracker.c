@@ -155,6 +155,8 @@ struct rift_tracker_ctx_s
 
 	rift_sensor_ctx **sensors;
 	size_t n_sensors, sensor_capacity;
+	ohmd_cv1touch_sensor_stream *sensor_streams;
+	size_t n_sensor_streams, sensor_stream_capacity;
 
 	rift_tracked_device_priv devices[RIFT_MAX_TRACKED_DEVICES];
 	uint8_t n_devices;
@@ -375,7 +377,16 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	/* Loop over the sensors we found and start the video flowing */
     for (i = 0; i < (int)tracker_ctx->n_sensors;) {
         rift_sensor_ctx *sensor = tracker_ctx->sensors[i];
-        if (!rift_sensor_start(sensor)) {
+        bool started = rift_sensor_start(sensor);
+        ohmd_cv1touch_sensor_stream stream;
+        rift_sensor_get_stream_info(sensor, &stream);
+        /* Copy before a failed start frees the object. Upsert success too, so
+         * reconnects/fallback never preserve an earlier failure for this serial. */
+        if (!rift_tracker_record_sensor_stream(tracker_ctx, &stream)) {
+            LOGE("Could not retain sensor stream diagnostics");
+            goto fail;
+        }
+        if (!started) {
             LOGW("Failed to start video stream for sensor %s\n", rift_sensor_serial_no(sensor));
             rift_sensor_free(sensor);
             tracker_ctx->n_sensors--;
@@ -611,6 +622,7 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 
 	if (tracker_ctx->tracker_lock) ohmd_destroy_mutex (tracker_ctx->tracker_lock);
 	free(tracker_ctx->sensors);
+	free(tracker_ctx->sensor_streams);
 	free (tracker_ctx);
 }
 
@@ -1191,6 +1203,49 @@ uint32_t rift_tracker_get_search_skip(rift_tracker_ctx *ctx)
 int rift_tracker_get_sensor_count(rift_tracker_ctx *ctx)
 {
 	return (int)ctx->n_sensors;
+}
+
+int rift_tracker_get_sensor_stream(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor_stream *out)
+{
+	if (index < 0 || (size_t)index >= ctx->n_sensor_streams || out == NULL)
+		return -1;
+	*out = ctx->sensor_streams[index];
+	return 0;
+}
+
+bool rift_tracker_record_sensor_stream(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_stream *stream)
+{
+	for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
+		if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].serial, stream->serial)) {
+			ctx->sensor_streams[i] = *stream;
+			return true;
+		}
+	}
+	if (ctx->n_sensor_streams >= INT_MAX)
+		return false;
+	if (ctx->n_sensor_streams == ctx->sensor_stream_capacity) {
+		size_t capacity = ctx->sensor_stream_capacity ? ctx->sensor_stream_capacity * 2 : 4;
+		if (capacity > INT_MAX) capacity = INT_MAX;
+		if (capacity > SIZE_MAX / sizeof(*ctx->sensor_streams)) return false;
+		void *next = realloc(ctx->sensor_streams, capacity * sizeof(*ctx->sensor_streams));
+		if (!next) return false;
+		ctx->sensor_streams = next;
+		ctx->sensor_stream_capacity = capacity;
+	}
+	ctx->sensor_streams[ctx->n_sensor_streams++] = *stream;
+	return true;
+}
+
+void rift_tracker_forget_sensor_stream(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
+		if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].serial, serial)) {
+			ctx->n_sensor_streams--;
+			memmove(ctx->sensor_streams + i, ctx->sensor_streams + i + 1,
+				(ctx->n_sensor_streams - i) * sizeof(*ctx->sensor_streams));
+			return;
+		}
+	}
 }
 
 int rift_tracker_get_sensor_video(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor_video *out)

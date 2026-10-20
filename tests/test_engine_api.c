@@ -48,6 +48,11 @@ int main(void)
 	CHECK(sizeof(ohmd_cv1touch_sensor_video) == 40);
 	ohmd_cv1touch_sensor_video video;
 	CHECK(ohmd_cv1touch_get_sensor_video(NULL, 0, &video) == -1);
+	CHECK(sizeof(ohmd_cv1touch_sensor_stream) == 64);
+	ohmd_cv1touch_sensor_stream stream;
+	CHECK(ohmd_cv1touch_get_sensor_stream(NULL, 0, &stream) == -1);
+	CHECK(ohmd_cv1touch_forget_sensor_stream(NULL, "CAMERA1") == -1);
+	CHECK(ohmd_cv1touch_forget_sensor_stream(NULL, NULL) == -1);
 	CHECK(sizeof(ohmd_cv1touch_led) == 24);
 	CHECK(sizeof(ohmd_cv1touch_frame_device) == 64);
 	CHECK(sizeof(ohmd_cv1touch_frame_info) == 248);

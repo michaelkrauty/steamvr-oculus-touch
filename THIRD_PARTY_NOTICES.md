@@ -24,6 +24,8 @@ Fatal records are independent of the native printf accumulator. Reentered log re
 
 Local OpenHMD changes count received camera frames atomically before analysis locks or queues and expose these 64-bit counters through the separate `ohmd_cv1touch_get_sensor_video` extension. Existing native sensor samples and controller shared memory retain their 32-bit released-buffer counter and layout.
 
+Local OpenHMD changes also retain per-sensor USB video startup diagnostics through cleanup, expose them through a separate `ohmd_cv1touch_get_sensor_stream` extension, and record the setting used by the last start attempt. The existing sensor sample and controller shared-memory layouts are unchanged; the diagnostics do not select another USB setting or retry a failed stream.
+
 ## Build and runtime dependencies
 
 Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.

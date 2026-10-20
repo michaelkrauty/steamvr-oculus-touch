@@ -234,7 +234,12 @@ static bool rift_sensor_usb_start(rift_sensor_device *base_dev, uint8_t min_fram
 
 	dev->frame_cb = frame_cb;
 	dev->frame_cb_data = cb_data;
+	base_dev->stream_status = (ohmd_cv1touch_sensor_stream){
+		.error_kind = OHMD_CV1TOUCH_STREAM_ERROR_OTHER,
+	};
 	ret = rift_sensor_uvc_stream_start (&dev->uvc_stream, min_frames, frame_captured_cb, dev);
+	if (ret < 0)
+		base_dev->stream_status = dev->uvc_stream.start_status;
 	ASSERT_MSG(ret >= 0, fail, "could not start streaming\n");
 	dev->stream_started = 1;
 
@@ -272,9 +277,14 @@ static bool rift_sensor_usb_start(rift_sensor_device *base_dev, uint8_t min_fram
 
 
 	LOGV("Sensor %d video streaming\n", dev->id);
+	base_dev->stream_status = (ohmd_cv1touch_sensor_stream){
+		.alt_setting = dev->uvc_stream.alt_setting,
+	};
 
 	return true;
 fail:
+	if (!base_dev->stream_status.error_code)
+		base_dev->stream_status.error_code = ret;
 	return false;
 }
 

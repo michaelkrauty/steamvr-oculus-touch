@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include "openhmd_cv1touch.h"
 #include "../ohmd-video.h"
 #include "../rift-sensor-usb.h"
 
@@ -69,6 +70,8 @@ struct rift_sensor_uvc_stream {
 
 	/* USB streaming alt_setting */
 	int alt_setting;
+	/* Most recent failed start; copied before cleanup can change errno. */
+	ohmd_cv1touch_sensor_stream start_status;
 
 	int num_transfers;
 	struct libusb_transfer **transfer;

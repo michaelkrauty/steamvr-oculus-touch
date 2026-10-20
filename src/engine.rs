@@ -57,6 +57,35 @@ impl From<ffi::ohmd_cv1touch_sensor_video> for SensorVideo {
     }
 }
 
+/// Last USB video start attempt, retained through cleanup and until detach is reported.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SensorStreamStart {
+    scope: &'static str,
+    pub serial: String,
+    pub error_kind: &'static str,
+    pub error_code: i32,
+    pub os_error: i32,
+    /// Setting used by that attempt if it succeeded; none if it failed.
+    pub alt_setting: Option<i32>,
+}
+
+impl From<ffi::ohmd_cv1touch_sensor_stream> for SensorStreamStart {
+    fn from(s: ffi::ohmd_cv1touch_sensor_stream) -> Self {
+        Self {
+            scope: "last_start_attempt",
+            serial: cstr_field(&s.serial),
+            error_kind: match s.error_kind {
+                ffi::OHMD_CV1TOUCH_STREAM_ERROR_NONE => "none",
+                ffi::OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH => "likely_usb_bandwidth",
+                _ => "other",
+            },
+            error_code: s.error_code,
+            os_error: s.os_error,
+            alt_setting: (s.alt_setting > 0).then_some(s.alt_setting),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorPose {
     pub serial: String,
@@ -366,6 +395,38 @@ impl Engine {
                     .then(|| video.into())
             })
             .collect()
+    }
+
+    /// Read the complete last-start table each time: discovery changes its set/order.
+    /// These records can outlive unplugging; they do not establish current USB presence.
+    pub fn sensor_streams(&self) -> Vec<SensorStreamStart> {
+        (0..c_int::MAX)
+            .map_while(|index| {
+                let mut stream = ffi::ohmd_cv1touch_sensor_stream::default();
+                // SAFETY: this engine owns the device; the output has the advertised layout.
+                (unsafe {
+                    ffi::ohmd_cv1touch_get_sensor_stream(self.hands[HAND_RIGHT], index, &mut stream)
+                } == 0)
+                    .then(|| stream.into())
+            })
+            .collect()
+    }
+
+    /// Drop a detached serial's diagnostic without freeing its native sensor object.
+    /// Repeated detach notifications are harmless. Call on the engine thread.
+    pub fn forget_sensor_stream(&self, serial: &str) -> Result<(), String> {
+        let serial_c = self::serial(serial)?;
+        // SAFETY: valid device and a complete, NUL-terminated serial.
+        if unsafe {
+            ffi::ohmd_cv1touch_forget_sensor_stream(self.hands[HAND_RIGHT], serial_c.as_ptr())
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "the engine could not clear video diagnostics for sensor {serial}"
+            ))
+        }
     }
 
     /// Gives the open sensor `serial` the camera -> world pose it tracks with from its next frame

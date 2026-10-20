@@ -649,16 +649,48 @@ int rift_sensor_uvc_stream_setup (ohmd_context* ohmd_ctx,
 	return 0;
 }
 
+static int stream_start_failed(rift_sensor_uvc_stream *stream, int code, int os_error)
+{
+#ifndef __linux__
+	os_error = 0; /* libusb's portable error code is available on every platform. */
+#endif
+	stream->start_status = (ohmd_cv1touch_sensor_stream){
+		.error_kind = OHMD_CV1TOUCH_STREAM_ERROR_OTHER,
+		.error_code = code,
+		.os_error = os_error,
+	};
+#ifdef __linux__
+	/* libusb v1.0.30's Linux SETINTERFACE and SUBMITURB paths log
+	 * ENOSPC at ERROR before returning OTHER or IO. We never set a libusb
+	 * log level, but LIBUSB_DEBUG can enable it. ENABLE_DEBUG_LOGGING
+	 * builds force logging and ignore context options/callbacks;
+	 * USE_SYSTEM_LOGGING_FACILITY can bypass global callbacks too.
+	 * There is no effective-log-level getter, so a system library cannot
+	 * be proven quiet. Logging may replace ioctl's errno even though we
+	 * capture it immediately after return: ENOSPC is only a likely
+	 * bandwidth cause, never proof (core.c/linux_usbfs.c).
+	 * A fallback can use failure at full bandwidth followed by success at
+	 * a lower setting as a measured basis for a stronger diagnosis. */
+	if (os_error == ENOSPC)
+		stream->start_status.error_kind = OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH;
+#endif
+	return code;
+}
+
 int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_frames,
 	rift_sensor_uvc_stream_frame_cb frame_cb, void *frame_cb_data)
 {
 	int ret, i;
 
 	/* A stopped stream retains buffers until its consumers have joined and clear runs. */
-	if (stream->video_running || stream->alloced_frames || stream->free_frames) return -EBUSY;
+	if (stream->video_running || stream->alloced_frames || stream->free_frames)
+		return stream_start_failed(stream, -EBUSY, EBUSY);
 
+	errno = 0;
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, stream->alt_setting);
+	const int start_errno = errno;
 	if (ret) {
+		stream_start_failed(stream, ret, start_errno);
 		LOGE("Failed to set USB interface 1 alt setting %d: %s (%d)",
 			stream->alt_setting, libusb_error_name(ret), ret);
 		LOGE("Check kernel USB logs; if bandwidth is exhausted, move this sensor to a different USB host controller");
@@ -704,8 +736,11 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
     libusb_lock_event_waiters(stream->usb_ctx);
     stream->active_transfers = 0;
 	for (int i = 0; i < stream->num_transfers; i++) {
+		errno = 0;
 		ret = libusb_submit_transfer(stream->transfer[i]);
+		const int submit_errno = errno;
 		if (ret < 0) {
+			stream_start_failed(stream, ret, submit_errno);
 			LOGE("failed to submit iso transfer %d. Error %d errno %d", i, ret, errno);
             libusb_unlock_event_waiters(stream->usb_ctx);
 			rift_sensor_uvc_stream_stop(stream);
@@ -716,6 +751,7 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
     libusb_unlock_event_waiters(stream->usb_ctx);
 	return 0;
 allocation_failed:
+	stream_start_failed(stream, -ENOMEM, ENOMEM);
 	rift_sensor_uvc_stream_stop(stream);
 	return -ENOMEM;
 }

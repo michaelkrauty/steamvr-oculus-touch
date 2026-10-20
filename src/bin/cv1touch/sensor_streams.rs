@@ -162,6 +162,21 @@ const RESTART: &str =
 #[cfg(not(windows))]
 const RESTART: &str = "then restart the daemon: systemctl --user restart cv1touchd";
 
+fn stream_failure(current: &serde_json::Value, serial: &str) -> Option<String> {
+    let stream = current["sensor_streams"].as_array()?.iter().find(|s| {
+        s["serial"]
+            .as_str()
+            .is_some_and(|s| status::sensor_identity(s) == serial)
+            && s["error_kind"].as_str() != Some("none")
+    })?;
+    match stream["error_kind"].as_str()? {
+        "likely_usb_bandwidth" => Some(format!("most likely not enough USB bandwidth on this controller: plug it into a different USB controller, {RESTART}")),
+        "other" => Some(format!("USB video couldn't start (error {}, system error {}): check USB access and daemon logs; after reconnecting, {RESTART}",
+            stream["error_code"].as_i64().unwrap_or(0), stream["os_error"].as_i64().unwrap_or(0))),
+        _ => None,
+    }
+}
+
 fn identities(serials: &[String]) -> BTreeSet<String> {
     serials.iter().map(|s| status::sensor_identity(s)).collect()
 }
@@ -278,6 +293,13 @@ fn with_sources(
             .is_some_and(|(&a, &b)| status::frames_advanced(a, b))
         {
             detail.push(format!("{serial} is streaming"));
+        } else if let Some(reason) = stream_failure(current, serial) {
+            failed = true;
+            if let Err(error) = &connected {
+                detail.push(format!("{serial}'s USB connection couldn't be checked: {error}; last start attempt: {reason}"));
+            } else {
+                detail.push(format!("{serial} isn't sending video: {reason}"));
+            }
         } else if reported.contains(serial) && !new.contains_key(serial) {
             unverified = true;
             let connection = connected.as_ref().err().map_or(String::new(), |error| {
@@ -835,6 +857,167 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Skipped);
         assert_eq!(usb_lists, 0);
     }
+    #[test]
+    fn known_usb_start_errors_explain_silent_video_without_guessing() {
+        let expected = cameras(&["CAMERA1"]);
+        let old = snapshot(&[]);
+        for (kind, error_code, os_error, wanted) in [
+            ("likely_usb_bandwidth", -99, 28, "not enough USB bandwidth"),
+            ("other", -3, 13, "USB video couldn't start"),
+        ] {
+            let mut current = old.clone();
+            current["sensor_streams"] = json!([{"serial": "Camera1", "error_kind": kind,
+                "error_code": error_code, "os_error": os_error, "alt_setting": null}]);
+            let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&expected));
+            assert!(!ok && detail.contains(wanted), "{detail}");
+            assert!(!detail.contains("bandwidth may"), "{detail}");
+            if kind == "likely_usb_bandwidth" {
+                assert!(detail.contains("different USB controller"), "{detail}");
+            } else {
+                assert!(
+                    detail.contains("error -3") && detail.contains("USB access"),
+                    "{detail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_video_and_usb_presence_take_precedence_over_old_start_errors() {
+        let expected = cameras(&["CAMERA1"]);
+        let old = snapshot(&[("CAMERA1", 40)]);
+        let mut current = snapshot(&[("CAMERA1", 92)]);
+        current["sensor_streams"] =
+            json!([{"serial": "CAMERA1", "error_kind": "likely_usb_bandwidth"}]);
+        let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&expected));
+        assert!(ok && detail.contains("is streaming"), "{detail}");
+        current["sensors"] = json!([]);
+        current["sensor_total"] = json!(0);
+        let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&[]));
+        assert!(
+            !ok && detail.contains("isn't connected") && !detail.contains("bandwidth"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_detached_camera_is_missing_even_if_the_retained_native_object_advanced() {
+        let expected = cameras(&["CAMERA1"]);
+        let old = snapshot(&[("CAMERA1", 40)]);
+        let mut current = snapshot(&[("CAMERA1", 92)]);
+        current["sensor_streams"] =
+            json!([{"serial": "CAMERA1", "error_kind": "likely_usb_bandwidth"}]);
+        let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&[]));
+        assert!(
+            !ok && detail.contains("isn't connected") && detail.contains("USB cable"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("bandwidth") && !detail.contains("streaming"),
+            "{detail}"
+        );
+    }
+    #[test]
+    fn unverified_usb_presence_labels_retained_errors_as_last_start_attempts() {
+        let expected = cameras(&["CAMERA1"]);
+        for kind in ["likely_usb_bandwidth", "other"] {
+            let mut value = snapshot(&[("CAMERA1", 0)]);
+            value["sensor_streams"] = json!([{"serial": "CAMERA1", "error_kind": kind,
+                "error_code": -99, "os_error": 28, "alt_setting": null}]);
+            let result = with_sources(
+                || Some(expected.clone()),
+                || Err("USB enumeration failed".into()),
+                Some(&value),
+                Some(&value),
+            );
+            let line = result.board_line();
+            assert!(
+                line.contains("USB connection couldn't be checked")
+                    && line.contains("last start attempt"),
+                "{line}"
+            );
+            assert!(
+                !line.contains("isn't sending video") && !line.contains("is connected"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn errno_based_bandwidth_advice_always_qualifies_the_cause() {
+        let expected = cameras(&["CAMERA1"]);
+        let mut value = snapshot(&[]);
+        value["sensor_streams"] = json!([{"serial": "CAMERA1", "error_kind": "likely_usb_bandwidth",
+            "error_code": -99, "os_error": 28, "alt_setting": null}]);
+        let result = with_sources(
+            || Some(expected.clone()),
+            || Ok(expected.clone()),
+            Some(&value),
+            Some(&value),
+        );
+        let (_, detail) = result.conclusion();
+        assert!(
+            detail.contains("most likely not enough USB bandwidth on this controller"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_last_successful_start_does_not_present_a_detached_camera_as_current() {
+        let expected = cameras(&["CAMERA1"]);
+        let old = snapshot(&[("CAMERA1", 40)]);
+        let mut current = snapshot(&[("CAMERA1", 92)]);
+        current["sensor_streams"] = json!([{"serial": "CAMERA1", "error_kind": "none",
+            "error_code": 0, "os_error": 0, "alt_setting": 2}]);
+        let result = || {
+            with_sources(
+                || Some(expected.clone()),
+                || Ok(Vec::new()),
+                Some(&old),
+                Some(&current),
+            )
+        };
+        let board = result().board_line();
+        let (ok, report_detail) = result().conclusion();
+        assert!(
+            board.starts_with("FAIL") && board.contains("isn't connected"),
+            "{board}"
+        );
+        assert!(
+            !ok && report_detail.contains("isn't connected"),
+            "{report_detail}"
+        );
+        assert!(!board.contains("is streaming") && !report_detail.contains("is streaming"));
+    }
+
+    #[test]
+    fn unavailable_counters_do_not_hide_known_start_failures() {
+        let mut current = snapshot(&[("CAMERA1", 40), ("CAMERA2", 0)]);
+        current["calibrated_sensors"] = json!(["CAMERA1", "CAMERA2", "CAMERA3"]);
+        for row in current["sensors"].as_array_mut().unwrap() {
+            row["frames_received"] = json!(null);
+        }
+        current["sensor_streams"] = json!([{"serial":"CAMERA2", "error_kind":"likely_usb_bandwidth",
+            "error_code":-99, "os_error":28, "alt_setting":null}]);
+        let result = with_sources(
+            || unreachable!(),
+            || Ok(cameras(&["CAMERA1", "CAMERA2"])),
+            Some(&current),
+            Some(&current),
+        );
+        let line = result.board_line();
+        assert!(line.starts_with("FAIL sensor_streams:"), "{line}");
+        assert!(
+            line.contains("CAMERA1") && line.contains("received-frame counter unavailable"),
+            "{line}"
+        );
+        assert!(
+            line.contains("CAMERA2 isn't sending video: most likely not enough USB bandwidth"),
+            "{line}"
+        );
+        assert!(line.contains("CAMERA3 isn't connected"), "{line}");
+    }
+
     #[test]
     fn stalled_counters_do_not_prove_usb_presence_when_enumeration_fails() {
         let expected = cameras(&["CAMERA1"]);

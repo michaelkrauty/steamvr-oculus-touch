@@ -118,6 +118,12 @@ test_sensor_discovery = executable('test_sensor_discovery', 'test_sensor_discove
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections'])
 test('sensor_discovery', test_sensor_discovery)
+# Real USB start/copy/reset and sensor getter; USB operations are stubbed.
+test_sensor_usb_start = executable('test_sensor_usb_start', 'test_sensor_usb_start.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [openhmd_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections'])
+test('sensor_usb_start', test_sensor_usb_start)
+
 # Camera delivery is counted before analysis; releasing old buffers is separate.
 test_sensor_video = executable('test_sensor_video', 'test_sensor_video.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
