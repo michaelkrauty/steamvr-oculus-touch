@@ -619,13 +619,33 @@ fn publish_sensor_snapshot(
     streams: &[engine::SensorStreamStart],
     video: &[engine::SensorVideo],
 ) {
-    // Status takes these locks in the same order, so counters and reasons share one sample.
-    let mut current = d.sensors.lock().unwrap();
-    *d.sensor_streams.lock().unwrap() = streams.to_vec();
-    *d.sensor_video.lock().unwrap() = video.to_vec();
-    *current = sensors.to_vec();
-    drop(current);
-    d.shm.publish_sensors(sensors);
+    publish_sensor_snapshot_with(d, sensors, streams, video, |snapshot| {
+        d.shm.publish_sensors(snapshot)
+    });
+}
+
+fn publish_sensor_snapshot_with(
+    d: &Daemon,
+    sensors: &[SensorStatus],
+    streams: &[engine::SensorStreamStart],
+    video: &[engine::SensorVideo],
+    publish: impl FnOnce(&[SensorStatus]),
+) {
+    // Status takes these locks in the same order. Retain the writer lock through the SHM
+    // seqlock write, including shutdown: counters and start reasons share this snapshot.
+    let mut snapshot = d.sensors.lock().unwrap();
+    let mut current_streams = d.sensor_streams.lock().unwrap();
+    let mut current_video = d.sensor_video.lock().unwrap();
+    if d.quit.load(Ordering::Acquire) {
+        snapshot.clear();
+        current_streams.clear();
+        current_video.clear();
+    } else {
+        *snapshot = sensors.to_vec();
+        *current_streams = streams.to_vec();
+        *current_video = video.to_vec();
+    }
+    publish(&snapshot);
 }
 
 fn sensor_status(d: &Daemon, s: &engine::Sensor) -> SensorStatus {
@@ -8281,6 +8301,71 @@ mod tests {
         assert!(engine_is_ready(&d, &d.opts.lock().unwrap()));
         publish_disconnected(&d);
         assert!(!engine_is_ready(&d, &d.opts.lock().unwrap()));
+    }
+
+    #[test]
+    fn sensor_snapshot_holds_the_writer_lock_until_the_shm_write_finishes() {
+        let d = status_daemon();
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, written) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let d = &d;
+            let first = scope.spawn(move || {
+                publish_sensor_snapshot_with(d, &[SensorStatus::default()], &[], &[], |snapshot| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    d.shm.publish_sensors(snapshot);
+                });
+                finished.send(()).unwrap();
+            });
+            writing.recv().unwrap();
+            let second = scope.spawn(move || {
+                // The first writer is paused just before its SHM write. A concurrent shutdown
+                // must still find its lock held, even though the Rust list has been replaced.
+                let locked = matches!(
+                    d.sensors.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                d.quit.store(true, Ordering::Release);
+                if !locked {
+                    // With the lock-lifetime mutation, shutdown overtakes the paused writer.
+                    publish_disconnected(d);
+                }
+                release.send(()).unwrap();
+                written.recv().unwrap();
+                if locked {
+                    publish_disconnected(d);
+                }
+                assert!(
+                    locked,
+                    "the first SHM writer no longer owns the sensor lock"
+                );
+            });
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert!(d.sensors.lock().unwrap().is_empty());
+        assert!(d.shm.sensors().unwrap().is_empty());
+        assert!(d.sensor_streams.lock().unwrap().is_empty());
+        assert!(d.sensor_video.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_keeps_a_late_sensor_snapshot_empty() {
+        let d = status_daemon();
+        d.quit.store(true, Ordering::Release);
+        publish_disconnected(&d);
+        publish_sensor_snapshot(
+            &d,
+            &[SensorStatus::default()],
+            &[ffi::ohmd_cv1touch_sensor_stream::default().into()],
+            &[ffi::ohmd_cv1touch_sensor_video::default().into()],
+        );
+        assert!(d.sensors.lock().unwrap().is_empty());
+        assert!(d.shm.sensors().unwrap().is_empty());
+        assert!(d.sensor_streams.lock().unwrap().is_empty());
+        assert!(d.sensor_video.lock().unwrap().is_empty());
     }
 
     #[test]
