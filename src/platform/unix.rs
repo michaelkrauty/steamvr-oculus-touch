@@ -455,6 +455,108 @@ impl Connection {
         std::os::unix::net::UnixStream::connect(endpoint).map(Connection)
     }
 
+    pub fn connect_until(endpoint: &Path, until: std::time::Instant) -> io::Result<Connection> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::time::Duration;
+
+        let bytes = endpoint.as_os_str().as_bytes();
+        // SAFETY: all-zero is a valid initial sockaddr_un, including its terminating NUL.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid control socket path",
+            ));
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+            *to = *from as libc::c_char;
+        }
+        let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+        // SAFETY: no pointers; nonblocking from creation, including the connect itself.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor owned only here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        loop {
+            super::ipc::remaining(until)?;
+            // SAFETY: a live socket and initialized address of the supplied length.
+            let connected = unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&address as *const libc::sockaddr_un).cast(),
+                    len as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EISCONN) {
+                break;
+            }
+            let mut ready = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let left = super::ipc::remaining(until)?;
+            let (pollfd, count, wait) = match e.raw_os_error() {
+                // AF_UNIX does not queue a nonblocking connect when the backlog is full.
+                // The unconnected fd is writable already: wait briefly before trying again.
+                Some(libc::EAGAIN) => {
+                    (std::ptr::null_mut(), 0, left.min(Duration::from_millis(10)))
+                }
+                Some(libc::EINPROGRESS | libc::EALREADY) => (&mut ready as *mut _, 1, left),
+                Some(libc::EINTR) => continue,
+                _ => return Err(e),
+            };
+            let ms = wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: either one valid pollfd or no descriptors; the timeout is bounded.
+            let result = unsafe { libc::poll(pollfd, count, ms) };
+            if result < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if result > 0 {
+                let mut error = 0 as libc::c_int;
+                let mut len = std::mem::size_of_val(&error) as libc::socklen_t;
+                // SAFETY: valid out-pointers and a live socket.
+                if unsafe {
+                    libc::getsockopt(
+                        fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut error as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+                break;
+            }
+        }
+        super::ipc::remaining(until)?;
+        let stream = std::os::unix::net::UnixStream::from(fd);
+        stream.set_nonblocking(false)?;
+        Ok(Connection(stream))
+    }
+
     pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         self.0.set_read_timeout(timeout)?;
         self.0.set_write_timeout(timeout)

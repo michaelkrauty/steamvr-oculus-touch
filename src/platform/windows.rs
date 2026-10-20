@@ -403,7 +403,7 @@ impl Drop for OpenedSegment {
 
 use windows_sys::Win32::Foundation::{
     LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
+    ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -499,8 +499,13 @@ unsafe impl Send for Connection {}
 
 impl Connection {
     pub fn connect(endpoint: &Path) -> io::Result<Connection> {
+        Self::connect_until(endpoint, std::time::Instant::now() + Duration::from_secs(6))
+    }
+
+    pub fn connect_until(endpoint: &Path, until: std::time::Instant) -> io::Result<Connection> {
         let name = pipe_name(endpoint)?;
-        for _ in 0..3 {
+        loop {
+            super::ipc::remaining(until)?;
             // SAFETY: a NUL-terminated pipe name; the handle is owned below.
             let pipe = unsafe {
                 CreateFileW(
@@ -524,14 +529,22 @@ impl Connection {
                 });
             }
             let e = io::Error::last_os_error();
+            super::ipc::remaining(until)?;
             if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
                 return Err(e);
             }
             // every instance is busy: wait for the listener to offer the next
+            let left = super::ipc::remaining(until)?;
+            let ms = left.as_millis().clamp(1, INFINITE as u128 - 1) as u32;
             // SAFETY: a NUL-terminated pipe name.
-            unsafe { WaitNamedPipeW(name.as_ptr(), 2000) };
+            if unsafe { WaitNamedPipeW(name.as_ptr(), ms) } == 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32) {
+                    continue;
+                }
+                return Err(e);
+            }
         }
-        Err(io::Error::from(io::ErrorKind::TimedOut))
     }
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {

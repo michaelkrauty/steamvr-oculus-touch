@@ -600,7 +600,7 @@ pub mod ipc {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::os;
 
@@ -627,33 +627,73 @@ pub mod ipc {
         os::lock_exclusive(path)
     }
 
-    pub struct Connection(pub(super) os::Connection);
+    pub(super) fn remaining(until: Instant) -> io::Result<Duration> {
+        until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+
+    pub struct Connection(pub(super) os::Connection, Option<Instant>);
 
     impl Connection {
         /// Connects to the listener at `endpoint`; NotFound when nobody listens there, and
         /// PermissionDenied when another account does.
         pub fn connect(endpoint: &Path) -> io::Result<Connection> {
-            os::Connection::connect(endpoint).map(Connection)
+            os::Connection::connect(endpoint).map(|stream| Connection(stream, None))
+        }
+
+        /// The same deadline bounds connecting and every subsequent read and write.
+        pub fn connect_until(endpoint: &Path, until: Instant) -> io::Result<Connection> {
+            remaining(until)?;
+            let stream = os::Connection::connect_until(endpoint, until)?;
+            remaining(until)?;
+            Ok(Connection(stream, Some(until)))
         }
 
         /// How long a read or a write may wait (None: as long as it takes).
         pub fn set_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
             self.0.set_timeout(timeout)
         }
+
+        fn prepare(&mut self) -> io::Result<()> {
+            if let Some(until) = self.1 {
+                self.0.set_timeout(Some(remaining(until)?))?;
+            }
+            Ok(())
+        }
+
+        fn completed(&self, result: io::Result<usize>) -> io::Result<usize> {
+            if let Some(until) = self.1 {
+                remaining(until)?;
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+            }
+            result
+        }
     }
 
     impl Read for Connection {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
+            self.prepare()?;
+            let result = self.0.read(buf);
+            self.completed(result)
         }
     }
 
     impl Write for Connection {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
+            self.prepare()?;
+            let result = self.0.write(buf);
+            self.completed(result)
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            self.prepare()?;
             self.0.flush()
         }
     }
@@ -676,7 +716,58 @@ pub mod ipc {
 
         /// The next connection; with `wait` false, WouldBlock when none is pending.
         pub fn accept(&mut self, wait: bool) -> io::Result<Connection> {
-            self.0.accept(wait).map(Connection)
+            self.0.accept(wait).map(|stream| Connection(stream, None))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pair(tag: &str) -> (Connection, Connection, PathBuf) {
+            let dir =
+                std::env::temp_dir().join(format!("cv1t-deadline-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("control.sock");
+            let mut listener = Listener::bind(&path).unwrap();
+            let client = Connection::connect(&path).unwrap();
+            let server = listener.accept(true).unwrap();
+            (client, server, dir)
+        }
+
+        #[test]
+        fn an_expired_request_does_not_consume_its_reply() {
+            let (mut client, mut server, dir) = pair("read");
+            server.write_all(b"x").unwrap();
+            drop(server);
+            client.1 = Some(Instant::now() - Duration::from_secs(1));
+            let mut byte = [0];
+            assert_eq!(
+                client.read(&mut byte).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            client.1 = None;
+            client.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, *b"x");
+            drop(client);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn an_expired_request_does_not_write_its_command() {
+            let (mut client, mut server, dir) = pair("write");
+            client.1 = Some(Instant::now() - Duration::from_secs(1));
+            assert_eq!(
+                client.write(b"x").unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            drop(client);
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty(), "{bytes:?}");
+            drop(server);
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 }

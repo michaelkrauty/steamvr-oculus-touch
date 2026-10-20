@@ -7,7 +7,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::hand::{
     BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, TOUCH_A, TOUCH_B, TOUCH_STICK,
@@ -422,8 +422,15 @@ fn serve_client_with_deadline(
 }
 
 pub fn request(socket: &Path, line: &str, timeout: Duration) -> io::Result<String> {
-    let mut stream = ipc::Connection::connect(socket)?;
-    stream.set_timeout(Some(timeout))?;
+    let until = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "control timeout is too long")
+    })?;
+    request_until(socket, line, until)
+}
+
+/// Sends a request and reads its reply within one deadline, including connecting.
+pub fn request_until(socket: &Path, line: &str, until: Instant) -> io::Result<String> {
+    let mut stream = ipc::Connection::connect_until(socket, until)?;
     stream.write_all(line.trim_end().as_bytes())?;
     stream.write_all(b"\n")?;
     let mut reply = String::new();
@@ -875,6 +882,53 @@ mod tests {
         assert_eq!(reply, "ok pong");
         assert_eq!(server.join().unwrap(), "status\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_request_times_out_when_the_daemon_does_not_accept_connections() {
+        let path =
+            std::env::temp_dir().join(format!("cv1t-ctl-backlog-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        #[cfg(unix)]
+        let (listener, queued) = {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::net::{UnixListener, UnixStream};
+            let listener = UnixListener::bind(&path).unwrap();
+            // SAFETY: a valid listening socket. A backlog of zero holds one pending connection.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+            let queued = UnixStream::connect(&path).unwrap();
+            (listener, queued)
+        };
+        #[cfg(windows)]
+        let (listener, queued) = {
+            let listener = ipc::Listener::bind(&path).unwrap();
+            // Until the listener accepts this client, it offers no second pipe instance.
+            let queued = ipc::Connection::connect(&path).unwrap();
+            (listener, queued)
+        };
+        let until = Instant::now() + Duration::from_millis(200);
+        let (done, finished) = std::sync::mpsc::channel();
+        let cleanup = thread::spawn(move || {
+            // Releases an old blocking connect too, so a regression fails rather than hangs.
+            // The deadline was made before this watchdog, even if either thread runs late.
+            let timed_out = matches!(
+                finished.recv_timeout(Duration::from_secs(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            drop(listener);
+            timed_out
+        });
+        let result = request_until(&path, "status", until);
+        let _ = done.send(());
+        let watchdog_intervened = cleanup.join().unwrap();
+        drop(queued);
+        let _ = std::fs::remove_file(path);
+        // A deadline check after the watchdog unblocks connect can still return TimedOut.
+        assert!(!watchdog_intervened, "the watchdog had to unblock connect");
+        assert_eq!(
+            result.err().map(|e| e.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
     }
 
     #[test]
