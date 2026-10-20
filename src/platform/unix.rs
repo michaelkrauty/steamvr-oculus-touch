@@ -870,8 +870,7 @@ impl Drop for OutputRedirect {
     }
 }
 
-/// The kernel keeps a process's name (comm) in 16 bytes, NUL included; pgrep -x matches no
-/// longer pattern.
+/// The kernel keeps a process's name (comm) in 16 bytes, NUL included.
 const PROCESS_NAME_MAX: usize = 15;
 
 /// `name` is plain (no regular expression characters): pgrep matches it as written.
@@ -892,6 +891,35 @@ pub fn process_running(name: &str) -> io::Result<bool> {
         Some(1) => Ok(false),
         _ => Err(io::Error::other(format!("pgrep exited {status}"))),
     }
+}
+
+/// Read the kernel's names without forking: the daemon has locked memory and real-time threads.
+pub fn process_running_without_child(name: &str) -> io::Result<bool> {
+    process_running_in(Path::new("/proc"), name)
+}
+
+fn process_running_in(proc: &Path, name: &str) -> io::Result<bool> {
+    let name = &name.as_bytes()[..name.len().min(PROCESS_NAME_MAX)];
+    for entry in std::fs::read_dir(proc)? {
+        let entry = entry?;
+        let pid = entry.file_name();
+        if pid.is_empty() || !pid.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        match std::fs::read(entry.path().join("comm")) {
+            Ok(comm) if comm.strip_suffix(b"\n").unwrap_or(&comm) == name => return Ok(true),
+            Ok(_) => {}
+            // Processes can exit during the scan, or be hidden by /proc's access policy, as
+            // with pgrep. Other errors (including exhausted descriptors) are not "not running".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) || e.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
 }
 
 pub fn end_with_this_process(command: &mut std::process::Command) -> io::Result<()> {
@@ -1134,6 +1162,28 @@ pub fn alert(title: &str, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_scan_matches_exact_kernel_names_and_ignores_exited_processes() {
+        let proc = std::env::temp_dir().join(format!("cv1t-process-scan-{}", std::process::id()));
+        let node = |pid: &str, name: &[u8]| {
+            std::fs::create_dir_all(proc.join(pid)).unwrap();
+            std::fs::write(proc.join(pid).join("comm"), name).unwrap();
+        };
+        node("11", b"vrserver.sh\n");
+        node("12", b"vrserver-helper\n");
+        node("self", b"vrserver\n");
+        node("14", b"VRSERVER\n");
+        std::fs::create_dir_all(proc.join("13")).unwrap();
+        assert!(!process_running_in(&proc, "vrserver").unwrap());
+        node("15", b"vrserver\n");
+        assert!(process_running_in(&proc, "vrserver").unwrap());
+        let long = "cv1touch-long-process";
+        node("16", format!("{}\n", &long[..PROCESS_NAME_MAX]).as_bytes());
+        assert!(process_running_in(&proc, long).unwrap());
+        std::fs::remove_dir_all(&proc).unwrap();
+        assert!(process_running_in(&proc, "vrserver").is_err());
+    }
 
     #[test]
     fn finds_the_headset_interfaces_among_the_hidraw_nodes() {

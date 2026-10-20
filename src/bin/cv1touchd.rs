@@ -178,6 +178,8 @@ struct Daemon {
     /// The base stations' raw poses as the SteamVR driver last reported them (`stations`), with
     /// when they arrived (shm clock).
     driver_stations: Mutex<Option<TimedStationPoses>>,
+    /// The fallback's last state and deadline, for `universe-watch`; never held during a connect.
+    universe_connection: Mutex<UniverseConnection>,
     /// `universe-watch off` stops the watch (the registration stays as last followed).
     universe_watch_on: AtomicBool,
     /// What the watch follows the registration through now, for `universe-watch`.
@@ -880,12 +882,143 @@ fn apply_tracked(
 }
 
 const UNIVERSE_CHECK_MS: u64 = 60_000;
+const UNIVERSE_RETRY_MAX_MS: u64 = 15 * 60_000;
+const UNIVERSE_PROCESS_CHECK_MS: u64 = 10_000;
 /// How often the watch reads SteamVR's log and looks at the stations the driver reports (cheap:
 /// no SteamVR connection; the driver reports every 2 s).
 const UNIVERSE_TICK_MS: u64 = 1_000;
 /// The driver's report counts as current this long; past it, the watch connects to SteamVR itself
-/// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS`.
+/// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS` while connected.
 const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UniverseConnectionState {
+    #[default]
+    Unknown,
+    Stopped,
+    CheckFailed,
+    ConnectFailed,
+    Connected,
+}
+
+#[derive(Clone, Copy)]
+struct UniverseConnection {
+    next_attempt: Option<std::time::Instant>,
+    retry_ms: u64,
+    state: UniverseConnectionState,
+}
+
+impl Default for UniverseConnection {
+    fn default() -> Self {
+        Self {
+            next_attempt: None,
+            retry_ms: UNIVERSE_CHECK_MS,
+            state: UniverseConnectionState::Unknown,
+        }
+    }
+}
+
+impl UniverseConnection {
+    fn stations(
+        &mut self,
+        now: std::time::Instant,
+        host_ns: u64,
+        reported: Option<TimedStationPoses>,
+        running: impl FnOnce() -> io::Result<bool>,
+        connect: impl FnOnce() -> Result<align::Stations, String>,
+        say: impl FnMut(String),
+    ) -> Option<align::Stations> {
+        match reported.filter(|(at, _)| host_ns.saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS) {
+            Some((_, stations)) => Some(stations),
+            None => self.connect(now, running, connect, say),
+        }
+    }
+
+    /// Failed OpenVR inits can leak descriptors inside the runtime. Never initialize it while
+    /// vrserver is absent or cannot be checked; a server still starting is retried less often.
+    /// Process checks run only when due. A stopped server resets the backoff when next checked,
+    /// then is checked every 10 s, without scanning processes on every universe tick.
+    fn connect<T>(
+        &mut self,
+        now: std::time::Instant,
+        running: impl FnOnce() -> io::Result<bool>,
+        connect: impl FnOnce() -> Result<T, String>,
+        mut say: impl FnMut(String),
+    ) -> Option<T> {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return None;
+        }
+        match running() {
+            Ok(false) => {
+                self.next_attempt = Some(now + Duration::from_millis(UNIVERSE_PROCESS_CHECK_MS));
+                self.retry_ms = UNIVERSE_CHECK_MS;
+                if self.state != UniverseConnectionState::Stopped {
+                    say("universe watch: SteamVR is not running; waiting for it".into());
+                }
+                self.state = UniverseConnectionState::Stopped;
+                return None;
+            }
+            Err(e) => {
+                self.next_attempt = Some(now + Duration::from_millis(UNIVERSE_PROCESS_CHECK_MS));
+                if self.state != UniverseConnectionState::CheckFailed {
+                    say(format!(
+                        "universe watch: cannot check SteamVR processes: {e}"
+                    ));
+                }
+                self.state = UniverseConnectionState::CheckFailed;
+                return None;
+            }
+            Ok(true) => {}
+        }
+        match connect() {
+            Ok(client) => {
+                self.retry_ms = UNIVERSE_CHECK_MS;
+                self.next_attempt = Some(now + Duration::from_millis(UNIVERSE_CHECK_MS));
+                if !matches!(
+                    self.state,
+                    UniverseConnectionState::Unknown | UniverseConnectionState::Connected
+                ) {
+                    say("universe watch: SteamVR is available again".into());
+                }
+                self.state = UniverseConnectionState::Connected;
+                Some(client)
+            }
+            Err(e) => {
+                self.next_attempt = Some(now + Duration::from_millis(self.retry_ms));
+                self.retry_ms = (self.retry_ms * 2).min(UNIVERSE_RETRY_MAX_MS);
+                if self.state != UniverseConnectionState::ConnectFailed {
+                    say(format!(
+                        "universe watch: {e}; retrying less often, up to 15 min apart"
+                    ));
+                }
+                self.state = UniverseConnectionState::ConnectFailed;
+                None
+            }
+        }
+    }
+
+    fn status(&self, now: std::time::Instant) -> String {
+        let seconds = self.next_attempt.map_or(0, |at| {
+            let remaining = at.saturating_duration_since(now);
+            remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
+        });
+        match self.state {
+            UniverseConnectionState::Unknown => "waiting to check SteamVR".into(),
+            UniverseConnectionState::Stopped => {
+                format!("waiting for SteamVR to start; next check in {seconds} s")
+            }
+            UniverseConnectionState::CheckFailed => {
+                format!("cannot check whether SteamVR is running; next check in {seconds} s")
+            }
+            UniverseConnectionState::ConnectFailed => {
+                format!("retrying SteamVR; next in {seconds} s")
+            }
+            UniverseConnectionState::Connected => {
+                format!("SteamVR connection succeeded; checking once a minute, next in {seconds} s")
+            }
+        }
+    }
+}
 
 /// Keeps the registration on the headset as SteamVR tracks it. SteamVR tracks the headset in the
 /// frame of the base station it bootstrapped from, and re-solves the stations' poses relative to
@@ -895,14 +1028,15 @@ const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
 /// and where SteamVR has it now; SteamVR's log names it (`steamvr_log`). Through a dropout the
 /// watch keeps to the last station named; with none named yet, it follows the stations' moves
 /// together. The stations' poses come from the driver every 2 s, or a short-lived background
-/// OpenVR connection once a minute (one that never keeps SteamVR from quitting); each layout
-/// SteamVR settles on is kept (`align::Layouts`), to place the stations no registration measured.
+/// OpenVR connection at most once a minute while SteamVR runs (one that never keeps SteamVR from
+/// quitting, with longer waits after failed inits); each layout SteamVR settles on is kept
+/// (`align::Layouts`), to place the stations no registration measured.
 fn universe_watch(d: Arc<Daemon>) {
     let mut first = true;
     let mut warned_disagree = false;
     let mut warned_log = false;
     let mut warned_layouts = false;
-    let mut last_connect: Option<std::time::Instant> = None;
+    let mut connection = UniverseConnection::default();
     let mut steamvr_log = cv1touch::steamvr_log::Watch::new(&cv1touch::steamvr_log::server_log());
     let layouts_path = align::layouts_path();
     let modified = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -952,30 +1086,22 @@ fn universe_watch(d: Arc<Daemon>) {
             layouts = align::load_layouts(&layouts_path);
         }
         // the stations as the driver sees them inside SteamVR; else (an older driver) a short
-        // SteamVR connection of our own, once a minute: each one costs vrserver an app connect
-        let reported = d
-            .driver_stations
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|(at, _)| shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS);
-        let now = match reported {
-            Some((_, v)) => v,
-            None => {
-                if last_connect
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(UNIVERSE_CHECK_MS))
-                {
-                    continue;
-                }
-                last_connect = Some(std::time::Instant::now());
-                let Ok(client) = cv1touch::vr::Client::connect() else {
-                    say(String::new());
-                    continue;
-                };
-                let v = client.stations();
-                drop(client);
-                v
+        // SteamVR connection of our own, at most once a minute: each costs vrserver an app connect
+        let reported = d.driver_stations.lock().unwrap().clone();
+        let now = connection.stations(
+            std::time::Instant::now(),
+            shm::now_ns(),
+            reported,
+            || platform::process::running_without_child("vrserver"),
+            || cv1touch::vr::Client::connect().map(|client| client.stations()),
+            log,
+        );
+        *d.universe_connection.lock().unwrap() = connection;
+        let Some(now) = now else {
+            if connection.state != UniverseConnectionState::Connected {
+                say(String::new());
             }
+            continue;
         };
         if now.is_empty() {
             continue;
@@ -2928,7 +3054,13 @@ fn handle(d: &Daemon, line: &str) -> String {
                         shm::now_ns().saturating_sub(*at) as f64 * 1e-9
                     )
                 }
-                _ => "no recent driver report: connecting to SteamVR once a minute".into(),
+                _ => format!(
+                    "no recent driver report: {}",
+                    d.universe_connection
+                        .lock()
+                        .unwrap()
+                        .status(std::time::Instant::now())
+                ),
             };
             let following = d.universe_following.lock().unwrap().clone();
             format!(
@@ -3537,6 +3669,7 @@ fn main() {
         universe_shift: Mutex::new(None),
         universe_recheck: AtomicBool::new(false),
         driver_stations: Mutex::new(None),
+        universe_connection: Mutex::new(UniverseConnection::default()),
         universe_watch_on: AtomicBool::new(true),
         universe_following: Mutex::new(String::new()),
         shaping_on: AtomicBool::new(true),
@@ -3702,6 +3835,303 @@ mod tests {
         assert_eq!(alert.update(Some((0.5, 2))), Some(LandmarkNotice::Moved));
     }
 
+    #[test]
+    fn universe_watch_status_waits_for_the_first_check() {
+        let d = status_daemon();
+        assert!(handle(&d, "universe-watch").contains("waiting to check SteamVR"));
+    }
+
+    #[test]
+    fn universe_watch_status_reports_the_state_and_remaining_wait() {
+        let d = status_daemon();
+        let start = std::time::Instant::now();
+        for (state, seconds, text) in [
+            (
+                UniverseConnectionState::Stopped,
+                10,
+                "waiting for SteamVR to start; next check in 10 s",
+            ),
+            (
+                UniverseConnectionState::CheckFailed,
+                10,
+                "cannot check whether SteamVR is running; next check in 10 s",
+            ),
+            (
+                UniverseConnectionState::ConnectFailed,
+                60,
+                "retrying SteamVR; next in 60 s",
+            ),
+            (
+                UniverseConnectionState::Connected,
+                60,
+                "SteamVR connection succeeded; checking once a minute, next in 60 s",
+            ),
+        ] {
+            let connection = UniverseConnection {
+                state,
+                next_attempt: Some(start + Duration::from_secs(seconds)),
+                ..Default::default()
+            };
+            assert_eq!(connection.status(start + Duration::from_millis(500)), text);
+            *d.universe_connection.lock().unwrap() = connection;
+            let reply = handle(&d, "universe-watch");
+            let label = text.split(';').next().unwrap();
+            assert!(reply.contains(label), "{reply}");
+        }
+        let connection = UniverseConnection {
+            state: UniverseConnectionState::ConnectFailed,
+            next_attempt: Some(start + Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert_eq!(
+            connection.status(start + Duration::from_secs(61)),
+            "retrying SteamVR; next in 0 s"
+        );
+    }
+
+    #[test]
+    fn universe_watch_keeps_failed_retries_across_fresh_then_stale_driver_reports() {
+        let mut connection = UniverseConnection::default();
+        let start = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let messages = std::cell::RefCell::new(Vec::new());
+        let stations = vec![("base-a".into(), nalgebra::Isometry3::identity())];
+        let mut tick = |seconds, reported| {
+            connection.stations(
+                start + Duration::from_secs(seconds),
+                seconds * 1_000_000_000,
+                reported,
+                || Ok(true),
+                || {
+                    calls.set(calls.get() + 1);
+                    Err("SteamVR is still starting".into())
+                },
+                |s| messages.borrow_mut().push(s),
+            )
+        };
+        assert_eq!(tick(0, None), None);
+        assert_eq!(calls.get(), 1);
+        let report = Some((1_000_000_000, stations.clone()));
+        assert_eq!(tick(1, report.clone()), Some(stations.clone()));
+        assert_eq!(tick(10, report.clone()), Some(stations.clone()));
+        assert_eq!(tick(11, report), None);
+        assert_eq!(calls.get(), 1, "a fresh report must not erase the deadline");
+        tick(59, None);
+        assert_eq!(calls.get(), 1);
+        tick(60, None);
+        assert_eq!(calls.get(), 2);
+        let report = Some((61_000_000_000, stations.clone()));
+        assert_eq!(tick(61, report.clone()), Some(stations));
+        tick(71, report);
+        tick(179, None);
+        assert_eq!(
+            calls.get(),
+            2,
+            "the longer backoff must survive reports too"
+        );
+        tick(180, None);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            messages.borrow().len(),
+            1,
+            "reports must not repeat warnings"
+        );
+    }
+
+    #[test]
+    fn universe_fallback_checks_processes_only_when_due() {
+        let mut connection = UniverseConnection::default();
+        let start = std::time::Instant::now();
+        let checks = std::cell::Cell::new(0);
+        let calls = std::cell::Cell::new(0);
+        let succeeds = std::cell::Cell::new(false);
+        let mut tick = |seconds, running| {
+            connection.connect(
+                start + Duration::from_secs(seconds),
+                || {
+                    checks.set(checks.get() + 1);
+                    Ok(running)
+                },
+                || -> Result<(), String> {
+                    calls.set(calls.get() + 1);
+                    if succeeds.get() {
+                        Ok(())
+                    } else {
+                        Err("SteamVR is still starting".into())
+                    }
+                },
+                |_| {},
+            )
+        };
+        for seconds in 0..40 {
+            tick(seconds, false);
+            assert_eq!(checks.get(), seconds as usize / 10 + 1, "at {seconds} s");
+            assert_eq!(calls.get(), 0);
+        }
+        tick(40, true);
+        assert_eq!((checks.get(), calls.get()), (5, 1));
+        for seconds in 41..100 {
+            tick(seconds, true);
+            assert_eq!((checks.get(), calls.get()), (5, 1));
+        }
+        tick(100, true);
+        assert_eq!((checks.get(), calls.get()), (6, 2));
+        for seconds in 101..220 {
+            tick(seconds, false);
+            assert_eq!((checks.get(), calls.get()), (6, 2));
+        }
+        tick(220, false);
+        assert_eq!((checks.get(), calls.get()), (7, 2));
+        for seconds in 221..230 {
+            tick(seconds, true);
+            assert_eq!((checks.get(), calls.get()), (7, 2));
+        }
+        tick(230, true);
+        assert_eq!((checks.get(), calls.get()), (8, 3));
+        tick(289, true);
+        assert_eq!((checks.get(), calls.get()), (8, 3));
+        tick(290, true);
+        assert_eq!(
+            (checks.get(), calls.get()),
+            (9, 4),
+            "a stop reset the backoff"
+        );
+        succeeds.set(true);
+        tick(410, true);
+        assert_eq!((checks.get(), calls.get()), (10, 5));
+        for seconds in 411..470 {
+            tick(seconds, false);
+            assert_eq!((checks.get(), calls.get()), (10, 5));
+        }
+        tick(470, false);
+        assert_eq!((checks.get(), calls.get()), (11, 5));
+    }
+
+    #[test]
+    fn universe_fallback_never_connects_while_steamvr_is_stopped() {
+        let mut connection = UniverseConnection::default();
+        let start = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let messages = std::cell::RefCell::new(Vec::new());
+        let mut tick = |seconds, running| {
+            connection.connect(
+                start + Duration::from_secs(seconds),
+                || Ok(running),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |s| messages.borrow_mut().push(s),
+            )
+        };
+        for seconds in [0, 60, 3600, 86_400] {
+            assert_eq!(tick(seconds, false), None);
+        }
+        assert_eq!(calls.get(), 0);
+        assert_eq!(messages.borrow().len(), 1, "one message while stopped");
+        assert_eq!(tick(86_401, true), None);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(tick(86_410, true), Some(()));
+        assert_eq!(calls.get(), 1, "a start is noticed at the next 10 s check");
+    }
+
+    #[test]
+    fn universe_fallback_backs_off_and_resets_after_success_or_stop() {
+        let mut connection = UniverseConnection::default();
+        let start = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let messages = std::cell::RefCell::new(Vec::new());
+        let mut tick = |seconds, running, succeeds| {
+            connection.connect(
+                start + Duration::from_secs(seconds),
+                || Ok(running),
+                || {
+                    calls.set(calls.get() + 1);
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err("SteamVR is still starting".to_string())
+                    }
+                },
+                |s| messages.borrow_mut().push(s),
+            )
+        };
+        let mut expected = 0;
+        for (seconds, due) in [
+            (0, true),
+            (59, false),
+            (60, true),
+            (179, false),
+            (180, true),
+            (419, false),
+            (420, true),
+            (899, false),
+            (900, true),
+            (1799, false),
+            (1800, true),
+            (2699, false),
+            (2700, true),
+        ] {
+            assert_eq!(tick(seconds, true, false), None);
+            expected += usize::from(due);
+            assert_eq!(calls.get(), expected, "at {seconds} s");
+        }
+        assert_eq!(
+            messages.borrow().len(),
+            1,
+            "retries do not repeat a warning"
+        );
+        assert_eq!(tick(3600, true, true), Some(()));
+        expected += 1;
+        assert_eq!(tick(3659, true, false), None);
+        assert_eq!(calls.get(), expected, "success keeps the minute interval");
+        tick(3660, true, false);
+        expected += 1;
+        tick(3719, true, false);
+        assert_eq!(calls.get(), expected);
+        tick(3720, true, false);
+        expected += 1;
+        assert_eq!(
+            calls.get(),
+            expected,
+            "success reset the failed retry delay"
+        );
+        tick(3721, false, false);
+        assert_eq!(calls.get(), expected, "stopping never initializes OpenVR");
+        tick(3839, true, false);
+        assert_eq!(calls.get(), expected, "the stop is checked only when due");
+        tick(3840, false, false);
+        tick(3849, true, false);
+        assert_eq!(calls.get(), expected);
+        tick(3850, true, false);
+        expected += 1;
+        assert_eq!(calls.get(), expected, "stopping reset the pending retry");
+        tick(3909, true, false);
+        assert_eq!(calls.get(), expected);
+        tick(3910, true, false);
+        assert_eq!(calls.get(), expected + 1, "stopping reset the retry delay");
+        assert_eq!(messages.borrow().len(), 5, "only state changes are logged");
+    }
+
+    #[test]
+    fn universe_fallback_does_not_connect_when_processes_cannot_be_checked() {
+        let mut connection = UniverseConnection::default();
+        let start = std::time::Instant::now();
+        let mut messages = Vec::new();
+        for seconds in [0, 60, 3600] {
+            assert_eq!(
+                connection.connect(
+                    start + Duration::from_secs(seconds),
+                    || Err(io::Error::other("process list unavailable")),
+                    || -> Result<(), String> { panic!("must not initialize OpenVR") },
+                    |s| messages.push(s),
+                ),
+                None
+            );
+        }
+        assert_eq!(messages.len(), 1);
+    }
+
     fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -3736,6 +4166,7 @@ mod tests {
             universe_shift: Mutex::new(None),
             universe_recheck: AtomicBool::new(false),
             driver_stations: Mutex::new(None),
+            universe_connection: Mutex::new(UniverseConnection::default()),
             universe_watch_on: AtomicBool::new(true),
             universe_following: Mutex::new(String::new()),
             shaping_on: AtomicBool::new(true),

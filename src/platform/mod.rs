@@ -751,6 +751,18 @@ pub mod process {
     /// Windows, in any case). Linux asks pgrep (procps); it keeps the first 15 bytes of a
     /// process's name, so a longer `name` is compared by those.
     pub fn running(name: &str) -> io::Result<bool> {
+        check_name(name)?;
+        os::process_running(name)
+    }
+
+    /// The same name check without starting a child process: /proc on Linux, a Toolhelp
+    /// snapshot on Windows. Safe to call from the daemon with locked memory and real-time threads.
+    pub fn running_without_child(name: &str) -> io::Result<bool> {
+        check_name(name)?;
+        os::process_running_without_child(name)
+    }
+
+    fn check_name(name: &str) -> io::Result<()> {
         if name.is_empty()
             || !name
                 .bytes()
@@ -761,7 +773,7 @@ pub mod process {
                 format!("{name:?} is not a plain program name"),
             ));
         }
-        os::process_running(name)
+        Ok(())
     }
 
     /// Makes the process `command` starts end when this one does, however it ends. On Linux it
@@ -1517,13 +1529,18 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_stem().unwrap().to_str().unwrap();
         assert!(name.len() > 15, "{name}");
-        assert!(process::running(name).unwrap());
-        assert!(process::running(&name.to_uppercase()).unwrap() == cfg!(windows));
-        assert!(!process::running("cv1touch-not-a-program").unwrap());
-        // a name, not an option to pgrep
-        assert!(!process::running("-cv1touch-not-a-program").unwrap());
-        assert!(process::running("vrserver|init").is_err());
-        assert!(process::running("").is_err());
+        for running in [
+            process::running as fn(&str) -> std::io::Result<bool>,
+            process::running_without_child,
+        ] {
+            assert!(running(name).unwrap());
+            assert!(running(&name.to_uppercase()).unwrap() == cfg!(windows));
+            assert!(!running("cv1touch-not-a-program").unwrap());
+            // a name, not an option
+            assert!(!running("-cv1touch-not-a-program").unwrap());
+            assert!(running("vrserver|init").is_err());
+            assert!(running("").is_err());
+        }
     }
 
     /// On Windows a real-time request takes no privileges: the thread runs time-critical.

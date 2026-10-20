@@ -108,8 +108,27 @@ pub struct Client {
 // thread at a time.
 unsafe impl Send for Client {}
 
+fn connect_with<T>(
+    running: impl FnOnce() -> std::io::Result<bool>,
+    init: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // Failed inits can leak descriptors inside SteamVR, even after shutdown. This also
+    // guards the setup guide's retries after user input; the daemon backs off separately.
+    if !running().map_err(|e| format!("cannot check SteamVR processes: {e}"))? {
+        return Err("SteamVR is not running; start it and try again".into());
+    }
+    init()
+}
+
 impl Client {
     pub fn connect() -> Result<Client, String> {
+        connect_with(
+            || crate::platform::process::running_without_child("vrserver"),
+            Self::initialize,
+        )
+    }
+
+    fn initialize() -> Result<Client, String> {
         // SAFETY: symbols looked up by NUL-terminated names have the declared C signatures.
         unsafe {
             let bundled = runtime_library();
@@ -344,6 +363,67 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use nalgebra::Vector3;
+
+    #[test]
+    fn shared_connection_guard_never_initializes_while_steamvr_is_stopped() {
+        let mut initialized = 0;
+        let result = connect_with(
+            || Ok(false),
+            || {
+                initialized += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(initialized, 0);
+        assert_eq!(
+            result,
+            Err("SteamVR is not running; start it and try again".into())
+        );
+    }
+
+    #[test]
+    fn shared_connection_guard_never_initializes_when_process_check_fails() {
+        let mut initialized = 0;
+        let result = connect_with(
+            || Err(std::io::Error::other("process list unavailable")),
+            || {
+                initialized += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(initialized, 0);
+        assert_eq!(
+            result,
+            Err("cannot check SteamVR processes: process list unavailable".into())
+        );
+    }
+
+    #[test]
+    fn shared_connection_guard_returns_the_initializer_result_when_running() {
+        let mut initialized = 0;
+        assert_eq!(
+            connect_with(
+                || Ok(true),
+                || {
+                    initialized += 1;
+                    Ok(7)
+                }
+            ),
+            Ok(7)
+        );
+        assert_eq!(initialized, 1);
+        assert_eq!(
+            connect_with(
+                || Ok(true),
+                || -> Result<(), String> {
+                    initialized += 1;
+                    Err("OpenVR init failed".into())
+                }
+            ),
+            Err("OpenVR init failed".into())
+        );
+        assert_eq!(initialized, 2);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const PRESSED: u64 = 0x1234_5678_9abc_def0;

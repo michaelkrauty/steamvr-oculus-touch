@@ -1415,6 +1415,10 @@ pub fn process_running(name: &str) -> io::Result<bool> {
     }
 }
 
+pub fn process_running_without_child(name: &str) -> io::Result<bool> {
+    process_running(name)
+}
+
 pub fn end_with_this_process(_command: &mut std::process::Command) -> io::Result<()> {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
