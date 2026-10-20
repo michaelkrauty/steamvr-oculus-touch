@@ -61,6 +61,7 @@ int rift_tracker_get_sensor_stream(rift_tracker_ctx *ctx, int index, ohmd_cv1tou
 bool rift_tracker_record_sensor_stream(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_stream *stream);
 void rift_tracker_forget_sensor_stream(rift_tracker_ctx *ctx, const char *serial);
 int rift_tracker_set_sensor_pose(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_pose *pose);
+int rift_tracker_retire_sensor(rift_tracker_ctx *ctx, const char *serial);
 int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask);
 int rift_tracker_sensor_pose_applied(rift_tracker_ctx *ctx, const char *serial);
 

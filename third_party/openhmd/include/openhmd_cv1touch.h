@@ -69,6 +69,23 @@ typedef struct ohmd_cv1touch_controller {
 #define OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH 1u
 #define OHMD_CV1TOUCH_STREAM_ERROR_OTHER 2u
 
+#define OHMD_CV1TOUCH_ATTACHMENT_UNKNOWN 0u
+#define OHMD_CV1TOUCH_ATTACHMENT_USB 1u /* legacy location only; not an incarnation */
+#define OHMD_CV1TOUCH_ATTACHMENT_WINDOWS 2u
+#define OHMD_CV1TOUCH_ATTACHMENT_SYSFS 3u
+
+/* Discovery identity, retained even when the stream fails and its object is freed.
+ * SYSFS: data[0] packs bus/address in its low two bytes; data[1..2] are the
+ * low/high halves of the pinned directory's inode. The pin lives with the start
+ * record, so kernfs cannot reuse that identity; equal inode means the same port
+ * directory, with exact (zero-tolerance) incarnation matching.
+ * Windows: data[0..1] are LastArrivalDate for USB\VID_2833&PID_0211\<serial>.
+ * Unknown and legacy location-only identities cannot consume a new attachment. */
+typedef struct ohmd_cv1touch_sensor_attachment {
+	uint32_t kind;
+	uint32_t data[3];
+} ohmd_cv1touch_sensor_attachment;
+
 /* Last USB video start attempt for each serial, separate from the sensor sample
  * ABI. A successful attempt clears the failure and records the setting it used.
  * Records can outlive unplugging: callers must forget on detach; engine close
@@ -80,7 +97,7 @@ typedef struct ohmd_cv1touch_sensor_stream {
 	int32_t error_code;                /* raw libusb/start return code, zero on success */
 	int32_t os_error;                  /* Linux caller errno, possibly clobbered; zero if unavailable */
 	int32_t alt_setting;               /* setting used by that attempt; zero if it failed */
-	uint32_t reserved[4];              /* zero; room for additive diagnostics */
+	ohmd_cv1touch_sensor_attachment attachment; /* replaces reserved bytes; still 64 bytes */
 } ohmd_cv1touch_sensor_stream;
 
 /* Separate acquisition diagnostics: frames delivered before any analysis lock or
@@ -110,6 +127,7 @@ typedef struct ohmd_cv1touch_sensor_video_quality {
 typedef struct ohmd_cv1touch_sensor {
 	char serial[32];
 	bool have_camera_pose;
+	uint8_t usb_gone; /* Live: 0/1, retained NO_DEVICE. Older recordings stored padding here. */
 	float camera_orient[4];            /* camera -> world */
 	float camera_pos[3];
 	uint32_t frames;                   /* cumulative frames released */
@@ -180,6 +198,10 @@ typedef void (*ohmd_cv1touch_report_cb)(void *user, int source, uint64_t host_ns
  * the callback must not allocate, lock or wait. */
 typedef void (*ohmd_cv1touch_activity_cb)(void *user, int reader, int device_id,
         uint64_t device_ns, uint64_t received_ns, bool asleep, float gyro_squared);
+/* Cold discovery only. The caller's immutable snapshot must precede native USB
+ * enumeration; a missing serial is unknown, never looked up after a failed start. */
+typedef void (*ohmd_cv1touch_sensor_attachment_cb)(void *user, const char *serial,
+	ohmd_cv1touch_sensor_attachment *out);
 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, const ohmd_cv1touch_config *config);
 /* Complete lists, copied transactionally into the context. Call before opening devices.
@@ -214,6 +236,7 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_contex
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_activity_callback(ohmd_context *ctx, ohmd_cv1touch_activity_cb cb, void *user);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_sensor_attachment_callback(ohmd_context *ctx, ohmd_cv1touch_sensor_attachment_cb cb, void *user);
 OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device *device);
 /* Process-wide log receiver, installed before any engine worker starts and not changed while
  * workers run. Each callback borrows one complete line, at most 2048 bytes, with its original
@@ -281,6 +304,9 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_stream(ohmd_device *
 /* Forget a detached serial without freeing its native sensor object. Idempotent;
  * returns 0, or -1 on invalid arguments/context. Engine thread only. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_forget_sensor_stream(ohmd_device *device, const char *serial);
+/* Retires this serial until engine replacement, fencing in-flight native pose commits.
+ * Idempotent, including when the serial is not open. Thread-safe while the device lives. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_retire_sensor(ohmd_device *device, const char *serial);
 /* Gives the sensor pose->serial names the camera -> world pose it tracks with from now on, as its
  * fixed pose at start did; applied by the sensor's own analysis thread before its next frame.
  * Returns 0, or -1 when no such sensor is open. */

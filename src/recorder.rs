@@ -1177,6 +1177,24 @@ pub fn decode_led_model(payload: &[u8]) -> Option<(i32, Vec<LedEntry>)> {
 mod frame_tests {
     use super::*;
 
+    #[test]
+    fn hotplug_legacy_sensor_padding_accepts_every_byte_without_a_rust_bool() {
+        // Check the ABI type BEFORE decoding a legacy invalid-bool representation.
+        // This makes the old-layout red proof safe to run too.
+        assert_eq!(
+            std::any::type_name_of_val(&SensorInfo::default().usb_gone),
+            "u8"
+        );
+        for padding in 2..=255u8 {
+            let mut bytes = vec![0u8; size_of::<SensorInfo>()];
+            bytes[33] = padding;
+            bytes[64..68].copy_from_slice(&17u32.to_le_bytes());
+            let s = decode_sensor_info(&bytes).unwrap();
+            assert_eq!(format!("{:?}", s.usb_gone), padding.to_string());
+            assert_eq!(s.frames, 17);
+        }
+    }
+
     /// A black frame with two blobs, noise at the floor, and a stride wider than the row: every
     /// pixel above the floor comes back, nothing else, in a few hundred bytes.
     #[test]

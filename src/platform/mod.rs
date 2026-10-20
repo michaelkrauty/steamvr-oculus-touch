@@ -862,6 +862,16 @@ pub mod usb {
         pub parent: Option<String>,
     }
 
+    /// A Rift sensor's USB presence, without opening or claiming its USB interfaces.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Sensor {
+        pub serial: String,
+        /// Identifies this attachment; a new USB address at the same port is a new attachment.
+        pub attachment: String,
+        /// Permissions or drivers are ready for the engine to attempt opening it.
+        pub ready: bool,
+    }
+
     /// The present devices of the USB vendor `vendor`, and their interfaces (on Windows, also
     /// the HID collections of their HID interfaces): on Linux each device before its interfaces,
     /// on Windows by `id`.
@@ -903,6 +913,118 @@ pub mod usb {
         Ok(Some((id, product)))
     }
 
+    /// Present Rift CV1 sensors and whether their USB permissions or drivers are ready.
+    pub fn sensors() -> io::Result<Vec<Sensor>> {
+        os::usb_sensors()
+    }
+
+    pub(crate) fn sensor_serial(serial: &str) -> bool {
+        !serial.is_empty() && serial.len() < 32 && serial.bytes().all(|b| b.is_ascii_alphanumeric())
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) struct WindowsSensorNode {
+        pub node: Node,
+        pub arrival: Option<u64>,
+        pub started: Option<bool>,
+        pub interface: bool,
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn sensors_on_windows(nodes: &[WindowsSensorNode]) -> Vec<Sensor> {
+        let winusb = |n: &WindowsSensorNode| {
+            n.started == Some(true)
+                && n.interface
+                && n.node.problem.is_none()
+                && n.node
+                    .driver
+                    .as_deref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case("winusb"))
+        };
+        nodes
+            .iter()
+            .filter_map(|n| {
+                let id = n.node.id.to_ascii_uppercase();
+                if n.node.product != 0x0211 || !id.starts_with(r"USB\VID_2833&PID_0211\") {
+                    return None;
+                }
+                let serial = n.node.id.rsplit('\\').next()?;
+                if !sensor_serial(serial) {
+                    return None;
+                }
+                let mut interfaces = nodes
+                    .iter()
+                    .filter(|i| {
+                        i.node
+                            .parent
+                            .as_deref()
+                            .is_some_and(|p| p.eq_ignore_ascii_case(&n.node.id))
+                            && i.node.id.to_ascii_uppercase().contains("&MI_")
+                    })
+                    .peekable();
+                let ready = n.arrival.is_some()
+                    && n.started == Some(true)
+                    && n.node.problem.is_none()
+                    && if interfaces.peek().is_none() {
+                        winusb(n)
+                    } else {
+                        let mut count = 0;
+                        let mut ready = true;
+                        for interface in interfaces {
+                            count += 1;
+                            ready &= winusb(interface);
+                        }
+                        count >= 2 && ready
+                    };
+                Some(Sensor {
+                    serial: serial.to_string(),
+                    attachment: n
+                        .arrival
+                        .map(|arrival| format!("{id}@{arrival:016x}"))
+                        .unwrap_or_default(),
+                    ready,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn winusb_interface_ready(
+        whole_device: bool,
+        registered: &[u16],
+        mut present: impl FnMut(u128) -> bool,
+    ) -> bool {
+        if whole_device {
+            // libusb's device pass opens a whole-device WinUSB driver by this standard interface.
+            return present(0xa5dcbf10_6530_11d2_901f_00c04fb951ed);
+        }
+        // Its generic pass discovers the first DeviceInterfaceGUIDs/DeviceInterfaceGUID entry
+        // for a composite interface. A later active entry cannot make an inactive first ready.
+        let Some(entry) = registered.get(..38) else {
+            return false;
+        };
+        if entry[0] != u16::from(b'{') || entry[37] != u16::from(b'}') {
+            return false;
+        }
+        let mut guid = 0u128;
+        for (i, &c) in entry.iter().enumerate().take(37).skip(1) {
+            if [9, 14, 19, 24].contains(&i) {
+                if c != u16::from(b'-') {
+                    return false;
+                }
+            } else {
+                let digit = match c {
+                    0x30..=0x39 => c - 0x30,
+                    0x41..=0x46 => c - 0x41 + 10,
+                    0x61..=0x66 => c - 0x61 + 10,
+                    _ => return false,
+                };
+                guid = (guid << 4) | u128::from(digit);
+            }
+        }
+        present(guid)
+    }
+
     /// The device interface a device node set up by `use_winusb` is offered under (Windows):
     /// libusb finds a WinUSB device by the interface its registry entry names.
     pub const WINUSB_INTERFACE: &str = "{00CFBFC2-E6AB-4A1F-98D6-1E197D3841CC}";
@@ -934,6 +1056,194 @@ pub mod usb {
     /// session): PermissionDenied when not. On Windows the driver decides: Unsupported.
     pub fn can_open(id: &str) -> io::Result<()> {
         os::can_open(id)
+    }
+    #[cfg(test)]
+    mod hotplug_tests {
+        use super::*;
+        #[test]
+        fn hotplug_windows_groups_interfaces_and_waits_for_both_winusb_drivers() {
+            let root = r"USB\VID_2833&PID_0211\SENSORALPHA";
+            let node = |id: &str, driver: Option<&str>, parent: Option<&str>| WindowsSensorNode {
+                arrival: Some(1),
+                started: Some(true),
+                interface: true,
+                node: Node {
+                    id: id.into(),
+                    product: 0x0211,
+                    name: String::new(),
+                    driver: driver.map(String::from),
+                    problem: None,
+                    parent: parent.map(String::from),
+                },
+            };
+            let mut nodes = vec![node(root, Some("usbccgp"), None)];
+            assert_eq!(sensors_on_windows(&nodes).len(), 1);
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes.push(node(
+                r"USB\VID_2833&PID_0211&MI_00\INTERFACEA",
+                Some("WinUSB"),
+                Some(root),
+            ));
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes.push(node(
+                r"USB\VID_2833&PID_0211&MI_01\INTERFACEB",
+                Some("winusb"),
+                Some(root),
+            ));
+            assert!(sensors_on_windows(&nodes)[0].ready);
+            assert_eq!(sensors_on_windows(&nodes)[0].serial, "SENSORALPHA");
+            nodes[2].node.problem = Some(28);
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes.truncate(1);
+            nodes[0].node.driver = Some("WinUSB".into());
+            assert!(sensors_on_windows(&nodes)[0].ready);
+            nodes[0].node.id = r"USB\VID_1234&PID_0211\OTHER".into();
+            assert!(sensors_on_windows(&nodes).is_empty());
+        }
+        #[test]
+        fn hotplug_windows_checks_the_registered_guids_including_other_driver_setups() {
+            let alpha = 0x11223344_5566_7788_99aa_bbccddeeff00;
+            let registered: Vec<_> = "{11223344-5566-7788-99AA-BBCCDDEEFF00}\0{22334455-6677-8899-AABB-CCDDEEFF0011}\0\0".encode_utf16().collect();
+            let mut queried = Vec::new();
+            assert!(winusb_interface_ready(false, &registered, |guid| {
+                queried.push(guid);
+                guid == alpha
+            }));
+            assert_eq!(queried, [alpha]);
+            assert!(!winusb_interface_ready(false, &registered, |_| false));
+            // libusb accepts REG_SZ, MULTI_SZ and concatenated registrations, without a final NUL.
+            for separator in ["", "\0", "\0\0"] {
+                let entries = format!("{{11223344-5566-7788-99AA-BBCCDDEEFF00}}{separator}{{22334455-6677-8899-AABB-CCDDEEFF0011}}");
+                assert!(winusb_interface_ready(
+                    false,
+                    &entries.encode_utf16().collect::<Vec<_>>(),
+                    |guid| guid == alpha
+                ));
+            }
+            for invalid in [
+                "",
+                "\0\0",
+                "not a GUID",
+                "{11223344-5566-7788-99AA-BBCCDDEEFF0Z}",
+                "{11223344_5566-7788-99AA-BBCCDDEEFF00}",
+            ] {
+                assert!(!winusb_interface_ready(
+                    false,
+                    &invalid.encode_utf16().collect::<Vec<_>>(),
+                    |_| panic!("invalid registrations cannot be ready")
+                ));
+            }
+        }
+
+        #[test]
+        fn hotplug_windows_does_not_consume_an_attempt_for_only_a_second_active_guid() {
+            let raw: Vec<_> = "{11223344-5566-7788-99AA-BBCCDDEEFF00}\0{22334455-6677-8899-AABB-CCDDEEFF0011}\0\0".encode_utf16().collect();
+            let mut queried = Vec::new();
+            assert!(!winusb_interface_ready(false, &raw, |guid| {
+                queried.push(guid);
+                guid == 0x22334455_6677_8899_aabb_ccddeeff0011
+            }));
+            assert_eq!(queried, [0x11223344_5566_7788_99aa_bbccddeeff00]);
+            let bad_first: Vec<_> = "bad}\0{11223344-5566-7788-99AA-BBCCDDEEFF00}"
+                .encode_utf16()
+                .collect();
+            assert!(!winusb_interface_ready(false, &bad_first, |_| panic!(
+                "a malformed first registration is unready"
+            )));
+        }
+
+        #[test]
+        fn hotplug_windows_whole_device_uses_the_standard_active_usb_interface() {
+            let mut queried = Vec::new();
+            assert!(winusb_interface_ready(true, &[], |guid| {
+                queried.push(guid);
+                guid == 0xa5dcbf10_6530_11d2_901f_00c04fb951ed
+            }));
+            assert_eq!(queried, [0xa5dcbf10_6530_11d2_901f_00c04fb951ed]);
+            assert!(!winusb_interface_ready(true, &[], |_| false));
+        }
+
+        fn whole_sensor() -> WindowsSensorNode {
+            WindowsSensorNode {
+                node: Node {
+                    id: r"USB\VID_2833&PID_0211\SENSORALPHA".into(),
+                    product: 0x0211,
+                    name: String::new(),
+                    driver: Some("WinUSB".into()),
+                    problem: None,
+                    parent: None,
+                },
+                arrival: Some(1),
+                started: Some(true),
+                interface: true,
+            }
+        }
+
+        #[test]
+        fn hotplug_windows_instance_spelling_does_not_change_the_attachment() {
+            let mut nodes = vec![whole_sensor()];
+            let original = sensors_on_windows(&nodes);
+            nodes[0].node.id.make_ascii_lowercase();
+            let lower = sensors_on_windows(&nodes);
+            assert!(original[0].ready && lower[0].ready);
+            assert!(original[0].serial.eq_ignore_ascii_case(&lower[0].serial));
+            assert_eq!(lower[0].serial, "sensoralpha");
+            assert_eq!(original[0].attachment, lower[0].attachment);
+        }
+
+        #[test]
+        fn hotplug_windows_arrival_changes_even_when_the_instance_id_does_not() {
+            use crate::sensor_hotplug::{Monitor, DEBOUNCE_NS};
+            let mut nodes = vec![whole_sensor()];
+            let initial = sensors_on_windows(&nodes);
+            let id = nodes[0].node.id.clone();
+            let mut monitor = Monitor::new(Ok(initial.clone()), &[]);
+            nodes[0].arrival = Some(2);
+            let returned = sensors_on_windows(&nodes);
+            assert_eq!(nodes[0].node.id, id);
+            assert_ne!(initial[0].attachment, returned[0].attachment);
+            assert!(monitor.update(1, Ok(returned.clone()), &[]).is_none());
+            let change = monitor
+                .update(DEBOUNCE_NS + 1, Ok(returned.clone()), &[])
+                .unwrap();
+            assert_eq!(change.unplugged, ["SENSORALPHA"]);
+            assert_eq!(change.plugged, returned);
+            assert!(monitor.waits_for_engine_start());
+            monitor.before_open();
+            monitor.opened();
+            assert!(!monitor.waits_for_engine_start());
+        }
+
+        #[test]
+        fn hotplug_windows_waits_for_active_interfaces_and_successful_started_status() {
+            use crate::sensor_hotplug::{Monitor, DEBOUNCE_NS};
+            for missing in ["interface", "status", "started", "arrival"] {
+                let mut nodes = vec![whole_sensor()];
+                match missing {
+                    "interface" => nodes[0].interface = false,
+                    "status" => nodes[0].started = None,
+                    "started" => nodes[0].started = Some(false),
+                    "arrival" => nodes[0].arrival = None,
+                    _ => unreachable!(),
+                }
+                let listed = sensors_on_windows(&nodes);
+                assert!(!listed[0].ready, "{missing}");
+                let mut monitor = Monitor::new(Ok(listed), &[]);
+                assert!(!monitor.waits_for_engine_start());
+                nodes[0] = whole_sensor();
+                let ready = sensors_on_windows(&nodes);
+                assert!(ready[0].ready);
+                assert!(monitor.update(1, Ok(ready.clone()), &[]).is_none());
+                monitor
+                    .update(DEBOUNCE_NS + 1, Ok(ready.clone()), &[])
+                    .unwrap();
+                assert!(monitor.waits_for_engine_start());
+                monitor.before_open();
+                monitor.opened();
+                assert!(monitor.update(2 * DEBOUNCE_NS, Ok(ready), &[]).is_none());
+                assert!(!monitor.waits_for_engine_start());
+            }
+        }
     }
 }
 

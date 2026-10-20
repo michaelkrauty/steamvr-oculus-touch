@@ -1280,6 +1280,136 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
     usb_devices_in(Path::new("/sys/bus/usb/devices"), vendor)
 }
 
+pub fn usb_sensors() -> io::Result<Vec<crate::platform::usb::Sensor>> {
+    usb_sensors_in(Path::new("/sys/bus/usb/devices"), Path::new("/dev/bus/usb"))
+}
+
+fn sysfs_read_at(directory: &File, field: &str) -> io::Result<String> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let field = std::ffi::CString::new(field)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: live directory fd and NUL-terminated relative metadata name. The owned
+    // File closes the new fd once; openat never substitutes a replacement directory.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            field.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut text = String::new();
+    unsafe { File::from_raw_fd(fd) }.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// One sysfs entry is still enumerating or leaving. That is not a present sensor, and it
+/// must not fail the scan for every other sensor.
+fn sensor_entry_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
+}
+
+fn usb_sensors_in(root: &Path, dev: &Path) -> io::Result<Vec<crate::platform::usb::Sensor>> {
+    use crate::platform::usb::{sensor_serial, Sensor};
+    use std::os::unix::fs::MetadataExt;
+    let mut sensors = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(_) = name.to_str().filter(|s| !s.contains(':')) else {
+            continue;
+        };
+        let dir = entry.path();
+        let read = |field| std::fs::read_to_string(dir.join(field)).map(|s| s.trim().to_string());
+        let vendor = match read("idVendor") {
+            Ok(vendor) => vendor,
+            Err(error) if sensor_entry_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let product = match read("idProduct") {
+            Ok(product) => product,
+            Err(error) if sensor_entry_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if vendor != "2833" || product != "0211" {
+            continue;
+        }
+        let directory = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&dir)
+        {
+            Ok(directory) => directory,
+            Err(error) if sensor_entry_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        // A live device's attributes stay put. A missing one means this device is still
+        // enumerating or being removed, never a partial view of a sensor the others must wait on.
+        let read = |field: &str| -> io::Result<Option<String>> {
+            match sysfs_read_at(&directory, field) {
+                Ok(text) => Ok(Some(text.trim().to_owned())),
+                Err(error) if sensor_entry_gone(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let (Some(vendor), Some(product)) = (read("idVendor")?, read("idProduct")?) else {
+            continue;
+        };
+        if vendor != "2833" || product != "0211" {
+            continue;
+        }
+        let Some(serial) = read("serial")? else {
+            continue;
+        };
+        if !sensor_serial(&serial) {
+            continue;
+        }
+        let number = |field: &str| -> io::Result<Option<u16>> {
+            let Some(text) = read(field)? else {
+                return Ok(None);
+            };
+            text.parse()
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        };
+        let (Some(bus), Some(address)) = (number("busnum")?, number("devnum")?) else {
+            continue;
+        };
+        let path = dev.join(format!("{bus:03}/{address:03}"));
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: permission query on a valid path; this never opens or claims a USB device.
+        let ready = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::R_OK | libc::W_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0;
+        sensors.push(Sensor {
+            serial,
+            // The native start record retains its own O_PATH pin, so a replacement at the
+            // same bus/address/port cannot reuse that inode while the old attempt exists.
+            attachment: match directory
+                .metadata()
+                .ok()
+                .map(|m| m.ino())
+                .filter(|&i| i != 0)
+            {
+                Some(inode) => format!("sysfs:{bus}:{address}@{inode:016x}"),
+                None => format!("sysfs:{bus}:{address}@unknown"),
+            },
+            ready,
+        });
+    }
+    sensors.sort_by(|a, b| a.serial.cmp(&b.serial));
+    Ok(sensors)
+}
+
 /// The interface classes worth naming in a report.
 fn interface_class(code: &str) -> &'static str {
     match code {
@@ -1565,6 +1695,220 @@ mod tests {
             "accepted a shared lock directory"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn recycled_usb_address(incarnation_available: bool) {
+        use crate::sensor_hotplug::{Monitor, DEBOUNCE_NS};
+        use std::os::unix::fs::MetadataExt;
+        let root = crate::socket_dir::SocketDir::new();
+        let (sys, dev) = (root.path().join("sys"), root.path().join("dev"));
+        let camera = sys.join("1-2.3");
+        let create = || {
+            std::fs::create_dir_all(&camera).unwrap();
+            for (field, value) in [
+                ("idVendor", "2833"),
+                ("idProduct", "0211"),
+                ("serial", "SENSORALPHA"),
+                ("busnum", "1"),
+                ("devnum", "7"),
+            ] {
+                std::fs::write(camera.join(field), value).unwrap();
+            }
+        };
+        create();
+        std::fs::create_dir_all(dev.join("001")).unwrap();
+        std::fs::write(dev.join("001/007"), "").unwrap();
+        let a_pin = std::fs::File::open(&camera).unwrap();
+        let a_ino = a_pin.metadata().unwrap().ino();
+        let failed_start = |ino: u64| {
+            let mut raw = crate::ffi::ohmd_cv1touch_sensor_stream::default();
+            for (out, byte) in raw.serial.iter_mut().zip(b"SENSORALPHA") {
+                *out = *byte as std::ffi::c_char;
+            }
+            raw.error_kind = crate::ffi::OHMD_CV1TOUCH_STREAM_ERROR_OTHER;
+            raw.error_code = -1;
+            if incarnation_available {
+                raw.attachment.kind = crate::ffi::OHMD_CV1TOUCH_ATTACHMENT_SYSFS;
+                raw.attachment.data = [1 | (7 << 8), ino as u32, (ino >> 32) as u32];
+            }
+            crate::engine::SensorStreamStart::from(raw)
+        };
+        let mut monitor = Monitor::new(Ok(vec![]), &[]);
+        monitor.before_open();
+        let a_start = failed_start(a_ino);
+        // No watcher scan sees A or the gap. B has the same serial, port, bus and address.
+        std::fs::remove_dir_all(&camera).unwrap();
+        create();
+        let b_pin = std::fs::File::open(&camera).unwrap();
+        let b_ino = b_pin.metadata().unwrap().ino();
+        assert_ne!(
+            a_ino, b_ino,
+            "the retained metadata reference pins A's inode"
+        );
+        let b = usb_sensors_in(&sys, &dev).unwrap();
+        monitor.reconcile_open(1, &[a_start], Some(&b));
+        monitor.update(1, Ok(b.clone()), &[]);
+        monitor.update(DEBOUNCE_NS + 1, Ok(b.clone()), &[]);
+        monitor.opened();
+        assert_eq!(
+            monitor.pending().len(),
+            1,
+            "B was suppressed by A's old or unknown incarnation"
+        );
+        assert!(
+            monitor.waits_for_engine_start(),
+            "B was suppressed by A's old or unknown incarnation"
+        );
+        monitor.before_open();
+        monitor.reconcile_open(DEBOUNCE_NS + 1, &[failed_start(b_ino)], Some(&b));
+        monitor.opened();
+        assert!(
+            monitor.pending().is_empty(),
+            "an ordinary failure of B's own attempt is not attempted again"
+        );
+    }
+
+    #[test]
+    fn a_reused_usb_address_cannot_consume_a_new_incarnation() {
+        recycled_usb_address(true);
+    }
+
+    #[test]
+    fn an_unavailable_usb_incarnation_stays_pending() {
+        recycled_usb_address(false);
+    }
+
+    #[test]
+    fn hotplug_linux_reads_only_rift_sensor_metadata_and_waits_for_access() {
+        let root = std::env::temp_dir().join(format!("cv1t-hotplug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (sys, dev) = (root.join("sys"), root.join("dev"));
+        let file = |name: &str, value: &str| {
+            let path = sys.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        };
+        for (port, vid, pid, serial) in [
+            ("1-2", "2833", "0211", "SENSORALPHA"),
+            ("1-3", "2833", "0031", "HEADSET"),
+            ("1-4", "1234", "0211", "OTHER"),
+            ("1-5", "2833", "0211", "invalid-serial"),
+        ] {
+            file(&format!("{port}/idVendor"), vid);
+            file(&format!("{port}/idProduct"), pid);
+            file(&format!("{port}/serial"), serial);
+            file(&format!("{port}/busnum"), "1");
+            file(&format!("{port}/devnum"), "7");
+        }
+        let mut found = usb_sensors_in(&sys, &dev).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].serial, "SENSORALPHA");
+        assert!(!found[0].ready);
+        let attachment = found[0].attachment.clone();
+        std::fs::create_dir_all(dev.join("001")).unwrap();
+        std::fs::write(dev.join("001/007"), "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let node = dev.join("001/007");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root's capability override makes a mode-000 node look writable. The sibling open
+        // test skips that case the same way.
+        if !elevated() {
+            assert!(
+                !usb_sensors_in(&sys, &dev).unwrap()[0].ready,
+                "an existing USB node without read/write access is not ready"
+            );
+        }
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o600)).unwrap();
+        found = usb_sensors_in(&sys, &dev).unwrap();
+        assert!(found[0].ready);
+        assert_eq!(found[0].attachment, attachment);
+        file("1-2/devnum", "8");
+        assert_ne!(
+            usb_sensors_in(&sys, &dev).unwrap()[0].attachment,
+            attachment
+        );
+        // An address change is detected too; inode pins also cover address reuse below.
+        use crate::sensor_hotplug::{Monitor, DEBOUNCE_NS};
+        let mut monitor = Monitor::new(Ok(found), &[]);
+        std::fs::write(dev.join("001/008"), "").unwrap();
+        let returned = usb_sensors_in(&sys, &dev).unwrap();
+        assert!(monitor.update(1, Ok(returned.clone()), &[]).is_none());
+        let change = monitor.update(DEBOUNCE_NS + 1, Ok(returned), &[]).unwrap();
+        assert_eq!(change.unplugged, ["SENSORALPHA"]);
+        assert_eq!(change.plugged.len(), 1);
+        assert!(monitor.waits_for_engine_start());
+        monitor.before_open();
+        monitor.opened();
+        assert!(!monitor.waits_for_engine_start());
+        std::fs::remove_file(sys.join("1-2/serial")).unwrap();
+        assert!(
+            usb_sensors_in(&sys, &dev).unwrap().is_empty(),
+            "a missing serial is still enumerating or leaving, not a failure of the whole scan"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// NotFound is a missing attribute. ENODEV is a node that leaves between open and read.
+    /// Other failures still fail the scan, so this must not treat every error as gone.
+    #[test]
+    fn sensor_entry_gone_is_a_missing_or_departing_node_only() {
+        assert!(sensor_entry_gone(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing attribute"
+        )));
+        assert!(sensor_entry_gone(&std::io::Error::from_raw_os_error(
+            libc::ENODEV
+        )));
+        assert!(!sensor_entry_gone(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a departure"
+        )));
+    }
+
+    /// One half-enumerated or departing sensor must not hide a sensor that is present.
+    #[test]
+    fn one_unreadable_sensor_entry_does_not_hide_another() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cv1t-hotplug-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (sys, dev) = (root.join("sys"), root.join("dev"));
+        let file = |name: &str, value: &str| {
+            let path = sys.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        };
+        file("1-7/idVendor", "2833");
+        file("1-7/idProduct", "0211");
+        file("1-7/serial", "SENSORBETA");
+        file("1-7/busnum", "1");
+        file("1-7/devnum", "10");
+        std::fs::create_dir_all(dev.join("001")).unwrap();
+        std::fs::write(dev.join("001/010"), "").unwrap();
+        std::fs::set_permissions(dev.join("001/010"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let expect_beta = |why: &str| {
+            let found = usb_sensors_in(&sys, &dev).unwrap();
+            assert_eq!(found.len(), 1, "{why}: {found:?}");
+            assert_eq!(found[0].serial, "SENSORBETA", "{why}");
+            assert!(found[0].ready, "{why}");
+        };
+        file("1-6/idVendor", "2833");
+        expect_beta("a missing product id");
+        file("1-6/idProduct", "0211");
+        expect_beta("a missing serial");
+        file("1-6/serial", "SENSORGAMMA");
+        file("1-6/devnum", "9");
+        expect_beta("a missing bus number");
+        file("1-6/busnum", "1");
+        std::fs::remove_file(sys.join("1-6/devnum")).unwrap();
+        expect_beta("a missing device number");
+        file("1-6/devnum", "9");
+        file("1-6/busnum", "nope");
+        assert!(
+            usb_sensors_in(&sys, &dev).is_err(),
+            "a garbled bus number is not a device that is leaving"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A tree laid out as /sys/bus/usb/devices: a sensor with its video interface bound to

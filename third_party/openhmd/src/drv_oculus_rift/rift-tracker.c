@@ -16,6 +16,11 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <time.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <limits.h>
+#endif
 
 #include "ohmd-video.h"
 
@@ -140,6 +145,11 @@ struct rift_tracked_device_priv {
 	FILE *debug_file;
 };
 
+struct sensor_stream_record {
+    ohmd_cv1touch_sensor_stream stream;
+    int pin_fd; /* one O_PATH|O_DIRECTORY|O_CLOEXEC metadata pin, closed on forget/replacement/close */
+};
+
 struct rift_tracker_ctx_s
 {
 	ohmd_context* ohmd_ctx;
@@ -155,7 +165,7 @@ struct rift_tracker_ctx_s
 
 	rift_sensor_ctx **sensors;
 	size_t n_sensors, sensor_capacity;
-	ohmd_cv1touch_sensor_stream *sensor_streams;
+	struct sensor_stream_record *sensor_streams;
 	size_t n_sensor_streams, sensor_stream_capacity;
 
 	rift_tracked_device_priv devices[RIFT_MAX_TRACKED_DEVICES];
@@ -269,6 +279,64 @@ static unsigned int uvc_handle_events(void *arg)
 	return 0;
 }
 
+static bool record_sensor_stream(rift_tracker_ctx *ctx,
+    const ohmd_cv1touch_sensor_stream *stream, int pin_fd);
+
+#ifndef _WIN32
+#ifndef CV1TOUCH_SYSFS_USB_ROOT
+#define CV1TOUCH_SYSFS_USB_ROOT "/sys/bus/usb/devices"
+#endif
+
+static bool sysfs_usb_number(int dir, const char *field, unsigned int expected)
+{
+    int fd = openat(dir, field, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char text[32] = {0}, extra;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    unsigned int value;
+    return n > 0 && sscanf(text, "%u %c", &value, &extra) == 1 && value == expected;
+}
+
+static int pin_sensor_attachment(libusb_device *device,
+    ohmd_cv1touch_sensor_attachment *attachment)
+{
+    *attachment = (ohmd_cv1touch_sensor_attachment){0};
+    unsigned int bus = libusb_get_bus_number(device), address = libusb_get_device_address(device);
+    uint8_t ports[7];
+    int count = libusb_get_port_numbers(device, ports, sizeof ports);
+    if (!bus || !address || count < 1 || count > 7) return -1;
+    char path[PATH_MAX];
+    int pos = snprintf(path, sizeof path, "%s/%u-", CV1TOUCH_SYSFS_USB_ROOT, bus);
+    if (pos < 0 || (size_t)pos >= sizeof path) return -1;
+    for (int p = 0; p < count; p++) {
+        int n = snprintf(path + pos, sizeof path - (size_t)pos, "%s%u", p ? "." : "", ports[p]);
+        if (n < 0 || (size_t)n >= sizeof path - (size_t)pos) return -1;
+        pos += n;
+    }
+    /* Pin BEFORE libusb_open, never after a possibly failed old handle. The path
+     * comes from its bus/port chain; attributes are read relative to that same
+     * directory so replacement cannot mix an old inode with new USB metadata.
+     * kernfs holds the node until inode eviction, preventing ID reuse while our
+     * O_PATH reference lives: linux fs/kernfs/inode.c, kernfs_init_inode and
+     * kernfs_evict_inode:
+     * https://github.com/torvalds/linux/blob/v6.17/fs/kernfs/inode.c#L188-L256
+     * Retain this one pin with the start record, including after sensor free. */
+    int fd = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat info;
+    if (fstat(fd, &info) != 0 || !info.st_ino ||
+        !sysfs_usb_number(fd, "busnum", bus) || !sysfs_usb_number(fd, "devnum", address)) {
+        close(fd);
+        return -1;
+    }
+    uint64_t inode = (uint64_t)info.st_ino;
+    *attachment = (ohmd_cv1touch_sensor_attachment){.kind = OHMD_CV1TOUCH_ATTACHMENT_SYSFS,
+        .data = {bus | (address << 8), (uint32_t)inode, (uint32_t)(inode >> 32)}};
+    return fd;
+}
+#endif
+
 rift_tracker_ctx *
 rift_tracker_new (ohmd_context* ohmd_ctx,
 		const uint8_t radio_id[5])
@@ -315,9 +383,16 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 		if (desc.idVendor != 0x2833 || (desc.idProduct != CV1_PID && desc.idProduct != DK2_PID))
 			continue;
 
+        ohmd_cv1touch_sensor_attachment attachment = {0};
+        int attachment_pin = -1;
+#ifndef _WIN32
+        if (!ohmd_ctx->cv1touch_sensor_attachment_cb)
+            attachment_pin = pin_sensor_attachment(devs[i], &attachment);
+#endif
 		ret = libusb_open(devs[i], &usb_devh);
 		if (ret) {
 			ohmd_log_fprintf (stderr, "Failed to open Rift Sensor device. Check permissions\n");
+            rift_sensor_close_attachment_pin(attachment_pin);
 			continue;
 		}
 
@@ -326,7 +401,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
             usb_devh, desc.iSerialNumber, serial, 32) : -1;
         if (ret <= 0 || ret >= 32 || !cv1touch_sensor_serial_valid((const char *)serial)) {
             LOGW("Ignoring Rift Sensor with unreadable or invalid serial");
-            libusb_close(usb_devh);
+            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
             continue;
         }
         bool duplicate = false;
@@ -335,38 +410,44 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
                 duplicate = true;
         if (duplicate) {
             LOGW("Ignoring duplicate Rift Sensor identity");
-            libusb_close(usb_devh);
+            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
             continue;
         }
         if (cv1touch_sensor_ignored(&ohmd_ctx->cv1touch_sensors,
                 &ohmd_ctx->cv1touch_config, (const char *)serial)) {
             LOGI("Ignoring Rift Sensor %s (configured ignore list)", serial);
-            libusb_close(usb_devh);
+            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
             continue;
         }
         /* Reserve before creating workers. Pointer-array growth never moves sensor objects. */
-        if (tracker_ctx->n_sensors >= INT_MAX) { libusb_close(usb_devh); goto fail; }
+        if (tracker_ctx->n_sensors >= INT_MAX) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
         if (tracker_ctx->n_sensors == tracker_ctx->sensor_capacity) {
             size_t capacity = tracker_ctx->sensor_capacity ? tracker_ctx->sensor_capacity * 2 : 4;
             if (capacity > INT_MAX) capacity = INT_MAX;
-            if (capacity > SIZE_MAX / sizeof(*tracker_ctx->sensors)) { libusb_close(usb_devh); goto fail; }
+            if (capacity > SIZE_MAX / sizeof(*tracker_ctx->sensors)) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
             void *next = realloc(tracker_ctx->sensors, capacity * sizeof(*tracker_ctx->sensors));
-            if (!next) { libusb_close(usb_devh); goto fail; }
+            if (!next) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
             tracker_ctx->sensors=next; tracker_ctx->sensor_capacity=capacity;
         }
 		rift_sensor_device *sensor_device = rift_sensor_usb_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, tracker_ctx->usb_ctx, usb_devh, radio_id);
 
 		if (sensor_device == NULL) {
 			LOGW("Failed to open Rift Sensor USB device %s\n", serial);
+            rift_sensor_close_attachment_pin(attachment_pin);
 			continue;
 		}
 
 		rift_sensor_ctx *sensor_ctx = rift_sensor_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, sensor_device, tracker_ctx);
 		if (sensor_ctx == NULL) {
 			LOGW("Failed to open Rift Sensor analyser for %s\n", serial);
+            rift_sensor_close_attachment_pin(attachment_pin);
 			continue;
 		}
 
+        if (ohmd_ctx->cv1touch_sensor_attachment_cb)
+            ohmd_ctx->cv1touch_sensor_attachment_cb(ohmd_ctx->cv1touch_sensor_attachment_user,
+                (const char *)serial, &attachment);
+        rift_sensor_set_attachment(sensor_ctx, &attachment, attachment_pin);
 		tracker_ctx->sensors[tracker_ctx->n_sensors] = sensor_ctx;
 		tracker_ctx->n_sensors++;
 
@@ -382,7 +463,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
         rift_sensor_get_stream_info(sensor, &stream);
         /* Copy before a failed start frees the object. Upsert success too, so
          * reconnects/fallback never preserve an earlier failure for this serial. */
-        if (!rift_tracker_record_sensor_stream(tracker_ctx, &stream)) {
+        if (!record_sensor_stream(tracker_ctx, &stream, rift_sensor_take_attachment_pin(sensor))) {
             LOGE("Could not retain sensor stream diagnostics");
             goto fail;
         }
@@ -622,6 +703,8 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 
 	if (tracker_ctx->tracker_lock) ohmd_destroy_mutex (tracker_ctx->tracker_lock);
 	free(tracker_ctx->sensors);
+    for (size_t s = 0; s < tracker_ctx->n_sensor_streams; s++)
+        rift_sensor_close_attachment_pin(tracker_ctx->sensor_streams[s].pin_fd);
 	free(tracker_ctx->sensor_streams);
 	free (tracker_ctx);
 }
@@ -1209,43 +1292,57 @@ int rift_tracker_get_sensor_stream(rift_tracker_ctx *ctx, int index, ohmd_cv1tou
 {
 	if (index < 0 || (size_t)index >= ctx->n_sensor_streams || out == NULL)
 		return -1;
-	*out = ctx->sensor_streams[index];
+	*out = ctx->sensor_streams[index].stream;
 	return 0;
+}
+
+/* Consumes pin_fd on success and failure. Private records own exactly one pin. */
+static bool record_sensor_stream(rift_tracker_ctx *ctx,
+    const ohmd_cv1touch_sensor_stream *stream, int pin_fd)
+{
+    struct sensor_stream_record record = {.stream = *stream, .pin_fd = pin_fd};
+    if (pin_fd < 0 && record.stream.attachment.kind == OHMD_CV1TOUCH_ATTACHMENT_SYSFS)
+        record.stream.attachment = (ohmd_cv1touch_sensor_attachment){0};
+    for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
+        if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].stream.serial, stream->serial)) {
+            rift_sensor_close_attachment_pin(ctx->sensor_streams[i].pin_fd);
+            ctx->sensor_streams[i] = record;
+            return true;
+        }
+    }
+    if (ctx->n_sensor_streams >= INT_MAX) goto fail;
+    if (ctx->n_sensor_streams == ctx->sensor_stream_capacity) {
+        size_t capacity = ctx->sensor_stream_capacity ? ctx->sensor_stream_capacity * 2 : 4;
+        if (capacity > INT_MAX) capacity = INT_MAX;
+        if (capacity > SIZE_MAX / sizeof(*ctx->sensor_streams)) goto fail;
+        void *next = realloc(ctx->sensor_streams, capacity * sizeof(*ctx->sensor_streams));
+        if (!next) goto fail;
+        ctx->sensor_streams = next;
+        ctx->sensor_stream_capacity = capacity;
+    }
+    ctx->sensor_streams[ctx->n_sensor_streams++] = record;
+    return true;
+fail:
+    rift_sensor_close_attachment_pin(pin_fd);
+    return false;
 }
 
 bool rift_tracker_record_sensor_stream(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_stream *stream)
 {
-	for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
-		if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].serial, stream->serial)) {
-			ctx->sensor_streams[i] = *stream;
-			return true;
-		}
-	}
-	if (ctx->n_sensor_streams >= INT_MAX)
-		return false;
-	if (ctx->n_sensor_streams == ctx->sensor_stream_capacity) {
-		size_t capacity = ctx->sensor_stream_capacity ? ctx->sensor_stream_capacity * 2 : 4;
-		if (capacity > INT_MAX) capacity = INT_MAX;
-		if (capacity > SIZE_MAX / sizeof(*ctx->sensor_streams)) return false;
-		void *next = realloc(ctx->sensor_streams, capacity * sizeof(*ctx->sensor_streams));
-		if (!next) return false;
-		ctx->sensor_streams = next;
-		ctx->sensor_stream_capacity = capacity;
-	}
-	ctx->sensor_streams[ctx->n_sensor_streams++] = *stream;
-	return true;
+    return record_sensor_stream(ctx, stream, -1);
 }
 
 void rift_tracker_forget_sensor_stream(rift_tracker_ctx *ctx, const char *serial)
 {
-	for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
-		if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].serial, serial)) {
-			ctx->n_sensor_streams--;
-			memmove(ctx->sensor_streams + i, ctx->sensor_streams + i + 1,
-				(ctx->n_sensor_streams - i) * sizeof(*ctx->sensor_streams));
-			return;
-		}
-	}
+    for (size_t i = 0; i < ctx->n_sensor_streams; i++) {
+        if (cv1touch_sensor_serial_equal(ctx->sensor_streams[i].stream.serial, serial)) {
+            rift_sensor_close_attachment_pin(ctx->sensor_streams[i].pin_fd);
+            ctx->n_sensor_streams--;
+            memmove(ctx->sensor_streams + i, ctx->sensor_streams + i + 1,
+                (ctx->n_sensor_streams - i) * sizeof(*ctx->sensor_streams));
+            return;
+        }
+    }
 }
 
 int rift_tracker_get_sensor_video(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor_video *out)
@@ -1298,4 +1395,13 @@ int rift_tracker_sensor_pose_applied(rift_tracker_ctx *ctx, const char *serial)
 			return applied;
 	}
 	return -1;
+}
+
+int rift_tracker_retire_sensor(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (int i = 0; i < ctx->n_sensors; i++) {
+		if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(ctx->sensors[i]), serial))
+			rift_sensor_retire(ctx->sensors[i]);
+	}
+	return 0;
 }

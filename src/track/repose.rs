@@ -333,6 +333,26 @@ impl Monitor {
         }
     }
 
+    /// A detached sensor has no remaining agreement window, inspection, verdict, placement or
+    /// cooldown. Its engine object is retired, which stops its search, and no restoration of
+    /// it is acknowledged: the search slot is free at once, and a verdict that waited for its
+    /// restoration is handed over at the next `update`.
+    pub fn forget(&mut self, serial: &str) {
+        let kept = |s: &String| !crate::status::same_sensor(s, serial);
+        self.last.retain(|s, _| kept(s));
+        self.lifetimes.retain(|s, _| kept(s));
+        self.unseen.retain(|s, _| kept(s));
+        self.inspecting.take_if(|i| !kept(&i.serial));
+        self.stopping.retain(kept);
+        self.inspection_cooling.retain(|s, _| kept(s));
+        self.over.retain(|s, _| kept(s));
+        self.deferred.take_if(|(s, _)| !kept(s));
+        self.dropped.take_if(|s| !kept(s));
+        self.handed_over.retain(|s, _| kept(s));
+        self.cooling.retain(|s, _| kept(s));
+        self.starved.retain(|s, _| kept(s));
+    }
+
     /// As `released`, and the sensor is left alone until `until_ns`.
     pub fn released_until(&mut self, serial: &str, until_ns: u64) {
         self.released(serial);
@@ -1228,6 +1248,115 @@ mod tests {
         (0..=windows)
             .map(|w| m.update(1_000 + w * WINDOW_NS, &room(w, &d)))
             .collect()
+    }
+
+    /// A detached sensor leaves nothing to judge, inspect, hand over, wait for or cool down; the
+    /// other sensor keeps all of its own, and forgetting both leaves the monitor empty.
+    #[test]
+    fn hotplug_forgetting_a_sensor_retires_its_state_only() {
+        let mut m = Monitor::new(WINDOW_NS);
+        for serial in ["SENSORALPHA", "SENSORBETA"] {
+            m.last.insert(serial.into(), Default::default());
+            m.lifetimes.insert(serial.into(), Default::default());
+            m.unseen.insert(serial.into(), [1, 1]);
+            m.stopping.insert(serial.into());
+            m.inspection_cooling.insert(serial.into(), 100);
+            m.over.insert(serial.into(), 2);
+            m.handed_over.insert(serial.into(), true);
+            m.cooling.insert(serial.into(), 100);
+            m.starved.insert(serial.into(), 1);
+        }
+        m.inspecting = Some(Inspection {
+            serial: "SENSORALPHA".into(),
+            hands: [true, false],
+            until_ns: 100,
+            evidence: Default::default(),
+            observed: Default::default(),
+        });
+        m.deferred = Some(("SENSORBETA".into(), MovedBy::Windows([None; 2])));
+        m.dropped = Some("SENSORBETA".into());
+        let serials = |m: &Monitor| {
+            [
+                m.last.keys().cloned().collect::<Vec<_>>(),
+                m.lifetimes.keys().cloned().collect(),
+                m.unseen.keys().cloned().collect(),
+                m.stopping.iter().cloned().collect(),
+                m.inspection_cooling.keys().cloned().collect(),
+                m.over.keys().cloned().collect(),
+                m.handed_over.keys().cloned().collect(),
+                m.cooling.keys().cloned().collect(),
+                m.starved.keys().cloned().collect(),
+                m.inspecting.iter().map(|i| i.serial.clone()).collect(),
+                m.deferred.iter().map(|(s, _)| s.clone()).collect(),
+                m.dropped.iter().cloned().collect(),
+            ]
+        };
+        m.forget("SENSORALPHA");
+        let beta = vec!["SENSORBETA".to_string()];
+        let want: [Vec<String>; 12] = std::array::from_fn(|i| match i {
+            9 => Vec::new(),
+            _ => beta.clone(),
+        });
+        assert_eq!(serials(&m), want);
+        m.forget("SENSORBETA");
+        assert_eq!(serials(&m), <[Vec<String>; 12]>::default());
+    }
+
+    /// A sensor unplugged while it is inspected or placed has no restoration to acknowledge: its
+    /// engine object is retired, which stops its search. Forgetting it frees the search slot at
+    /// once. A verdict that waited for its restoration is handed over at the next update, and
+    /// another sensor can be inspected although the unplugged one was being placed.
+    #[test]
+    fn hotplug_an_unplugged_sensor_holds_no_search_slot_or_waiting_verdict() {
+        let at = |w: u64| 1_000 + w * WINDOW_NS;
+        // A and B agree. C sees only unlabelled blobs. D misses 80 of its 100 observed checks
+        // in windows 3 and 4. C and D are unplugged after window 4; E, plugged in then, sees
+        // only unlabelled blobs.
+        let room = |w: u64| {
+            let mut room = vec![
+                sensor("A", 100 * w, 0, 0.3, 0.1),
+                sensor("B", 100 * w, 0, 0.3, 0.1),
+            ];
+            if w <= 4 {
+                room.push(visibility("C", (100 * w, 100 * w), (0, 0), 0.0, 0.0));
+                room.push(sensor("D", 100 * w, 80 * w.saturating_sub(2), 0.3, 0.1));
+            } else {
+                room.push(visibility("E", (100 * w, 100 * w), (0, 0), 0.0, 0.0));
+            }
+            room
+        };
+        let mut m = Monitor::new(WINDOW_NS);
+        for w in 0..=4 {
+            let want = match w {
+                2 => vec![Change::Inspect("C".into())],
+                4 => vec![Change::Interrupted {
+                    serial: "C".into(),
+                    moved: "D".into(),
+                }],
+                _ => vec![],
+            };
+            assert_eq!(m.update(at(w), &room(w)), want, "window {w}");
+        }
+        assert!(m.restoring().contains("C"));
+        m.forget("C");
+        assert!(m.restoring().is_empty());
+        assert_eq!(
+            m.update(at(4) + 1_000_000_000, &room(4)),
+            [moved_in_windows(
+                "D",
+                on_hand(0, last_window(100, 80, Some((0.3, 0.1))))
+            )]
+        );
+        assert!(m.handed_over("D"));
+        m.forget("D");
+        for w in 5..=7 {
+            let want = if w == 7 {
+                vec![Change::Inspect("E".into())]
+            } else {
+                vec![]
+            };
+            assert_eq!(m.update(at(w), &room(w)), want, "window {w}");
+        }
     }
 
     /// A sensor that misses nearly every check moved a lot: judged after two windows in a row,

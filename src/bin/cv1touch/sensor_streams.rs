@@ -25,6 +25,8 @@ pub(super) struct Check {
     // A confirmed failure can coexist with cameras that need another sample.
     pending: bool,
     drop_notes: Vec<status::VideoDropNote>,
+    // Sensors whose hot-plug reason this check already gives.
+    explained: BTreeSet<String>,
 }
 
 impl Check {
@@ -34,6 +36,7 @@ impl Check {
             detail: detail.into(),
             pending: outcome == Outcome::Pending,
             drop_notes: Vec::new(),
+            explained: BTreeSet::new(),
         }
     }
 
@@ -79,14 +82,25 @@ impl Check {
     }
 }
 
+/// The check, the sensors whose hot-plug reason it gives, and the last daemon status read.
 pub(super) fn doctor(
     calibration: Option<&file::CalibrationFile>,
-) -> ((bool, String), io::Result<Option<serde_json::Value>>) {
-    sample_status(
+) -> (
+    (bool, String),
+    BTreeSet<String>,
+    io::Result<Option<serde_json::Value>>,
+) {
+    let mut explained = BTreeSet::new();
+    let (check, daemon) = sample_status(
         || daemon_status(Duration::from_secs(5), DaemonPurpose::Check),
         thread::sleep,
-        |first, second| from_snapshots(|| calibration.map(calibration_serials), first, second),
-    )
+        |first, second| {
+            let check = from_snapshots(|| calibration.map(calibration_serials), first, second);
+            explained.clone_from(&check.explained);
+            check
+        },
+    );
+    (check, explained, daemon)
 }
 
 // Preserve request errors alongside the sampled status, as the other CLI status helpers do.
@@ -150,11 +164,12 @@ fn sample(
     (result.conclusion(), current)
 }
 
+/// The board's line, and the sensors whose hot-plug reason it gives.
 pub(super) fn board_note(
     first: Option<&serde_json::Value>,
     second: Option<&serde_json::Value>,
-) -> String {
-    from_snapshots(
+) -> (String, BTreeSet<String>) {
+    let mut check = from_snapshots(
         || {
             file::load(&file::default_path())
                 .ok()
@@ -163,8 +178,9 @@ pub(super) fn board_note(
         },
         first,
         second,
-    )
-    .board_line()
+    );
+    let explained = std::mem::take(&mut check.explained);
+    (check.board_line(), explained)
 }
 
 fn calibration_serials(calibration: &file::CalibrationFile) -> Vec<String> {
@@ -206,6 +222,53 @@ fn stream_failure(current: &serde_json::Value, serial: &str) -> Option<String> {
 
 fn identities(serials: &[String]) -> BTreeSet<String> {
     serials.iter().map(|s| status::sensor_identity(s)).collect()
+}
+
+enum SensorWait {
+    /// Ends on its own: sample again.
+    Settling(String),
+    /// Lasts until something outside the daemon changes (a restart, USB access): another
+    /// sample would only repeat it.
+    Waiting(String),
+    Replug(String),
+}
+
+/// What to run when USB access may never become ready on its own.
+fn usb_wait_advice() -> &'static str {
+    if cfg!(windows) {
+        "If it keeps waiting, run cv1touch sensors to check its driver"
+    } else {
+        "If it keeps waiting, run cv1touch sensors to check USB access"
+    }
+}
+
+/// A calibrated sensor the daemon has seen and not yet opened. Waiting to open is not a
+/// bandwidth or cable failure. `waiting_replug` still is a failure, in its own words.
+/// Each line uses the daemon's reason once: the lead does not say the same thing again. The
+/// reason's last full stop is dropped, as this check's other clauses have none.
+fn sensor_waiting(current: &serde_json::Value, serial: &str) -> Option<SensorWait> {
+    let pending = current["sensor_hotplug"]["pending"].as_array()?;
+    let entry = pending.iter().find(|entry| {
+        entry["serial"]
+            .as_str()
+            .is_some_and(|found| status::sensor_identity(found) == serial)
+    })?;
+    let detail = entry["detail"]
+        .as_str()
+        .unwrap_or("The daemon did not say why.")
+        .trim_end_matches('.');
+    Some(match entry["state"].as_str()? {
+        "opening" | "waiting_headset" | "checking_usb" => {
+            SensorWait::Settling(format!("{serial} is plugged in. {detail}"))
+        }
+        "waiting_engine_start" => SensorWait::Waiting(format!("{serial} is plugged in. {detail}")),
+        "waiting_usb" => SensorWait::Waiting(format!(
+            "{serial} is plugged in. {detail}. {}",
+            usb_wait_advice()
+        )),
+        "waiting_replug" => SensorWait::Replug(format!("{serial}: {detail}")),
+        _ => return None,
+    })
 }
 
 fn with_sources(
@@ -312,6 +375,7 @@ fn with_sources(
     let mut unverified = false;
     let mut pending = false;
     let mut detail = Vec::new();
+    let mut explained = BTreeSet::new();
     for serial in calibrated.difference(&ignored) {
         // Native objects may outlive unplugging. OS absence beats retained counters.
         if connected.as_ref().is_ok_and(|list| !list.contains(serial)) {
@@ -325,6 +389,22 @@ fn with_sources(
             .is_some_and(|(&a, &b)| b.advanced_from(a))
         {
             detail.push(format!("{serial} is streaming"));
+        } else if let Some(notice) = sensor_waiting(current, serial) {
+            explained.insert(serial.clone());
+            detail.push(match notice {
+                SensorWait::Settling(text) => {
+                    pending = true;
+                    text
+                }
+                SensorWait::Waiting(text) => {
+                    unverified = true;
+                    text
+                }
+                SensorWait::Replug(text) => {
+                    failed = true;
+                    text
+                }
+            });
         } else if let Some(reason) = stream_failure(current, serial) {
             failed = true;
             if let Err(error) = &connected {
@@ -436,6 +516,7 @@ fn with_sources(
         detail: detail.join("; "),
         pending,
         drop_notes,
+        explained,
     }
 }
 
@@ -1520,6 +1601,7 @@ mod tests {
             "{line}"
         );
     }
+
     fn quality_sample(received: u64, decoded: Value, format: Value, dropped: Value) -> Value {
         let mut sample = snapshot(&[("CAMERA1", 0)]);
         sample["sensors"][0]["frames_received"] = received.into();
@@ -1797,5 +1879,242 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hotplug_aware_stream_advice_still_restarts_the_daemon() {
+        for connected in [false, true] {
+            for kind in [None, Some("likely_usb_bandwidth"), Some("other")] {
+                let mut current = snapshot(&[("CAMERA1", 40)]);
+                current["calibrated_sensors"] = json!(["CAMERA1"]);
+                current["sensor_hotplug"] = json!({"pending": []});
+                if let Some(kind) = kind {
+                    current["sensor_streams"] = json!([{"serial":"CAMERA1", "error_kind":kind,
+                        "error_code":-1, "os_error":0, "alt_setting":null}]);
+                }
+                let result = with_sources(
+                    || unreachable!(),
+                    || {
+                        Ok(if connected {
+                            cameras(&["CAMERA1"])
+                        } else {
+                            vec![]
+                        })
+                    },
+                    Some(&current),
+                    Some(&current),
+                );
+                let (ok, detail) = result.conclusion();
+                assert!(!ok);
+                // a reconnected sensor is used only when the engine starts again
+                assert!(detail.contains(RESTART), "{detail}");
+            }
+        }
+    }
+
+    fn waiting_sensor(state: &str, detail: &str) -> Value {
+        json!({
+            "generation": 1,
+            "mode": "calibrated",
+            "engine_ready": true,
+            "ignored_sensors": [],
+            "sensor_frames_received": true,
+            "sensor_total": 0,
+            "sensors": [],
+            "calibrated_sensors": ["SENSORX"],
+            "sensor_hotplug": {
+                "pending": [{"serial": "sensorx", "state": state, "detail": detail}],
+                "scan_error": null
+            }
+        })
+    }
+
+    fn waiting_check(state: &str, detail: &str) -> Check {
+        let current = waiting_sensor(state, detail);
+        with_sources(
+            || unreachable!(),
+            || Ok(cameras(&["SensorX"])),
+            Some(&current),
+            Some(&current),
+        )
+    }
+
+    /// Each daemon state has its own outcome. A wait that ends on its own is still being checked
+    /// and is sampled again; one that needs a restart or USB access is settled at once, without
+    /// "after the daemon settles". The full doctor and board lines are pinned for each.
+    #[test]
+    fn a_sensor_waiting_to_be_opened_is_not_a_bandwidth_failure() {
+        let usb_detail = if cfg!(windows) {
+            "This sensor's driver interfaces aren't active yet."
+        } else {
+            "This sensor's USB device isn't accessible yet (permissions)."
+        };
+        let usb_advice = if cfg!(windows) {
+            "If it keeps waiting, run cv1touch sensors to check its driver"
+        } else {
+            "If it keeps waiting, run cv1touch sensors to check USB access"
+        };
+        let usb_line = format!(
+            "SENSORX is plugged in. {}. {usb_advice}",
+            usb_detail.trim_end_matches('.')
+        );
+        let scan_line = format!(
+            "SENSORX is plugged in. USB information is unavailable; the daemon is still checking for this sensor. {usb_advice}"
+        );
+        let restart = "SENSORX is plugged in. This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (systemctl --user restart cv1touchd)";
+        let settles = "; run cv1touch doctor again after the daemon settles";
+        let cases = [
+            (
+                "waiting_engine_start",
+                "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (systemctl --user restart cv1touchd).",
+                Outcome::NotVerified,
+                restart.to_string(),
+                format!("not verified sensor_streams: {restart}"),
+            ),
+            (
+                "waiting_usb",
+                usb_detail,
+                Outcome::NotVerified,
+                usb_line.clone(),
+                format!("not verified sensor_streams: {usb_line}"),
+            ),
+            (
+                "waiting_usb",
+                "USB information is unavailable; the daemon is still checking for this sensor.",
+                Outcome::NotVerified,
+                scan_line.clone(),
+                format!("not verified sensor_streams: {scan_line}"),
+            ),
+            (
+                "checking_usb",
+                "Its USB connection just changed; the daemon is checking it again.",
+                Outcome::Pending,
+                format!("not verified: SENSORX is plugged in. Its USB connection just changed; the daemon is checking it again{settles}"),
+                "checking sensor_streams: SENSORX is plugged in. Its USB connection just changed; the daemon is checking it again".to_string(),
+            ),
+            (
+                "opening",
+                "The engine is opening this sensor.",
+                Outcome::Pending,
+                format!("not verified: SENSORX is plugged in. The engine is opening this sensor{settles}"),
+                "checking sensor_streams: SENSORX is plugged in. The engine is opening this sensor".to_string(),
+            ),
+            (
+                "waiting_headset",
+                "Waiting for the headset; this sensor is opened with it.",
+                Outcome::Pending,
+                format!("not verified: SENSORX is plugged in. Waiting for the headset; this sensor is opened with it{settles}"),
+                "checking sensor_streams: SENSORX is plugged in. Waiting for the headset; this sensor is opened with it".to_string(),
+            ),
+        ];
+        for (state, detail, outcome, conclusion, board) in cases {
+            let result = waiting_check(state, detail);
+            assert_eq!(result.outcome, outcome, "{state}");
+            assert_eq!(result.pending, outcome == Outcome::Pending, "{state}");
+            assert_eq!(
+                result.explained,
+                BTreeSet::from(["SENSORX".to_string()]),
+                "{state}"
+            );
+            assert_eq!(
+                waiting_check(state, detail).conclusion(),
+                (false, conclusion),
+                "{state}"
+            );
+            assert_eq!(waiting_check(state, detail).board_line(), board, "{state}");
+            assert!(!board.to_ascii_lowercase().contains("bandwidth"), "{board}");
+            assert!(!board.contains(".;"), "{board}");
+            // Only a wait that ends on its own is sampled again.
+            let current = waiting_sensor(state, detail);
+            let mut reads = 0;
+            let ((ok, _), _) = sample(
+                || {
+                    reads += 1;
+                    Some(current.clone())
+                },
+                |_| {},
+                |previous, current| {
+                    with_sources(
+                        || unreachable!(),
+                        || Ok(cameras(&["SensorX"])),
+                        previous,
+                        current,
+                    )
+                },
+            );
+            assert!(!ok, "{state}");
+            let expected = if outcome == Outcome::Pending {
+                MAX_SAMPLES
+            } else {
+                2
+            };
+            assert_eq!(reads, expected, "{state}");
+        }
+    }
+
+    /// Doctor's video check and its hot-plug check, and the board's video line and its hot-plug
+    /// note, give a waiting sensor's reason once per surface.
+    #[test]
+    fn a_waiting_sensors_reason_is_given_once_per_surface() {
+        let reason = "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (systemctl --user restart cv1touchd).";
+        let mut current = waiting_sensor("waiting_engine_start", reason);
+        let mut pending = current["sensor_hotplug"]["pending"]
+            .as_array()
+            .unwrap()
+            .clone();
+        // an uncalibrated sensor's reason has no video line of its own
+        pending
+            .push(json!({"serial": "SENSORY", "state": "waiting_engine_start", "detail": reason}));
+        current["sensor_hotplug"]["pending"] = json!(pending);
+        let check = || {
+            with_sources(
+                || unreachable!(),
+                || Ok(cameras(&["SENSORX", "SENSORY"])),
+                Some(&current),
+                Some(&current),
+            )
+        };
+        let explained = check().explained;
+        assert_eq!(explained, BTreeSet::from(["SENSORX".to_string()]));
+        let (_, video) = check().conclusion();
+        let (ok, hotplug) = status::sensor_hotplug_check(&current, &explained).unwrap();
+        assert!(!ok);
+        assert_eq!(hotplug, format!("Sensor SENSORY: {reason}"));
+        let doctor = format!("{video}\n{hotplug}");
+        let board = format!(
+            "{}\n{}",
+            check().board_line(),
+            status::sensor_hotplug_note(&current, &explained).unwrap()
+        );
+        for surface in [doctor, board] {
+            assert_eq!(
+                surface.matches("will be used the next time").count(),
+                2,
+                "{surface}"
+            );
+            // the daemon spells it "sensorx"; the video line uses its identity
+            let upper = surface.to_ascii_uppercase();
+            assert_eq!(upper.matches("SENSORX").count(), 1, "{surface}");
+            assert!(surface.contains("SENSORY isn't calibrated"), "{surface}");
+        }
+    }
+
+    #[test]
+    fn a_sensor_that_must_be_plugged_in_again_is_not_a_bandwidth_failure() {
+        let detail = "Its USB device went away; unplug this sensor and plug it back in.";
+        let result = waiting_check("waiting_replug", detail);
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(!result.pending);
+        assert_eq!(
+            result.conclusion(),
+            (
+                false,
+                "SENSORX: Its USB device went away; unplug this sensor and plug it back in".into()
+            )
+        );
+        assert_eq!(
+            waiting_check("waiting_replug", detail).board_line(),
+            "FAIL sensor_streams: SENSORX: Its USB device went away; unplug this sensor and plug it back in"
+        );
     }
 }

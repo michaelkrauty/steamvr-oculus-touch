@@ -248,3 +248,8 @@ test('config_write_api', test_config_write, args: ['api'])
 test('config_write_radio', test_config_write, args: ['radio'])
 test('config_write_fresh', test_config_write, args: ['fresh'])
 test('config_write_mode', test_config_write, args: ['mode'])
+
+test_sensor_retirement = executable('test_sensor_retirement', 'test_sensor_retirement.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [openhmd_dep, dependency('libusb-1.0'), threads_dep], link_args: ['-Wl,--gc-sections', '-lm'])
+test('sensor_retirement', test_sensor_retirement, timeout: 10)

@@ -1059,7 +1059,8 @@ int main(int argc, char **argv)
     for (int requested = 1; requested <= 2; requested++) {
         int other = 3 - requested;
         ohmd_context ctx = {.monotonic_ticks_per_sec = 1000000000};
-        rift_sensor_ctx sensor = {.ohmd_ctx = &ctx};
+        rift_sensor_device usb = {0}; /* a pose commit checks that its USB device is still there */
+        rift_sensor_ctx sensor = {.ohmd_ctx = &ctx, .dev = &usb};
         snprintf(sensor.serial_no, sizeof sensor.serial_no, "CameraA");
         sensor.sensor_lock = ohmd_create_mutex(&ctx);
         sensor.bw = blobwatch_new(BLOB_THRESHOLD_CV1);

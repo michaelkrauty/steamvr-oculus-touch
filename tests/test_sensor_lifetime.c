@@ -2,6 +2,9 @@
 // Copyright 2026 michaelkrauty
 /* Exercise actual analyser construction/destruction with failure at every owned
  * allocation. */
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <errno.h>
 #include "ohmd-pipewire.h"
 #include "rift-sensor-pose-search.h"
 #include "rift-sensor.h"
@@ -115,8 +118,58 @@ static void serial_case_matches(void) {
   CHECK(!rift_sensor_clear_cv1touch_pose(&sensor, "camera1", 0, 0));
 }
 
+static void gone_diagnostic_survives_publication(void) {
+  rift_sensor_device dev = {0};
+  rift_sensor_ctx sensor = {0};
+  sensor.dev = &dev;
+  sensor.sensor_lock = (void *)1;
+  ohmd_cv1touch_sensor out;
+  CHECK(sizeof(out) == 120 && offsetof(ohmd_cv1touch_sensor, camera_orient) == 36);
+  rift_sensor_get_cv1touch_info(&sensor, &out);
+  CHECK(!out.usb_gone);
+  __atomic_store_n(&dev.usb_gone, 1, __ATOMIC_RELAXED);
+  for (int i = 0; i < 2; i++) {
+    rift_sensor_get_cv1touch_info(&sensor, &out);
+    CHECK(out.usb_gone);
+  }
+}
+
+/* The actual sensor owns a pending pin until the retained start record takes it.
+ * No device nodes: a metadata directory exercises real close-on-free ownership. */
+static void pin_ownership_survives_sensor_free(bool transfer) {
+  calls = owned = closed = fail_at = 0;
+  ohmd_context ctx = {0};
+  rift_sensor_device_funcs funcs = {.stop = stop, .free = close_device};
+  rift_sensor_device *device = calloc(1, sizeof *device);
+  CHECK(device);
+  device->funcs = &funcs;
+  device->calib.width = 1280;
+  device->calib.height = 960;
+  rift_sensor_ctx *sensor = rift_sensor_new(&ctx, 0, "TEST000001", device, NULL);
+  CHECK(sensor && sensor->attachment_pin == -1);
+  int pin = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+  CHECK(pin >= 0);
+  ohmd_cv1touch_sensor_attachment key = {.kind = OHMD_CV1TOUCH_ATTACHMENT_SYSFS};
+  rift_sensor_set_attachment(sensor, &key, pin);
+  if (transfer) {
+    CHECK(rift_sensor_take_attachment_pin(sensor) == pin);
+    CHECK(sensor->attachment_pin == -1);
+  }
+  rift_sensor_free(sensor);
+  CHECK(closed == 1 && owned == 2); /* directly freed sensor and frame array */
+  if (transfer) {
+    int flags = fcntl(pin, F_GETFD);
+    CHECK(flags >= 0 && (flags & FD_CLOEXEC));
+    rift_sensor_close_attachment_pin(pin);
+  }
+  CHECK(fcntl(pin, F_GETFD) == -1 && errno == EBADF);
+}
+
 int main(void) {
+  pin_ownership_survives_sensor_free(false);
+  pin_ownership_survives_sensor_free(true);
   serial_case_matches();
+  gone_diagnostic_survives_publication();
   ohmd_context ctx = {0};
   rift_sensor_device_funcs funcs = {.stop = stop, .free = close_device};
   /* Buffers and outer analyser are freed directly, so subtract their successful

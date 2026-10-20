@@ -175,6 +175,7 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	dev = ohmd_alloc(ohmd_ctx, sizeof (rift_sensor_usb_device));
 	if (!dev) { libusb_close(usb_devh); return NULL; }
 	dev->base.funcs = &usb_device_funcs;
+	dev->uvc_stream.device_gone = &dev->base.usb_gone;
 
 	dev->ohmd_ctx = ohmd_ctx;
 	dev->id = id;

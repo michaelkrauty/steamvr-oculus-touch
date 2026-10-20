@@ -26,6 +26,7 @@ pub mod platform;
 pub mod recorder;
 pub mod register;
 pub mod rendermodel;
+pub mod sensor_hotplug;
 pub mod settings;
 pub mod setup;
 pub mod shm;

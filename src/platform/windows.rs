@@ -1583,7 +1583,13 @@ unsafe fn device_property(
     Some(String::from_utf16_lossy(&buf[..len])).filter(|s| !s.is_empty())
 }
 
-pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
+/// The present devices of `vendor`, of every class; with `enumerator` (such as `"USB"`), only
+/// those that bus enumerated, so a frequent scan does not list every device on the system.
+fn usb_devices_each(
+    vendor: u16,
+    enumerator: Option<&str>,
+    mut visit: impl FnMut(u32, Option<u32>, crate::platform::usb::Node),
+) -> io::Result<()> {
     use crate::platform::usb::Node;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Get_DevNode_Status, CM_Get_Device_IDW, CM_Get_Parent, SetupDiEnumDeviceInfo,
@@ -1591,20 +1597,20 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
         SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_SERVICE, SP_DEVINFO_DATA,
     };
     use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
-    // SAFETY: SetupAPI calls with valid out-pointers and correctly sized structures; the device
-    // information set is destroyed once.
+    let enumerator = enumerator.map(wide);
+    // SAFETY: SetupAPI calls with valid out-pointers, a NUL-terminated enumerator name or null,
+    // and correctly sized structures; the device information set is destroyed once.
     unsafe {
         let set = SetupDiGetClassDevsW(
             std::ptr::null(),
-            std::ptr::null(),
+            enumerator.as_ref().map_or(std::ptr::null(), |e| e.as_ptr()),
             std::ptr::null_mut(),
             DIGCF_ALLCLASSES | DIGCF_PRESENT,
         );
         if set == INVALID_HANDLE_VALUE as isize {
             return Err(io::Error::last_os_error());
         }
-        let result = (|| -> io::Result<Vec<Node>> {
-            let mut nodes = Vec::new();
+        let result = (|| -> io::Result<()> {
             for index in 0.. {
                 let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
                 data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
@@ -1633,9 +1639,11 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
                     continue;
                 };
                 let (mut status, mut problem) = (0, 0);
-                let problem = (CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0)
-                    == CR_SUCCESS
-                    && status & DN_HAS_PROBLEM != 0)
+                let status = (CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0)
+                    == CR_SUCCESS)
+                    .then_some(status);
+                let problem = status
+                    .is_some_and(|s| s & DN_HAS_PROBLEM != 0)
                     .then_some(problem);
                 let mut parent_node = 0;
                 let mut parent = [0u16; 512];
@@ -1646,23 +1654,187 @@ pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
                         let len = parent.iter().position(|&c| c == 0).unwrap_or(parent.len());
                         String::from_utf16_lossy(&parent[..len])
                     });
-                nodes.push(Node {
-                    id,
-                    product,
-                    name: device_property(set, &data, SPDRP_FRIENDLYNAME)
-                        .or_else(|| device_property(set, &data, SPDRP_DEVICEDESC))
-                        .unwrap_or_default(),
-                    driver: device_property(set, &data, SPDRP_SERVICE),
-                    problem,
-                    parent,
-                });
+                visit(
+                    data.DevInst,
+                    status,
+                    Node {
+                        id,
+                        product,
+                        name: device_property(set, &data, SPDRP_FRIENDLYNAME)
+                            .or_else(|| device_property(set, &data, SPDRP_DEVICEDESC))
+                            .unwrap_or_default(),
+                        driver: device_property(set, &data, SPDRP_SERVICE),
+                        problem,
+                        parent,
+                    },
+                );
             }
-            nodes.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(nodes)
+            Ok(())
         })();
         SetupDiDestroyDeviceInfoList(set);
         result
     }
+}
+
+pub fn usb_devices(vendor: u16) -> io::Result<Vec<crate::platform::usb::Node>> {
+    let mut nodes = Vec::new();
+    usb_devices_each(vendor, None, |_, _, node| nodes.push(node))?;
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(nodes)
+}
+
+fn sensor_arrival(devinst: u32) -> Option<u64> {
+    use windows_sys::Win32::Devices::{
+        DeviceAndDriverInstallation::{CM_Get_DevNode_PropertyW, CR_SUCCESS},
+        Properties::{DEVPKEY_Device_LastArrivalDate, DEVPROP_TYPE_FILETIME},
+    };
+    let (mut arrival, mut kind, mut size) = (0u64, 0u32, 8u32);
+    // SAFETY: the property is a FILETIME; the output buffer has the stated eight bytes.
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_LastArrivalDate,
+            &mut kind,
+            (&mut arrival as *mut u64).cast(),
+            &mut size,
+            0,
+        )
+    };
+    (result == CR_SUCCESS && kind == DEVPROP_TYPE_FILETIME && size == 8).then_some(arrival)
+}
+
+fn sensor_interface_present(id: &[u16], guid: u128) -> bool {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CR_SUCCESS,
+    };
+    let guid = windows_sys::core::GUID::from_u128(guid);
+    let mut size = 0;
+    // SAFETY: the instance ID is NUL-terminated and the output size pointer is valid.
+    if unsafe {
+        CM_Get_Device_Interface_List_SizeW(
+            &mut size,
+            &guid,
+            id.as_ptr(),
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+    } != CR_SUCCESS
+        || size <= 1
+    {
+        return false;
+    }
+    let mut paths = vec![0u16; size as usize];
+    // SAFETY: paths holds the number of UTF-16 characters reported by the size query.
+    // A registration changing between calls is unready; the next scan tries again.
+    unsafe {
+        CM_Get_Device_Interface_ListW(
+            &guid,
+            id.as_ptr(),
+            paths.as_mut_ptr(),
+            size,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        ) == CR_SUCCESS
+            && paths[0] != 0
+    }
+}
+
+fn sensor_interface(id: &str, whole_device: bool) -> bool {
+    if whole_device {
+        let id = wide(id);
+        return crate::platform::usb::winusb_interface_ready(true, &[], |guid| {
+            sensor_interface_present(&id, guid)
+        });
+    }
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+        System::Registry::{RegCloseKey, RegQueryValueExW, REG_MULTI_SZ, REG_SZ},
+    };
+    let Ok(node) = DeviceNode::open(id) else {
+        return false;
+    };
+    let Ok(key) = node.key(false) else {
+        return false;
+    };
+    // SAFETY: this read-only key is open, value names are terminated and the byte buffer
+    // covers the size query. A resize or failed query is unready until the next scan.
+    let registered = unsafe {
+        (|| {
+            let mut name = wide("DeviceInterfaceGUIDs");
+            let (mut size, mut kind) = (0u32, 0u32);
+            let mut result = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            );
+            if result == ERROR_FILE_NOT_FOUND {
+                name = wide("DeviceInterfaceGUID");
+                result = RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    std::ptr::null_mut(),
+                    &mut size,
+                );
+            }
+            if result != ERROR_SUCCESS || !matches!(kind, REG_SZ | REG_MULTI_SZ) || size % 2 != 0 {
+                return None;
+            }
+            let mut data = vec![0u16; size as usize / 2 + 2];
+            let result = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                data.as_mut_ptr().cast(),
+                &mut size,
+            );
+            if result != ERROR_SUCCESS || !matches!(kind, REG_SZ | REG_MULTI_SZ) || size % 2 != 0 {
+                return None;
+            }
+            data.truncate(size as usize / 2);
+            Some(data)
+        })()
+    };
+    // SAFETY: this function owns the key and closes it once, after every read outcome.
+    unsafe {
+        RegCloseKey(key);
+    }
+    let Some(registered) = registered else {
+        return false;
+    };
+    let id = wide(id);
+    crate::platform::usb::winusb_interface_ready(false, &registered, |guid| {
+        sensor_interface_present(&id, guid)
+    })
+}
+
+pub fn usb_sensors() -> io::Result<Vec<crate::platform::usb::Sensor>> {
+    use crate::platform::usb::WindowsSensorNode;
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::DN_STARTED;
+    let mut nodes = Vec::new();
+    // every second: the USB bus's own devices only, the sensors and their interfaces among them
+    usb_devices_each(0x2833, Some("USB"), |devinst, status, node| {
+        let upper = node.id.to_ascii_uppercase();
+        if node.product != 0x0211 || !upper.starts_with(r"USB\VID_2833&PID_0211") {
+            return;
+        }
+        let root = upper.starts_with(r"USB\VID_2833&PID_0211\");
+        let winusb = node
+            .driver
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("winusb"));
+        nodes.push(WindowsSensorNode {
+            arrival: root.then(|| sensor_arrival(devinst)).flatten(),
+            started: status.map(|s| s & DN_STARTED != 0),
+            interface: winusb && sensor_interface(&node.id, root),
+            node,
+        });
+    })?;
+    Ok(crate::platform::usb::sensors_on_windows(&nodes))
 }
 
 /// A string or number under HKEY_LOCAL_MACHINE.

@@ -78,6 +78,34 @@ impl BackgroundMonitor {
         Self::start(reference, window_ns, min_hits, analyse)
     }
 
+    /// The worker blocks inside analysis until `release` receives. The daemon's radio-exit test
+    /// uses this to prove a failure is marked before `Drop` joins. Nothing else calls it.
+    #[doc(hidden)]
+    pub fn block_in_analysis_for_test(
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> io::Result<Self> {
+        let entered = Mutex::new(Some(entered));
+        let release = Mutex::new(release);
+        Self::start(
+            vec![Landmark {
+                serial: "A".into(),
+                x: 0.0,
+                y: 0.0,
+                seen: 1.0,
+            }],
+            1,
+            1,
+            move |_, _, _, _| {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                let _ = release.lock().unwrap().recv();
+                None
+            },
+        )
+    }
+
     fn start(
         reference: Vec<Landmark>,
         window_ns: u64,

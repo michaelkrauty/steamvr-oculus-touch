@@ -10,7 +10,7 @@ use std::ffi::{c_void, CStr};
 #[cfg(feature = "engine")]
 use std::ptr;
 #[cfg(feature = "engine")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ffi;
 #[cfg(feature = "engine")]
@@ -97,6 +97,8 @@ impl From<ffi::ohmd_cv1touch_sensor_video_quality> for SensorVideoQuality {
 pub struct SensorStreamStart {
     scope: &'static str,
     pub serial: String,
+    #[serde(skip)]
+    pub attachment: Option<String>,
     pub error_kind: &'static str,
     pub error_code: i32,
     pub os_error: i32,
@@ -106,9 +108,12 @@ pub struct SensorStreamStart {
 
 impl From<ffi::ohmd_cv1touch_sensor_stream> for SensorStreamStart {
     fn from(s: ffi::ohmd_cv1touch_sensor_stream) -> Self {
+        let serial = cstr_field(&s.serial);
+        let attachment = sensor_attachment(&serial, s.attachment);
         Self {
             scope: "last_start_attempt",
-            serial: cstr_field(&s.serial),
+            attachment,
+            serial,
             error_kind: match s.error_kind {
                 ffi::OHMD_CV1TOUCH_STREAM_ERROR_NONE => "none",
                 ffi::OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH => "likely_usb_bandwidth",
@@ -118,6 +123,29 @@ impl From<ffi::ohmd_cv1touch_sensor_stream> for SensorStreamStart {
             os_error: s.os_error,
             alt_setting: (s.alt_setting > 0).then_some(s.alt_setting),
         }
+    }
+}
+
+/// Decode only complete discovery identities. Unknown/invalid data cannot spend an attempt.
+fn sensor_attachment(serial: &str, key: ffi::ohmd_cv1touch_sensor_attachment) -> Option<String> {
+    match key.kind {
+        ffi::OHMD_CV1TOUCH_ATTACHMENT_SYSFS => {
+            let bus = key.data[0] & 255;
+            let address = (key.data[0] >> 8) & 255;
+            let inode = u64::from(key.data[1]) | (u64::from(key.data[2]) << 32);
+            (bus != 0 && address != 0 && inode != 0)
+                .then(|| format!("sysfs:{bus}:{address}@{inode:016x}"))
+        }
+        ffi::OHMD_CV1TOUCH_ATTACHMENT_WINDOWS => {
+            let arrival = u64::from(key.data[0]) | (u64::from(key.data[1]) << 32);
+            (arrival != 0).then(|| {
+                format!(
+                    r"USB\VID_2833&PID_0211\{}@{arrival:016x}",
+                    serial.to_ascii_uppercase()
+                )
+            })
+        }
+        _ => None,
     }
 }
 
@@ -276,12 +304,52 @@ pub trait EngineSink: Send + Sync {
     }
 }
 
+/// The only native operation allowed away from the engine thread. The sensor roster is
+/// immutable after open, and retirement takes each sensor's lock. Drop invalidates this
+/// target before closing any native device and waits for an in-flight retirement first.
+#[cfg(feature = "engine")]
+struct RetirementDevice(*mut ffi::ohmd_device);
+#[cfg(feature = "engine")]
+// SAFETY: only SensorRetirement uses the pointer, under its lifetime mutex, for retirement.
+unsafe impl Send for RetirementDevice {}
+
+#[cfg(feature = "engine")]
+#[derive(Clone, Default)]
+pub struct SensorRetirement(Arc<Mutex<Option<RetirementDevice>>>);
+
+#[cfg(feature = "engine")]
+impl SensorRetirement {
+    fn with_device<T>(&self, f: impl FnOnce(*mut ffi::ohmd_device) -> T) -> Option<T> {
+        let target = self.0.lock().unwrap();
+        target.as_ref().map(|d| f(d.0))
+    }
+
+    fn invalidate(&self) {
+        self.0.lock().unwrap().take();
+    }
+
+    pub fn retire(&self, serial: &str) -> Result<(), String> {
+        let serial = self::serial(serial)?;
+        // SAFETY: the guard keeps the device alive; only this immutable-roster, locked
+        // native operation is exposed here. Native callbacks never acquire this guard.
+        let result =
+            self.with_device(|d| unsafe { ffi::ohmd_cv1touch_retire_sensor(d, serial.as_ptr()) });
+        match result {
+            None | Some(0) => Ok(()),
+            Some(_) => Err("the engine could not retire a sensor".into()),
+        }
+    }
+}
+
 #[cfg(feature = "engine")]
 pub struct Engine {
     ctx: *mut ffi::ohmd_context,
     hands: [*mut ffi::ohmd_device; 2],
     last_io_errors: u32,
+    retirement: SensorRetirement,
     sink: *mut Arc<dyn EngineSink>,
+    #[cfg(windows)]
+    _sensor_attachments: Box<SensorAttachments>,
 }
 
 #[cfg(feature = "engine")]
@@ -299,6 +367,42 @@ pub fn ffi_callback(run: impl FnOnce()) {
         // SAFETY: the native fatal path drains once within its bound and never returns.
         unsafe { ffi::ohmd_cv1touch_abort() };
     }
+}
+
+#[cfg(all(feature = "engine", any(windows, test)))]
+struct SensorAttachments {
+    // Box this owner so the callback's user pointer stays valid when Engine moves.
+    sensors: Vec<crate::platform::usb::Sensor>,
+}
+
+#[cfg(all(feature = "engine", any(windows, test)))]
+unsafe extern "C" fn sensor_attachment_cb(
+    user: *mut std::ffi::c_void,
+    serial: *const std::ffi::c_char,
+    out: *mut crate::ffi::ohmd_cv1touch_sensor_attachment,
+) {
+    ffi_callback(|| unsafe {
+        if user.is_null() || serial.is_null() || out.is_null() {
+            return;
+        }
+        *out = Default::default();
+        let snapshot = &*(user as *const SensorAttachments);
+        let serial = std::ffi::CStr::from_ptr(serial).to_string_lossy();
+        if let Some(sensor) = snapshot
+            .sensors
+            .iter()
+            .find(|s| crate::status::same_sensor(&s.serial, &serial))
+        {
+            if let Some((_, arrival)) = sensor.attachment.rsplit_once('@') {
+                if let Ok(arrival) = u64::from_str_radix(arrival, 16) {
+                    if arrival != 0 {
+                        (*out).kind = crate::ffi::OHMD_CV1TOUCH_ATTACHMENT_WINDOWS;
+                        (*out).data = [arrival as u32, (arrival >> 32) as u32, 0];
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// A NUL-terminated C char array field as a String.
@@ -320,6 +424,12 @@ impl Engine {
     /// Probes and opens both Touch controllers with OpenHMD's auto-update thread disabled.
     pub fn open(opts: &EngineOptions, sink: Arc<dyn EngineSink>) -> Result<Engine, String> {
         let sensors = build_sensor_config(opts)?;
+        // Capture before creating the native context: a later USB listing can belong to a
+        // replacement whose predecessor's failed stream object has already been freed.
+        #[cfg(windows)]
+        let sensor_attachments = Box::new(SensorAttachments {
+            sensors: crate::platform::usb::sensors().unwrap_or_default(),
+        });
         // SAFETY: FFI into OpenHMD; every pointer passed is valid for the call, and `sink` outlives
         // the context (freed in Drop after ohmd_ctx_destroy joins the engine's threads).
         unsafe {
@@ -332,8 +442,17 @@ impl Engine {
                 ctx,
                 hands: [ptr::null_mut(); 2],
                 last_io_errors: 0,
+                retirement: SensorRetirement::default(),
                 sink,
+                #[cfg(windows)]
+                _sensor_attachments: sensor_attachments,
             };
+            #[cfg(windows)]
+            ffi::ohmd_cv1touch_set_sensor_attachment_callback(
+                ctx,
+                Some(sensor_attachment_cb),
+                engine._sensor_attachments.as_ref() as *const SensorAttachments as *mut c_void,
+            );
             let cfg = build_config(opts);
             ffi::ohmd_cv1touch_configure(ctx, &cfg);
             if ffi::ohmd_cv1touch_configure_sensors(
@@ -387,6 +506,7 @@ impl Engine {
                 ));
             }
             engine.last_io_errors = ffi::ohmd_cv1touch_get_io_errors(engine.hands[HAND_RIGHT]);
+            *engine.retirement.0.lock().unwrap() = Some(RetirementDevice(engine.hands[HAND_RIGHT]));
             Ok(engine)
         }
     }
@@ -514,6 +634,11 @@ impl Engine {
         }
     }
 
+    /// A retirement-only handle; safe to call from a watcher while an update is blocked.
+    pub fn sensor_retirement(&self) -> SensorRetirement {
+        self.retirement.clone()
+    }
+
     /// Gives the open sensor `serial` the camera -> world pose it tracks with from its next frame
     /// on (its calibrated pose at start, until then). Err when no such sensor is open.
     pub fn set_sensor_pose(
@@ -602,6 +727,7 @@ impl Engine {
 #[cfg(feature = "engine")]
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.retirement.invalidate();
         // SAFETY: we own the context; destroying it stops all engine threads before the sink is freed.
         unsafe {
             for h in self.hands {
@@ -679,7 +805,125 @@ impl Drop for RadioDecoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_identity_round_trips_pinned_sysfs_and_windows_arrival() {
+        use crate::ffi;
+        let mut key = ffi::ohmd_cv1touch_sensor_attachment {
+            kind: ffi::OHMD_CV1TOUCH_ATTACHMENT_SYSFS,
+            data: [1 | (7 << 8), 0x9abcdef0, 0x12345678],
+        };
+        assert_eq!(
+            super::sensor_attachment("SENSORALPHA", key).as_deref(),
+            Some("sysfs:1:7@123456789abcdef0")
+        );
+        let mut raw = ffi::ohmd_cv1touch_sensor_stream {
+            attachment: key,
+            ..Default::default()
+        };
+        for (out, byte) in raw.serial.iter_mut().zip(b"SENSORALPHA") {
+            *out = *byte as std::ffi::c_char;
+        }
+        let start: super::SensorStreamStart = raw.into();
+        assert_eq!(
+            start.attachment.as_deref(),
+            Some("sysfs:1:7@123456789abcdef0")
+        );
+        key.data[1] = 0;
+        key.data[2] = 0;
+        assert!(super::sensor_attachment("SENSORALPHA", key).is_none());
+        key.kind = ffi::OHMD_CV1TOUCH_ATTACHMENT_USB;
+        assert!(
+            super::sensor_attachment("SENSORALPHA", key).is_none(),
+            "location alone has no incarnation"
+        );
+        key.kind = ffi::OHMD_CV1TOUCH_ATTACHMENT_WINDOWS;
+        key.data = [0x9abcdef0, 0x12345678, 0];
+        assert_eq!(
+            super::sensor_attachment("SensorAlpha", key).as_deref(),
+            Some(r"USB\VID_2833&PID_0211\SENSORALPHA@123456789abcdef0")
+        );
+        key.data = [0; 3];
+        assert!(super::sensor_attachment("SENSORALPHA", key).is_none());
+        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_stream>(), 64);
+    }
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn windows_discovery_callback_uses_only_its_pre_enumeration_snapshot() {
+        let mut snapshot = super::SensorAttachments {
+            sensors: vec![crate::platform::usb::Sensor {
+                serial: "SensorAlpha".into(),
+                attachment: r"USB\VID_2833&PID_0211\SENSORALPHA@123456789abcdef0".into(),
+                ready: true,
+            }],
+        };
+        let serial = std::ffi::CString::new("sensoralpha").unwrap();
+        let mut out = crate::ffi::ohmd_cv1touch_sensor_attachment::default();
+        // SAFETY: all callback pointers refer to live fixtures for the entire call.
+        unsafe {
+            super::sensor_attachment_cb(
+                &mut snapshot as *mut _ as *mut _,
+                serial.as_ptr(),
+                &mut out,
+            );
+        }
+        assert_eq!(
+            super::sensor_attachment("SENSORALPHA", out).as_deref(),
+            Some(r"USB\VID_2833&PID_0211\SENSORALPHA@123456789abcdef0")
+        );
+        let later = std::ffi::CString::new("SENSORLATER").unwrap();
+        // It arrived after the snapshot, so a completion listing cannot invent its generation.
+        unsafe {
+            super::sensor_attachment_cb(
+                &mut snapshot as *mut _ as *mut _,
+                later.as_ptr(),
+                &mut out,
+            );
+        }
+        assert!(super::sensor_attachment("SENSORLATER", out).is_none());
+    }
+
     use super::*;
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn hotplug_retirement_cannot_outlive_its_native_device() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let retirement = SensorRetirement::default();
+        *retirement.0.lock().unwrap() =
+            Some(RetirementDevice(std::ptr::NonNull::dangling().as_ptr()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let r = &retirement;
+            scope.spawn(move || {
+                r.with_device(|_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            scope.spawn(move || {
+                r.invalidate();
+                closed_tx.send(()).unwrap();
+            });
+            let early = closed_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+            release_tx.send(()).unwrap();
+            if !early {
+                closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            assert!(
+                !early,
+                "close must wait for the retirement using its native device"
+            );
+        });
+        assert!(
+            retirement.with_device(|_| ()).is_none(),
+            "a retained handle must never touch a closed device"
+        );
+    }
 
     #[test]
     fn quality_mapping_preserves_unknown_raw_jpeg_and_u64_values() {

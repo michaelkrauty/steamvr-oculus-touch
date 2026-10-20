@@ -410,6 +410,16 @@ impl Tracker {
         self.agreement.push(CameraAgreement::default());
     }
 
+    pub(super) fn forget_camera(&mut self, id: usize) {
+        self.camera_updates[id].clear();
+        self.cancel_inspection(id);
+        self.searched_at[id] = 0;
+        self.agreement[id] = CameraAgreement::default();
+        if self.track_camera == Some(id) {
+            self.track_camera = None;
+        }
+    }
+
     fn gravity(&self) -> Vector3<f64> {
         Vector3::new(0.0, -self.params.gravity, 0.0)
     }
@@ -1485,6 +1495,48 @@ mod tests {
     use nalgebra::{Point3, Translation3, UnitQuaternion, Vector2};
 
     const G: f64 = 9.80665;
+
+    /// A removed sensor's held search exposures and accepted updates go with it; the other
+    /// cameras keep theirs.
+    #[test]
+    fn hotplug_a_forgotten_camera_leaves_no_held_search_or_updates() {
+        let w = world(1);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let prior = Filter {
+            x: Nominal {
+                q: UnitQuaternion::identity(),
+                p: Vector3::zeros(),
+                v: Vector3::zeros(),
+                bg: Vector3::zeros(),
+                ba: Vector3::zeros(),
+            },
+            cov: Cov::identity(),
+        };
+        for camera in [0, 1] {
+            tr.camera_updates[camera].push_back(10);
+            tr.searched_at[camera] = 10;
+            tr.inspection_frames.push_back(InspectionFrame {
+                camera,
+                exposure: 10,
+                until: 20,
+                prior,
+                peers: true,
+            });
+        }
+        tr.track_camera = Some(0);
+        tr.forget_camera(0);
+        assert!(tr.camera_updates[0].is_empty());
+        assert_eq!(tr.camera_updates[1], [10]);
+        assert_eq!(tr.searched_at, [0, 10, 0]);
+        assert_eq!(
+            tr.inspection_frames
+                .iter()
+                .map(|f| f.camera)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(tr.track_camera, None);
+    }
 
     struct World {
         cams: Vec<Camera>,

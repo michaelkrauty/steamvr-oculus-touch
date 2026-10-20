@@ -403,7 +403,8 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     ];
     #[cfg(windows)]
     checks.push(sensors::doctor_check());
-    let ((stream_ok, stream_detail), daemon) = sensor_streams::doctor(calibration.as_ref().ok());
+    let ((stream_ok, stream_detail), explained, daemon) =
+        sensor_streams::doctor(calibration.as_ref().ok());
     let socket = control::socket_path();
     let detail = daemon
         .as_ref()
@@ -415,6 +416,9 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     if let Some(d) = &daemon {
         let (ok, detail) = sensor_poses_check(d);
         checks.push(("sensor_poses", ok, detail));
+        if let Some((ok, note)) = status::sensor_hotplug_check(d, &explained) {
+            checks.push(("sensor_hotplug", ok, note));
+        }
     }
     (checks, daemon)
 }
@@ -573,6 +577,8 @@ fn status_board(shm_name: &str) -> i32 {
     let mut video_rates = status::VideoRateHistory::default();
     let mut stream_sample: Option<(u64, serde_json::Value)> = None;
     let mut stream_note = "sensor_streams: skipped: waiting for video samples".to_string();
+    // the sensors whose hot-plug reason stream_note already gives
+    let mut stream_explained = std::collections::BTreeSet::new();
     loop {
         let now = shm::now_ns();
         if reader.as_ref().is_none_or(|r| r.stale(now, 500_000_000)) {
@@ -594,7 +600,8 @@ fn status_board(shm_name: &str) -> i32 {
                     if now.saturating_sub(*then)
                         >= sensor_streams::SAMPLE_INTERVAL.as_nanos() as u64 =>
                 {
-                    stream_note = sensor_streams::board_note(Some(previous), Some(current));
+                    (stream_note, stream_explained) =
+                        sensor_streams::board_note(Some(previous), Some(current));
                     stream_sample = Some((now, current.clone()));
                 }
                 None => stream_sample = Some((now, current.clone())),
@@ -603,6 +610,7 @@ fn status_board(shm_name: &str) -> i32 {
         } else {
             stream_sample = None;
             stream_note = "sensor_streams: skipped: control diagnostics unavailable".into();
+            stream_explained.clear();
         }
         let (sensors, sensor_note) =
             board_sensors(complete.as_ref(), unavailable.as_deref(), || {
@@ -629,6 +637,12 @@ fn status_board(shm_name: &str) -> i32 {
             if !message.is_empty() {
                 println!("{message}");
             }
+        }
+        if let Some(note) = complete
+            .as_ref()
+            .and_then(|v| status::sensor_hotplug_note(v, &stream_explained))
+        {
+            println!("{note}");
         }
         let _ = io::stdout().flush();
         thread::sleep(Duration::from_millis(200));

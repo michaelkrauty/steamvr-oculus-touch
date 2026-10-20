@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include "openhmd_cv1touch.h"
+#include <stdint.h>
 
 #include "ohmd-video.h"
 #include "rift-tracker-common.h"
@@ -50,6 +51,8 @@ struct rift_sensor_device {
 	uint32_t cv1touch_video_format;
 	uint64_t cv1touch_frames_decoded;
 	uint64_t cv1touch_frames_dropped;
+	/* Retained after NO_DEVICE, read by the engine without taking the USB event lock. */
+	uint32_t usb_gone;
 };
 
 #define rift_sensor_device_start_video(d,min_frames,frame_cb,frame_cb_data) \

@@ -3,7 +3,7 @@
 
 //! Text rendering of the live status board (`cv1touch status`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::hand::{
     BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, FLAG_ASLEEP, FLAG_CALIBRATED,
@@ -329,6 +329,68 @@ pub fn sensors_from_status(value: &serde_json::Value) -> Result<Vec<SensorStatus
         .collect()
 }
 
+/// Pending sensors are not in the engine's roster yet; keep the reason visible until pickup.
+/// `explained` holds the identities whose reason the same surface already shows, in its sensor
+/// video line: each reason is given once.
+pub fn sensor_hotplug_note(
+    value: &serde_json::Value,
+    explained: &BTreeSet<String>,
+) -> Option<String> {
+    hotplug_note(&unexplained_pending(value, explained), value)
+}
+
+/// The doctor's `sensor_hotplug` check: whether it passes, and the note. A sensor the engine is
+/// opening, one waiting for the headset the engine opens with, or one whose USB change is still
+/// settling needs nothing of its own.
+pub fn sensor_hotplug_check(
+    value: &serde_json::Value,
+    explained: &BTreeSet<String>,
+) -> Option<(bool, String)> {
+    let pending = unexplained_pending(value, explained);
+    let note = hotplug_note(&pending, value)?;
+    let in_progress = value["sensor_hotplug"]["scan_error"].is_null()
+        && pending.iter().all(|s| {
+            matches!(
+                s["state"].as_str(),
+                Some("opening" | "waiting_headset" | "checking_usb")
+            )
+        });
+    Some((in_progress, note))
+}
+
+fn unexplained_pending<'a>(
+    value: &'a serde_json::Value,
+    explained: &BTreeSet<String>,
+) -> Vec<&'a serde_json::Value> {
+    value["sensor_hotplug"]["pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| {
+            s["serial"]
+                .as_str()
+                .is_none_or(|serial| !explained.contains(&sensor_identity(serial)))
+        })
+        .collect()
+}
+
+fn hotplug_note(pending: &[&serde_json::Value], value: &serde_json::Value) -> Option<String> {
+    let mut notes: Vec<String> = pending
+        .iter()
+        .filter_map(|s| {
+            Some(format!(
+                "Sensor {}: {}",
+                s["serial"].as_str()?,
+                s["detail"].as_str()?
+            ))
+        })
+        .collect();
+    if let Some(error) = value["sensor_hotplug"]["scan_error"].as_str() {
+        notes.push(format!("Could not check for plugged-in sensors: {error}"));
+    }
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
 fn state_text(s: &ControllerState) -> &'static str {
     if s.flags & FLAG_CALIBRATED == 0 {
         "not paired / never seen"
@@ -643,6 +705,7 @@ mod tests {
             assert_eq!(rate[0], expected);
         }
     }
+
     fn quality_snapshot(
         format: serde_json::Value,
         received: u64,
@@ -804,5 +867,77 @@ mod tests {
             changed["sensors"][0][field] = value;
             assert!(video_drop_notes(&old, &changed).is_empty());
         }
+    }
+
+    #[test]
+    fn hotplug_an_open_in_progress_or_a_missing_headset_is_no_doctor_failure() {
+        let pending = |states: &[&str]| {
+            serde_json::json!({"sensor_hotplug": {"pending": states.iter().map(|state| serde_json::json!({
+                "serial": "SENSORALPHA", "state": state, "detail": "Some detail."})).collect::<Vec<_>>()}})
+        };
+        let none = BTreeSet::new();
+        assert_eq!(sensor_hotplug_check(&pending(&[]), &none), None);
+        for (states, ok) in [
+            (&["opening"][..], true),
+            (&["waiting_headset", "opening"][..], true),
+            (&["checking_usb"][..], true),
+            (&["waiting_engine_start"][..], false),
+            (&["opening", "waiting_usb"][..], false),
+            (&["waiting_replug"][..], false),
+        ] {
+            let (passed, note) = sensor_hotplug_check(&pending(states), &none).unwrap();
+            assert_eq!(passed, ok, "{states:?}");
+            assert!(note.contains("Sensor SENSORALPHA: Some detail."));
+        }
+        let mut failed_scan = pending(&["opening"]);
+        failed_scan["sensor_hotplug"]["scan_error"] = "USB listing interrupted".into();
+        assert_eq!(
+            sensor_hotplug_check(&failed_scan, &none).map(|(ok, _)| ok),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn hotplug_pending_note_is_shared_by_status_and_doctor() {
+        let none = BTreeSet::new();
+        assert!(sensor_hotplug_note(&serde_json::json!({}), &none).is_none());
+        let value = serde_json::json!({"sensor_hotplug": {"pending": [{"serial": "SENSORALPHA",
+            "detail": "This sensor will be used the next time the tracking engine starts."}],
+            "scan_error": "USB listing interrupted"}});
+        assert_eq!(
+            sensor_hotplug_note(&value, &none).unwrap(),
+            "Sensor SENSORALPHA: This sensor will be used the next time the tracking engine starts.\nCould not check for plugged-in sensors: USB listing interrupted"
+        );
+    }
+
+    /// A reason the sensor video line already gives is not given again on the same surface:
+    /// the remaining sensors, and a failed scan, are still reported and judged on their own.
+    #[test]
+    fn hotplug_a_reason_already_given_is_not_repeated() {
+        let value = serde_json::json!({"sensor_hotplug": {"pending": [
+            {"serial": "SensorAlpha", "state": "waiting_engine_start", "detail": "Restart."},
+            {"serial": "SENSORBRAVO", "state": "opening", "detail": "Opening."}],
+            "scan_error": null}});
+        let alpha = BTreeSet::from(["SENSORALPHA".to_string()]);
+        assert_eq!(
+            sensor_hotplug_note(&value, &alpha).as_deref(),
+            Some("Sensor SENSORBRAVO: Opening.")
+        );
+        assert_eq!(
+            sensor_hotplug_check(&value, &alpha),
+            Some((true, "Sensor SENSORBRAVO: Opening.".into()))
+        );
+        let both = BTreeSet::from(["SENSORALPHA".to_string(), "SENSORBRAVO".to_string()]);
+        assert_eq!(sensor_hotplug_note(&value, &both), None);
+        assert_eq!(sensor_hotplug_check(&value, &both), None);
+        let mut failed_scan = value.clone();
+        failed_scan["sensor_hotplug"]["scan_error"] = "USB listing interrupted".into();
+        assert_eq!(
+            sensor_hotplug_check(&failed_scan, &both),
+            Some((
+                false,
+                "Could not check for plugged-in sensors: USB listing interrupted".into()
+            ))
+        );
     }
 }

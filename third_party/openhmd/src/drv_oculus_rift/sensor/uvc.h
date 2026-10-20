@@ -24,6 +24,7 @@ enum rift_sensor_uvc_discard {
 };
 
 struct rift_sensor_uvc_stream {
+	uint32_t *device_gone;
 	ohmd_context* ohmd_ctx;
 	/* Sensor number in log lines */
 	int sensor_id;

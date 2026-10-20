@@ -61,6 +61,8 @@ struct rift_sensor_ctx_s
 	rift_tracker_ctx *tracker;
 
 	rift_sensor_device *dev;
+	ohmd_cv1touch_sensor_attachment attachment;
+	int attachment_pin;
 
 	rift_sensor_analysis_frame *frames;
 	ohmd_jpeg_decoder *jpeg_decoder;
@@ -97,6 +99,7 @@ struct rift_sensor_ctx_s
 	ohmd_cond *long_analysis_q_cond;
 
 	int shutdown;
+	bool retired; /* sensor_lock fences retirement against an in-flight pose commit */
 
 	bool long_analysis_busy;
 
@@ -218,7 +221,7 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 			sensor->serial_no);
 
 	__atomic_fetch_add(&sensor->cv1touch_frames, 1, __ATOMIC_RELAXED);
-	if (frame->bwobs && sensor->ohmd_ctx->cv1touch_frame_cb) {
+	if (!sensor->retired && frame->bwobs && sensor->ohmd_ctx->cv1touch_frame_cb) {
 		ohmd_cv1touch_frame_info info;
 		ohmd_cv1touch_blob blobs[MAX_BLOBS_PER_FRAME];
 		int n = frame->bwobs->num_blobs;
@@ -553,7 +556,8 @@ static void apply_pending_pose(rift_sensor_ctx *sensor)
 	sensor->have_pending_pose = false;
 	sensor->pending_clear = false;
 	sensor->pending_inspection_extension = false;
-	__atomic_store_n(&sensor->search_cancelled, false, __ATOMIC_RELAXED);
+	/* A retired sensor still acknowledges the pose, but starts no new search. */
+	__atomic_store_n(&sensor->search_cancelled, sensor->retired, __ATOMIC_RELAXED);
 }
 
 /* A pose command can wake the fast worker even if this camera supplies no new frames. */
@@ -585,6 +589,7 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 
 	sensor_ctx = ohmd_alloc(ohmd_ctx, sizeof (rift_sensor_ctx));
 	if (!sensor_ctx) { rift_sensor_device_free(dev); return NULL; }
+	sensor_ctx->attachment_pin = -1;
 
 	sensor_ctx->ohmd_ctx = ohmd_ctx;
 	sensor_ctx->dev = dev;
@@ -742,6 +747,7 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 
 	rift_pose_finder_clear (&sensor_ctx->pf);
 
+	rift_sensor_close_attachment_pin(sensor_ctx->attachment_pin);
 	free(sensor_ctx->frames);
 	free (sensor_ctx);
 }
@@ -933,6 +939,21 @@ static void queue_long_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame
 	ohmd_cond_signal(sensor->long_analysis_q_cond);
 }
 
+/* Done with this frame: send it to the long analysis thread if it needs a search that may
+ * start now, otherwise back to the capture thread. Called with sensor_lock held. */
+static void finish_fast_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
+{
+	if (frame->need_long_analysis && !sensor->long_analysis_busy &&
+	    !__atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED) &&
+	    !__atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED) &&
+	    !search_deadline_expired(sensor)) {
+		queue_long_frame(sensor, frame);
+	} else {
+		frame->long_analysis_start_ts = frame->long_analysis_finish_ts = frame->image_analysis_finish_ts;
+		release_capture_frame(sensor, frame);
+	}
+}
+
 static unsigned int fast_analysis_thread(void *arg)
 {
 	rift_sensor_ctx *sensor = arg;
@@ -951,21 +972,7 @@ static unsigned int fast_analysis_thread(void *arg)
 				if (init_frame_analyse(sensor, frame))
 					analyse_frame_fast(sensor, frame);
 				ohmd_lock_mutex (sensor->sensor_lock);
-
-				/* Done with this frame - either send it back to the capture thread,
-				 * or to the long analysis thread (unless the thread is still busy
-				 * processing something else
-				 */
-				if (frame->need_long_analysis && !sensor->long_analysis_busy &&
-				    !__atomic_load_n(&sensor->search_cancelled, __ATOMIC_RELAXED) &&
-				    !__atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED) &&
-				    !search_deadline_expired(sensor)) {
-					queue_long_frame(sensor, frame);
-				} else {
-					frame->long_analysis_start_ts = frame->long_analysis_finish_ts = frame->image_analysis_finish_ts;
-					release_capture_frame(sensor, frame);
-				}
-
+				finish_fast_frame(sensor, frame);
 				frame = NULL;
 			}
 
@@ -992,11 +999,13 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 		obj_world_pose->pos.x, obj_world_pose->pos.y, obj_world_pose->pos.z);
 
 	bool inspected = sensor_ctx->pf.inspection_mask & (1u << dev->id);
-	bool ret = false;
-	if (!inspected)
-		ret = rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
-			score, obj_world_pose, sensor_ctx->serial_no);
+	/* Analysis runs without sensor_lock. Retirement and the final pose commit share it,
+	 * so a frame that was already being fitted cannot move a hand after retirement. */
 	ohmd_lock_mutex(sensor_ctx->sensor_lock);
+	bool ret = !inspected && !sensor_ctx->retired &&
+		!__atomic_load_n(&sensor_ctx->dev->usb_gone, __ATOMIC_RELAXED) &&
+		rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
+			score, obj_world_pose, sensor_ctx->serial_no);
 	int slot = -1, other_slot = -1;
 	for (int d = 0; d < frame->n_devices; d++) {
 		int id = sensor_ctx->devices[d]->id;
@@ -1105,6 +1114,18 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	return ret;
 }
 
+void rift_sensor_retire(rift_sensor_ctx *sensor)
+{
+	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->retired = true;
+	/* Its inspection or placement search stops at the next loop boundary, and no new one
+	 * ever starts on it, even after a pose is applied (apply_pending_pose keeps the
+	 * cancellation): the daemon frees the one search slot when it forgets the sensor,
+	 * without waiting for a restoration acknowledgement. */
+	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
+	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor)
 {
 	return sensor->serial_no;
@@ -1190,6 +1211,7 @@ void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor
 	/* The provisional placement writes pf without this lock; Phase 3 replaces it with a fixed pose. */
 	ohmd_lock_mutex(sensor->sensor_lock);
 	out->have_camera_pose = sensor->pf.have_camera_pose;
+	out->usb_gone = __atomic_load_n(&sensor->dev->usb_gone, __ATOMIC_RELAXED) != 0;
 	pose = sensor->pf.camera_pose;
 	ohmd_unlock_mutex(sensor->sensor_lock);
 	out->camera_orient[0] = pose.orient.x;
@@ -1213,9 +1235,23 @@ void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor
 		out->pose_fixes[i] = __atomic_load_n(&sensor->cv1touch_pose_fixes[i], __ATOMIC_RELAXED);
 }
 
+void rift_sensor_set_attachment(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_attachment *attachment, int pin_fd)
+{
+	sensor->attachment = *attachment;
+	sensor->attachment_pin = pin_fd;
+}
+
+int rift_sensor_take_attachment_pin(rift_sensor_ctx *sensor)
+{
+	int pin = sensor->attachment_pin;
+	sensor->attachment_pin = -1;
+	return pin;
+}
+
 void rift_sensor_get_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_stream *out)
 {
 	/* Starts and diagnostic reads both run on the engine thread. */
 	*out = sensor->dev->stream_status;
+	out->attachment = sensor->attachment;
 	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);
 }

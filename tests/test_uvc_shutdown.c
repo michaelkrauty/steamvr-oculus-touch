@@ -4,6 +4,7 @@
 /* Exercise real callbacks, retry maintenance and stop with libusb's callback
  * lock contract. No USB devices are opened. Every failed completion must return,
  * even when no sibling transfer remains, so a peer can stop independently. */
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -15,18 +16,23 @@
 static pthread_mutex_t waiters = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int submissions;
 static atomic_bool submit_ok;
-static int alt_result, alt_errno, submit_errno;
+static int alt_result, alt_errno, submit_errno, clear_result, clears;
 static bool alt_logging;
+static int submit_error = LIBUSB_ERROR_IO;
 static struct rift_sensor_uvc_stream stream;
 static struct libusb_transfer transfers[6];
+/* A stream whose stop begins while a completion is resubmitting. */
+static struct rift_sensor_uvc_stream *stop_during_submit;
 
 int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *transfer)
 {
 	(void)transfer;
 	atomic_fetch_add(&submissions, 1);
+	if (stop_during_submit)
+		rift_sensor_uvc_stream_request_stop(stop_during_submit);
 	if (!submit_ok) {
 		errno = submit_errno;
-		return LIBUSB_ERROR_IO;
+		return submit_error;
 	}
 	return 0;
 }
@@ -41,7 +47,8 @@ int LIBUSB_CALL libusb_set_interface_alt_setting(libusb_device_handle *dev, int 
 		if (alt_logging) errno = ENOSPC;
 		return alt_result;
 	}
-	return 0;
+	clears++;
+	return clear_result;
 }
 
 void LIBUSB_CALL libusb_lock_event_waiters(libusb_context *ctx)
@@ -88,6 +95,50 @@ static void *complete_transfers(void *unused)
 		CHECK(pthread_mutex_unlock(&waiters) == 0);
 	}
 	return NULL;
+}
+
+/* The engine's log goes to stdout in this unity build. A pipe holds these few lines. */
+static int log_pipe[2] = {-1, -1}, saved_stdout = -1;
+static char log_text[4096];
+
+static void capture_log(void)
+{
+	fflush(stdout);
+	CHECK(pipe(log_pipe) == 0);
+	CHECK(fcntl(log_pipe[0], F_SETFL, O_NONBLOCK) == 0);
+	saved_stdout = dup(1);
+	CHECK(saved_stdout >= 0 && dup2(log_pipe[1], 1) == 1);
+}
+
+/* Returns everything logged since capture_log, and keeps capturing. */
+static const char *captured_log(void)
+{
+	fflush(stdout);
+	size_t used = strlen(log_text);
+	ssize_t n;
+	while ((n = read(log_pipe[0], log_text + used, sizeof log_text - 1 - used)) > 0)
+		used += (size_t)n;
+	log_text[used] = 0;
+	return log_text;
+}
+
+static void end_capture(void)
+{
+	captured_log();
+	CHECK(dup2(saved_stdout, 1) == 1);
+	close(saved_stdout);
+	close(log_pipe[0]);
+	close(log_pipe[1]);
+	fputs(log_text, stdout);
+	log_text[0] = 0;
+}
+
+static int count_lines(const char *text, const char *needle)
+{
+	int n = 0;
+	for (const char *at = text; (at = strstr(at, needle)) != NULL; at += strlen(needle))
+		n++;
+	return n;
 }
 
 static int allocation_count, fail_allocation;
@@ -194,6 +245,101 @@ static void startup_submission_failures(void)
 	submit_ok = true;
 }
 
+static void device_gone_is_retained_only_for_no_device(void)
+{
+    uint32_t gone = 0;
+    struct libusb_transfer *parked[1];
+    struct rift_sensor_uvc_stream s = {0};
+    s.device_gone = &gone;
+    s.parked = parked;
+    s.video_running = true;
+    struct libusb_transfer t = {0};
+    t.user_data = &s;
+    s.active_transfers = 1;
+    t.status = LIBUSB_TRANSFER_ERROR;
+    iso_transfer_cb(&t);
+    CHECK(gone == 0 && s.active_transfers == 0);
+    s.active_transfers = 1;
+    t.status = LIBUSB_TRANSFER_NO_DEVICE;
+    iso_transfer_cb(&t);
+    CHECK(gone == 1 && s.active_transfers == 0);
+    /* Later cancellations must not clear the retained evidence. */
+    s.active_transfers = 1;
+    t.status = LIBUSB_TRANSFER_CANCELLED;
+    iso_transfer_cb(&t);
+    CHECK(gone == 1);
+    gone = 0;
+    submit_ok = false;
+    submit_error = LIBUSB_ERROR_NO_DEVICE;
+    t.status = LIBUSB_TRANSFER_COMPLETED;
+    s.active_transfers = 1;
+    iso_transfer_cb(&t);
+    CHECK(gone == 1 && s.active_transfers == 0 && s.n_parked == 0);
+    gone = 0;
+    s.parked[0] = &t;
+    s.n_parked = 1;
+    resubmit_parked(&s);
+    CHECK(gone == 1 && s.n_parked == 0 && s.active_transfers == 0);
+    gone = 0;
+    submit_error = LIBUSB_ERROR_IO;
+    s.parked[0] = &t;
+    s.n_parked = 1;
+    resubmit_parked(&s);
+    CHECK(gone == 0 && s.n_parked == 1);
+}
+
+/* Stopping a stream makes two USB calls fail on purpose. A stop clears the alternate setting
+ * and so removes the endpoint that a completion running meanwhile resubmits to (libusb:
+ * LIBUSB_ERROR_IO). A sensor unplugged while open has no alternate setting left to clear:
+ * when its transfers reported it gone the stop does not try, and otherwise libusb says
+ * NO_DEVICE and leaves errno as it was. Neither is a failure worth a warning; a real one
+ * still is. */
+static void expected_stop_failures_are_quiet(void)
+{
+	struct libusb_transfer *parked[1];
+	struct rift_sensor_uvc_stream s = {0};
+	struct libusb_transfer t = {0};
+	s.parked = parked;
+	t.user_data = &s;
+	t.status = LIBUSB_TRANSFER_COMPLETED;
+	submit_ok = false;
+	submit_error = LIBUSB_ERROR_IO;
+	capture_log();
+	/* Streaming: the failed submission is parked for a retry and reported. */
+	s.video_running = true;
+	s.active_transfers = 1;
+	iso_transfer_cb(&t);
+	CHECK(s.n_parked == 1 && s.active_transfers == 0);
+	CHECK(count_lines(captured_log(), "[WW] Parked USB xfer: LIBUSB_ERROR_IO") == 1);
+	/* Stopped while the completion ran: nothing to retry or report. */
+	s.n_parked = 0;
+	s.active_transfers = 1;
+	stop_during_submit = &s;
+	iso_transfer_cb(&t);
+	stop_during_submit = NULL;
+	CHECK(!s.video_running && s.n_parked == 0 && s.active_transfers == 0);
+	CHECK(count_lines(captured_log(), "[WW]") == 1);
+	errno = EINVAL;
+	clear_result = LIBUSB_ERROR_NO_DEVICE;
+	CHECK(rift_sensor_uvc_stream_stop(&s) == 0);
+	CHECK(count_lines(captured_log(), "[WW]") == 1);
+	/* Its transfers reported it gone, as on Windows, where clearing may fail otherwise. */
+	uint32_t gone = 1;
+	s.device_gone = &gone;
+	clear_result = LIBUSB_ERROR_IO;
+	clears = 0;
+	CHECK(rift_sensor_uvc_stream_stop(&s) == 0);
+	CHECK(clears == 0 && count_lines(captured_log(), "[WW]") == 1);
+	gone = 0;
+	CHECK(rift_sensor_uvc_stream_stop(&s) == 0);
+	CHECK(clears == 1);
+	CHECK(count_lines(captured_log(), "[WW] Failed to clear USB alt setting to 0 for sensor: LIBUSB_ERROR_IO") == 1);
+	CHECK(count_lines(captured_log(), "[WW]") == 2);
+	end_capture();
+	clear_result = 0;
+	submit_ok = true;
+}
+
 int main(void)
 {
 	alarm(5);
@@ -247,6 +393,8 @@ int main(void)
 	startup_allocation_failures();
 	startup_error_diagnostics();
 	startup_submission_failures();
+	device_gone_is_retained_only_for_no_device();
+	expected_stop_failures_are_quiet();
 	alarm(0);
 	puts("test_uvc_shutdown: ok");
 	return 0;

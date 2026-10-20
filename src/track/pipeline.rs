@@ -237,6 +237,7 @@ pub struct Pipeline {
     clocks: [LinearClock; 2],
     trackers: [Option<Tracker>; 2],
     cams: BTreeMap<String, RegisteredCamera>,
+    camera_slots: usize,
     /// Registration ids of the sensors whose frames are probed, not tracked with.
     probed: std::collections::BTreeSet<usize>,
     /// Registration ids of the sensors whose frames are dropped (given up on).
@@ -277,6 +278,7 @@ impl Pipeline {
             clocks: [LinearClock::default(), LinearClock::default()],
             trackers: [None, None],
             cams: BTreeMap::new(),
+            camera_slots: 0,
             probed: Default::default(),
             ignored: Default::default(),
             pending: [Vec::new(), Vec::new()],
@@ -307,7 +309,8 @@ impl Pipeline {
             registered.camera = camera;
             return;
         }
-        let id = self.cams.len();
+        let id = self.camera_slots;
+        self.camera_slots += 1;
         self.cams
             .insert(serial.to_string(), RegisteredCamera { id, camera });
         if self
@@ -321,6 +324,36 @@ impl Pipeline {
         for tracker in self.trackers.iter_mut().flatten() {
             tracker.register_camera();
         }
+    }
+
+    /// Retire the camera and everything waiting to use it. IDs are never reused within this
+    /// pipeline: a solver result still in flight must not apply to a later camera. Returns its
+    /// retired ID so placement state can be forgotten under the same identity.
+    pub fn remove_sensor(&mut self, serial: &str) -> Option<usize> {
+        let serial = self
+            .cams
+            .keys()
+            .find(|s| crate::status::same_sensor(s, serial))
+            .cloned()?;
+        self.ignore(&serial, true);
+        let camera = self.cams.remove(&serial)?;
+        let id = camera.id;
+        self.probed.remove(&id);
+        self.ignored.remove(&id);
+        self.inspecting.remove(&id);
+        self.identity_evidence.remove(&id);
+        self.observed_evidence.remove(&id);
+        self.identity_lifetimes.remove(&id);
+        self.lifecycle_changes.remove(&id);
+        for starts in &mut self.inspection_starts {
+            starts.retain(|s| s.camera != id);
+        }
+        self.events.retain(|e| e.camera != id);
+        self.probes.retain(|p| p.camera != id);
+        for tracker in self.trackers.iter_mut().flatten() {
+            tracker.forget_camera(id);
+        }
+        Some(id)
     }
 
     /// Probes the sensor `serial` from now on (`on`), or tracks with it again: false when no
@@ -419,7 +452,7 @@ impl Pipeline {
                 device_id,
                 Body { leds, imu_pos },
                 self.opts.params,
-                self.cams.len(),
+                self.camera_slots,
             );
             tr.debug = self.opts.trace;
             if let Some((g, a)) = self.opts.seed_biases[hand] {
@@ -2839,6 +2872,138 @@ mod tests {
             0
         );
         assert!(p.ignore("B", false));
+    }
+
+    #[test]
+    fn hotplug_removed_sensor_cannot_leave_probes_or_reuse_another_cameras_id() {
+        let mut p = Pipeline::new(Options::default());
+        for serial in ["SENSORALPHA", "SENSORBETA"] {
+            p.sensor(serial, synth::camera_model(), Isometry3::identity());
+        }
+        p.body(DEVICE_RIGHT, synth::touch_leds(), Vector3::zeros());
+        p.trackers[HAND_RIGHT].as_mut().unwrap().agreement[1].samples = 7;
+        for (t_e, camera) in [(1, 0), (2, 1)] {
+            p.probing[0].push(PendingProbe {
+                t_e,
+                camera,
+                blobs: Vec::new(),
+                identity_epoch: 0,
+            });
+        }
+        p.probe("SENSORALPHA", true);
+        let removed_camera = *p.camera("SENSORALPHA").unwrap();
+        p.pending[0].push(Pending {
+            camera: 0,
+            cam: removed_camera,
+            t_e: 1,
+            exposure_host_ns: 1,
+            frame_start_host_ns: 1,
+            blobs: Vec::new(),
+            engine: None,
+            identity_epoch: None,
+        });
+        p.events.push(FrameEvent {
+            camera: 0,
+            hand: 0,
+            t_e: 1,
+            exposure_host_ns: 1,
+            frame_start_host_ns: 1,
+            outcome: Outcome::Waiting,
+            engine: None,
+            tracked: None,
+        });
+        p.probes.push(Probe {
+            camera: 0,
+            hand: 0,
+            device_id: DEVICE_RIGHT,
+            identity_epoch: 0,
+            world_from_model: Isometry3::identity(),
+            pos_sd: 0.0,
+            blobs: Vec::new(),
+            labels: Vec::new(),
+        });
+        assert!(p.remove_sensor("SENSORALPHA").is_some());
+        assert!(p.pending[0].is_empty());
+        assert!(p.events.is_empty());
+        assert!(p.probes.is_empty());
+        assert!(p.camera("SENSORALPHA").is_none());
+        assert!(!p.is_probed("SENSORALPHA"));
+        assert_eq!(p.serial_of(0), None);
+        assert_eq!(
+            p.probing[0].iter().map(|p| p.camera).collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(p.camera_agreement().len(), 1);
+        p.sensor("SENSORGAMMA", synth::camera_model(), Isometry3::identity());
+        assert_eq!(p.camera_id("SENSORBETA"), Some(1));
+        assert_eq!(p.camera_id("SENSORGAMMA"), Some(2));
+        assert_eq!(
+            p.trackers[HAND_RIGHT].as_ref().unwrap().agreement[1].samples,
+            7
+        );
+        let mut early = Pipeline::new(Options::default());
+        early.sensor("SENSORALPHA", synth::camera_model(), Isometry3::identity());
+        early.sensor("SENSORBETA", synth::camera_model(), Isometry3::identity());
+        assert!(early.remove_sensor("SENSORALPHA").is_some());
+        early.body(DEVICE_RIGHT, synth::touch_leds(), Vector3::zeros());
+        assert_eq!(
+            early.trackers[HAND_RIGHT].as_ref().unwrap().agreement.len(),
+            2
+        );
+    }
+
+    /// A removed sensor's inspection, its held search exposures and its identity lifetimes go
+    /// with it, including lifecycle changes no consumer has taken: none can be handed over for
+    /// a camera that no longer has a serial. The other sensor keeps all of its own.
+    #[test]
+    fn hotplug_a_removed_sensor_leaves_no_inspection_or_identity_state() {
+        let mut p = Pipeline::new(Options::default());
+        for serial in ["SENSORALPHA", "SENSORBETA"] {
+            p.sensor(serial, synth::camera_model(), Isometry3::identity());
+            p.begin_inspection(serial);
+            let mut invalidated: [Evidence; 2] = Default::default();
+            invalidated[HAND_RIGHT].note(3, State::Invalidated);
+            p.inspection_lifecycle(serial, &invalidated);
+        }
+        for (hand, camera) in [(HAND_LEFT, 0), (HAND_RIGHT, 0), (HAND_RIGHT, 1)] {
+            p.inspection_starts[hand].push(InspectionExposure {
+                camera,
+                frame_start_host_ns: 1,
+                t_e: 1,
+                until: 2,
+                held: false,
+            });
+        }
+        assert!(p.remove_sensor("SENSORALPHA").is_some());
+        let beta = [1];
+        assert_eq!(p.inspecting.iter().copied().collect::<Vec<_>>(), beta);
+        assert_eq!(
+            p.identity_evidence.keys().copied().collect::<Vec<_>>(),
+            beta
+        );
+        assert_eq!(
+            p.observed_evidence.keys().copied().collect::<Vec<_>>(),
+            beta
+        );
+        assert_eq!(
+            p.identity_lifetimes.keys().copied().collect::<Vec<_>>(),
+            beta
+        );
+        assert_eq!(
+            p.take_lifecycle_changes()
+                .into_iter()
+                .map(|(camera, _)| camera)
+                .collect::<Vec<_>>(),
+            beta
+        );
+        assert!(p.inspection_starts[HAND_LEFT].is_empty());
+        assert_eq!(
+            p.inspection_starts[HAND_RIGHT]
+                .iter()
+                .map(|s| s.camera)
+                .collect::<Vec<_>>(),
+            beta
+        );
     }
 
     #[test]

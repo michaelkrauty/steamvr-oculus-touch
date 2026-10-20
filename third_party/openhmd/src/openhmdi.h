@@ -155,6 +155,8 @@ struct ohmd_context {
 	void *cv1touch_report_user;
 	ohmd_cv1touch_activity_cb cv1touch_activity_cb;
 	void *cv1touch_activity_user;
+	ohmd_cv1touch_sensor_attachment_cb cv1touch_sensor_attachment_cb;
+	void *cv1touch_sensor_attachment_user;
 };
 
 // helper functions

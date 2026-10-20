@@ -426,13 +426,21 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		reject_frame(stream, UVC_DISCARD_INCOMPLETE);
 }
 
+static void note_device_gone(struct rift_sensor_uvc_stream *stream)
+{
+	if (stream->device_gone)
+		__atomic_store_n(stream->device_gone, 1, __ATOMIC_RELAXED);
+}
+
 /* Puts transfers parked after a failed submit back in flight, stopping at the first that fails again */
 static void resubmit_parked(struct rift_sensor_uvc_stream *stream)
 {
 	while (stream->n_parked > 0 && stream->video_running) {
 		int ret = libusb_submit_transfer(stream->parked[stream->n_parked - 1]);
-		if (ret == LIBUSB_ERROR_NO_DEVICE)
+		if (ret == LIBUSB_ERROR_NO_DEVICE) {
+			note_device_gone(stream);
 			stream->n_parked = 0;
+		}
 		if (ret < 0)
 			return;
 		stream->n_parked--;
@@ -450,6 +458,8 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		if (stream->video_running && transfer->status != LIBUSB_TRANSFER_CANCELLED)
 			reject_frame(stream, UVC_DISCARD_TRANSFER);
+		if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
+			note_device_gone(stream);
 		if (transfer->status != LIBUSB_TRANSFER_CANCELLED)
 			LOGE("USB transfer error: %u", transfer->status);
 		stream->active_transfers--;
@@ -482,10 +492,15 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 	ret = libusb_submit_transfer(transfer);
 	if (ret >= 0)
 		return;
-	if (ret != LIBUSB_ERROR_NO_DEVICE) {
+	if (ret == LIBUSB_ERROR_NO_DEVICE) {
+		note_device_gone(stream);
+	} else if (stream->video_running) {
 		LOGW("Parked USB xfer: %s", libusb_error_name(ret));
 		stream->parked[stream->n_parked++] = transfer;
 	}
+	/* Otherwise a stop began while this callback ran and the submission failed, perhaps
+	 * because clearing the alternate setting removed the endpoint. Nothing is retried after a
+	 * stop began; a new start submits every transfer. */
 	stream->active_transfers--;
 }
 
@@ -797,9 +812,15 @@ int rift_sensor_uvc_stream_stop(struct rift_sensor_uvc_stream *stream)
 	/* Nonblocking stop requests can be broadcast before any stream drains. */
 	rift_sensor_uvc_stream_request_stop(stream);
 
-	ret = libusb_set_interface_alt_setting(stream->devh, 1, 0);
-	if (ret) {
-		LOGW("Failed to clear USB alt setting to 0 for sensor errno %d (%s)", errno, strerror(errno));
+	/* A sensor unplugged while open keeps its handle until the engine closes; it has no
+	 * alternate setting left to clear. Its transfers already said so (libusb reports Windows
+	 * removal statuses as NO_DEVICE too), so do not try. libusb's own NO_DEVICE says so as
+	 * well, without a system call and leaving errno as it was: report libusb's error for
+	 * everything else. */
+	if (!stream->device_gone || !__atomic_load_n(stream->device_gone, __ATOMIC_RELAXED)) {
+		ret = libusb_set_interface_alt_setting(stream->devh, 1, 0);
+		if (ret && ret != LIBUSB_ERROR_NO_DEVICE)
+			LOGW("Failed to clear USB alt setting to 0 for sensor: %s", libusb_error_name(ret));
 	}
 
 	libusb_lock_event_waiters(stream->usb_ctx);

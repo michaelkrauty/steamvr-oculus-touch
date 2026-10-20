@@ -15,6 +15,20 @@
 #ifndef __RIFT_SENSOR_H__
 #define __RIFT_SENSOR_H__
 
+/* Only metadata directory pins, never USB handles. Shared cleanup also covers
+ * discovery failure before a sensor or retained start record takes ownership. */
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+static inline void rift_sensor_close_attachment_pin(int fd)
+{
+#ifndef _WIN32
+    if (fd >= 0) close(fd);
+#else
+    (void)fd;
+#endif
+}
+
 typedef struct rift_sensor_ctx_s rift_sensor_ctx;
 typedef struct rift_sensor_frame_device_state rift_sensor_frame_device_state;
 typedef struct rift_sensor_analysis_frame rift_sensor_analysis_frame;
@@ -92,6 +106,7 @@ static inline int rift_sensor_frame_blob_label(const rift_sensor_analysis_frame 
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_device *dev, rift_tracker_ctx *tracker);
 void rift_sensor_request_stop(rift_sensor_ctx *sensor_ctx);
+void rift_sensor_retire(rift_sensor_ctx *sensor);
 void rift_sensor_retry(rift_sensor_ctx *sensor_ctx, uint64_t now_ns);
 void rift_sensor_free (rift_sensor_ctx *sensor_ctx);
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor);
@@ -99,6 +114,8 @@ void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor
 void rift_sensor_get_video_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_video *out);
 void rift_sensor_get_video_quality(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_video_quality *out);
 void rift_sensor_get_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_stream *out);
+void rift_sensor_set_attachment(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_attachment *attachment, int pin_fd);
+int rift_sensor_take_attachment_pin(rift_sensor_ctx *sensor);
 /* True when pose->serial is this sensor: it tracks with that camera -> world pose from its next frame on. */
 bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_sensor_pose *pose);
 /* True when serial is this sensor: from its next frame on it has no pose, and labels blobs by the long search. */

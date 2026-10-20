@@ -56,6 +56,24 @@ impl<F> FrameQueue<F> {
         }
     }
 
+    /// Retire one sensor, rejecting its later callbacks without disturbing other queues.
+    pub fn remove(&mut self, serial: &str) {
+        if let Some(index) = self
+            .roster
+            .iter()
+            .position(|s| crate::status::same_sensor(s, serial))
+        {
+            let serial = self.roster.remove(index);
+            self.frames.remove(&serial);
+            if index < self.next {
+                self.next -= 1;
+            }
+            if self.next >= self.roster.len() {
+                self.next = 0;
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         for frames in self.frames.values_mut() {
             frames.clear();
@@ -134,6 +152,25 @@ impl<F> FrameQueue<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotplug_removal_keeps_other_sensors_frames_and_rejects_late_callbacks() {
+        let mut q = FrameQueue::default();
+        q.register(["SENSORALPHA".into(), "SENSORBETA".into()]);
+        q.push_frame("SENSORALPHA", 1, 1);
+        q.push_frame("SENSORBETA", 2, 2);
+        q.push_clock(3, 4);
+        q.remove("SENSORALPHA");
+        q.push_frame("SENSORALPHA", 5, 5);
+        assert_eq!(q.pop_frame(), Some(2));
+        assert_eq!(q.pop_frame(), None);
+        assert_eq!(q.take_clocks(), [(3, 4)]);
+        assert_eq!(q.stats().unknown_frames, 1);
+        assert_eq!(q.stats().sensors, 1);
+        q.remove("SENSORBETA");
+        q.remove("SENSORBETA");
+        assert_eq!(q.pop_frame(), None);
+    }
 
     #[test]
     fn late_analysis_keeps_the_two_newest_exposures_in_order() {

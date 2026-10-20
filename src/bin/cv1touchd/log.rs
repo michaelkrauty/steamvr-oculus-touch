@@ -288,9 +288,29 @@ fn install(logger: Logger) -> io::Result<Guard> {
 }
 
 pub(super) fn line(args: fmt::Arguments<'_>) {
+    #[cfg(test)]
+    if CAPTURED
+        .with_borrow_mut(|lines| lines.as_mut().map(|lines| lines.push(args.to_string())))
+        .is_some()
+    {
+        return;
+    }
     if let Some(logger) = LOGGER.get() {
         logger.line(args);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The lines `run` logs on this thread, kept from the logger. Tests only.
+#[cfg(test)]
+pub(super) fn capture(run: impl FnOnce()) -> Vec<String> {
+    let outer = CAPTURED.replace(Some(Vec::new()));
+    run();
+    CAPTURED.replace(outer).unwrap_or_default()
 }
 
 pub(super) fn raw(args: fmt::Arguments<'_>) {

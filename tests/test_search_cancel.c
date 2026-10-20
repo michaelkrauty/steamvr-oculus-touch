@@ -247,7 +247,7 @@ int main(void)
     sensor.pf.inspection_mask = 0;
 
 
-	for (int mode = 0; mode < 3; mode++) {
+	for (int mode = 0; mode < 4; mode++) {
         int requested = mode % 2 + 1;
 		CHECK(rift_sensor_clear_cv1touch_pose(&sensor, "CameraA", 30000000000, 1u << requested));
 		apply_pending_pose(&sensor);
@@ -281,6 +281,9 @@ int main(void)
 		if (mode == 1) {
 			__atomic_fetch_add(&now_ticks, 30000000000, __ATOMIC_RELAXED);
 		} else if (mode == 2) {
+			/* The sensor is unplugged: retiring it stops its search like a restoration. */
+			rift_sensor_retire(&sensor);
+		} else if (mode == 3) {
 			rift_sensor_request_stop(&sensor);
 		} else {
 			CHECK(rift_sensor_set_cv1touch_pose(&sensor, &pose));
@@ -295,18 +298,34 @@ int main(void)
 		pthread_mutex_unlock(&gate_lock);
 		CHECK(pthread_join(worker, NULL) == 0);
 		CHECK(polls == 1); /* The loop did not advance to a second anchor after stopping. */
-		if (mode == 2) {
+		if (mode == 3) {
 			CHECK(sensor.search_stopping);
 			break;
 		}
 		if (mode == 0) CHECK(wakeups == 2);
 		if (mode != 0) {
 			CHECK(mode == 2 || search_deadline_expired(&sensor));
+			/* A retired sensor still applies and acknowledges a pose restored before the
+			 * daemon forgot it: the engine thread does not wait for it forever. */
 			CHECK(rift_sensor_set_cv1touch_pose(&sensor, &pose));
 		}
 		CHECK(rift_sensor_cv1touch_pose_applied(&sensor, "CameraA") == 0);
 		CHECK(next_fast_frame(&sensor) == NULL); /* A restored pose needs no camera frame. */
 		CHECK(rift_sensor_cv1touch_pose_applied(&sensor, "CameraA") == 1);
+		if (mode == 2) {
+			/* It starts no new search, though: a frame that needs one goes back to capture.
+			 * A restored pose has no deadline to end such a search. */
+			blobservation late_observation = {0};
+			rift_sensor_analysis_frame late = {.vframe = &video, .bwobs = &late_observation,
+				.need_long_analysis = true};
+			int freed = released;
+			finish_fast_frame(&sensor, &late);
+			CHECK(released == freed + 1);
+			CHECK(POP_QUEUE(&sensor.long_analysis_q) == NULL);
+			CHECK(POP_QUEUE(&sensor.capture_frame_q) == &late);
+			CHECK(__atomic_load_n(&sensor.search_cancelled, __ATOMIC_RELAXED));
+		}
+		sensor.retired = false; /* the next mode inspects a sensor that is still plugged in */
         CHECK(sensor.pf.inspection_pose_mask == 0);
 		CHECK(!search_deadline_expired(&sensor));
 	}
