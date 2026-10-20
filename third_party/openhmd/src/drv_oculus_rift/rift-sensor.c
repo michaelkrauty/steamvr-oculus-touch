@@ -64,6 +64,10 @@ struct rift_sensor_ctx_s
 
 	rift_sensor_analysis_frame *frames;
 	ohmd_jpeg_decoder *jpeg_decoder;
+	/* JPEG images discarded or kept despite warnings since jpeg_window_start, logged at
+	 * most every 10 s. Fast analysis thread only. */
+	uint32_t jpeg_failed, jpeg_warned;
+	uint64_t jpeg_window_start;
 
 	blobwatch* bw;
 	rift_pose_finder pf;
@@ -253,6 +257,19 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 	PUSH_QUEUE(&sensor->capture_frame_q, frame);
 }
 
+/* Blob extraction reads a packed, complete GRAY8 image. A short image can still
+ * contain old pixels in its reused buffer; padding cannot recover missing pixels. */
+static bool valid_raw_frame(const rift_sensor_device *dev, const ohmd_video_frame *frame)
+{
+	if (frame->format != OHMD_VIDEO_FRAME_FORMAT_GRAY8 || frame->data == NULL ||
+			frame->width <= 0 || frame->height <= 0 ||
+			frame->width != dev->calib.width || frame->height != dev->calib.height ||
+			frame->stride != frame->width || (size_t)frame->height > SIZE_MAX / frame->width)
+		return false;
+	size_t size = (size_t)frame->width * frame->height;
+	return frame->data_size == size && frame->data_block_size >= size;
+}
+
 /* Called by the rift_sensor_device when a frame is captured. Attach
  * it to a rift_sensor_analysis_frame, retrieve the exposure info
  * from the tracker, and push it on the fast analysis queue
@@ -264,6 +281,13 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 
 	OHMD_ASSERT(sensor);
+
+	/* The UVC assembler checks raw frames before delivery. Also protect callers
+	 * using a different capture backend before taking ownership or queueing work. */
+	if (vframe->format != OHMD_VIDEO_FRAME_FORMAT_JPEG && !valid_raw_frame(dev, vframe)) {
+		ohmd_video_frame_release(vframe);
+		return;
+	}
 
 	ohmd_lock_mutex (sensor->sensor_lock);
 
@@ -591,6 +615,37 @@ static unsigned int long_analysis_thread(void *arg)
 }
 
 #if HAVE_LIBJPEG
+#define JPEG_REPORT_NS 10000000000ULL
+
+/* Times come from the captured images, so this reads no clock. */
+static void note_jpeg_decode(rift_sensor_ctx *sensor, uint64_t ts, bool decoded)
+{
+	if (!decoded || ohmd_jpeg_decoder_warnings(sensor->jpeg_decoder) > 0) {
+		if (sensor->jpeg_failed + sensor->jpeg_warned == 0)
+			sensor->jpeg_window_start = ts;
+		if (decoded)
+			sensor->jpeg_warned++;
+		else
+			sensor->jpeg_failed++;
+	}
+	if (sensor->jpeg_failed + sensor->jpeg_warned == 0 || ts < sensor->jpeg_window_start + JPEG_REPORT_NS)
+		return;
+
+	unsigned secs = (unsigned)((ts - sensor->jpeg_window_start + 500000000) / 1000000000);
+	const char *message = ohmd_jpeg_decoder_message(sensor->jpeg_decoder);
+	if (sensor->jpeg_failed != 0) {
+		char kept[64] = "";
+		if (sensor->jpeg_warned != 0)
+			snprintf(kept, sizeof kept, ", and kept %u despite decoder warnings", sensor->jpeg_warned);
+		LOGW("Sensor %d video: discarded %u damaged image%s in the last %u s (%u could not be decoded)%s; latest decoder message: %s",
+				sensor->id, sensor->jpeg_failed, sensor->jpeg_failed == 1 ? "" : "s", secs, sensor->jpeg_failed, kept, message);
+	} else {
+		LOGW("Sensor %d video: kept %u image%s despite decoder warnings in the last %u s; latest decoder message: %s",
+				sensor->id, sensor->jpeg_warned, sensor->jpeg_warned == 1 ? "" : "s", secs, message);
+	}
+	sensor->jpeg_failed = sensor->jpeg_warned = 0;
+}
+
 bool decode_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
 {
 	ohmd_video_frame *vframe = frame->vframe;
@@ -607,7 +662,9 @@ bool decode_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
 		}
 	}
 
-	if (!ohmd_jpeg_decoder_decode(sensor->jpeg_decoder, vframe, &out_vframe))
+	bool decoded = ohmd_jpeg_decoder_decode(sensor->jpeg_decoder, vframe, &out_vframe);
+	note_jpeg_decode(sensor, vframe->start_ts, decoded);
+	if (!decoded)
 		return false;
 
 	ohmd_video_frame_release(frame->vframe);
@@ -649,7 +706,7 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 		return false;
 #endif
 
-	return true;
+	return valid_raw_frame(sensor->dev, frame->vframe);
 }
 
 static unsigned int fast_analysis_thread(void *arg)

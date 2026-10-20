@@ -11,8 +11,21 @@
 typedef struct rift_sensor_uvc_stream rift_sensor_uvc_stream;
 typedef void (*rift_sensor_uvc_stream_frame_cb)(struct rift_sensor_uvc_stream *stream, ohmd_video_frame *frame, void *cb_data);
 
+/* Why the assembler discarded an image, in the order the log summary lists them */
+enum rift_sensor_uvc_discard {
+	UVC_DISCARD_INCOMPLETE,
+	UVC_DISCARD_TOO_LONG,
+	UVC_DISCARD_HEADER,
+	UVC_DISCARD_CAMERA_ERROR,
+	UVC_DISCARD_TRANSFER,
+	UVC_DISCARD_SEQUENCE,
+	UVC_DISCARD_REASONS
+};
+
 struct rift_sensor_uvc_stream {
 	ohmd_context* ohmd_ctx;
+	/* Sensor number in log lines */
+	int sensor_id;
 
 	ohmd_video_frame_format format;
 	int stride;
@@ -36,9 +49,23 @@ struct rift_sensor_uvc_stream {
 	int frame_collected;
 	/* true if we're skipping the current frame */
 	bool skip_frame;
+	/* An image starts only at an observed FID/PTS boundary. */
+	bool have_frame_id;
+	bool frame_delivered;
+	bool reject_next_frame;
+	/* Inspect segment lengths only until the camera's JPEG scan begins. */
+	size_t jpeg_header_offset;
+	bool jpeg_scan_started;
 
 	/* Time at which we started skipping frames */
 	uint64_t skip_frame_start;
+
+	/* Images discarded since discard_window_start, logged at most every 10 s */
+	uint32_t discards[UVC_DISCARD_REASONS];
+	uint32_t n_discards;
+	/* Damaged packets seen while no new image could be identified. */
+	uint32_t bad_packets;
+	uint64_t discard_window_start;
 
 	/* USB streaming alt_setting */
 	int alt_setting;

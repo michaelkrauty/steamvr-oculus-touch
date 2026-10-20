@@ -190,6 +190,7 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	ohmd_log_printf ("Opened Rift Sensor %d w/ Serial %s. Connecting to Radio address 0x%02x%02x%02x%02x%02x\n",
 		id, serial_no, hmd_radio_id[0], hmd_radio_id[1], hmd_radio_id[2], hmd_radio_id[3], hmd_radio_id[4]);
 
+	dev->uvc_stream.sensor_id = id;
 	ret = rift_sensor_uvc_stream_setup (ohmd_ctx, usb_ctx, dev->usb_devh, &desc, &dev->uvc_stream);
 	ASSERT_MSG(ret >= 0, fail, "could not prepare for streaming\n");
 

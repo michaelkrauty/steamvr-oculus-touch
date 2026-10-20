@@ -121,176 +121,297 @@ int rift_sensor_uvc_get_cur(libusb_device_handle *dev, uint8_t interface, uint8_
 	return ret;
 }
 
+#define UVC_DISCARD_REPORT_NS 10000000000ULL
+
+/* Plain names for the log summary: "2 incomplete, 1 with a damaged header" */
+static const char *const uvc_discard_names[UVC_DISCARD_REASONS] = {
+	[UVC_DISCARD_INCOMPLETE] = "incomplete",
+	[UVC_DISCARD_TOO_LONG] = "too long",
+	[UVC_DISCARD_HEADER] = "with a damaged header",
+	[UVC_DISCARD_CAMERA_ERROR] = "marked faulty by the camera",
+	[UVC_DISCARD_TRANSFER] = "hit by a USB transfer error",
+	[UVC_DISCARD_SEQUENCE] = "out of sequence",
+};
+
+static uint64_t uvc_now(struct rift_sensor_uvc_stream *stream)
+{
+#ifdef _WIN32
+	/* cv1touch: the platform layer's nanosecond clock, which is the daemon's clock there */
+	return ohmd_monotonic_get(stream->ohmd_ctx);
+#else
+	struct timespec now;
+	(void)stream;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+#endif
+}
+
+static void report_discards(struct rift_sensor_uvc_stream *stream, uint64_t now)
+{
+	char reasons[256] = "";
+	size_t used = 0;
+
+	for (int i = 0; i < UVC_DISCARD_REASONS; i++) {
+		if (stream->discards[i] == 0)
+			continue;
+		int n = snprintf(reasons + used, sizeof reasons - used, "%s%u %s", used ? ", " : "",
+				stream->discards[i], uvc_discard_names[i]);
+		if (n > 0)
+			used = OHMD_MIN(used + (size_t)n, sizeof reasons - 1);
+		stream->discards[i] = 0;
+	}
+	unsigned secs = (unsigned)((now - stream->discard_window_start + 500000000) / 1000000000);
+	if (stream->n_discards != 0) {
+		char packets[80] = "";
+		if (stream->bad_packets != 0)
+			snprintf(packets, sizeof packets, "; %u more damaged packets while skipping images", stream->bad_packets);
+		LOGW("Sensor %d video: discarded %u damaged image%s in the last %u s (%s)%s", stream->sensor_id,
+				stream->n_discards, stream->n_discards == 1 ? "" : "s", secs, reasons, packets);
+	} else {
+		LOGW("Sensor %d video: received %u damaged packets in the last %u s while waiting for an image boundary",
+				stream->sensor_id, stream->bad_packets, secs);
+	}
+	stream->n_discards = 0;
+	stream->bad_packets = 0;
+}
+
+/* Bad traffic advances the reporting window even when an image was already discarded.
+ * Keep that packet count separate: an unframed packet is not another rejected image. */
+static void count_discard(struct rift_sensor_uvc_stream *stream, enum rift_sensor_uvc_discard reason,
+		bool image)
+{
+	uint64_t now = uvc_now(stream);
+
+	if (stream->n_discards == 0 && stream->bad_packets == 0)
+		stream->discard_window_start = now;
+	if (image) {
+		stream->n_discards++;
+		stream->discards[reason]++;
+	} else {
+		stream->bad_packets++;
+	}
+	if (now >= stream->discard_window_start + UVC_DISCARD_REPORT_NS)
+		report_discards(stream, now);
+}
+
+/* Ignore the image's remaining packets until a valid boundary. Keep our buffer: it is
+ * still owned by the assembler and can be reused directly. */
+static void drop_frame(struct rift_sensor_uvc_stream *stream)
+{
+	stream->skip_frame = true;
+	stream->frame_collected = 0;
+	if (stream->cur_frame)
+		stream->cur_frame->data_size = 0;
+}
+
+/* Discard the image being assembled and count it once. Damage between a delivered image
+ * and the next boundary costs nothing: that next image still has to start at a boundary. */
+static void reject_frame(struct rift_sensor_uvc_stream *stream, enum rift_sensor_uvc_discard reason)
+{
+	bool image = !stream->frame_delivered && !stream->skip_frame;
+	if (image)
+		drop_frame(stream);
+	count_discard(stream, reason, image);
+}
+
+static void deliver_frame(struct rift_sensor_uvc_stream *stream)
+{
+	uint64_t start_ts = stream->cur_frame->start_ts;
+
+	stream->cur_frame->data_size = stream->frame_collected;
+	if (stream->frame_cb) {
+		stream->frame_cb(stream, stream->cur_frame, stream->frame_cb_data);
+		stream->cur_frame = NULL;
+	}
+	stream->frame_collected = 0;
+	stream->frame_delivered = true;
+
+	/* Also report the end of an episode, timed by the stamp this image already has. */
+	if ((stream->n_discards != 0 || stream->bad_packets != 0) &&
+			start_ts >= stream->discard_window_start + UVC_DISCARD_REPORT_NS)
+		report_discards(stream, start_ts);
+}
+
+/* An APP segment can contain a thumbnail's EOI. Skip marker payloads by their
+ * lengths until SOS; the camera's baseline entropy stream then escapes FF bytes.
+ * Header state spans USB packets, without scanning the image's pixel payload. */
+static bool jpeg_scan_started(struct rift_sensor_uvc_stream *stream)
+{
+	if (stream->jpeg_scan_started || stream->jpeg_header_offset == SIZE_MAX)
+		return stream->jpeg_scan_started;
+	size_t size = stream->frame_collected;
+	if (size < 2)
+		return false;
+	const unsigned char *data = stream->cur_frame->data;
+	size_t offset = stream->jpeg_header_offset;
+	if (offset == 0) {
+		if (data[0] != 0xff || data[1] != 0xd8)
+			goto invalid;
+		offset = 2;
+	}
+	while (offset < size) {
+		if (data[offset] != 0xff)
+			goto invalid;
+		while (offset + 1 < size && data[offset + 1] == 0xff)
+			offset++;
+		if (size - offset < 4)
+			break;
+		unsigned marker = data[offset + 1];
+		if (marker == 0 || marker == 0xd8 || marker == 0xd9)
+			goto invalid;
+		if (marker == 1 || (marker >= 0xd0 && marker <= 0xd7)) {
+			offset += 2;
+			continue;
+		}
+		size_t length = ((unsigned)data[offset + 2] << 8) | data[offset + 3];
+		if (length < 2)
+			goto invalid;
+		if (length > size - offset - 2)
+			break;
+		offset += 2 + length;
+		if (marker == 0xda) {
+			stream->jpeg_scan_started = true;
+			break;
+		}
+	}
+	stream->jpeg_header_offset = offset;
+	return stream->jpeg_scan_started;
+invalid:
+	/* Still deliver at UVC EOF: the decoder supplies the image validation. */
+	stream->jpeg_header_offset = SIZE_MAX;
+	return false;
+}
+
 void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *payload,
 		     size_t len)
 {
-	struct uvc_payload_header *h = (struct uvc_payload_header *)payload;
-	int payload_len;
-	int frame_id;
-	uint32_t pts = (uint32_t)(-1);
-#if VERBOSE_DEBUG
-	uint32_t scr = (uint32_t)(-1);
-	bool have_scr;
-#endif
-	bool error, have_pts, is_eof;
-
+	/* Empty service intervals are normal during sensor blanking. Nonempty
+	 * packets must contain the entire header before any field is inspected. */
 	if (len == 0)
 		return;
-	if (len == 12)
-		return;
-
-	if (h->bHeaderLength != 12) {
-		if (h->bHeaderLength != 0)
-			LOGI("invalid UVC header: len %u/%u\n", h->bHeaderLength, (uint32_t) len);
+	if (len < sizeof(struct uvc_payload_header)) {
+		reject_frame(stream, UVC_DISCARD_HEADER);
 		return;
 	}
+	struct uvc_payload_header *h = (struct uvc_payload_header *)payload;
+	if (h->bHeaderLength != sizeof *h || !(h->bmHeaderInfo & 0x80)) {
+		reject_frame(stream, UVC_DISCARD_HEADER);
+		return;
+	}
+	int frame_id = h->bmHeaderInfo & 1;
+	bool is_eof = (h->bmHeaderInfo & 2) != 0;
+	/* A header without a PTS continues the current exposure. */
+	uint32_t pts = (h->bmHeaderInfo & 4) ? __le32_to_cpu(h->dwPresentationTime) : stream->cur_pts;
+	payload += sizeof *h;
+	len -= sizeof *h;
 
-	payload += h->bHeaderLength;
-	payload_len = len - h->bHeaderLength;
-	frame_id = h->bmHeaderInfo & 0x01;
-	is_eof = (h->bmHeaderInfo & 0x02) != 0;
-	have_pts = (h->bmHeaderInfo & 0x04) != 0;
-#if VERBOSE_DEBUG
-	have_scr = (h->bmHeaderInfo & 0x08) != 0;
-#endif
-	error = (h->bmHeaderInfo & 0x40) != 0;
-
-	if (error) {
-		ohmd_log_printf("UVC frame error\n");
+	if (!stream->have_frame_id) {
+		/* Opening the interface can land inside an image. Observe its identity
+		 * but wait for the next real boundary before accepting any pixels. */
+		stream->have_frame_id = true;
+		stream->frame_id = frame_id;
+		stream->cur_pts = pts;
+		stream->skip_frame = true;
 		return;
 	}
 
-	if (have_pts) {
-		pts = __le32_to_cpu(h->dwPresentationTime);
-		/* Skip this warning for JPEG, where we only output
-		 * when we see the frame change: */
-		if (stream->frame_collected != 0 && pts != stream->cur_pts &&
-				stream->format != OHMD_VIDEO_FRAME_FORMAT_JPEG) {
-			ohmd_log_printf("UVC PTS changed in-frame at %u bytes. Lost %u ms\n",
-			    stream->frame_collected,
-			    (pts - stream->cur_pts) * 1000 / RIFT_SENSOR_CLOCK_FREQ);
-			stream->cur_pts = pts;
-		}
-	}
-#if VERBOSE_DEBUG
-	if (have_scr) {
-		scr = __le32_to_cpu(h->scrSourceClock);
-	}
-#endif
-
-	if (frame_id != stream->frame_id) {
-		struct timespec ts;
-		uint64_t time;
-
-		if (stream->frame_collected > 0) {
-			ohmd_log_printf("UVC Dropping short frame: %u < %u (%d lost)\n",
-						stream->frame_collected, stream->frame_size,
-						stream->frame_size - stream->frame_collected);
-		}
-
-		/* Start of new frame */
-#ifdef _WIN32
-		/* cv1touch: the platform layer's nanosecond clock, which is the daemon's clock there */
-		(void)ts;
-		time = ohmd_monotonic_get(stream->ohmd_ctx);
-#else
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		time = ts.tv_sec * 1000000000 + ts.tv_nsec;
-#endif
-
-		/* Get a frame to capture into */
-		if (stream->cur_frame == NULL) {
-			ohmd_lock_mutex(stream->frames_lock);
-			if (stream->n_free_frames > 0) {
-				stream->n_free_frames--;
-				stream->cur_frame = stream->free_frames[stream->n_free_frames];
-			} else
-				stream->cur_frame = NULL;
-			ohmd_unlock_mutex(stream->frames_lock);
-		}
-
+	/* A new image needs a new PTS. A lone FID toggle can be a damaged header in the middle
+	 * of the old image. After a delivery a new PTS alone also starts one: FID repeats when
+	 * an even number of whole images was lost. */
+	if (pts != stream->cur_pts && (frame_id != stream->frame_id || stream->frame_delivered)) {
+		if (!stream->frame_delivered && !stream->skip_frame)
+			reject_frame(stream, UVC_DISCARD_INCOMPLETE);
+		bool skip = stream->reject_next_frame;
+		stream->reject_next_frame = false;
 		stream->frame_id = frame_id;
 		stream->cur_pts = pts;
 		stream->frame_collected = 0;
-		stream->skip_frame = false;
+		stream->skip_frame = skip;
+		stream->frame_delivered = false;
+		stream->jpeg_header_offset = 0;
+		stream->jpeg_scan_started = false;
+	} else if (frame_id != stream->frame_id || pts != stream->cur_pts) {
+		/* Never join pixels from different exposures just because FID was lost. */
+		reject_frame(stream, UVC_DISCARD_SEQUENCE);
+		return;
+	}
 
+	/* The camera's error flag belongs to this header's image, including its opening
+	 * header. Adopt the boundary before deciding whether that candidate was rejected. */
+	if (h->bmHeaderInfo & 0x40) {
+		reject_frame(stream, UVC_DISCARD_CAMERA_ERROR);
+		return;
+	}
+
+	if (stream->frame_delivered) {
+		/* Extra raw data means the image size or boundary was wrong, so the next boundary
+		 * is untrustworthy: discard that image too. libjpeg stops at EOI, so bytes after a
+		 * delivered JPEG cannot change it. */
+		if (len != 0 && stream->format != OHMD_VIDEO_FRAME_FORMAT_JPEG) {
+			bool image = !stream->reject_next_frame;
+			stream->reject_next_frame = true;
+			count_discard(stream, UVC_DISCARD_TOO_LONG, image);
+		}
+		return;
+	}
+	if (stream->skip_frame)
+		return;
+
+	if (len != 0) {
+		if (stream->cur_frame == NULL) {
+			ohmd_lock_mutex(stream->frames_lock);
+			if (stream->n_free_frames > 0)
+				stream->cur_frame = stream->free_frames[--stream->n_free_frames];
+			ohmd_unlock_mutex(stream->frames_lock);
+		}
 		if (stream->cur_frame == NULL) {
 			if (stream->skip_frame_start == 0) {
 				LOGW("No frame provided for pixel data. Skipping frames");
-				stream->skip_frame_start = time;
+				stream->skip_frame_start = uvc_now(stream);
 			}
-			stream->skip_frame = true;
+			drop_frame(stream);
+			return;
 		}
-
-		ohmd_video_frame *frame = stream->cur_frame;
-
-		if (frame) {
-			OHMD_ASSERT(frame->data_block_size >= stream->frame_size);
-			frame->start_ts = time;
-			frame->pts = pts;
-			frame->stride = stream->stride;
-			frame->width = stream->width;
-			frame->height = stream->height;
-			frame->format = stream->format;
+		if (stream->frame_collected == 0) {
+			/* Keep the first pixel packet's host time, regardless of later drops
+			 * or header-only packets. Camera exposure matching uses this stamp. */
+			stream->cur_frame->start_ts = uvc_now(stream);
+			stream->cur_frame->pts = stream->cur_pts;
+			stream->cur_frame->stride = stream->stride;
+			stream->cur_frame->width = stream->width;
+			stream->cur_frame->height = stream->height;
+			stream->cur_frame->format = stream->format;
+			stream->cur_frame->data_size = 0;
 
 			if (stream->skip_frame_start != 0) {
 				LOGW("Got capture frame after %f sec", (stream->cur_frame->start_ts - stream->skip_frame_start) / 1000000000.0);
 				stream->skip_frame_start = 0;
 			}
 		}
-
-#if VERBOSE_DEBUG
-		int64_t dt = 0;
-		if (stream->cur_frame)
-			dt = time - stream->cur_frame->start_ts;
-
-		ohmd_log_printf ("UVC dt %f PTS %f SCR %f delta %d\n",
-		    (double) (dt) / (1000000000.0),
-		    (double) (pts) / RIFT_SENSOR_CLOCK_FREQ,
-		    (double) (scr) / RIFT_SENSOR_CLOCK_FREQ,
-		    scr - pts);
-#endif
-	}
-
-	if (stream->skip_frame || stream->cur_frame == NULL)
-		return;
-
-	if (stream->frame_collected + payload_len > stream->frame_size) {
-		ohmd_log_printf("UVC frame buffer overflow: %u + %u > %u\n",
-		       stream->frame_collected, payload_len, stream->frame_size);
-		return;
-	}
-
-	memcpy(stream->cur_frame->data + stream->frame_collected, payload,
-	       payload_len);
-	stream->frame_collected += payload_len;
-
-	/* For JPEG frames, check if we just saw the EOF marker, so we can
-	 * emit the frame immediately. Otherwise we end up waiting a few ms
-	 * longer until the next frame starts to see the frame_id change
-	 * before we know that this one finished */
-	if (stream->format == OHMD_VIDEO_FRAME_FORMAT_JPEG && stream->frame_collected >= 2) {
-		uint8_t *eof_marker = stream->cur_frame->data + stream->frame_collected - 2;
-		if (eof_marker[0] == 0xFF && eof_marker[1] == 0xD9) {
-			is_eof = true;
+		if (len > (size_t)(stream->frame_size - stream->frame_collected)) {
+			reject_frame(stream, UVC_DISCARD_TOO_LONG);
+			return;
 		}
+		memcpy(stream->cur_frame->data + stream->frame_collected, payload, len);
+		stream->frame_collected += (int)len;
 	}
 
-	if (stream->frame_collected == stream->frame_size || is_eof) {
-		stream->cur_frame->data_size = stream->frame_collected;
-		if (stream->frame_cb) {
-			stream->frame_cb(stream, stream->cur_frame, stream->frame_cb_data);
-			stream->cur_frame = NULL;
+	if (stream->format == OHMD_VIDEO_FRAME_FORMAT_JPEG) {
+		/* Early EOI delivery is safe only after SOS, outside any APP/thumbnail data.
+		 * EOF can also deliver padded or truncated input for the decoder to check. */
+		if (stream->frame_collected >= 2 && (is_eof ||
+				(jpeg_scan_started(stream) && stream->cur_frame->data[stream->frame_collected - 2] == 0xff &&
+				 stream->cur_frame->data[stream->frame_collected - 1] == 0xd9))) {
+			deliver_frame(stream);
+			return;
 		}
-		stream->frame_collected = 0;
+	} else if (stream->frame_collected == stream->frame_size) {
+		/* No EOF/boundary wait: hand off on the packet that completes the image. */
+		deliver_frame(stream);
+		return;
 	}
-
-	if (is_eof) {
-		/* Always restart a frame after eof.
-		 * CV1 sensor never seems to set this
-		 * bit, but others might in the future */
-		stream->frame_collected = 0;
-	}
+	if (is_eof)
+		reject_frame(stream, UVC_DISCARD_INCOMPLETE);
 }
 
 /* Puts transfers parked after a failed submit back in flight, stopping at the first that fails again */
@@ -315,6 +436,8 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 
 	/* Handle error conditions */
 	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		if (stream->video_running && transfer->status != LIBUSB_TRANSFER_CANCELLED)
+			reject_frame(stream, UVC_DISCARD_TRANSFER);
 		if (transfer->status != LIBUSB_TRANSFER_CANCELLED)
 			LOGE("USB transfer error: %u", transfer->status);
 		stream->active_transfers--;
@@ -334,6 +457,10 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 
 		payload = libusb_get_iso_packet_buffer_simple(transfer, i);
 		payload_len = transfer->iso_packet_desc[i].actual_length;
+		if (transfer->iso_packet_desc[i].status != LIBUSB_TRANSFER_COMPLETED) {
+			reject_frame(stream, UVC_DISCARD_TRANSFER);
+			continue;
+		}
 		process_payload(stream, payload, payload_len);
 	}
 
@@ -540,6 +667,12 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
 
 	stream->video_running = true;
 	stream->cur_frame = NULL;
+	stream->have_frame_id = false;
+	stream->skip_frame = true;
+	stream->frame_delivered = stream->reject_next_frame = false;
+	stream->frame_collected = 0;
+	stream->jpeg_header_offset = 0;
+	stream->jpeg_scan_started = false;
 
 	stream->frame_cb = frame_cb;
 	stream->frame_cb_data = frame_cb_data;
@@ -649,6 +782,7 @@ int rift_sensor_uvc_stream_clear (struct rift_sensor_uvc_stream *stream)
 	free(stream->alloced_frames);
 	free(stream->free_frames);
 	stream->alloced_frames = stream->free_frames = NULL;
+	stream->cur_frame = NULL;
 	stream->n_alloced_frames = stream->n_free_frames = 0;
 
 

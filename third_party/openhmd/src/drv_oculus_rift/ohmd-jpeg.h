@@ -17,5 +17,9 @@ typedef struct ohmd_jpeg_decoder ohmd_jpeg_decoder;
 ohmd_jpeg_decoder *ohmd_jpeg_decoder_new(ohmd_context *ohmd_ctx);
 void ohmd_jpeg_decoder_free(ohmd_jpeg_decoder *jd);
 bool ohmd_jpeg_decoder_decode(ohmd_jpeg_decoder *jd, ohmd_video_frame *in, ohmd_video_frame **out);
+/* The text of the latest libjpeg warning or decode failure; empty until one occurs */
+const char *ohmd_jpeg_decoder_message(const ohmd_jpeg_decoder *jd);
+/* Warnings that left the pixels of the last decoded image intact */
+int ohmd_jpeg_decoder_warnings(const ohmd_jpeg_decoder *jd);
 
 #endif

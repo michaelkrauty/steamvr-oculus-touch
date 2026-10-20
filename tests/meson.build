@@ -85,6 +85,34 @@ test_uvc_shutdown = executable('test_uvc_shutdown', 'test_uvc_shutdown.c',
   dependencies: [threads_dep, dependency('libusb-1.0')],
   link_args: ['-Wl,--gc-sections'])
 test('uvc_shutdown', test_uvc_shutdown, timeout: 10)
+test_uvc_frames = executable('test_uvc_frames', 'test_uvc_frames.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
+foreach scenario : ['stale-tail', 'nearly-complete', 'header-only', 'fid-sequence',
+                    'pts-sequence', 'malformed-header', 'error-flag', 'truncated-header',
+                    'initial-boundary', 'overflow', 'trailing-data', 'buffer-retention',
+                    'packet-error', 'timestamp', 'jpeg', 'missing-pts', 'missing-header-end',
+                    'same-fid-after-stall', 'gap-damage', 'discard-summary', 'starvation-log',
+                    'opening-error-raw', 'opening-error-jpeg', 'bad-traffic-start', 'bad-traffic-rejected',
+                    'raw-overrun-report', 'latency']
+  test('uvc_frames_' + scenario, test_uvc_frames, args: [scenario])
+endforeach
+test_jpeg_dep = dependency('libjpeg', required: false)
+test_sensor_frame_quality = executable('test_sensor_frame_quality', 'test_sensor_frame_quality.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'] +
+    (test_jpeg_dep.found() ? ['-DHAVE_LIBJPEG=1'] : []),
+  dependencies: [threads_dep, dependency('libusb-1.0'), test_jpeg_dep],
+  link_args: ['-Wl,--gc-sections', '-lm'])
+foreach scenario : ['layout', 'capture-guard']
+  test('sensor_frame_' + scenario.underscorify(), test_sensor_frame_quality, args: [scenario])
+endforeach
+if test_jpeg_dep.found()
+  foreach scenario : ['jpeg', 'jpeg-corrupt', 'jpeg-padding', 'jpeg-extraneous', 'jpeg-extraneous-header',
+                      'jpeg-truncated', 'jpeg-missing-eoi', 'jpeg-bad-code', 'jpeg-resync', 'jpeg-warning-codes',
+                      'jpeg-summary', 'jpeg-embedded-eoi', 'jpeg-progression']
+    test('sensor_frame_' + scenario.underscorify(), test_sensor_frame_quality, args: [scenario])
+  endforeach
+endif
 # Hardware-free discovery/lifetime regression using the actual native tracker.
 test_sensor_discovery = executable('test_sensor_discovery', 'test_sensor_discovery.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
