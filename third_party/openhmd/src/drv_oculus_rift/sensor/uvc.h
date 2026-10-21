@@ -46,12 +46,16 @@ struct rift_sensor_uvc_stream {
 	int frame_id;
 	/* Current PTS being accumulated */
 	uint32_t cur_pts;
+	/* The opening header carried a presentation time. Read only before the first boundary. */
+	bool have_pts;
 	/* Number of bytes collected from the current frame */
 	int frame_collected;
 	/* true if we're skipping the current frame */
 	bool skip_frame;
 	/* An image starts only at an observed FID/PTS boundary. */
 	bool have_frame_id;
+	/* A boundary has been accepted since this stream started. */
+	bool have_boundary;
 	bool frame_delivered;
 	bool reject_next_frame;
 	/* Inspect segment lengths only until the camera's JPEG scan begins. */

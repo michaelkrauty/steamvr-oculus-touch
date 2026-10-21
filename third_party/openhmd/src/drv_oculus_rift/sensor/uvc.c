@@ -303,7 +303,8 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 	int frame_id = h->bmHeaderInfo & 1;
 	bool is_eof = (h->bmHeaderInfo & 2) != 0;
 	/* A header without a PTS continues the current exposure. */
-	uint32_t pts = (h->bmHeaderInfo & 4) ? __le32_to_cpu(h->dwPresentationTime) : stream->cur_pts;
+	bool header_has_pts = (h->bmHeaderInfo & 4) != 0;
+	uint32_t pts = header_has_pts ? __le32_to_cpu(h->dwPresentationTime) : stream->cur_pts;
 	payload += sizeof *h;
 	len -= sizeof *h;
 
@@ -313,20 +314,29 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		stream->have_frame_id = true;
 		stream->frame_id = frame_id;
 		stream->cur_pts = pts;
+		stream->have_pts = header_has_pts;
 		stream->skip_frame = true;
 		return;
 	}
 
 	/* A new image needs a new PTS. A lone FID toggle can be a damaged header in the middle
 	 * of the old image. After a delivery a new PTS alone also starts one: FID repeats when
-	 * an even number of whole images was lost. */
-	if (pts != stream->cur_pts && (frame_id != stream->frame_id || stream->frame_delivered)) {
+	 * an even number of whole images was lost. Before the first boundary the same PTS rule
+	 * applies, and only when both headers carried a presentation time. A header with no PTS
+	 * keeps cur_pts, so the comparison already requires one on this header. The first packet
+	 * after a stream opens is left over from an earlier stream: its timestamp predates this
+	 * stream's clock. The first image arrives about 1 s later with frame ID 0 and a new
+	 * timestamp. When the leftover also had frame ID 0, that image (145 to 157 packets) was
+	 * rejected as out of sequence. */
+	if (pts != stream->cur_pts && (frame_id != stream->frame_id || stream->frame_delivered ||
+			(!stream->have_boundary && stream->have_pts))) {
 		if (!stream->frame_delivered && !stream->skip_frame)
 			reject_frame(stream, UVC_DISCARD_INCOMPLETE);
 		bool skip = stream->reject_next_frame;
 		stream->reject_next_frame = false;
 		stream->frame_id = frame_id;
 		stream->cur_pts = pts;
+		stream->have_boundary = true;
 		stream->frame_collected = 0;
 		stream->skip_frame = skip;
 		stream->frame_delivered = false;
@@ -702,6 +712,8 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
 	stream->video_running = true;
 	stream->cur_frame = NULL;
 	stream->have_frame_id = false;
+	stream->have_pts = false;
+	stream->have_boundary = false;
 	stream->skip_frame = true;
 	stream->frame_delivered = stream->reject_next_frame = false;
 	stream->frame_collected = 0;

@@ -134,7 +134,25 @@ static void full(unsigned fid, uint32_t pts)
     CHECK(stream.n_free_frames == 1 && stream.cur_frame == NULL);
 }
 
-static void start(void)
+/* A complete raw image, then the separate 12-byte end header the sensor sends.
+ * Exact size delivers on the completing payload packet. The end header adds nothing. */
+static void full_eof(unsigned fid, uint32_t pts)
+{
+    int before = callbacks;
+    for (int i = 0; i < FRAME_BYTES; i += 4096) {
+        feed(fid, pts, 0, image + i, 4096);
+        CHECK(callbacks == before + (i + 4096 == FRAME_BYTES));
+    }
+    CHECK(delivered_packet == packet_number);
+    CHECK(last_bytes == FRAME_BYTES);
+    CHECK(stream.n_free_frames == 1 && stream.cur_frame == NULL);
+    uint32_t bad = stream.bad_packets, discards = stream.n_discards;
+    feed(fid, pts, 2, NULL, 0);
+    CHECK(callbacks == before + 1 && delivered_packet != packet_number);
+    CHECK(stream.bad_packets == bad && stream.n_discards == discards);
+}
+
+static void begin(void)
 {
     memset(&stream, 0, sizeof stream);
     memset(image, 0, sizeof image);
@@ -148,6 +166,11 @@ static void start(void)
     stream.frames_lock = (void *)1;
     stream.skip_frame = true;
     CHECK(rift_sensor_uvc_stream_start(&stream, 1, captured, NULL) == 0);
+}
+
+static void start(void)
+{
+    begin();
     /* Observe an initial identity before the first trustworthy FID transition. */
     feed(0, 0, 0, NULL, 0);
 }
@@ -368,6 +391,136 @@ static void initial_boundary(void)
     feed(0, 0, 0, image, FRAME_BYTES);
     CHECK(callbacks == 0);
     full(1, 1000);
+    finish();
+}
+
+/* The first packet is left over from an earlier stream (frame ID 0, PTS A). The first
+ * image reuses frame ID 0 with PTS B and is delivered; the next image, frame ID 1 and
+ * PTS C, follows. Each image ends with a separate header-only end packet. */
+static void startup_same_fid(void)
+{
+    begin();
+    uint64_t dropped = 0;
+    stream.frames_dropped = &dropped;
+    feed(0, 1000, 0, image, FRAME_BYTES);
+    CHECK(callbacks == 0 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    for (int y = 100; y < 106; y++) memset(image + y * WIDTH + 20, 200, 6);
+    full_eof(0, 2000);
+    CHECK(callbacks == 1 && last_blobs == 1);
+    CHECK(stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    memset(image, 0, sizeof image);
+    full_eof(1, 3000);
+    CHECK(callbacks == 2 && last_blobs == 0 && last_bytes == FRAME_BYTES);
+    CHECK(stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+
+    /* The same struct starts again with the relaxed rule armed, not left closed. */
+    CHECK(rift_sensor_uvc_stream_stop(&stream) == 0);
+    CHECK(rift_sensor_uvc_stream_clear(&stream) == 0);
+    callbacks = packet_number = delivered_packet = 0;
+    stream.frames_lock = (void *)1;
+    CHECK(rift_sensor_uvc_stream_start(&stream, 1, captured, NULL) == 0);
+    CHECK(stream.frames_dropped == &dropped && !stream.have_boundary);
+    feed(0, 4000, 0, image, FRAME_BYTES);
+    full_eof(0, 5000);
+    CHECK(callbacks == 1 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    finish();
+}
+
+/* Opening frame ID 1 and a first image with frame ID 0: both fields change, which
+ * already started an image. That image is still delivered and nothing is counted. */
+static void startup_new_fid(void)
+{
+    begin();
+    uint64_t dropped = 0;
+    stream.frames_dropped = &dropped;
+    feed(1, 1000, 0, image, FRAME_BYTES);
+    CHECK(callbacks == 0 && dropped == 0);
+    for (int y = 100; y < 106; y++) memset(image + y * WIDTH + 20, 200, 6);
+    full_eof(0, 2000);
+    CHECK(callbacks == 1 && last_blobs == 1);
+    CHECK(stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    memset(image, 0, sizeof image);
+    full_eof(1, 3000);
+    CHECK(callbacks == 2 && last_blobs == 0 && last_bytes == FRAME_BYTES);
+    CHECK(stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    finish();
+}
+
+/* Packets that repeat the opening frame ID and timestamp are the leftover. A short
+ * EOF and a payload longer than one image are still not delivered and not counted. */
+static void startup_matching_tail(void)
+{
+    begin();
+    uint64_t dropped = 0;
+    stream.frames_dropped = &dropped;
+    feed(0, 1000, 0, image, 4096);
+    feed(0, 1000, 2, image, FRAME_BYTES / 2);
+    CHECK(callbacks == 0 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    unsigned char *packet = calloc(1, FRAME_BYTES + 1 + 12);
+    CHECK(packet != NULL);
+    packet[0] = 12;
+    packet[1] = 0x8c;
+    for (int i = 0; i < 4; i++) packet[2 + i] = (unsigned char)(1000 >> (8 * i));
+    packet_number++;
+    process_payload(&stream, packet, FRAME_BYTES + 1 + 12);
+    free(packet);
+    CHECK(callbacks == 0 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    CHECK(stream.discards[UVC_DISCARD_TOO_LONG] == 0);
+    CHECK(stream.discards[UVC_DISCARD_INCOMPLETE] == 0);
+    full_eof(1, 2000);
+    CHECK(callbacks == 1 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    finish();
+}
+
+/* Before the first boundary a frame-ID change with the latched PTS is one damaged
+ * packet, not a new image. The image that then arrives with a new PTS is kept. */
+static void startup_fid_only(void)
+{
+    begin();
+    uint64_t dropped = 0;
+    stream.frames_dropped = &dropped;
+    feed(0, 1000, 0, image, 4096);
+    feed(1, 1000, 0, image, 4096);
+    CHECK(callbacks == 0 && stream.bad_packets == 1 && stream.n_discards == 0 && dropped == 0);
+    CHECK(stream.discards[UVC_DISCARD_SEQUENCE] == 0);
+    full_eof(0, 2000);
+    CHECK(callbacks == 1 && stream.bad_packets == 1 && stream.n_discards == 0 && dropped == 0);
+    full_eof(1, 3000);
+    CHECK(callbacks == 2 && stream.bad_packets == 1 && stream.n_discards == 0 && dropped == 0);
+    finish();
+}
+
+/* The opening header carries no presentation time, so a same frame ID with a new
+ * timestamp is not an image start. Each of its packets, including the end header,
+ * counts as a damaged packet and nothing is delivered or dropped. The next frame
+ * ID, with its own timestamp, is kept. Removing the have_pts gate delivers the
+ * same-frame-ID image instead. */
+static void startup_no_pts(void)
+{
+    begin();
+    uint64_t dropped = 0;
+    stream.frames_dropped = &dropped;
+    unsigned char opening[12 + 4096] = {12, 0x88};
+    packet_number++;
+    process_payload(&stream, opening, sizeof opening);
+    CHECK(callbacks == 0 && stream.bad_packets == 0 && stream.n_discards == 0 && dropped == 0);
+    CHECK(stream.have_frame_id && !stream.have_pts && !stream.have_boundary && stream.skip_frame);
+
+    uint32_t packets = 0;
+    for (int i = 0; i < FRAME_BYTES; i += 4096) {
+        feed(0, 1000, 0, image + i, 4096);
+        packets++;
+        CHECK(callbacks == 0);
+    }
+    feed(0, 1000, 2, NULL, 0);
+    packets++;
+    CHECK(callbacks == 0 && stream.bad_packets == packets && stream.n_discards == 0 && dropped == 0);
+    CHECK(stream.discards[UVC_DISCARD_SEQUENCE] == 0);
+    CHECK(stream.discards[UVC_DISCARD_INCOMPLETE] == 0);
+
+    full_eof(1, 2000);
+    CHECK(callbacks == 1 && last_bytes == FRAME_BYTES);
+    CHECK(stream.bad_packets == packets && stream.n_discards == 0 && dropped == 0);
     finish();
 }
 
@@ -670,6 +823,11 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "error-flag")) error_flag();
     else if (!strcmp(argv[1], "truncated-header")) truncated_header();
     else if (!strcmp(argv[1], "initial-boundary")) initial_boundary();
+    else if (!strcmp(argv[1], "startup-same-fid")) startup_same_fid();
+    else if (!strcmp(argv[1], "startup-new-fid")) startup_new_fid();
+    else if (!strcmp(argv[1], "startup-matching-tail")) startup_matching_tail();
+    else if (!strcmp(argv[1], "startup-fid-only")) startup_fid_only();
+    else if (!strcmp(argv[1], "startup-no-pts")) startup_no_pts();
     else if (!strcmp(argv[1], "overflow")) overflow();
     else if (!strcmp(argv[1], "trailing-data")) trailing_data();
     else if (!strcmp(argv[1], "buffer-retention")) buffer_retention();
