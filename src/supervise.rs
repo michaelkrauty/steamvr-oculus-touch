@@ -319,7 +319,7 @@ pub struct Log {
     dir: PathBuf,
     file: Option<File>,
     /// Held before recovery and for this supervisor's lifetime, across all runtime directories.
-    lock: Option<File>,
+    lock: Option<platform::ipc::Lock>,
     stderr_notice: Option<String>,
     warned_unavailable: bool,
     /// The current file size, including bytes from before this supervisor started.

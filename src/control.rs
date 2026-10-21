@@ -4,7 +4,6 @@
 //! Control protocol over $XDG_RUNTIME_DIR/cv1touch/control.sock (AF_UNIX stream): one request line
 //! gets one reply line starting with "ok" or "err <reason>".
 
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -359,8 +358,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
     }
 }
 
-/// Exclusive, non-blocking lock on `path`; held until the returned File is dropped.
-pub fn lock_single_instance(path: &Path) -> io::Result<File> {
+/// Exclusive, non-blocking lock on `path`, released as soon as the returned lock is dropped.
+pub fn lock_single_instance(path: &Path) -> io::Result<ipc::Lock> {
     ipc::lock_exclusive(path)
 }
 

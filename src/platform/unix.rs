@@ -147,7 +147,27 @@ pub(crate) fn private_lock_directory(path: &Path) -> io::Result<File> {
     Ok(dir)
 }
 
-fn lock_shm_name(name: &str) -> io::Result<File> {
+/// An exclusive `flock`, released when this value is dropped.
+///
+/// Closing the descriptor is not enough. The lock belongs to the open file description, and a
+/// child that another thread is starting holds a copy of that descriptor until it executes or
+/// exits, so the close alone can leave the lock held.
+///
+/// A forked child that ran this destructor without executing would release the parent's lock.
+/// This repository has no such child: a process it starts executes, or leaves through `_exit`.
+#[derive(Debug)]
+pub struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `self.0` owns a valid descriptor. LOCK_UN releases the lock for every copy of
+        // this open file description, including one a child still holds.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lock_shm_name(name: &str) -> io::Result<Lock> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
     let component = name
@@ -188,7 +208,7 @@ fn lock_shm_name(name: &str) -> io::Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(file)
+    Ok(Lock(file))
 }
 
 pub struct OwnedSegment {
@@ -196,7 +216,8 @@ pub struct OwnedSegment {
     len: usize,
     name: std::ffi::CString,
     unlinked: AtomicBool,
-    _ownership: File,
+    // Dropped after `Drop::drop` unlinks the segment: the destructor runs before the fields.
+    _ownership: Lock,
 }
 
 // SAFETY: a shared mapping; callers synchronise access to its contents.
@@ -453,7 +474,7 @@ pub fn unlink_private_socket(endpoint: &Path) -> io::Result<()> {
     }
 }
 
-pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+pub fn lock_exclusive(path: &Path) -> io::Result<Lock> {
     use std::os::fd::AsRawFd;
     let file = OpenOptions::new()
         .read(true)
@@ -466,7 +487,7 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(file)
+    Ok(Lock(file))
 }
 
 pub struct Connection(std::os::unix::net::UnixStream);

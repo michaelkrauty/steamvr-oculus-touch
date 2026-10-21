@@ -457,7 +457,25 @@ pub fn runtime_dir() -> std::path::PathBuf {
     super::dirs::get().config
 }
 
-pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+/// An exclusive one-byte lock, released when this value is dropped.
+///
+/// Closing the handle need not release a byte-range lock at once (Windows unlocks it when
+/// resources allow), so the same range is unlocked first.
+#[derive(Debug)]
+pub struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        // SAFETY: a zeroed OVERLAPPED is offset 0, the same one-byte range LockFileEx locked.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: `self.0` owns the live synchronous handle. Unlocking finishes before it closes.
+        let _ = unsafe { UnlockFileEx(self.0.as_raw_handle() as _, 0, 1, 0, &mut overlapped) };
+    }
+}
+
+pub fn lock_exclusive(path: &Path) -> io::Result<Lock> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -471,8 +489,8 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)?;
     // Ownership is a byte-range lock, not a refusal to let editors or scanners open the file.
-    // SAFETY: a live synchronous handle and a zeroed offset/event. FAIL_IMMEDIATELY never waits;
-    // closing this handle releases the one-byte lock, even though the file may be empty.
+    // SAFETY: a live synchronous handle and a zeroed offset/event. FAIL_IMMEDIATELY never waits.
+    // Drop unlocks this one-byte range before the handle closes, even though the file may be empty.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     if unsafe {
         LockFileEx(
@@ -494,7 +512,7 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
             },
         );
     }
-    Ok(file)
+    Ok(Lock(file))
 }
 
 fn pipe_name(endpoint: &Path) -> io::Result<Vec<u16>> {

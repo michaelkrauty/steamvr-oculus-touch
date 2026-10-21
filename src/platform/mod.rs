@@ -616,7 +616,6 @@ pub mod shutdown {
 pub mod ipc {
     //! The control channel: one stream per request, private to this user (a Unix-domain socket on
     //! Linux, a named pipe on Windows), and the lock that keeps one daemon per user.
-    use std::fs::File;
     use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -686,9 +685,13 @@ pub mod ipc {
         os::unlink_private_socket(endpoint)
     }
 
-    /// An exclusive lock on `path` (created if missing), held until the file is dropped; fails at
-    /// once (WouldBlock) while another process holds it.
-    pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+    pub use super::os::Lock;
+
+    /// An exclusive lock on `path` (created if missing), released as soon as the returned [`Lock`]
+    /// is dropped. Fails at once ([`io::ErrorKind::WouldBlock`]) while another holder has it. On
+    /// Unix, closing the file alone would not release it while a child being started still has a
+    /// copy of the descriptor.
+    pub fn lock_exclusive(path: &Path) -> io::Result<Lock> {
         os::lock_exclusive(path)
     }
 
@@ -1266,6 +1269,132 @@ mod tests {
         assert!(super::ipc::lock_exclusive(&path).is_err());
         drop(first);
         drop(super::ipc::lock_exclusive(&path).unwrap());
+    }
+
+    /// Holds a forked copy of this process's descriptors, with no `exec` and no Rust destructors,
+    /// across `check`. The child only writes, reads and `_exit`s.
+    #[cfg(unix)]
+    fn while_a_child_holds_the_descriptors(check: impl FnOnce()) {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut copied = [0; 2];
+        let mut release = [0; 2];
+        // SAFETY: pipe2 writes two fresh descriptors into the array.
+        assert_eq!(
+            unsafe { libc::pipe2(copied.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: each descriptor came from pipe2 and is owned here.
+        let copied_read = unsafe { OwnedFd::from_raw_fd(copied[0]) };
+        let copied_write = unsafe { OwnedFd::from_raw_fd(copied[1]) };
+        let release_read = unsafe { OwnedFd::from_raw_fd(release[0]) };
+        let release_write = unsafe { OwnedFd::from_raw_fd(release[1]) };
+        let copied_write_fd = copied_write.as_raw_fd();
+        let release_read_fd = release_read.as_raw_fd();
+
+        let child = std::thread::spawn(move || {
+            let mut command = Command::new("true");
+            // SAFETY: pre_exec runs between fork and exec. The child only calls prctl, write,
+            // read and _exit, which are async-signal-safe, then _exit. It does not allocate, drop,
+            // or touch the test harness, so it cannot release the parent's lock.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        libc::_exit(1);
+                    }
+                    let one = [1u8];
+                    if libc::write(copied_write_fd, one.as_ptr() as *const libc::c_void, 1) != 1 {
+                        libc::_exit(1);
+                    }
+                    let mut done = [0u8; 1];
+                    loop {
+                        let n =
+                            libc::read(release_read_fd, done.as_mut_ptr() as *mut libc::c_void, 1);
+                        if n >= 0 || *libc::__errno_location() != libc::EINTR {
+                            break;
+                        }
+                    }
+                    libc::_exit(0);
+                });
+            }
+            command.status().unwrap();
+        });
+
+        let mut ready = libc::pollfd {
+            fd: copied_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = loop {
+            // SAFETY: one valid pollfd; the timeout is five seconds.
+            let n = unsafe { libc::poll(&mut ready, 1, 5_000) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break n;
+        };
+        assert_eq!(
+            polled, 1,
+            "the child did not signal that it holds the descriptors"
+        );
+        let mut byte = [0u8; 1];
+        // SAFETY: the pipe is readable and the buffer is one byte.
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    copied_read.as_raw_fd(),
+                    byte.as_mut_ptr() as *mut libc::c_void,
+                    1,
+                )
+            },
+            1
+        );
+
+        struct Release(OwnedFd);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let one = [1u8];
+                // SAFETY: the write end stays open until the child has been told to exit.
+                unsafe {
+                    libc::write(self.0.as_raw_fd(), one.as_ptr() as *const libc::c_void, 1);
+                }
+            }
+        }
+        {
+            let _release = Release(release_write);
+            let _held_until_the_child_exits = (copied_write, release_read);
+            check();
+        }
+        child.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_lock_is_taken_at_once_while_a_child_holds_its_descriptor() {
+        let (_fixture, endpoint) = endpoint("lock-release");
+        let path = endpoint.with_file_name("cv1touchd.lock");
+        let held = super::ipc::lock_exclusive(&path).unwrap();
+        while_a_child_holds_the_descriptors(|| {
+            drop(held);
+            drop(super::ipc::lock_exclusive(&path).unwrap());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_segment_is_created_at_once_while_a_child_holds_its_ownership_lock() {
+        let name = segment_name("release");
+        let owner = OwnedSegment::create(&name, 64).unwrap();
+        while_a_child_holds_the_descriptors(|| {
+            drop(owner);
+            drop(OwnedSegment::create(&name, 64).unwrap());
+        });
     }
 
     #[cfg(windows)]
@@ -2077,15 +2206,7 @@ mod tests {
             OpenedSegment::open(&name, 64),
             Err(OpenError::NotFound)
         ));
-        // the name is free again; a process another test is starting may hold a forked copy of
-        // the ownership lock until it executes (the descriptor closes on exec), so allow a moment
-        let free = (0..200).any(|_| {
-            OwnedSegment::create(&name, 64).is_ok() || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(free, "the name stays taken");
+        OwnedSegment::create(&name, 64).unwrap();
     }
 
     #[test]
