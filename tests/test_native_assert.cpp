@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include "support/expected_abort.h"
 #ifdef OHMD_NONBLOCK_ASSERT
 #include "openhmd_cv1touch.h"
 
@@ -35,6 +36,7 @@ int main(int argc, char **)
     ohmd_cv1touch_set_log_callback(collect);
     ohmd_cv1touch_set_log_fatal_callback(drain);
 #endif
+    prepare_expected_abort();
     OHMD_ASSERT(argc == 0);
     return 1;
 }

@@ -38,13 +38,9 @@ fn run(kind: &str, test: &str) {
         let sink: Arc<dyn EngineSink> = Arc::new(sink);
         let user = (&sink as *const Arc<dyn EngineSink>).cast_mut().cast();
         let info = engine::FrameInfo::default();
+        expected_abort::prepare();
         // SAFETY: valid input buffers and a live Arc; none of these callbacks touches hardware.
         unsafe {
-            let limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            assert_eq!(libc::setrlimit(libc::RLIMIT_CORE, &limit), 0);
             match kind {
                 "frame" => callbacks::frame_cb(user, &info, 0, std::ptr::null()),
                 "image" => callbacks::image_cb(user, &info, 1, 1, 1, [0u8].as_ptr()),

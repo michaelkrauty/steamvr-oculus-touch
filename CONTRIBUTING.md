@@ -31,6 +31,8 @@ Review all branches, tags, pull requests, issues, releases, artifacts, and Actio
 
 ## Local validation and contributions
 
+Fatal-path tests disable core dumps in the child immediately before its expected abort. On Linux they also disable dumpability so piped crash handlers stay asleep. Keep this out of production and socket-fixture owners; see [the intentional-abort inventory and focused audit](docs/testing-aborts.md).
+
 The memory-residency and real-time scheduling smoke tests are opt-in because they require host resource limits or services that ordinary CI runners do not provide. On a configured host, run the memory check separately with `cargo test --locked --bin cv1touchd locked_memory_stays_resident_once_touched -- --ignored`; it locks memory for that test process. Inspect the other ignored tests' requirements before running them. The daemon reports a fallback when memory locking or real-time scheduling is unavailable.
 
 Preserve upstream copyright and license notices. Update third-party provenance when changing the pinned source. Do not submit copied SteamVR/Oculus assets, personal calibration, raw room captures, device serial numbers, credentials, or workstation-specific settings. Any public example configuration must use fictional identifiers and synthetic geometry.

@@ -2,6 +2,7 @@
 // Copyright 2026 michaelkrauty
 
 #include <string.h>
+#include "support/expected_abort.h"
 #include "../third_party/openhmd/src/log-output.c"
 
 static unsigned calls;
@@ -32,11 +33,13 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "fatal") == 0) {
         ohmd_cv1touch_set_log_callback(collect);
         ohmd_cv1touch_set_log_fatal_callback(recursive_fatal);
+        prepare_expected_abort();
         OHMD_ASSERT(0 && "outer assertion");
     } else if (strcmp(argv[1], "partial") == 0) {
         partial = true;
         ohmd_cv1touch_set_log_callback(collect);
         ohmd_log_printf("unfinished fragment");
+        prepare_expected_abort();
         OHMD_ASSERT(0 && "independent fatal record");
     } else {
         ohmd_cv1touch_set_log_callback(asserting_receiver);
@@ -44,8 +47,10 @@ int main(int argc, char **argv)
             char text[4096];
             memset(text, 'x', sizeof text - 1);
             text[sizeof text - 1] = '\0';
+            prepare_expected_abort();
             ohmd_log_printf("%s\n", text);
         } else {
+            prepare_expected_abort();
             ohmd_log_printf("short record\n");
         }
     }

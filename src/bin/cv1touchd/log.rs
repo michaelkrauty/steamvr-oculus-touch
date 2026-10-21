@@ -742,13 +742,7 @@ mod assertion_tests {
             // No devices or state: call the real math assertion with a NaN quaternion.
             let _logging = init().unwrap();
             // SAFETY: the fixture exposes the real math source with valid NaN input buffers.
-            // The zero core limit keeps the deliberate failure from leaving a core file behind.
             unsafe {
-                let limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                assert_eq!(libc::setrlimit(libc::RLIMIT_CORE, &limit), 0);
                 let path = std::ffi::CString::new(concat!(
                     env!("CV1TOUCH_NATIVE_DIR"),
                     "/tests/libtest_native_assert_bridge.so"
@@ -759,6 +753,7 @@ mod assertion_tests {
                 let symbol = libc::dlsym(library, c"cv1touch_test_native_assert".as_ptr());
                 assert!(!symbol.is_null());
                 let fail: unsafe extern "C" fn() = std::mem::transmute(symbol);
+                super::super::expected_abort::prepare();
                 fail();
             }
             panic!("native assertion returned");

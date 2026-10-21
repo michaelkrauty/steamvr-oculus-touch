@@ -8,6 +8,10 @@
 #[path = "../../tests/support/socket_dir.rs"]
 mod socket_dir;
 
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/expected_abort.rs"]
+mod expected_abort;
+
 use std::fs;
 use std::io;
 use std::mem;

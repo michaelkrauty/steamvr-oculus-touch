@@ -7,11 +7,6 @@ import signal
 import subprocess
 import sys
 
-if os.name == "posix":
-    import resource
-
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
 for mode in ("short", "truncated", "fatal", "partial"):
     result = subprocess.run([sys.argv[1], mode], capture_output=True, timeout=2)
     assert result.returncode != 0, (mode, result)

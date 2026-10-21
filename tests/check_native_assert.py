@@ -7,11 +7,6 @@ import signal
 import subprocess
 import sys
 
-if os.name == "posix":
-    import resource
-
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
 exe, mode = sys.argv[1:]
 subprocess.run([exe], check=True, timeout=2)
 result = subprocess.run([exe, "fail"], capture_output=True, timeout=2)
