@@ -1397,6 +1397,17 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_listener_is_bound_again_at_once_while_a_child_holds_it() {
+        let (_fixture, path) = endpoint("listener-release");
+        let listener = Listener::bind_private(&path).unwrap();
+        while_a_child_holds_the_descriptors(|| {
+            drop(listener);
+            drop(Listener::bind_private(&path).unwrap());
+        });
+    }
+
     #[cfg(windows)]
     #[test]
     fn an_ordinary_reader_does_not_own_the_supervisor_lock() {

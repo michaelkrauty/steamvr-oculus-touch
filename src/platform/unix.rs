@@ -622,6 +622,19 @@ impl Connection {
 
 pub struct Listener(std::os::unix::net::UnixListener);
 
+// Shut down before close. A child another thread is starting holds a copy of this descriptor
+// until it executes, and close alone would leave that copy accepting. The socket is not cloned:
+// the field is private, and there is no try_clone. Drop means stop serving (the accept thread,
+// both bind paths, and the tests). A forked child that ran this destructor without executing
+// would stop the parent's listener; this repository has no such child.
+impl Drop for Listener {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: self.0 owns the listening socket. SHUT_RDWR applies to every copy of it.
+        let _ = unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+}
+
 fn probe_control_socket(endpoint: &Path) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: all-zero is a valid initial sockaddr_un; fields and pathname are set below.

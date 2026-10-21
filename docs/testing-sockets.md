@@ -133,6 +133,7 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `src/platform/mod.rs` | `a_connection_carries_a_line_each_way` | T + P + 28 = 115 | 39 |
 | `src/platform/mod.rs` | `a_silent_listener_times_a_read_out_and_a_second_listener_is_refused` | T + P + 31 = 118 | 42 |
 | `src/platform/mod.rs` | `the_listener_keeps_serving_after_clients_vanish` | T + P + 30 = 117 | 41 |
+| `src/platform/mod.rs` | `a_dropped_listener_is_bound_again_at_once_while_a_child_holds_it` | fixture introduced with short paths | 51 |
 | `src/platform/unix.rs` | `container_control_creates_a_private_directory_and_socket` | T + P + 44 = 131 | 50 |
 | `src/platform/unix.rs` | `container_control_new_directory_ignores_a_restrictive_umask` | T + P + 43 = 130 | 50 |
 | `src/platform/unix.rs` | `container_control_refuses_existing_unsafe_directories_without_changing_them` | T + P + 44 = 131 | 50 |
