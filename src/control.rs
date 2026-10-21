@@ -376,22 +376,43 @@ pub fn socket_path() -> PathBuf {
 /// The driver opens a new connection for each haptic or station report; persistent clients
 /// also work while they keep sending complete requests. Partial bytes do not extend a deadline.
 pub fn serve_client(conn: ipc::Connection, handle: impl FnMut(&str) -> String) {
-    serve_client_with_deadline(conn, Duration::from_secs(2), handle);
+    serve_client_with_initial_deadline(conn, REQUEST_IDLE, handle);
 }
 
+const REQUEST_IDLE: Duration = Duration::from_secs(2);
+
 /// One client's request lines, each answered with one reply line. A client that stops reading
-/// for a second, takes longer than `idle` to send its next request, or sends more than
-/// 4 KiB in one request is dropped. Complete requests may keep a connection open indefinitely.
-fn serve_client_with_deadline(
+/// for a second, takes longer than `initial_idle` to send its first request (two seconds for
+/// each subsequent request), or sends more than 4 KiB in one request is dropped. Fixtures can
+/// allow more time between connecting and delivering their first request.
+pub fn serve_client_with_initial_deadline(
+    conn: ipc::Connection,
+    initial_idle: Duration,
+    handle: impl FnMut(&str) -> String,
+) {
+    serve_client_with_clock(conn, initial_idle, REQUEST_IDLE, Instant::now, handle);
+}
+
+fn request_time_left(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
+}
+
+// Production uses the same first/subsequent window and the real clock. Socket tests can
+// separate initial thread scheduling from idle expiry, and advance time between exchanges.
+fn serve_client_with_clock(
     mut conn: ipc::Connection,
+    initial_idle: Duration,
     idle: Duration,
+    mut now: impl FnMut() -> Instant,
     mut handle: impl FnMut(&str) -> String,
 ) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    let mut deadline = std::time::Instant::now() + idle;
+    let mut deadline = now() + initial_idle;
     loop {
-        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        let Some(left) = request_time_left(deadline, now()) else {
             return;
         };
         if conn.set_timeout(Some(left)).is_err() {
@@ -413,7 +434,7 @@ fn serve_client_with_deadline(
             if conn.write_all(format!("{reply}\n").as_bytes()).is_err() {
                 return;
             }
-            deadline = std::time::Instant::now() + idle;
+            deadline = now() + idle;
         }
         if buf.len() > 4096 {
             return; // no newline in 4 KiB: not a protocol client
@@ -452,13 +473,26 @@ mod tests {
         ipc::Connection,
         thread::JoinHandle<Vec<String>>,
     ) {
+        client_pair_with_clock(tag, idle, idle, Instant::now)
+    }
+
+    fn client_pair_with_clock(
+        tag: &str,
+        initial_idle: Duration,
+        idle: Duration,
+        now: impl FnMut() -> Instant + Send + 'static,
+    ) -> (
+        crate::socket_dir::SocketDir,
+        ipc::Connection,
+        thread::JoinHandle<Vec<String>>,
+    ) {
         let fixture = crate::socket_dir::SocketDir::new();
         let path = fixture.path().join(format!("{tag}.sock"));
         let mut listener = ipc::Listener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let conn = listener.accept(true).unwrap();
             let mut seen = Vec::new();
-            serve_client_with_deadline(conn, idle, |line| {
+            serve_client_with_clock(conn, initial_idle, idle, now, |line| {
                 seen.push(line.to_owned());
                 format!("ok {line}")
             });
@@ -493,7 +527,13 @@ mod tests {
 
     #[test]
     fn partial_bytes_do_not_extend_a_request_deadline() {
-        let (fixture, mut conn, server) = client_pair("trickle", Duration::from_millis(150));
+        // Establish the successful exchange without putting thread startup on the idle budget.
+        let (fixture, mut conn, server) = client_pair_with_clock(
+            "trickle",
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+            Instant::now,
+        );
         conn.write_all(b"ping\n").unwrap();
         assert_eq!(reply(&mut conn), "ok ping\n");
         let mut ended = false;
@@ -514,18 +554,135 @@ mod tests {
 
     #[test]
     fn complete_requests_keep_a_persistent_connection_alive() {
-        let idle = Duration::from_millis(500);
-        let (fixture, mut conn, server) = client_pair("persistent", idle);
-        let began = std::time::Instant::now();
-        for _ in 0..8 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let idle = Duration::from_secs(10);
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let clock = elapsed.clone();
+        let began = Instant::now();
+        let (fixture, mut conn, server) =
+            client_pair_with_clock("persistent", idle, idle, move || {
+                began + Duration::from_secs(clock.load(Ordering::SeqCst))
+            });
+        for step in 1..=8 {
+            // Each exchange advances the server's clock by half its idle window, without
+            // making either thread wait for wall time or requiring it to win a short deadline.
+            elapsed.store(step * 5, Ordering::SeqCst);
             conn.write_all(b"ping\n").unwrap();
             assert_eq!(reply(&mut conn), "ok ping\n");
-            thread::sleep(Duration::from_millis(100));
         }
-        assert!(began.elapsed() > idle);
+        assert!(Duration::from_secs(elapsed.load(Ordering::SeqCst)) > idle);
         drop(conn);
         assert_eq!(server.join().unwrap(), ["ping"; 8]);
         drop(fixture);
+    }
+
+    #[test]
+    fn the_initial_request_can_have_a_longer_window_than_later_requests() {
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join("clock.sock");
+        let mut listener = ipc::Listener::bind(&path).unwrap();
+        let mut conn = ipc::Connection::connect(&path).unwrap();
+        let server = listener.accept(true).unwrap();
+        conn.write_all(b"ping\n").unwrap();
+        let mut clock = Instant::now();
+        let mut seen = Vec::new();
+        serve_client_with_clock(
+            server,
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+            || {
+                let now = clock;
+                clock += Duration::from_secs(1);
+                now
+            },
+            |line| {
+                assert_eq!(
+                    line, "ping",
+                    "a request after the short idle window was handled"
+                );
+                seen.push(line.to_owned());
+                // Queue the next request only after the first read has completed. The
+                // supplied clock expires the short window before the next read, so
+                // reusing the initial window handles this request and fails immediately.
+                conn.write_all(b"expired\n").unwrap();
+                "ok".into()
+            },
+        );
+        assert_eq!(seen, ["ping"]);
+    }
+
+    #[test]
+    fn a_request_expired_on_the_supplied_clock_is_not_handled() {
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join("clock.sock");
+        let mut listener = ipc::Listener::bind(&path).unwrap();
+        let mut conn = ipc::Connection::connect(&path).unwrap();
+        let server = listener.accept(true).unwrap();
+        conn.write_all(b"ping\n").unwrap();
+        let mut clock = Instant::now();
+        serve_client_with_clock(
+            server,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            || {
+                let now = clock;
+                clock += Duration::from_secs(6);
+                now
+            },
+            |_| panic!("an expired request was handled"),
+        );
+    }
+
+    #[test]
+    fn a_fixture_can_receive_its_first_request_after_three_seconds() {
+        for (initial, expected) in [(Duration::from_secs(5), 1), (REQUEST_IDLE, 0)] {
+            let fixture = crate::socket_dir::SocketDir::new();
+            let path = fixture.path().join("delay.sock");
+            let mut listener = ipc::Listener::bind(&path).unwrap();
+            let mut client = ipc::Connection::connect(&path).unwrap();
+            let server = listener.accept(true).unwrap();
+            client.write_all(b"ping\n").unwrap();
+            let mut clock = Instant::now();
+            let mut handled = 0;
+            serve_client_with_clock(
+                server,
+                initial,
+                REQUEST_IDLE,
+                || {
+                    let now = clock;
+                    clock += Duration::from_secs(3);
+                    now
+                },
+                |_| {
+                    handled += 1;
+                    "ok".into()
+                },
+            );
+            assert_eq!(handled, expected);
+        }
+    }
+
+    #[test]
+    fn the_supplied_initial_deadline_reaches_the_server() {
+        let fixture = crate::socket_dir::SocketDir::new();
+        let path = fixture.path().join("initial.sock");
+        let mut listener = ipc::Listener::bind(&path).unwrap();
+        let mut client = ipc::Connection::connect(&path).unwrap();
+        let server = listener.accept(true).unwrap();
+        client.write_all(b"ping\n").unwrap();
+        serve_client_with_initial_deadline(server, Duration::ZERO, |_| {
+            panic!("the expired initial deadline was replaced")
+        });
+    }
+
+    #[test]
+    fn a_reached_request_deadline_has_no_time_left() {
+        let now = Instant::now();
+        let next = now + Duration::from_nanos(1);
+        assert_eq!(request_time_left(next, now), Some(Duration::from_nanos(1)));
+        assert_eq!(request_time_left(now, now), None);
+        assert_eq!(request_time_left(now, next), None);
     }
 
     #[test]
@@ -882,7 +1039,7 @@ mod tests {
             stream.get_mut().write_all(b"ok pong\n").unwrap();
             line
         });
-        let reply = request(&path, "status", Duration::from_secs(2)).unwrap();
+        let reply = request(&path, "status", Duration::from_secs(5)).unwrap();
         assert_eq!(reply, "ok pong");
         assert_eq!(server.join().unwrap(), "status\n");
         let _ = std::fs::remove_file(&path);

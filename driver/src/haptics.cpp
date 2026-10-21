@@ -100,18 +100,20 @@ std::string HapticSender::default_socket_path()
 }
 #endif
 
-HapticSender::HapticSender() = default;
+HapticSender::HapticSender(uint32_t timeout_ms) : control_(timeout_ms) {}
 
-HapticSender::HapticSender(std::string socket_path, std::string fallback) : control_(std::move(socket_path), std::move(fallback)) {}
+HapticSender::HapticSender(std::string socket_path, std::string fallback, uint32_t timeout_ms)
+    : control_(std::move(socket_path), std::move(fallback), timeout_ms) {}
 
-ControlClient::ControlClient() : ControlClient(HapticSender::default_socket_path())
+ControlClient::ControlClient(uint32_t timeout_ms) : ControlClient(HapticSender::default_socket_path(), {}, timeout_ms)
 {
 #ifndef _WIN32
 	paths_[1] = container_socket_path(geteuid());
 #endif
 }
 
-ControlClient::ControlClient(std::string path, std::string fallback) : paths_{std::move(path), std::move(fallback)} {}
+ControlClient::ControlClient(std::string path, std::string fallback, uint32_t timeout_ms)
+    : paths_{std::move(path), std::move(fallback)}, timeout_ms_(timeout_ms) {}
 
 #ifndef _WIN32
 std::string container_socket_path(uint32_t uid)
@@ -238,11 +240,11 @@ static bool owned_by_this_user(HANDLE pipe)
 	return ours;
 }
 
-/* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
-bool send_control_line(const std::string &path, const std::string &line)
+/* One request, one reply line; the 100 ms default keeps a stuck daemon from piling commands up. */
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms)
 {
 	const std::wstring name = control_pipe_name(path);
-	if (name.empty())
+	if (name.empty() || !timeout_ms)
 		return false;
 	auto open = [&] {
 		// identification only: the server may check who we are, not act as us
@@ -251,7 +253,7 @@ bool send_control_line(const std::string &path, const std::string &line)
 	};
 	HANDLE pipe = open();
 	// every instance busy for a moment: the daemon offers the next one as it accepts
-	if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeW(name.c_str(), 100))
+	if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeW(name.c_str(), timeout_ms))
 		pipe = open();
 	if (pipe == INVALID_HANDLE_VALUE)
 		return false;
@@ -262,11 +264,11 @@ bool send_control_line(const std::string &path, const std::string &line)
 	HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	bool ok = event != nullptr;
 	DWORD moved = 0;
-	ok = ok && pipe_io(pipe, event, true, const_cast<char *>(line.data()), static_cast<DWORD>(line.size()), &moved, 100) &&
+	ok = ok && pipe_io(pipe, event, true, const_cast<char *>(line.data()), static_cast<DWORD>(line.size()), &moved, timeout_ms) &&
 	     moved == line.size();
 	if (ok) {
 		char reply[256];
-		ok = pipe_io(pipe, event, false, reply, sizeof reply - 1, &moved, 100) && moved >= 2 && std::strncmp(reply, "ok", 2) == 0;
+		ok = pipe_io(pipe, event, false, reply, sizeof reply - 1, &moved, timeout_ms) && moved >= 2 && std::strncmp(reply, "ok", 2) == 0;
 	}
 	if (event)
 		CloseHandle(event);
@@ -297,16 +299,16 @@ static void report_long_control_path(const std::string &path, size_t limit)
 
 /* Only an error from connect may select another endpoint. Once connected, a failed write or
  * reply does not say whether the command arrived, so it must never be sent a second time. */
-static int connect_control_socket(const std::string &path, int *connect_error)
+static int connect_control_socket(const std::string &path, int *connect_error, uint32_t timeout_ms)
 {
 	*connect_error = 0;
 	sockaddr_un addr{};
-	if (path.size() >= sizeof addr.sun_path)
+	if (path.size() >= sizeof addr.sun_path || !timeout_ms)
 		return -1;
 	const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0)
 		return -1;
-	timeval tv{0, 100'000};
+	timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	addr.sun_family = AF_UNIX;
@@ -319,7 +321,7 @@ static int connect_control_socket(const std::string &path, int *connect_error)
 	return fd;
 }
 
-/* One request, one reply line; 100 ms timeouts so a stuck daemon cannot pile commands up. */
+/* One request, one reply line; the 100 ms default keeps a stuck daemon from piling commands up. */
 static bool exchange_control_line(int fd, const std::string &line)
 {
 	bool ok = send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size());
@@ -332,10 +334,10 @@ static bool exchange_control_line(int fd, const std::string &line)
 	return ok;
 }
 
-bool send_control_line(const std::string &path, const std::string &line)
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms)
 {
 	int error = 0;
-	const int fd = connect_control_socket(path, &error);
+	const int fd = connect_control_socket(path, &error, timeout_ms);
 	return fd >= 0 && exchange_control_line(fd, line);
 }
 #endif
@@ -343,7 +345,7 @@ bool send_control_line(const std::string &path, const std::string &line)
 bool ControlClient::send(const std::string &line)
 {
 #ifdef _WIN32
-	return send_control_line(paths_[0], line);
+	return send_control_line(paths_[0], line, timeout_ms_);
 #else
 	path_too_long_ = false;
 	for (unsigned attempt = 0; attempt < 2; attempt++) {
@@ -367,7 +369,7 @@ bool ControlClient::send(const std::string &line)
 				return false;
 			error = ENOENT; // a vanished cached directory can fail back; never connect without validation
 		} else {
-			fd = connect_control_socket(path, &error);
+			fd = connect_control_socket(path, &error, timeout_ms_);
 		}
 		if (fd >= 0) {
 			last_ = which;

@@ -10,6 +10,66 @@ before column evaluates `T=80`, `P=7`, `N=20`, and the largest applicable
 suffix/UID. All `T`-dependent paths were unbounded by the tests. Linux's
 `sun_path[108]` permits 107 pathname bytes.
 
+## Peer scheduling and timeouts
+
+Positive driver socket exchanges use `kControlTestTimeoutMs` (5 seconds), passed
+through the default-path and explicit-path `ControlClient` and `HapticSender`
+constructors. The production default remains 100 ms. The `--status` contract
+probe retains that production default; fixture-based contract exchanges use the
+longer budget. Socket send and receive budgets and Windows pipe waits receive
+the same injected value. Zero is rejected rather than disabling Linux timeouts.
+
+The driver contract records the time its SHM waiter returns and compares it to
+the fixture's published timestamp. The 2-second wake-latency assertion excludes
+the control reply, which has the full 5-second fixture budget. On Linux the
+fixture observes the waiter's futex syscall through procfs before publication;
+on Windows it also checks that the expected manual-reset event was signalled.
+Its server uses a cancellation channel as well as the `exit` request: failed
+shutdown delivery wakes the idle server without needing another socket
+connection. The server's nonblocking accept loop waits on that channel for up to
+10 ms between polls.
+The fixture allows 5 seconds to deliver the first request after connecting;
+the daemon keeps its 2-second initial and subsequent request windows. An
+injected-clock regression models first delivery after 3 seconds, accepting it
+with the fixture window and rejecting it with the daemon's window. A queued
+request with an expired initial window checks that the public wrapper forwards
+that window. Neither regression sleeps.
+An exact deadline is expired before setting the platform timeout, even if two
+clock reads are equal. A fixed-clock boundary regression checks time before,
+at and after expiry without relying on the platform's zero-timeout behavior.
+
+`test_control_timeout` checks the requested socket options exactly, then reads
+back both installed options. It accepts kernel tick rounding and queues the reply
+inside the connection hook before the client's exchange, so no reply thread has
+to beat the deadline. It covers free sends and both constructor forms of clients
+and haptic workers, at 100 ms and 5 seconds, without sleeps or retries.
+
+Rust successful round trips allow 5 seconds. The partial-request test separates
+its initial successful exchange from the deliberately short subsequent idle
+window. The persistent-request test advances an injected clock between replies
+instead of sleeping: it still exchanges eight requests over more than one idle
+window. A queued-request regression proves that expiry uses the supplied clock.
+Tests deliberately checking silent reads, expired requests, full backlogs or
+stopped listeners keep their short deadlines; no peer must reply within them.
+The disconnect test already gates peer closure before writing; station-format
+tests do not open sockets.
+
+Daemon admission tests wait for test-only completion notifications emitted after
+the client slot is dropped, then send one request with a 5-second budget. EOF
+alone can arrive before the slot is free; successful requests do not retry that
+race. The observer and its channel are absent from production builds.
+
+Python setup fixtures keep the release CLI's production deadlines: 750 ms for
+status and 1 second for inputs. Before a load measurement was stopped, seven
+complete 15-test suites passed (105 tests, no failures) with the CLI and mock
+server pinned to one CPU alongside 256 low-priority competitors. The interrupted
+eighth attempt is excluded. Under the same load, the 100 ms driver probe failed
+30 of 30 attempts; its 5-second fixture version passed all 30. The setup results
+support keeping its existing deadlines without a build or runtime override;
+they do not measure exact request latency. Host-wide spinner pools are no longer
+used: future slow-CPU checks must constrain only the tested process tree with a
+CPU quota.
+
 ## Fixture ownership and bounds
 
 The Rust, native C++ and Python socket fixtures create a unique `0700` directory
@@ -61,6 +121,10 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `src/control.rs` | `partial_bytes_do_not_extend_a_request_deadline` | T + P + 28 = 115 | 42 |
 | `src/control.rs` | `complete_requests_keep_a_persistent_connection_alive` | T + P + 31 = 118 | 45 |
 | `src/control.rs` | `an_overlong_complete_request_is_not_handled` | T + P + 25 = 112 | 39 |
+| `src/control.rs` | `the_initial_request_can_have_a_longer_window_than_later_requests` | fixture introduced with short paths | 40 |
+| `src/control.rs` | `a_request_expired_on_the_supplied_clock_is_not_handled` | fixture introduced with short paths | 40 |
+| `src/control.rs` | `a_fixture_can_receive_its_first_request_after_three_seconds` | fixture introduced with short paths | 40 |
+| `src/control.rs` | `the_supplied_initial_deadline_reaches_the_server` | fixture introduced with short paths | 42 |
 | `src/control.rs` | `request_roundtrip` | T + P + 20 = 107 | 42 |
 | `src/control.rs` | `a_request_times_out_when_the_daemon_does_not_accept_connections` | T + P + 23 = 110 | 42 |
 | `src/platform/mod.rs` | `an_expired_request_does_not_consume_its_reply` | T + P + 33 = 120 | 39 |
@@ -81,6 +145,8 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `examples/driver_contract.rs` | `legacy control endpoint` | T + P + 20 = 107 | 42 |
 | `examples/driver_contract.rs` | `private fallback endpoint` | T + P + 36 = 123 | 50 |
 | `examples/driver_contract.rs` | `missing legacy candidate` | T + P + 23 = 110 | 45 |
+| `examples/driver_contract.rs` | `a_failed_shutdown_before_exit_is_sent_releases_the_server` | fixture introduced with short paths | 39 |
+| `driver/tests/test_control_timeout.cpp` | `timeout configuration` | fixture introduced with short paths | 51 |
 | `driver/tests/test_control_disconnect.cpp` | `control / fallback` | T + P + 30 / 31 = 117 / 118 | 42 / 43 |
 | `driver/tests/test_haptics.cpp` | `sends_to_the_socket` | T + P + 16 = 103 | 42 |
 | `driver/tests/test_control_client.cpp` | `legacy / shared fixtures` | 39 + R / 47 + R = 45 / 53 | 41 / 49 |

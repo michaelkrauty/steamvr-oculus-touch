@@ -22,8 +22,8 @@ HapticCommand clamp_haptic(int hand, float duration_s, float frequency_hz, float
 std::string haptic_line(const HapticCommand &c);
 
 /* One request line to the daemon's control socket, one reply line back ("ok..." is success);
- * 100 ms timeouts, so a stuck daemon cannot hold the caller. */
-bool send_control_line(const std::string &path, const std::string &line);
+ * Defaults to 100 ms; socket fixtures can allow more time for their peer to be scheduled. */
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms = 100);
 #ifndef _WIN32
 /* The same UID-scoped path and private-directory policy as src/platform/unix.rs. */
 std::string container_socket_path(uint32_t uid);
@@ -34,8 +34,8 @@ bool control_directory_is_private(const std::string &dir, uint32_t uid);
  * single path never falls through to another daemon. */
 class ControlClient {
 public:
-	ControlClient();
-	explicit ControlClient(std::string path, std::string fallback = {});
+	explicit ControlClient(uint32_t timeout_ms = 100);
+	explicit ControlClient(std::string path, std::string fallback = {}, uint32_t timeout_ms = 100);
 	bool send(const std::string &line);
 	const std::string &path() const { return paths_[last_]; }
 #ifndef _WIN32
@@ -46,6 +46,7 @@ public:
 private:
 	std::string paths_[2];
 	unsigned last_ = 0;
+	uint32_t timeout_ms_;
 #ifndef _WIN32
 	unsigned warned_long_paths_ = 0;
 	bool path_too_long_ = false;
@@ -61,8 +62,8 @@ std::wstring control_pipe_name(const std::string &path);
  * per hand wins, and submit() never blocks the caller. */
 class HapticSender {
 public:
-	HapticSender();
-	explicit HapticSender(std::string socket_path, std::string fallback = {});
+	explicit HapticSender(uint32_t timeout_ms = 100);
+	explicit HapticSender(std::string socket_path, std::string fallback = {}, uint32_t timeout_ms = 100);
 	~HapticSender();
 	void start();
 	void stop();

@@ -3484,6 +3484,9 @@ fn make_usb_thread_realtime() {
 /// The control endpoint's server; requests stop being handled at `stop`.
 struct ControlServer {
     one_at_a_time: Arc<Mutex<()>>,
+    // A Mutex keeps the server Sync: tests share it across threads through an Arc.
+    #[cfg(test)]
+    released: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl ControlServer {
@@ -3640,10 +3643,16 @@ fn with_container_control(
 fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer {
     let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let one_at_a_time = Arc::new(Mutex::new(()));
+    #[cfg(test)]
+    let (release, released) = std::sync::mpsc::channel();
     let server = ControlServer {
         one_at_a_time: Arc::clone(&one_at_a_time),
+        #[cfg(test)]
+        released: Mutex::new(released),
     };
     for mut listener in listeners {
+        #[cfg(test)]
+        let release = release.clone();
         let (d, clients, one_at_a_time) = (
             Arc::clone(&d),
             Arc::clone(&clients),
@@ -3672,12 +3681,16 @@ fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer
                         continue; // dropped: closed at once
                     };
                     let (d, one_at_a_time) = (Arc::clone(&d), Arc::clone(&one_at_a_time));
+                    #[cfg(test)]
+                    let release = release.clone();
                     let spawned =
                         thread::Builder::new()
                             .name("cv1t-client".into())
                             .spawn(move || {
-                                let _slot = slot;
                                 serve_client(&d, conn, &one_at_a_time);
+                                drop(slot);
+                                #[cfg(test)]
+                                let _ = release.send(());
                             });
                     if spawned.is_err() {
                         log("control endpoint: no thread for a client");
@@ -6439,7 +6452,7 @@ mod tests {
             listeners.push(ipc::Listener::bind(&second_endpoint).unwrap());
             listeners
         };
-        let _server = serve_control(Arc::new(status_daemon()), listeners);
+        let server = serve_control(Arc::new(status_daemon()), listeners);
         let mut clients = Vec::new();
         for i in 0..MAX_CLIENTS {
             let path = if i % 2 == 0 {
@@ -6459,15 +6472,18 @@ mod tests {
             .iter_mut()
             .all(|conn| matches!(conn.read(&mut [0]), Ok(0)));
         drop(clients);
+        // EOF can be observed before its client thread drops the admission slot.
+        for _ in 0..MAX_CLIENTS {
+            server
+                .released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
         let served = [&endpoint, &second_endpoint].iter().all(|endpoint| {
-            (0..50).any(|_| {
-                let answered = control::request(endpoint, "status", Duration::from_secs(2))
-                    .is_ok_and(|reply| reply.starts_with("ok {"));
-                if !answered {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                answered
-            })
+            control::request(endpoint, "status", Duration::from_secs(5))
+                .is_ok_and(|reply| reply.starts_with("ok {"))
         });
         let _ = fs::remove_dir_all(dir);
         assert!(closed, "idle clients kept the control slots");
@@ -6558,17 +6574,18 @@ mod tests {
             Reply::Closed,
             "one client over the limit"
         );
+        // A queued completion also proves a slot is free: no new client has claimed it.
         idle.pop();
-        // the freed slot serves the next client once its thread has seen the hang-up
-        let served = (0..50).any(|_| {
-            let mut next = connect();
-            let ok = next.write_all(b"status\n").is_ok() && answered(reply(&mut next));
-            if !ok {
-                thread::sleep(Duration::from_millis(20));
-            }
-            ok
-        });
-        assert!(served);
+        control
+            .released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let mut next = connect();
+        next.write_all(b"status\n").unwrap();
+        assert!(answered(reply(&mut next)));
+        drop(next);
         drop(idle);
 
         for endpoint in [&endpoint, &second_endpoint] {

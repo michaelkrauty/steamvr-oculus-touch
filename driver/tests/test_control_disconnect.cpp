@@ -2,6 +2,7 @@
 // Copyright 2026 michaelkrauty
 
 #include "haptics.h"
+#include "control_test.h"
 #include "socket_dir.h"
 #include <cassert>
 #include <csignal>
@@ -69,7 +70,7 @@ int main()
         close(gate[1]);
         peer_closed_fd = gate[0];
         signal(SIGPIPE, SIG_DFL);
-        cv1t::ControlClient client(path, fallback);
+        cv1t::ControlClient client(path, fallback, kControlTestTimeoutMs);
         const bool ok = client.send("haptic right 0.1 160 1\n");
         _exit(ok ? 1 : 0);
     }

@@ -2,6 +2,7 @@
 // Copyright 2026 michaelkrauty
 
 #include "haptics.h"
+#include "control_test.h"
 #include "socket_dir.h"
 #include <cassert>
 #include <cerrno>
@@ -112,13 +113,13 @@ static void runtime_is_tried_first_and_an_explicit_path_stays_exact()
 {
 	Paths p;
 	Server legacy(p.legacy), shared(p.shared);
-	ControlClient c(p.legacy, p.shared);
+	ControlClient c(p.legacy, p.shared, kControlTestTimeoutMs);
 	auto reply = legacy.reply();
 	assert(c.send("status\n"));
 	reply.join();
 	assert(!shared.pending());
 	assert(unlink(p.legacy.c_str()) == 0);
-	assert(!ControlClient(p.legacy).send("status\n"));
+	assert(!ControlClient(p.legacy, {}, kControlTestTimeoutMs).send("status\n"));
 	assert(!shared.pending());
 }
 
@@ -126,7 +127,7 @@ static void a_missing_socket_falls_back_and_the_working_endpoint_is_remembered()
 {
 	Paths p;
 	Server shared(p.shared);
-	ControlClient c(p.legacy, p.shared);
+	ControlClient c(p.legacy, p.shared, kControlTestTimeoutMs);
 	auto first = shared.reply();
 	assert(c.send("status\n"));
 	first.join();
@@ -147,7 +148,7 @@ static void a_refused_socket_falls_back()
 	Paths p;
 	{ Server stale(p.legacy); }
 	Server shared(p.shared);
-	ControlClient c(p.legacy, p.shared);
+	ControlClient c(p.legacy, p.shared, kControlTestTimeoutMs);
 	auto reply = shared.reply();
 	assert(c.send("status\n"));
 	reply.join();
@@ -158,7 +159,7 @@ static void a_missing_cached_directory_falls_back_but_an_unsafe_one_does_not()
 	for (bool missing : {true, false}) {
 		Paths p;
 		Server shared(p.shared);
-		ControlClient c(p.legacy, p.shared);
+		ControlClient c(p.legacy, p.shared, kControlTestTimeoutMs);
 		auto first = shared.reply();
 		assert(c.send("status\n"));
 		first.join();
@@ -185,14 +186,14 @@ static void other_connection_errors_do_not_fall_back()
 	Server shared(p.shared);
 	FILE *file = fopen(p.legacy.c_str(), "w");
 	assert(file && fclose(file) == 0);
-	assert(!ControlClient(p.legacy + "/socket", p.shared).send("status\n")); // ENOTDIR
+	assert(!ControlClient(p.legacy + "/socket", p.shared, kControlTestTimeoutMs).send("status\n")); // ENOTDIR
 	assert(!shared.pending());
-	assert(!ControlClient(p.root + "/" + std::string(200, 'x'), p.shared).send("status\n")); // too long
+	assert(!ControlClient(p.root + "/" + std::string(200, 'x'), p.shared, kControlTestTimeoutMs).send("status\n")); // too long
 	assert(!shared.pending());
 	if (geteuid() != 0) {
 		assert(mkdir((p.root + "/denied").c_str(), 0700) == 0);
 		assert(chmod((p.root + "/denied").c_str(), 0000) == 0);
-		assert(!ControlClient(p.root + "/denied/socket", p.shared).send("status\n")); // EACCES
+		assert(!ControlClient(p.root + "/denied/socket", p.shared, kControlTestTimeoutMs).send("status\n")); // EACCES
 		assert(!shared.pending());
 		assert(chmod((p.root + "/denied").c_str(), 0700) == 0);
 	}
@@ -203,7 +204,7 @@ static void a_failed_acknowledgement_does_not_resend_the_request()
 	for (const std::string line : {"error rejected\n", "o", ""}) {
 		Paths p;
 		Server legacy(p.legacy), shared(p.shared);
-		ControlClient c(p.legacy, p.shared);
+		ControlClient c(p.legacy, p.shared, kControlTestTimeoutMs);
 		auto reply = legacy.reply(line);
 		assert(!c.send("status\n"));
 		reply.join();
@@ -219,13 +220,13 @@ static void the_shared_socket_requires_a_private_real_directory()
 	assert(!cv1t::control_directory_is_private(p.root + "/shared", geteuid() + 1));
 	for (mode_t mode : {0755, 0770, 01700}) {
 		assert(chmod((p.root + "/shared").c_str(), mode) == 0);
-		assert(!ControlClient(p.legacy, p.shared).send("status\n"));
+		assert(!ControlClient(p.legacy, p.shared, kControlTestTimeoutMs).send("status\n"));
 		assert(!shared.pending());
 	}
 	assert(chmod((p.root + "/shared").c_str(), 0700) == 0);
 	assert(rename((p.root + "/shared").c_str(), (p.root + "/real").c_str()) == 0);
 	assert(symlink((p.root + "/real").c_str(), (p.root + "/shared").c_str()) == 0);
-	assert(!ControlClient(p.legacy, p.shared).send("status\n"));
+	assert(!ControlClient(p.legacy, p.shared, kControlTestTimeoutMs).send("status\n"));
 	assert(!shared.pending());
 }
 
@@ -233,7 +234,7 @@ static void the_haptic_worker_uses_and_remembers_the_same_fallback()
 {
 	Paths p;
 	Server shared(p.shared);
-	cv1t::HapticSender haptics(p.legacy, p.shared);
+	cv1t::HapticSender haptics(p.legacy, p.shared, kControlTestTimeoutMs);
 	haptics.start();
 	auto first = shared.reply("ok\n", "haptic right 0.2500 160.0 1.000\n");
 	haptics.submit(1, 0.25f, 160.0f, 1.0f);
@@ -259,14 +260,14 @@ static void default_constructors_reach_the_shared_socket(bool worker)
 	assert(cv1t::HapticSender::default_socket_path() == p.root + "/missing-runtime/cv1touch/control.sock");
 	Server shared(path);
 	if (worker) {
-		cv1t::HapticSender haptics;
+		cv1t::HapticSender haptics(kControlTestTimeoutMs);
 		haptics.start();
 		auto reply = shared.reply("ok\n", "haptic right 0.2500 160.0 1.000\n");
 		haptics.submit(1, 0.25f, 160.0f, 1.0f);
 		reply.join();
 		haptics.stop();
 	} else {
-		ControlClient client;
+		ControlClient client(kControlTestTimeoutMs);
 		auto reply = shared.reply();
 		assert(client.send("status\n"));
 		reply.join();

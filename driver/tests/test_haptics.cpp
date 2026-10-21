@@ -22,6 +22,7 @@
 
 #include "cv1touch_shm.h"
 #include "haptics.h"
+#include "control_test.h"
 #include "socket_dir.h"
 
 using namespace cv1t;
@@ -163,7 +164,7 @@ static void sends_to_the_socket()
 	assert(!name.empty());
 	HANDLE srv = serve_pipe(name, this_user_only());
 	assert(srv != INVALID_HANDLE_VALUE);
-	HapticSender s(path);
+	HapticSender s(path, {}, kControlTestTimeoutMs);
 	s.start();
 	s.submit(CV1T_HAND_RIGHT, 0.25f, 160.0f, 1.0f);
 	assert(ConnectNamedPipe(srv, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED);
@@ -192,7 +193,7 @@ static std::string logged_for(const std::string &path, bool worker)
 	assert(dup2(output[1], STDERR_FILENO) == STDERR_FILENO);
 	close(output[1]);
 	if (worker) {
-		HapticSender sender(path);
+		HapticSender sender(path, {}, kControlTestTimeoutMs);
 		sender.start();
 		sender.submit(CV1T_HAND_LEFT, 0.01f, 320.0f, 0.5f);
 		// the worker always says why it could not deliver the command
@@ -200,7 +201,7 @@ static std::string logged_for(const std::string &path, bool worker)
 		assert(poll(&ready, 1, 5000) == 1 && (ready.revents & POLLIN));
 		sender.stop();
 	} else {
-		ControlClient client(path);
+		ControlClient client(path, {}, kControlTestTimeoutMs);
 		assert(!client.send("stations\n"));
 		assert(!client.send("stations\n")); // one warning per endpoint, without a haptic event
 	}
@@ -281,7 +282,7 @@ static void sends_to_the_socket()
 	assert(path.size() < sizeof addr.sun_path);
 	std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
 	assert(bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0 && listen(srv, 4) == 0);
-	HapticSender s(path);
+	HapticSender s(path, {}, kControlTestTimeoutMs);
 	s.start();
 	s.submit(CV1T_HAND_RIGHT, 0.25f, 160.0f, 1.0f);
 	int conn = accept(srv, nullptr, nullptr);

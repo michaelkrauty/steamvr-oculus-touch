@@ -31,10 +31,11 @@ foreach t : ['test_pose', 'test_inputs', 'test_haptics', 'test_shm_client', 'tes
     cpp_args: ['-DCV1T_DRIVER_TEST']))
 endforeach
 # Run by examples/driver_contract.rs against the daemon's own shared-memory and control code.
-executable('test_daemon_contract', 'tests/test_daemon_contract.cpp', driver_common,
+contract_test = executable('test_daemon_contract', 'tests/test_daemon_contract.cpp', driver_common,
   include_directories: driver_inc,
   dependencies: [openvr_dep, threads_dep],
   cpp_args: ['-DCV1T_DRIVER_TEST'])
+test('test_daemon_contract_timing', contract_test, args: ['--timing'])
 if windows
   test('driver_exports', import('python').find_installation(), args: [files('tests/check_exports.py'), driver_lib])
   subdir_done()
@@ -53,3 +54,11 @@ test('test_control_disconnect', executable('test_control_disconnect',
   dependencies: [openvr_dep, threads_dep],
   cpp_args: ['-DCV1T_DRIVER_TEST'],
   link_args: ['-Wl,--wrap=write', '-Wl,--wrap=send']))
+
+# Check timeout configuration with replies already queued, independent of scheduling.
+test('test_control_timeout', executable('test_control_timeout',
+  'tests/test_control_timeout.cpp', driver_common,
+  include_directories: driver_inc,
+  dependencies: [openvr_dep, threads_dep],
+  cpp_args: ['-DCV1T_DRIVER_TEST'],
+  link_args: ['-Wl,--wrap=connect', '-Wl,--wrap=setsockopt']))
