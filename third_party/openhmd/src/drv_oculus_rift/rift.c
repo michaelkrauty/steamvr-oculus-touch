@@ -427,7 +427,6 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	uint64_t cv1touch_received_ns = local_ts;
 	// The top bits are carrying something unknown. Ignore them
 	uint8_t buttons = msg->touch.buttons & 0xf;
-	rift_touch_calibration *c = &touch->calibration;
 
 	if (touch->buttons != buttons) {
 		LOGV ("touch controller %d buttons now %x",
@@ -435,23 +434,22 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	}
 	touch->buttons = buttons;
 
-	if (touch_message_empty(msg))
+	if (touch_empty_activity(hmd->ctx, 0, touch, msg, cv1touch_received_ns))
 		return;
 
 	if (!touch->have_calibration && !update_touch_calibration(hmd, touch))
 		return;
 
 	// time in microseconds
-	cv1touch_sample_time t = touch_sample_time(touch, msg);
+	vec3f gyro, accel;
+	cv1touch_sample_time t = touch_sample_imu(hmd->ctx, 0, touch, msg, cv1touch_received_ns, &gyro, &accel);
 	int32_t dt = t.dt;
 	uint32_t device_ts = t.device_ts;
 	local_ts -= TICK_US_TO_NS(dt);
 
 	const double dt_s = 1e-6 * dt;
 	vec3f mag = {{0.0f, 0.0f, 0.0f}};
-	vec3f gyro;
-	vec3f accel;
-	touch_decode_imu(c, msg, &gyro, &accel);
+
 	touch->cv1touch_accel = accel;
 	touch->cv1touch_gyro = gyro;
 
@@ -1696,6 +1694,8 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radi
 		else
 			continue;
 		rift_touch_controller_t *touch = &dec->touch[t];
+		if (touch_empty_activity(dec->hmd->ctx, 1, touch, msg, received_ns))
+			continue;
 		if (!touch->have_calibration) {
 			rift_touch_controller_t *engine = &dec->hmd->touch_dev[t];
 			if (!__atomic_load_n(&engine->have_calibration, __ATOMIC_ACQUIRE))
@@ -1703,7 +1703,7 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radi
 			touch->calibration = engine->calibration;
 			touch->have_calibration = true;
 		}
-		if (touch_decode_sample(touch, msg, received_ns, &out[n]))
+		if (touch_decode_sample(dec->hmd->ctx, touch, msg, received_ns, &out[n]))
 			n++;
 	}
 	return n;

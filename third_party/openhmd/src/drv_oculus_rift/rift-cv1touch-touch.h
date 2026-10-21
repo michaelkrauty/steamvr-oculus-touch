@@ -23,6 +23,24 @@ static bool touch_message_empty(const pkt_rift_radio_message *msg)
 	      msg->touch.gyro[0] || msg->touch.gyro[1] || msg->touch.gyro[2]);
 }
 
+/* Both readers notify in decoded message order, using only that reader's clock. */
+static void touch_activity(ohmd_context *ctx, int reader, const rift_touch_controller_t *touch,
+        uint64_t received_ns, bool asleep, float gyro_squared)
+{
+	if (ctx && ctx->cv1touch_activity_cb)
+		ctx->cv1touch_activity_cb(ctx->cv1touch_activity_user, reader, touch->base.id,
+		        touch->cv1touch_clock_ns, received_ns, asleep, gyro_squared);
+}
+
+static bool touch_empty_activity(ohmd_context *ctx, int reader, const rift_touch_controller_t *touch,
+        const pkt_rift_radio_message *msg, uint64_t received_ns)
+{
+	if (!touch_message_empty(msg))
+		return false;
+	touch_activity(ctx, reader, touch, received_ns, true, 0.0f);
+	return true;
+}
+
 /* The message's IMU sample with the factory calibration applied: rad/s and m/s^2, IMU frame. */
 static void touch_decode_imu(const rift_touch_calibration *c, const pkt_rift_radio_message *msg, vec3f *gyro_out, vec3f *accel_out)
 {
@@ -141,17 +159,28 @@ static cv1touch_sample_time touch_sample_time(rift_touch_controller_t *touch, co
 	return t;
 }
 
+/* Notify after factory calibration, before a later sample can replace this motion evidence. */
+static cv1touch_sample_time touch_sample_imu(ohmd_context *ctx, int reader,
+        rift_touch_controller_t *touch, const pkt_rift_radio_message *msg, uint64_t received_ns,
+        vec3f *gyro, vec3f *accel)
+{
+	cv1touch_sample_time t = touch_sample_time(touch, msg);
+	touch_decode_imu(&touch->calibration, msg, gyro, accel);
+	touch_activity(ctx, reader, touch, received_ns, false,
+	        gyro->x * gyro->x + gyro->y * gyro->y + gyro->z * gyro->z);
+	return t;
+}
+
 /* A calibrated controller's message decoded on `touch`'s own state into `out` (IMU sample,
  * inputs, times), received at host time `received_ns`; false for an empty message, which only
  * carries the buttons. */
-static bool touch_decode_sample(rift_touch_controller_t *touch, const pkt_rift_radio_message *msg, uint64_t received_ns, ohmd_cv1touch_controller *out)
+static bool touch_decode_sample(ohmd_context *ctx, rift_touch_controller_t *touch, const pkt_rift_radio_message *msg, uint64_t received_ns, ohmd_cv1touch_controller *out)
 {
 	touch->buttons = msg->touch.buttons & 0xf;
-	if (touch_message_empty(msg))
+	if (touch_empty_activity(ctx, 1, touch, msg, received_ns))
 		return false;
-	cv1touch_sample_time t = touch_sample_time(touch, msg);
 	vec3f gyro, accel;
-	touch_decode_imu(&touch->calibration, msg, &gyro, &accel);
+	cv1touch_sample_time t = touch_sample_imu(ctx, 1, touch, msg, received_ns, &gyro, &accel);
 	touch_decode_inputs(touch, msg);
 
 	memset(out, 0, sizeof *out);

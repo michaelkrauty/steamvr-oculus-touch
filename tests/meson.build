@@ -166,6 +166,11 @@ test_hmd_tracker_failure = executable('test_hmd_tracker_failure', 'test_hmd_trac
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [dependency('hidapi-hidraw')], link_args: ['-Wl,--gc-sections', '-lm'])
 test('hmd_tracker_failure', test_hmd_tracker_failure)
+# Both production readers report Touch activity, sleep beacons included.
+test_radio_activity = executable('test_radio_activity', 'test_radio_activity.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [dependency('hidapi-hidraw')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('radio_activity', test_radio_activity)
 
 # Optional diagnostic streams must also unwind allocation/connection failures.
 test_pw_dep = dependency('libpipewire-0.3', required: false)

@@ -73,7 +73,7 @@ static void an_empty_message_carries_only_the_buttons(void)
 	pkt_rift_radio_message m = touch_msg(0, 0, 0, 0x13); /* top bits are not buttons */
 	m.touch.accel[2] = 0;
 	ohmd_cv1touch_controller out;
-	CHECK(!touch_decode_sample(&t, &m, 5, &out));
+	CHECK(!touch_decode_sample(NULL, &t, &m, 5, &out));
 	CHECK(t.buttons == 0x3);
 	CHECK(!t.time_valid); /* and no time passes */
 }
@@ -84,7 +84,7 @@ static void decodes_the_imu_sample_and_times(void)
 	calibrated(&t);
 	ohmd_cv1touch_controller out;
 	pkt_rift_radio_message m = touch_msg(500000, 1024, 16384, 0x1);
-	CHECK(touch_decode_sample(&t, &m, 777, &out));
+	CHECK(touch_decode_sample(NULL, &t, &m, 777, &out));
 	CHECK(out.calibrated && out.device_id == 2 && out.received_host_ns == 777);
 	CHECK(out.device_time_ns == rift_device_time_next(0, 0, 498000));
 	CHECK(out.buttons == 0x1);
@@ -102,8 +102,8 @@ static void the_decoders_state_is_its_own(void)
 	calibrated(&copy);
 	ohmd_cv1touch_controller out;
 	pkt_rift_radio_message a = touch_msg(3000000, 0, 0, 0), b = touch_msg(3002000, 0, 0, 0);
-	CHECK(touch_decode_sample(&copy, &a, 1, &out));
-	CHECK(touch_decode_sample(&copy, &b, 2, &out));
+	CHECK(touch_decode_sample(NULL, &copy, &a, 1, &out));
+	CHECK(touch_decode_sample(NULL, &copy, &b, 2, &out));
 	CHECK(!engine.time_valid && engine.cv1touch_clock_ns == 0);
 	cv1touch_sample_time ea = touch_sample_time(&engine, &a);
 	cv1touch_sample_time eb = touch_sample_time(&engine, &b);
@@ -111,8 +111,65 @@ static void the_decoders_state_is_its_own(void)
 	CHECK(eb.device_ns == out.device_time_ns);
 }
 
+static struct {
+	int n, reader[4], device[4];
+	uint64_t host[4], device_ns[4];
+	bool asleep[4];
+	float gyro_squared[4];
+} activity;
+
+static void ordered_activity(void *user, int reader, int device, uint64_t device_ns, uint64_t host, bool asleep, float gyro_squared)
+{
+	CHECK(user == &activity && activity.n < 4);
+	int n = activity.n++;
+	activity.reader[n] = reader;
+	activity.device[n] = device;
+	activity.host[n] = host;
+	activity.device_ns[n] = device_ns;
+	activity.asleep[n] = asleep;
+	activity.gyro_squared[n] = gyro_squared;
+}
+
+static void activity_follows_decoding_on_each_reader(void)
+{
+	for (int reader = 0; reader < 2; reader++) {
+		ohmd_context ctx = {0};
+		ctx.cv1touch_activity_cb = ordered_activity;
+		ctx.cv1touch_activity_user = &activity;
+		memset(&activity, 0, sizeof activity);
+		rift_touch_controller_t t;
+		calibrated(&t);
+		pkt_rift_radio_message data = touch_msg(1000000, 0, 0, 0), beacon = {0};
+		ohmd_cv1touch_controller out;
+		for (int i = 0; i < 4; i++) {
+			bool empty = i == 0 || i == 2;
+			pkt_rift_radio_message *m = empty ? &beacon : &data;
+			data.touch.gyro[2] = i == 1 ? 16384 : 0;
+			uint64_t host = 750 + i * 2;
+			if (reader == 0) {
+				if (!touch_empty_activity(&ctx, reader, &t, m, host)) {
+					vec3f gyro, accel;
+					touch_sample_imu(&ctx, reader, &t, m, host, &gyro, &accel);
+				}
+			} else {
+				CHECK(touch_decode_sample(&ctx, &t, m, host, &out) == !empty);
+			}
+			CHECK(activity.n == i + 1 && activity.reader[i] == reader);
+			CHECK(activity.device[i] == 2 && activity.host[i] == host);
+			CHECK(activity.asleep[i] == empty);
+			CHECK((activity.gyro_squared[i] > 0.25f) == (i == 1));
+			CHECK(activity.device_ns[i] == t.cv1touch_clock_ns);
+			if (!empty) data.touch.timestamp += 2000;
+		}
+		CHECK(activity.device_ns[0] == 0);
+		CHECK(activity.device_ns[1] == activity.device_ns[2]);
+		CHECK(activity.device_ns[3] > activity.device_ns[2]);
+	}
+}
+
 int main(void)
 {
+	activity_follows_decoding_on_each_reader();
 	times_samples_like_the_engine();
 	an_empty_message_carries_only_the_buttons();
 	decodes_the_imu_sample_and_times();

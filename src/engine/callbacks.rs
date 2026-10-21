@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-use crate::engine::{ffi_callback, Blob, EngineSink, FrameInfo};
+use crate::engine::{ffi_callback, Blob, EngineSink, FrameInfo, RadioReader};
 use std::ffi::{c_int, c_void};
 use std::sync::Arc;
 
@@ -58,5 +58,25 @@ pub(super) unsafe extern "C" fn report_cb(
             &[]
         };
         sink.report(source, ts, data);
+    });
+}
+
+pub(super) unsafe extern "C" fn activity_cb(
+    user: *mut c_void,
+    reader: c_int,
+    device: c_int,
+    device_ns: u64,
+    host_ns: u64,
+    asleep: bool,
+    gyro_squared: f32,
+) {
+    ffi_callback(|| unsafe {
+        let reader = match reader {
+            0 => RadioReader::Engine,
+            1 => RadioReader::Radio,
+            _ => return,
+        };
+        let sink = &*(user as *const Arc<dyn EngineSink>);
+        sink.activity(reader, device, device_ns, host_ns, asleep, gyro_squared);
     });
 }

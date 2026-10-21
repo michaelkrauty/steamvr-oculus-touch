@@ -167,6 +167,11 @@ typedef void (*ohmd_cv1touch_image_cb)(void *user, const ohmd_cv1touch_frame_inf
                                        int stride, const uint8_t *pixels);
 /* Called from the update thread for every HID report read from the headset or its radio. */
 typedef void (*ohmd_cv1touch_report_cb)(void *user, int source, uint64_t host_ns, const uint8_t *data, int len);
+/* Ordered Touch activity from the decoder that owns the clock: reader 0 is the engine, 1 the
+ * dedicated radio decoder. Empty beacons never advance device time. Set before opening devices;
+ * the callback must not allocate, lock or wait. */
+typedef void (*ohmd_cv1touch_activity_cb)(void *user, int reader, int device_id,
+        uint64_t device_ns, uint64_t received_ns, bool asleep, float gyro_squared);
 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_configure(ohmd_context *ctx, const ohmd_cv1touch_config *config);
 /* Complete lists, copied transactionally into the context. Call before opening devices.
@@ -179,6 +184,7 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_configure_sensors(ohmd_context 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_context *ctx, ohmd_cv1touch_report_cb cb, void *user);
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_activity_callback(ohmd_context *ctx, ohmd_cv1touch_activity_cb cb, void *user);
 OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device *device);
 /* Process-wide log receiver, installed before any engine worker starts and not changed while
  * workers run. Each callback borrows one complete line, at most 2048 bytes, with its original

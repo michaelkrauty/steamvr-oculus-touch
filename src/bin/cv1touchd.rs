@@ -245,6 +245,11 @@ struct Daemon {
     /// The render offsets as fitted (per hand, xyzw), before the tilt: what `tilt` turns, so that
     /// a republish does not turn them again.
     fitted_render_orient: Mutex<[[f32; 4]; 2]>,
+    /// Ordered decoded activity, kept apart by reader and hand. Only that reader's publisher
+    /// consumes its queue, so handoff cannot mix independent clocks or readers' HID delays.
+    radio_activity: [[cv1touch::hand::RadioActivityQueue; 2]; 2],
+    /// The current publisher's gap identity, lifecycle and plain use decision across handoff.
+    classification: [PublishedClassification; 2],
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
     /// Wakes the radio thread: new camera frames or bodies, or time to stop. It lives as long as
@@ -270,6 +275,16 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// The report as the radio thread read it, or the fallback engine delivered it.
+    fn radio_report(&self, report: &[u8], at: u64) {
+        if self.rec.active() {
+            self.rec
+                .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
+        }
+        self.flight
+            .note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
+    }
+
     fn wake_radio(&self) {
         self.radio_wake.wake();
     }
@@ -531,6 +546,26 @@ impl LandmarkWatch {
 }
 
 impl EngineSink for Daemon {
+    #[allow(clippy::too_many_arguments)]
+    fn activity(
+        &self,
+        reader: engine::RadioReader,
+        device: i32,
+        device_ns: u64,
+        host_ns: u64,
+        asleep: bool,
+        gyro_squared: f32,
+    ) {
+        if let Some(h) = pipeline::device_hand(device) {
+            self.radio_activity[reader as usize][h].push(cv1touch::hand::RadioActivity {
+                device_time_ns: device_ns,
+                received_host_ns: host_ns,
+                asleep,
+                moving: cv1touch::hand::in_use_motion(gyro_squared),
+            });
+        }
+    }
+
     fn frame(&self, info: &engine::FrameInfo, blobs: &[Blob]) {
         if self.rec.active() {
             self.rec.write(
@@ -568,16 +603,14 @@ impl EngineSink for Daemon {
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
         // the radio thread records its own copy of the radio's reports, stamped as they land
         let radio_thread = source == 1 && self.radio_on.load(Ordering::Acquire);
-        if self.rec.active() && !radio_thread {
+        if source == 1 && !radio_thread {
+            self.radio_report(data, ts);
+        } else if self.rec.active() && !radio_thread {
             self.rec.write(
                 recorder::RAW_REPORT,
                 ts,
                 &[&(source as u32).to_le_bytes(), data],
             );
-        }
-        if source == 1 && !radio_thread {
-            self.flight
-                .note(recorder::RAW_REPORT, ts, &[&1u32.to_le_bytes(), data]);
         }
         if source == 1 {
             for (hand, pct) in cv1touch::hand::battery_from_radio(data) {
@@ -648,7 +681,7 @@ fn publish_unavailable_with_lock<'a>(
     mut emit: impl FnMut(String),
     mut lock: impl FnMut(usize) -> Option<std::sync::MutexGuard<'a, HandPublisher>>,
 ) {
-    let mut notices = [None; 2];
+    let mut notices: [GapNotices; 2] = Default::default();
     let mut published = false;
     for h in [HAND_LEFT, HAND_RIGHT] {
         if d.quit.load(Ordering::Acquire) || worker_has(d, h, now) {
@@ -667,20 +700,26 @@ fn publish_unavailable_with_lock<'a>(
             continue;
         };
         let cause = unavailable_cause(d, h, &publisher, now);
+        {
+            let HandPublisher { hand, memory, .. } = &mut *publisher;
+            prepare_unavailable_classification_events(d, h, now, hand, memory, cause, |e| {
+                notices[h].push(e)
+            });
+        }
         let mut state = publisher.hand.unavailable(now, cause);
         inputs.apply(h, &mut state);
         drop(inputs);
-        notices[h] = publisher.publish(d, h, state, now);
+        if let Some(event) = publisher.publish(d, h, state, now) {
+            notices[h].push(event);
+        }
         published = true;
     }
     // Release both hands and wake readers before any notice can wait on stderr.
     if published {
         d.shm.signal();
     }
-    for (h, event) in notices.into_iter().enumerate() {
-        if let Some(event) = event {
-            emit(gap_notice(h, event));
-        }
+    for (h, event) in notices.iter().enumerate() {
+        event.emit(h, &mut emit);
     }
 }
 
@@ -1526,6 +1565,8 @@ fn engine_session(
         log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
     }
     let link = RadioLink::default();
+    // dropped after the scope below has joined the radio thread and the engine loop returned
+    let _classification = ClassificationSession(d, shm::now_ns);
     // the radio thread holds a decoder pointing into the engine: the scope joins it first
     engine_scope(&d.failed_worker, |scope| {
         let stop = StopRadio { d, link: &link };
@@ -2477,7 +2518,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
                 d.inputs.lock().unwrap().set_identity(h, identity);
             }
             link.engine_view.lock().unwrap()[h] = Some(c);
-            if !link.hands.engine_publishes(h) {
+            if !engine_publishes_hand_persistent(d, &link.hands, h, &c, shm::now_ns) {
                 continue;
             }
             if c.device_time_ns != holds.last_sample[h] {
@@ -2655,12 +2696,7 @@ fn radio_main(
             };
             let at = shm::now_ns();
             let report = &buf[..n];
-            if d.rec.active() {
-                d.rec
-                    .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
-            }
-            d.flight
-                .note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
+            d.radio_report(report, at);
             let (samples, k) = dec.decode(report, at);
             for s in &samples[..k] {
                 let Some(h) = pipeline::device_hand(s.device_id) else {
@@ -2674,7 +2710,7 @@ fn radio_main(
                 };
                 let c = radio_sample(&view, s);
                 let now = shm::now_ns();
-                publish_hand_state(d, h, &c, shm::now_ns, Some(pipe));
+                publish_radio_hand_state(d, h, &c, shm::now_ns, Some(pipe), log);
                 newest[h] = Some(*s);
                 last_publish[h] = now;
                 arrived[h] = Some(HoldParts {
@@ -2774,13 +2810,16 @@ fn refresh_radio_hands(
     let now = clock();
     let mut refreshed = false;
     for h in [HAND_LEFT, HAND_RIGHT] {
+        if !link.hands.radio_publishes(h) {
+            d.radio_activity[engine::RadioReader::Radio as usize][h].discard();
+        }
         if !link.hands.radio_publishes(h) || now.saturating_sub(last_publish[h]) < RADIO_REFRESH_NS
         {
             continue;
         }
         let view = link.engine_view.lock().unwrap()[h];
         if let (Some(s), Some(view)) = (newest[h], view) {
-            publish_hand_state_with_log(
+            publish_radio_hand_state(
                 d,
                 h,
                 &radio_sample(&view, &s),
@@ -2805,6 +2844,20 @@ fn refresh_radio_hands(
                 d.hand_workers[h].store(now, Ordering::Release);
                 continue;
             }
+            let mut gaps = GapNotices::default();
+            publisher.memory.reader = engine::RadioReader::Radio;
+            {
+                let HandPublisher { hand, memory, .. } = &mut *publisher;
+                prepare_hand_classification_events(
+                    d,
+                    h,
+                    HandClassification::Missing(GapCause::Radio),
+                    now,
+                    hand,
+                    memory,
+                    |e| gaps.push(e),
+                );
+            }
             let mut state = publisher.hand.unavailable(now, GapCause::Radio);
             inputs.apply(h, &mut state);
             drop(inputs);
@@ -2812,6 +2865,7 @@ fn refresh_radio_hands(
             drop(publisher);
             HandNotices {
                 gap: notice,
+                gaps,
                 ..Default::default()
             }
             .emit(d, h, &mut emit);
@@ -2909,9 +2963,159 @@ impl Rest {
     }
 }
 
+/// Ownership admits only one publisher per hand. All fields are stored before its release.
+/// Sample anchors and motion times use the process's shared host-monotonic clock. Publication
+/// does not stamp elapsed silence: a pause between classification and publication loses no time.
+#[derive(Default)]
+struct PublishedClassification {
+    reader: AtomicU32,
+    flags: AtomicU32,
+    recording_anchor_ns: std::sync::atomic::AtomicU64,
+    motion_host_ns: std::sync::atomic::AtomicU64,
+    confirmed_sleep_before_ns: std::sync::atomic::AtomicU64,
+}
+
+impl PublishedClassification {
+    fn inherit_with_clock(
+        &self,
+        memory: &mut HandMemory,
+        hand: &mut Hand,
+        clock: impl FnOnce() -> u64,
+    ) {
+        let reader = self.reader.load(Ordering::Acquire);
+        if reader != 0 && (!memory.history_loaded || reader != memory.reader as u32 + 1) {
+            let flags = self.flags.load(Ordering::Relaxed);
+            hand.inherit_classification_at(
+                cv1touch::hand::ClassificationHistory {
+                    gap_in_use: flags & 1 != 0,
+                    motion_host_ns: self.motion_host_ns.load(Ordering::Relaxed),
+                    gap: (flags & 4 != 0).then(|| cv1touch::hand::GapHistory {
+                        recording_anchor_ns: self.recording_anchor_ns.load(Ordering::Relaxed),
+                        confirmed_sleep_before_ns: self
+                            .confirmed_sleep_before_ns
+                            .load(Ordering::Relaxed),
+                        open: flags & 32 != 0,
+                        expired: flags & 8 != 0,
+                        silence_logged: flags & 16 != 0,
+                        spans_handoff: flags & 2 != 0,
+                        capture_requested: flags & 64 != 0,
+                        cause: match (flags >> 7) & 3 {
+                            1 => GapCause::Reopen,
+                            2 => GapCause::Stall,
+                            _ => GapCause::Radio,
+                        },
+                    }),
+                },
+                clock(),
+            );
+        }
+        memory.history_loaded = true;
+    }
+
+    fn publish(&self, reader: engine::RadioReader, hand: &Hand) {
+        let history = hand.classification_history();
+        let mut flags = u32::from(history.gap_in_use);
+        if let Some(gap) = history.gap {
+            flags |= 4
+                | (u32::from(gap.expired) << 3)
+                | (u32::from(gap.silence_logged) << 4)
+                | (u32::from(gap.open) << 5)
+                | (u32::from(gap.spans_handoff) << 1)
+                | (u32::from(gap.capture_requested) << 6)
+                | (match gap.cause {
+                    GapCause::Radio => 0,
+                    GapCause::Reopen => 1,
+                    GapCause::Stall => 2,
+                } << 7);
+            self.recording_anchor_ns
+                .store(gap.recording_anchor_ns, Ordering::Relaxed);
+            self.confirmed_sleep_before_ns
+                .store(gap.confirmed_sleep_before_ns, Ordering::Relaxed);
+        }
+        self.flags.store(flags, Ordering::Relaxed);
+        self.motion_host_ns
+            .store(history.motion_host_ns, Ordering::Relaxed);
+        self.reader.store(reader as u32 + 1, Ordering::Release);
+    }
+
+    /// Nothing for the next publisher to take over.
+    fn clear(&self) {
+        self.reader.store(0, Ordering::Release);
+    }
+}
+
+/// Readers have stopped before this guard drops. Finish their queued activity before resetting
+/// reader-local evidence. A Radio identity, its capture lifecycle and an already-proven nap
+/// survive reopening; a native hold never arms a capture. Read the clock after each hand lock.
+/// A failed worker may have left that state half-updated: it is left to the process exit.
+struct ClassificationSession<'a, F: Fn() -> u64>(&'a Daemon, F);
+
+impl<F: Fn() -> u64> Drop for ClassificationSession<'_, F> {
+    fn drop(&mut self) {
+        let d = self.0;
+        if thread::panicking() || d.failed_worker.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let mut notices: [GapNotices; 2] = Default::default();
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let mut publisher = d.hands[h].lock().unwrap_or_else(|e| e.into_inner());
+            if d.quit.load(Ordering::Acquire) {
+                d.classification[h].clear();
+            } else {
+                let now = (self.1)();
+                let cause = unavailable_cause(d, h, &publisher, now);
+                let HandPublisher { hand, memory, .. } = &mut *publisher;
+                if let Some(reader) = hand.classification_reader() {
+                    d.radio_activity[reader][h].drain_events(hand, |e| {
+                        record_gap(d, h, e, memory);
+                        notices[h].push(e);
+                    });
+                }
+                prepare_unavailable_classification_events(d, h, now, hand, memory, cause, |e| {
+                    notices[h].push(e)
+                });
+                hand.preserve_reopen_sleep();
+                // A non-publishing reader may have observed motion or a return. Its discarded
+                // timing is still evidence; its beacons cannot prove the outgoing gap asleep.
+                let outgoing = hand.classification_reader();
+                for reader in [engine::RadioReader::Engine, engine::RadioReader::Radio] {
+                    if outgoing == Some(reader as usize) {
+                        continue;
+                    }
+                    let queue = &d.radio_activity[reader as usize][h];
+                    queue.discard();
+                    d.classification[h].publish(memory.reader, hand);
+                    memory.reader = reader;
+                    hand.select_classification_reader(reader as usize);
+                    memory.history_loaded = false;
+                    d.classification[h].inherit_with_clock(memory, hand, || now);
+                    let mut capture = |e| {
+                        record_gap(d, h, e, memory);
+                        notices[h].push(e);
+                    };
+                    queue.drain_events(hand, &mut capture);
+                    unavailable_classification(d, hand, now, cause, &mut capture);
+                }
+                hand.reset_reader_evidence();
+                d.classification[h].publish(memory.reader, hand);
+            }
+            publisher.memory.history_loaded = false;
+            for reader in &d.radio_activity {
+                reader[h].reset();
+            }
+        }
+        for (h, notice) in notices.iter().enumerate() {
+            notice.emit(h, log);
+        }
+    }
+}
+
 /// What `publish_hand_state` keeps per hand from one sample to the next.
 #[derive(Debug, Default)]
 struct HandMemory {
+    /// The reader this publisher owns; independent of whether the other reader is running.
+    reader: engine::RadioReader,
+    history_loaded: bool,
     /// The tracker's wrong-lock count at the last sample, to log each drop.
     wrong_locks: u64,
     /// Whether the connected controller had a position at the last sample.
@@ -3012,68 +3216,126 @@ fn apply_tracker(
     }
 }
 
-/// Record changes in publication order under the hand lock, without I/O. A radio gap of at
-/// least `flight::SHORTEST_NS` is recorded if it began in use or ends; a shorter one that ends is
-/// a blip and is cancelled. A request the recorder rejects, because an older recording's window
-/// ends before it, is kept for retry. A gap an engine reopen or a stalled thread began is no
-/// radio dropout and is never recorded.
+/// Arms in-use gaps, including explicit promotion of an open gap, and the classifier's
+/// recordable returns. A cancellation applies only to its own original anchor.
 fn record_gap(d: &Daemon, h: usize, event: GapEvent, memory: &mut HandMemory) {
     match event {
         GapEvent::Began {
             last_sample_host_ns,
             moving: true,
             cause: GapCause::Radio,
+            ..
+        }
+        | GapEvent::InUse {
+            last_sample_host_ns,
+            cause: GapCause::Radio,
         } => memory.request_capture(&d.flight, h, last_sample_host_ns, true),
         GapEvent::Ended {
             last_sample_host_ns,
-            silent_ns,
+            asleep: false,
             cause: GapCause::Radio,
-        } if silent_ns >= flight::SHORTEST_NS => {
-            memory.request_capture(&d.flight, h, last_sample_host_ns, false)
-        }
+            recordable: true,
+            capture_requested: false,
+            ..
+        } => memory.request_capture(&d.flight, h, last_sample_host_ns, false),
+        GapEvent::Ended {
+            recordable: true,
+            capture_requested: true,
+            ..
+        } => {}
         GapEvent::Ended {
             last_sample_host_ns,
             cause: GapCause::Radio,
             ..
-        } => memory.cancel_capture(&d.flight, h, last_sample_host_ns),
+        } => {
+            memory.cancel_capture(&d.flight, h, last_sample_host_ns);
+        }
         _ => {}
     }
 }
 
-/// Format a notice after publication, outside the hand lock. It names what began the gap.
-fn gap_notice(h: usize, event: GapEvent) -> String {
-    let name = ["left", "right"][h];
-    let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
+/// The log line for a gap event, formatted only once the hand lock is released.
+struct GapMessage {
+    name: &'static str,
+    event: GapEvent,
+}
+
+/// A still controller's silence is logged once it has waited `SLEEP_BEACON_WAIT_NS` for a
+/// beacon. A blip that ended sooner and is not recorded was never logged, so neither is its end.
+fn gap_message(name: &'static str, event: GapEvent) -> Option<GapMessage> {
     match event {
-        GapEvent::Began { moving, cause, .. } => format!(
-            "{name}: {}: holding it as it was, inputs included, for up to {ride_s:.0} s",
-            match cause {
-                GapCause::Radio if moving => "radio silent (in use)",
-                GapCause::Radio => "radio silent (still)",
-                GapCause::Reopen => "tracking engine reopening",
-                GapCause::Stall => "tracking thread stalled",
-            }
-        ),
+        GapEvent::Began {
+            moving: false,
+            asleep: false,
+            cause: GapCause::Radio,
+            ..
+        } => None,
         GapEvent::Ended {
-            silent_ns, cause, ..
-        } => {
-            let s = silent_ns as f64 * 1e-9;
-            match cause {
-                GapCause::Radio => format!("{name}: radio back after {s:.2} s"),
-                GapCause::Reopen => format!("{name}: back after {s:.2} s (engine reopened)"),
-                GapCause::Stall => format!("{name}: back after {s:.2} s (tracking thread stalled)"),
+            silent_ns,
+            asleep: false,
+            recordable: false,
+            capture_requested: false,
+            cause: GapCause::Radio,
+            ..
+        } if silent_ns < cv1touch::hand::SLEEP_BEACON_WAIT_NS => None,
+        _ => Some(GapMessage { name, event }),
+    }
+}
+
+impl std::fmt::Display for GapMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.name;
+        let ride_s = HandConfig::default().ride_through_ns as f64 * 1e-9;
+        match self.event {
+            GapEvent::Began { cause: GapCause::Reopen, .. } => write!(f, "{name}: tracking engine reopening: holding it as it was, inputs included, for up to {ride_s:.0} s"),
+            GapEvent::Began { cause: GapCause::Stall, .. } => write!(f, "{name}: tracking thread stalled: holding it as it was, inputs included, for up to {ride_s:.0} s"),
+            GapEvent::Ended { cause: GapCause::Reopen, silent_ns, .. } => write!(f, "{name}: back after {:.2} s (engine reopened)", silent_ns as f64 * 1e-9),
+            GapEvent::Ended { cause: GapCause::Stall, silent_ns, .. } => write!(f, "{name}: back after {:.2} s (tracking thread stalled)", silent_ns as f64 * 1e-9),
+            GapEvent::Expired { cause: GapCause::Reopen, silent_ns, .. } => write!(f, "{name}: no sample for {:.0} s through the engine reopen: standby, inputs released", silent_ns as f64 * 1e-9),
+            GapEvent::Expired { cause: GapCause::Stall, silent_ns, .. } => write!(f, "{name}: tracking thread stalled for {:.0} s: standby, inputs released", silent_ns as f64 * 1e-9),
+            GapEvent::Began { asleep: true, .. } | GapEvent::Asleep => write!(f, "{name}: asleep"),
+            GapEvent::InUse { .. } => write!(f, "{name}: was in use when its samples stopped"),
+            GapEvent::Began { .. } | GapEvent::StillSilent => write!(
+                f,
+                "{name}: {}: holding it as it was, inputs included, for up to {ride_s:.0} s",
+                if matches!(self.event, GapEvent::StillSilent) {
+                    "radio silent (still)"
+                } else {
+                    "radio silent (in use)"
+                }
+            ),
+            GapEvent::Ended { asleep: true, uncertain: true, .. } => write!(f, "{name}: awake again (gap duration uncertain)"),
+            GapEvent::Ended {
+                silent_ns,
+                asleep: true,
+                ..
+            } => write!(
+                f,
+                "{name}: awake again after {:.2} s",
+                silent_ns as f64 * 1e-9
+            ),
+            GapEvent::Ended {
+                uncertain: true, ..
+            } => write!(f, "{name}: radio back (gap duration uncertain)"),
+            GapEvent::Ended { silent_ns, .. } => {
+                write!(
+                    f,
+                    "{name}: radio back after {:.2} s",
+                    silent_ns as f64 * 1e-9
+                )
             }
-        }
-        GapEvent::Expired { silent_ns, cause } => {
-            let s = silent_ns as f64 * 1e-9;
-            let why = match cause {
-                GapCause::Radio => format!("radio silent for {s:.0} s"),
-                GapCause::Reopen => format!("no sample for {s:.0} s through the engine reopen"),
-                GapCause::Stall => format!("tracking thread stalled for {s:.0} s"),
-            };
-            format!("{name}: {why}: standby, inputs released")
+            GapEvent::Expired { silent_ns, asleep, .. } => write!(
+                f,
+                "{name}: {} for {:.0} s: standby, inputs released",
+                if asleep { "asleep" } else { "radio silent" },
+                silent_ns as f64 * 1e-9
+            ),
         }
     }
+}
+
+fn gap_notice(h: usize, event: GapEvent) -> String {
+    gap_message(["left", "right"][h], event).map_or_else(String::new, |m| m.to_string())
 }
 
 /// Hands due dropout recordings to the daemon's single writer without waiting for storage.
@@ -3155,6 +3417,232 @@ fn radio_sample(view: &engine::Controller, s: &engine::Controller) -> engine::Co
     }
 }
 
+/// A decoded snapshot is not permission to end a native hold. That belongs only to a fresh
+/// accepted publication. Missing publication chooses its cause before any activity can tick.
+enum HandClassification<'a> {
+    Accepted(&'a engine::Controller),
+    Unpublished(&'a engine::Controller),
+    Missing(GapCause),
+    Drain,
+}
+
+/// Consume one reader's ordered batch under the existing publication lock. The cause is set
+/// before draining a stalled publisher; raw returns cannot end a Reopen/Stall hold. Notices
+/// are retained for emission only after the hand lock is released.
+fn prepare_hand_classification_events(
+    d: &Daemon,
+    h: usize,
+    input: HandClassification<'_>,
+    now: u64,
+    hand: &mut Hand,
+    memory: &mut HandMemory,
+    mut event: impl FnMut(GapEvent),
+) {
+    hand.select_classification_reader(memory.reader as usize);
+    d.classification[h].inherit_with_clock(memory, hand, || now);
+    let reader = memory.reader;
+    let mut capture = |e| {
+        record_gap(d, h, e, memory);
+        event(e);
+    };
+    if let HandClassification::Missing(cause) = input {
+        unavailable_classification(d, hand, now, cause, &mut capture);
+    }
+    d.radio_activity[reader as usize][h].drain_events(hand, &mut capture);
+    match input {
+        HandClassification::Accepted(c) => hand.classify_events(c, now, &mut capture),
+        HandClassification::Unpublished(c) => {
+            hand.classify_unpublished_events(c, now, &mut capture)
+        }
+        HandClassification::Missing(cause) => {
+            unavailable_classification(d, hand, now, cause, &mut capture)
+        }
+        HandClassification::Drain => {}
+    }
+    d.classification[h].publish(reader, hand);
+}
+
+/// A queued return may have ended an old Radio gap just before teardown. Its successor is
+/// native when it was still reporting at the first stop boundary, even if the published pose
+/// was older. An already-open Radio identity always keeps its cause and recording anchor.
+fn unavailable_classification(
+    d: &Daemon,
+    hand: &mut Hand,
+    now: u64,
+    cause: GapCause,
+    event: impl FnMut(GapEvent),
+) {
+    let stopped = d.engine_stopped_ns.load(Ordering::Acquire);
+    let cause = if cause == GapCause::Radio
+        && d.engine_offline.load(Ordering::Acquire)
+        && stopped != 0
+        && hand.classification_history().gap.is_some_and(|g| {
+            !g.open
+                && stopped.saturating_sub(g.recording_anchor_ns)
+                    < HandConfig::default().connect_timeout_ns
+        }) {
+        GapCause::Reopen
+    } else {
+        cause
+    };
+    hand.unavailable_events(now, cause, event);
+}
+
+/// Heartbeat and teardown observe the current owner. They cannot take ownership or begin the
+/// next reader's imported-use window while that reader is not publishing yet. They never drain
+/// activity: a stalled worker may still be producing. Only its owner, or joined-session teardown,
+/// consumes a queue, preserving its report/loss ordering.
+#[allow(clippy::too_many_arguments)]
+fn prepare_unavailable_classification_events(
+    d: &Daemon,
+    h: usize,
+    now: u64,
+    hand: &mut Hand,
+    memory: &mut HandMemory,
+    cause: GapCause,
+    mut event: impl FnMut(GapEvent),
+) {
+    let mut capture = |e| {
+        record_gap(d, h, e, memory);
+        event(e);
+    };
+    unavailable_classification(d, hand, now, cause, &mut capture);
+    d.classification[h].publish(memory.reader, hand);
+}
+
+/// Gap events of one publication, logged after the hand lock is released. A sample normally
+/// has none, and a few fit inline; a drain that finished more gaps (one queue can finish every
+/// retained interval) spills to the heap, where each of their log lines goes anyway.
+#[derive(Default)]
+struct GapNotices {
+    inline: [Option<GapEvent>; 4],
+    len: usize,
+    spill: Vec<GapEvent>,
+}
+impl GapNotices {
+    fn push(&mut self, event: GapEvent) {
+        match self.inline.get_mut(self.len) {
+            Some(slot) => *slot = Some(event),
+            None => self.spill.push(event),
+        }
+        self.len += 1;
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn emit(&self, h: usize, mut emit: impl FnMut(String)) {
+        for &event in self.inline.iter().flatten().chain(&self.spill) {
+            if let Some(message) = gap_message(["left", "right"][h], event) {
+                emit(message.to_string());
+            }
+        }
+    }
+}
+
+enum HandPublication {
+    Superseded,
+    Hold(GapCause),
+    Sample { stale: bool },
+}
+
+/// Called under the hand lock with a fresh clock, before either pre-handoff classification
+/// or actual publication. The latter reads its clock again after the input lock as well.
+fn hand_publication(
+    d: &Daemon,
+    h: usize,
+    publisher: &HandPublisher,
+    c: &engine::Controller,
+    now: u64,
+) -> HandPublication {
+    if !c.calibrated || c.received_host_ns == 0 {
+        return HandPublication::Hold(GapCause::Reopen);
+    }
+    let timeout = HandConfig::default().connect_timeout_ns;
+    let stale = now.saturating_sub(c.received_host_ns) >= timeout;
+    if stale
+        && publisher
+            .memory
+            .last_live
+            .is_some_and(|last| now.saturating_sub(last.received_host_ns) < timeout)
+    {
+        return HandPublication::Superseded;
+    }
+    let delayed = stale
+        && publisher.memory.last_live.is_none_or(|last| {
+            c.received_host_ns > last.received_host_ns
+                || (c.received_host_ns == last.received_host_ns
+                    && c.device_time_ns != last.device_time_ns)
+        });
+    if delayed {
+        HandPublication::Hold(unavailable_cause(d, h, publisher, now))
+    } else {
+        HandPublication::Sample { stale }
+    }
+}
+
+/// Finish this reader's batch before the single ownership decision releases the hand.
+fn engine_publishes_hand_persistent(
+    d: &Daemon,
+    ownership: &HandOwnership,
+    h: usize,
+    c: &engine::Controller,
+    clock: impl FnOnce() -> u64,
+) -> bool {
+    let mut notices = GapNotices::default();
+    if !ownership.radio_publishes(h) || ownership.radio_gone.load(Ordering::Acquire) {
+        let mut publisher = d.hands[h].lock().unwrap();
+        let now = clock();
+        if d.quit.load(Ordering::Acquire) || d.engine_offline.load(Ordering::Acquire) {
+            return false;
+        }
+        let input = match hand_publication(d, h, &publisher, c, now) {
+            HandPublication::Superseded => HandClassification::Drain,
+            HandPublication::Hold(cause) => HandClassification::Missing(cause),
+            HandPublication::Sample { .. } => HandClassification::Unpublished(c),
+        };
+        publisher.memory.reader = engine::RadioReader::Engine;
+        let HandPublisher { hand, memory, .. } = &mut *publisher;
+        prepare_hand_classification_events(d, h, input, now, hand, memory, |e| notices.push(e));
+    }
+    let publishes = ownership.engine_publishes(h);
+    if !publishes {
+        d.radio_activity[engine::RadioReader::Engine as usize][h].discard();
+    }
+    notices.emit(h, log);
+    publishes
+}
+
+fn publish_radio_hand_state(
+    d: &Daemon,
+    h: usize,
+    c: &engine::Controller,
+    clock: impl FnOnce() -> u64,
+    pipe: Option<&mut Pipeline>,
+    emit: impl FnMut(String),
+) {
+    publish_hand_state_for_reader(
+        d,
+        h,
+        engine::RadioReader::Radio,
+        c,
+        clock,
+        || {
+            pipe.filter(|p| p.has_body(h)).map(|p| {
+                let v = |a: [f32; 3]| nalgebra::Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+                p.imu(
+                    h,
+                    c.device_time_ns,
+                    c.received_host_ns,
+                    v(c.imu_gyro),
+                    v(c.imu_accel),
+                );
+                (p.stats(h).wrong_locks, p.latest(h))
+            })
+        },
+        emit,
+    );
+}
+
 /// Publishes one hand's state from `c`: the engine's controller, or the radio thread's sample over
 /// the engine's view of it (`radio_sample`), with the tracker's pose when it has the hand's body.
 fn publish_hand_state(
@@ -3205,6 +3693,19 @@ fn publish_hand_state_with_tracking(
     track: impl FnOnce() -> Option<(u64, Option<Stamped>)>,
     emit: impl FnMut(String),
 ) {
+    publish_hand_state_for_reader(d, h, engine::RadioReader::Engine, c, clock, track, emit);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_hand_state_for_reader(
+    d: &Daemon,
+    h: usize,
+    reader: engine::RadioReader,
+    c: &engine::Controller,
+    clock: impl FnOnce() -> u64,
+    track: impl FnOnce() -> Option<(u64, Option<Stamped>)>,
+    emit: impl FnMut(String),
+) {
     // IMU processing can fit queued camera frames; no publication lock may span that work.
     let tracked = track();
     let mut notices = HandNotices::default();
@@ -3215,24 +3716,24 @@ fn publish_hand_state_with_tracking(
     if d.quit.load(Ordering::Acquire) || d.engine_offline.load(Ordering::Acquire) {
         return;
     }
-    let timeout = HandConfig::default().connect_timeout_ns;
-    let stale = c.received_host_ns != 0 && now.saturating_sub(c.received_host_ns) >= timeout;
-    if stale
-        && publisher
-            .memory
-            .last_live
-            .is_some_and(|last| now.saturating_sub(last.received_host_ns) < timeout)
+    let (missing, stale) = match hand_publication(d, h, &publisher, c, now) {
+        HandPublication::Superseded => return,
+        HandPublication::Hold(cause) => (Some(cause), true),
+        HandPublication::Sample { stale } => (None, stale),
+    };
+    publisher.memory.reader = reader;
     {
-        // Another publisher already has newer live data. The delayed result cannot replace it.
-        return;
+        let HandPublisher { hand, memory, .. } = &mut *publisher;
+        prepare_hand_classification_events(
+            d,
+            h,
+            missing.map_or(HandClassification::Accepted(c), HandClassification::Missing),
+            now,
+            hand,
+            memory,
+            |e| notices.gaps.push(e),
+        );
     }
-    let delayed = stale
-        && publisher.memory.last_live.is_none_or(|last| {
-            c.received_host_ns > last.received_host_ns
-                || (c.received_host_ns == last.received_host_ns
-                    && c.device_time_ns != last.device_time_ns)
-        });
-    let missing = delayed.then(|| unavailable_cause(d, h, &publisher, now));
     let HandPublisher {
         hand,
         shaper,
@@ -3276,7 +3777,9 @@ fn publish_hand_state_with_tracking(
     inputs.apply(h, &mut state);
     drop(inputs);
     d.inject.apply(h, now, &mut state);
-    notices.gap = publisher.publish_worker(d, h, state, now);
+    if let Some(event) = publisher.publish_worker(d, h, state, now) {
+        notices.gaps.push(event);
+    }
     drop(publisher);
     notices.emit(d, h, emit);
 }
@@ -3284,19 +3787,21 @@ fn publish_hand_state_with_tracking(
 #[derive(Default)]
 struct HandNotices {
     messages: Vec<String>,
+    gaps: GapNotices,
     gap: Option<GapEvent>,
 }
 
 impl HandNotices {
-    fn emit(self, d: &Daemon, h: usize, mut emit: impl FnMut(String)) {
+    fn emit(&mut self, d: &Daemon, h: usize, mut emit: impl FnMut(String)) {
         let gap = self.gap.map(|event| gap_notice(h, event));
-        if gap.is_some() || !self.messages.is_empty() {
+        if gap.is_some() || !self.gaps.is_empty() || !self.messages.is_empty() {
             d.shm.signal();
         }
-        for message in self.messages {
+        for message in self.messages.drain(..) {
             emit(message);
         }
-        if let Some(message) = gap {
+        self.gaps.emit(h, &mut emit);
+        if let Some(message) = gap.filter(|m| !m.is_empty()) {
             emit(message);
         }
     }
@@ -3343,7 +3848,9 @@ impl HandPublisher {
         self.memory.retry_captures(&d.flight, h);
         if state.flags & ffi::CV1T_FLAG_RADIO_GAP != 0 {
             if let Some(last) = &self.memory.last_live {
+                let asleep = state.flags & ffi::CV1T_FLAG_ASLEEP;
                 state = held_through_gap(last, now);
+                state.flags |= asleep;
             }
         } else {
             self.memory.last_live = (state.flags & ffi::CV1T_FLAG_CONNECTED != 0).then_some(state);
@@ -4730,6 +5237,8 @@ fn main() {
         extra_latency_ns: std::sync::atomic::AtomicI64::new(start_latency_ns(&settings)),
         tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
         fitted_render_orient: Mutex::new(fitted_render_orient),
+        radio_activity: Default::default(),
+        classification: Default::default(),
         battery: [
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
@@ -4830,7 +5339,45 @@ mod tests {
         super::record_gap(d, h, event, &mut publisher.memory);
     }
 
+    fn note_gap(d: &Daemon, h: usize, event: GapEvent) {
+        record_test_gap(d, h, event);
+        if let Some(message) = gap_message(["left", "right"][h], event) {
+            log!("{message}");
+        }
+    }
+
+    // Some tests own a Hand/Memory explicitly. Put it into the real persistent publisher for
+    // the production call, then return its updated state.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn publish_hand_state_legacy(
+        d: &Daemon,
+        h: usize,
+        c: &engine::Controller,
+        now: u64,
+        hand: &mut Hand,
+        pipe: Option<&mut Pipeline>,
+        shaper: &mut VelocityShaper,
+        memory: &mut HandMemory,
+    ) {
+        {
+            let mut publisher = d.hands[h].lock().unwrap();
+            std::mem::swap(&mut publisher.hand, hand);
+            std::mem::swap(&mut publisher.memory, memory);
+            std::mem::swap(&mut publisher.shaper, shaper);
+        }
+        let reader = d.hands[h].lock().unwrap().memory.reader;
+        if matches!(reader, engine::RadioReader::Radio) {
+            publish_radio_hand_state(d, h, c, || now, pipe, log);
+        } else {
+            publish_hand_state(d, h, c, || now, pipe);
+        }
+        let mut publisher = d.hands[h].lock().unwrap();
+        std::mem::swap(&mut publisher.hand, hand);
+        std::mem::swap(&mut publisher.memory, memory);
+        std::mem::swap(&mut publisher.shaper, shaper);
+    }
     use super::*;
+    use cv1touch::flight;
     use std::io::Write;
 
     #[cfg(unix)]
@@ -5967,6 +6514,7 @@ mod tests {
                     GapEvent::Began {
                         last_sample_host_ns: BASE + at * MS,
                         moving: true,
+                        asleep: false,
                         cause: GapCause::Radio,
                     },
                 );
@@ -6001,6 +6549,7 @@ mod tests {
                     GapEvent::Began {
                         last_sample_host_ns: BASE + at * MS,
                         moving: true,
+                        asleep: false,
                         cause: GapCause::Radio,
                     },
                 );
@@ -6011,6 +6560,10 @@ mod tests {
                 GapEvent::Ended {
                     last_sample_host_ns: BASE + 10010 * MS,
                     silent_ns: 300 * MS,
+                    asleep: false,
+                    uncertain: false,
+                    recordable: false,
+                    capture_requested: true,
                     cause: GapCause::Radio,
                 },
             );
@@ -6032,6 +6585,7 @@ mod tests {
                     GapEvent::Began {
                         last_sample_host_ns: BASE + at * MS,
                         moving: true,
+                        asleep: false,
                         cause: GapCause::Radio,
                     },
                 );
@@ -6141,6 +6695,7 @@ mod tests {
                     last_sample_host_ns: last,
                     moving,
                     cause: GapCause::Radio,
+                    asleep: false,
                 },
             );
             record_test_gap(
@@ -6150,6 +6705,10 @@ mod tests {
                     last_sample_host_ns: last,
                     silent_ns: flight::SHORTEST_NS,
                     cause: GapCause::Radio,
+                    asleep: false,
+                    uncertain: false,
+                    recordable: true,
+                    capture_requested: false,
                 },
             );
         }
@@ -6240,6 +6799,8 @@ mod tests {
             extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
             tilt_mdeg: std::sync::atomic::AtomicI32::new(0),
             fitted_render_orient: Mutex::new([[0.0, 0.0, 0.0, 1.0]; 2]),
+            radio_activity: Default::default(),
+            classification: Default::default(),
             battery: [
                 std::sync::atomic::AtomicI32::new(-1),
                 std::sync::atomic::AtomicI32::new(-1),
@@ -6815,8 +7376,7 @@ mod tests {
         }
     }
 
-    /// A gap that ends is recorded too, however still the controller was: held steady (aiming)
-    /// it does not turn, but asleep it would not have come back.
+    /// A still gap without sleep beacons that ends is recorded too: aiming need not turn it.
     #[test]
     fn a_gap_that_ends_is_recorded() {
         let d = status_daemon();
@@ -6839,6 +7399,3115 @@ mod tests {
         let due = d.flight.due(now + flight::AFTER_NS);
         assert_eq!(due.len(), 1);
         assert_eq!((due[0].hand, due[0].last_report_ns), (HAND_LEFT, now));
+    }
+
+    fn sleep_report(hand: usize) -> [u8; 64] {
+        let mut r = [0u8; 64];
+        r[0] = 0x0c;
+        r[3] = 0x1c;
+        r[5] = if hand == HAND_LEFT { 2 } else { 3 };
+        r
+    }
+
+    #[test]
+    fn sleep_and_radio_gaps_record_only_the_gaps_worth_keeping() {
+        for (moving, beacon, silent_ns, recorded) in [
+            (false, true, 2_000_000_000, false),
+            (true, true, 2_000_000_000, true),
+            (false, false, 500_000_000, true),
+            (false, false, 499_999_999, false),
+            (true, true, 499_999_999, false),
+            (true, false, 499_999_999, false),
+        ] {
+            for h in [HAND_LEFT, HAND_RIGHT] {
+                let d = status_daemon();
+                let mut hand = Hand::new(h, HandConfig::default());
+                let mut shaper = VelocityShaper::new(ShapeParams::default());
+                let mut memory = HandMemory::default();
+                let now = 1_000_000_000;
+                let mut c = engine::Controller {
+                    calibrated: true,
+                    device_time_ns: 1_000_000,
+                    received_host_ns: now,
+                    imu_gyro: [if moving { 1.0 } else { 0.01 }, 0.0, 0.0],
+                    trigger: 0.8,
+                    buttons: 1,
+                    ..Default::default()
+                };
+                let mut publish = |c: &engine::Controller, at| {
+                    publish_hand_state_legacy(
+                        &d,
+                        h,
+                        c,
+                        at,
+                        &mut hand,
+                        None,
+                        &mut shaper,
+                        &mut memory,
+                    )
+                };
+                publish(&c, now);
+                let live = d.shm.hand(h).unwrap();
+                if beacon {
+                    d.activity(
+                        engine::RadioReader::Engine,
+                        if h == HAND_LEFT {
+                            calib::DEVICE_LEFT
+                        } else {
+                            calib::DEVICE_RIGHT
+                        },
+                        c.device_time_ns,
+                        now + 2_000_000,
+                        true,
+                        0.0,
+                    );
+                }
+                publish(&c, now + 150_000_000);
+                let held = d.shm.hand(h).unwrap();
+                assert_eq!(held.flags & ffi::CV1T_FLAG_ASLEEP != 0, beacon && !moving);
+                assert_eq!(
+                    held.flags & ffi::CV1T_FLAG_RADIO_GAP,
+                    ffi::CV1T_FLAG_RADIO_GAP
+                );
+                assert_eq!((held.buttons, held.trigger), (live.buttons, live.trigger));
+                assert_eq!(held.device_time_ns, live.device_time_ns);
+                assert_eq!(held.received_host_ns, live.received_host_ns);
+                c.device_time_ns += 2_000_000;
+                c.received_host_ns = now + silent_ns;
+                publish(&c, c.received_host_ns);
+                assert_eq!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+                let due = d.flight.due(now + flight::AFTER_NS);
+                assert_eq!(
+                    due.len(),
+                    recorded as usize,
+                    "{moving} {beacon} {silent_ns}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_beacon_reclassifies_the_gap_on_either_radio_path() {
+        for radio_thread in [false, true] {
+            let d = status_daemon();
+            d.radio_on.store(radio_thread, Ordering::Release);
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut shaper = VelocityShaper::new(ShapeParams::default());
+            let mut memory = HandMemory {
+                reader: if radio_thread {
+                    engine::RadioReader::Radio
+                } else {
+                    engine::RadioReader::Engine
+                },
+                ..Default::default()
+            };
+            let now = 1_000_000_000;
+            let c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 1_000_000,
+                received_host_ns: now,
+                ..Default::default()
+            };
+            let mut publish = |at| {
+                publish_hand_state_legacy(
+                    &d,
+                    HAND_LEFT,
+                    &c,
+                    at,
+                    &mut hand,
+                    None,
+                    &mut shaper,
+                    &mut memory,
+                )
+            };
+            publish(now);
+            publish(now + 150_000_000);
+            assert_eq!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            let at = now + 750_000_000;
+            if radio_thread {
+                d.radio_report(&sleep_report(HAND_LEFT), at);
+                d.activity(
+                    engine::RadioReader::Radio,
+                    calib::DEVICE_LEFT,
+                    c.device_time_ns,
+                    at,
+                    true,
+                    0.0,
+                );
+            } else {
+                d.report(1, at, &sleep_report(HAND_LEFT));
+                d.activity(
+                    engine::RadioReader::Engine,
+                    calib::DEVICE_LEFT,
+                    c.device_time_ns,
+                    at,
+                    true,
+                    0.0,
+                );
+            }
+            publish(at);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            let mut other = Hand::new(HAND_RIGHT, HandConfig::default());
+            let mut events = Vec::new();
+            for reader in &d.radio_activity {
+                reader[HAND_RIGHT].drain_events(&mut other, |e| events.push(e));
+            }
+            assert!(events.is_empty() && other.take_event().is_none());
+        }
+    }
+
+    #[test]
+    fn a_beacon_drained_after_wake_does_not_hide_the_previous_dropout() {
+        for radio_thread in [false, true] {
+            for h in [HAND_LEFT, HAND_RIGHT] {
+                for after_wake_ns in [0, 2_000_000] {
+                    let d = status_daemon();
+                    d.radio_on.store(radio_thread, Ordering::Release);
+                    let mut hand = Hand::new(h, HandConfig::default());
+                    let mut shaper = VelocityShaper::new(ShapeParams::default());
+                    let mut memory = HandMemory {
+                        reader: if radio_thread {
+                            engine::RadioReader::Radio
+                        } else {
+                            engine::RadioReader::Engine
+                        },
+                        ..Default::default()
+                    };
+                    let now = 1_000_000_000;
+                    let mut c = engine::Controller {
+                        calibrated: true,
+                        device_time_ns: 1_000_000,
+                        received_host_ns: now,
+                        ..Default::default()
+                    };
+                    let mut publish = |c: &engine::Controller, at| {
+                        publish_hand_state_legacy(
+                            &d,
+                            h,
+                            c,
+                            at,
+                            &mut hand,
+                            None,
+                            &mut shaper,
+                            &mut memory,
+                        )
+                    };
+                    publish(&c, now);
+                    publish(&c, now + 150_000_000);
+                    // The fallback engine can drain both reports before publishing its sample.
+                    c.device_time_ns += 2_000_000;
+                    c.received_host_ns = now + 800_000_000;
+                    let beacon_at = c.received_host_ns + after_wake_ns;
+                    let mut wake = sleep_report(h);
+                    wake[6] = 1;
+                    for (report, at) in [(wake, c.received_host_ns), (sleep_report(h), beacon_at)] {
+                        if radio_thread {
+                            d.radio_report(&report, at);
+                        } else {
+                            d.report(1, at, &report);
+                        }
+                    }
+                    let reader = if radio_thread {
+                        engine::RadioReader::Radio
+                    } else {
+                        engine::RadioReader::Engine
+                    };
+                    d.activity(
+                        reader,
+                        if h == HAND_LEFT {
+                            calib::DEVICE_LEFT
+                        } else {
+                            calib::DEVICE_RIGHT
+                        },
+                        c.device_time_ns,
+                        c.received_host_ns,
+                        false,
+                        0.0,
+                    );
+                    d.activity(
+                        reader,
+                        if h == HAND_LEFT {
+                            calib::DEVICE_LEFT
+                        } else {
+                            calib::DEVICE_RIGHT
+                        },
+                        c.device_time_ns,
+                        beacon_at,
+                        true,
+                        0.0,
+                    );
+                    publish(&c, beacon_at);
+                    let due = d.flight.due(now + flight::AFTER_NS);
+                    assert_eq!(
+                        due.len(),
+                        1,
+                        "radio thread {radio_thread}, beacon +{after_wake_ns}"
+                    );
+                    assert_eq!(due[0].last_report_ns, now);
+                    publish(&c, c.received_host_ns + 150_000_000);
+                    assert_eq!(
+                        d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP != 0,
+                        after_wake_ns != 0,
+                    );
+                    c.device_time_ns += 2_000_000;
+                    c.received_host_ns = now + 1_600_000_000;
+                    publish(&c, c.received_host_ns);
+                    assert_eq!(
+                        d.flight.due(c.received_host_ns + flight::AFTER_NS).len(),
+                        usize::from(after_wake_ns == 0),
+                    );
+                }
+            }
+        }
+    }
+
+    fn ordered_drain_recordings(
+        radio_thread: bool,
+        before_wake: bool,
+        second_sample: bool,
+        other_reader: bool,
+        foreign_beacon: bool,
+    ) -> usize {
+        let d = status_daemon();
+        d.radio_on
+            .store(radio_thread || other_reader, Ordering::Release);
+        let h = HAND_LEFT;
+        let mut hand = Hand::new(h, HandConfig::default());
+        let mut shaper = VelocityShaper::new(ShapeParams::default());
+        let mut memory = HandMemory {
+            reader: if radio_thread {
+                engine::RadioReader::Radio
+            } else {
+                engine::RadioReader::Engine
+            },
+            ..Default::default()
+        };
+        let start = 1_000_000_000;
+        let mut c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 1_000_000,
+            received_host_ns: start,
+            ..Default::default()
+        };
+        let mut publish = |c: &engine::Controller, at| {
+            publish_hand_state_legacy(&d, h, c, at, &mut hand, None, &mut shaper, &mut memory)
+        };
+        publish(&c, start);
+        publish(&c, start + 150_000_000);
+        let report = |sample: bool, at, radio: bool| {
+            let mut r = sleep_report(h);
+            if sample {
+                r[6] = 1;
+            }
+            let reader = if radio {
+                engine::RadioReader::Radio
+            } else {
+                engine::RadioReader::Engine
+            };
+            if radio {
+                d.radio_report(&r, at);
+            } else {
+                d.report(1, at, &r);
+            }
+            d.activity(
+                reader,
+                calib::DEVICE_LEFT,
+                1_000_000
+                    + if at == start + 804_000_000 {
+                        4_000_000
+                    } else {
+                        2_000_000
+                    },
+                at,
+                !sample,
+                0.0,
+            );
+        };
+        if before_wake {
+            report(false, start + 750_000_000, radio_thread);
+        }
+        if other_reader {
+            if foreign_beacon {
+                report(false, start + 750_000_000, true);
+            }
+            report(true, start + 800_000_000, true);
+            report(false, start + 802_000_000, true);
+        }
+        report(
+            true,
+            start
+                + if other_reader {
+                    810_000_000
+                } else {
+                    800_000_000
+                },
+            radio_thread,
+        );
+        if !other_reader {
+            report(false, start + 802_000_000, radio_thread);
+        }
+        if second_sample {
+            report(true, start + 804_000_000, radio_thread);
+        }
+        c.device_time_ns += if second_sample { 4_000_000 } else { 2_000_000 };
+        c.received_host_ns = start
+            + if other_reader {
+                810_000_000
+            } else if second_sample {
+                804_000_000
+            } else {
+                800_000_000
+            };
+        publish(&c, c.received_host_ns + 4_000_000);
+        d.flight.due(start + flight::AFTER_NS).len()
+    }
+
+    #[test]
+    fn data_beacon_data_in_one_drain_does_not_hide_a_dropout() {
+        for radio in [false, true] {
+            assert_eq!(
+                ordered_drain_recordings(radio, false, true, false, false),
+                1,
+                "radio {radio}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hand_still_published_by_the_engine_uses_only_engine_evidence() {
+        // Radio return at 800 + beacon at 802 cannot classify an engine return at 810.
+        assert_eq!(
+            ordered_drain_recordings(false, false, false, true, false),
+            1
+        );
+        // Even a genuine nap on the other reader cannot be used for this hand's publisher.
+        assert_eq!(ordered_drain_recordings(false, false, false, true, true), 1);
+    }
+
+    #[test]
+    fn a_naps_first_beacon_survives_wake_and_another_beacon_in_one_drain() {
+        for radio in [false, true] {
+            assert_eq!(
+                ordered_drain_recordings(radio, true, false, false, false),
+                0,
+                "radio {radio}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_in_use_handoff_gap_is_not_captured_again_on_return() {
+        let d = status_daemon();
+        let (a, b) = (5_000_000_000, 5_000_000_000);
+        let cfg = HandConfig::default();
+        let mut outgoing = Hand::new(HAND_LEFT, cfg);
+        let mut incoming = Hand::new(HAND_LEFT, cfg);
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: a,
+            imu_gyro: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        outgoing.classify_events(&c, a, |e| note_gap(&d, HAND_LEFT, e));
+        outgoing.tick_events(a + 150_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        incoming.inherit_classification_at(outgoing.classification_history(), b + 200_000_000);
+        incoming.tick_events(b + flight::AFTER_NS, |e| note_gap(&d, HAND_LEFT, e));
+        let saved = d.flight.due(a + flight::AFTER_NS);
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].last_report_ns, saved[0].began_in_use), (a, true));
+        let wake = engine::Controller {
+            device_time_ns: 4_000_000,
+            received_host_ns: b + 12_000_000_000,
+            imu_gyro: [0.0; 3],
+            ..c
+        };
+        incoming.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+        assert!(
+            d.flight.due(a + 12_000_000_000).is_empty(),
+            "the same gap was already captured at its start"
+        );
+    }
+
+    fn saved_in_use_gap_with_an_unpublished_return(lost: bool) {
+        let d = status_daemon();
+        let (a, b) = (5_000_000_000, 5_000_000_000);
+        let cfg = HandConfig::default();
+        let mut outgoing = Hand::new(HAND_LEFT, cfg);
+        let mut incoming = Hand::new(HAND_LEFT, cfg);
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: a,
+            imu_gyro: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        outgoing.classify_events(&c, a, |e| note_gap(&d, HAND_LEFT, e));
+        outgoing.tick_events(a + 150_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        outgoing.tick_events(a + flight::AFTER_NS, |e| note_gap(&d, HAND_LEFT, e));
+        let saved = d.flight.due(a + flight::AFTER_NS);
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].last_report_ns, saved[0].began_in_use), (a, true));
+        let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+        if lost {
+            for i in 0..256 {
+                queue.push(cv1touch::hand::RadioActivity {
+                    device_time_ns: 2_000_000,
+                    received_host_ns: b + 11_000_000_000 + i * 1_000_000,
+                    asleep: true,
+                    moving: false,
+                });
+            }
+        }
+        queue.push(cv1touch::hand::RadioActivity {
+            device_time_ns: 4_000_000,
+            received_host_ns: b + 12_000_000_000,
+            asleep: false,
+            moving: false,
+        });
+        queue.discard();
+        incoming.inherit_classification_at(outgoing.classification_history(), b + 12_100_000_000);
+        queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+        assert!(
+            d.flight.due(a + 12_100_000_000).is_empty(),
+            "an unpublished return must not re-arm the saved in-use gap"
+        );
+        assert!(incoming
+            .classification_history()
+            .gap
+            .is_none_or(|g| g.recording_anchor_ns != a));
+    }
+
+    #[test]
+    fn an_expired_in_use_discarded_return_does_not_rearm_its_saved_window() {
+        saved_in_use_gap_with_an_unpublished_return(false);
+    }
+
+    #[test]
+    fn an_expired_in_use_lost_return_does_not_rearm_its_saved_window() {
+        saved_in_use_gap_with_an_unpublished_return(true);
+    }
+
+    mod publication_freshness_tests {
+        use super::*;
+        const BASE: u64 = 80_000_000_000;
+        const MS: u64 = 1_000_000;
+        fn sample(at: u64, moving: bool) -> engine::Controller {
+            engine::Controller {
+                calibrated: true,
+                received_host_ns: BASE + at * MS,
+                device_time_ns: (at + 1) * MS,
+                imu_gyro: [if moving { 1.0 } else { 0.0 }, 0.0, 0.0],
+                trigger: 0.8,
+                ..Default::default()
+            }
+        }
+        fn publish(d: &Daemon, c: &engine::Controller, at: u64) {
+            publish_hand_state(d, HAND_LEFT, c, || BASE + at * MS, None);
+        }
+        fn queue(d: &Daemon, c: &engine::Controller) {
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                c.device_time_ns,
+                c.received_host_ns,
+                false,
+                c.imu_gyro[0] * c.imu_gyro[0],
+            );
+        }
+        fn preclassify(d: &Daemon, ownership: &HandOwnership, c: &engine::Controller, at: u64) {
+            assert!(engine_publishes_hand_persistent(
+                d,
+                ownership,
+                HAND_LEFT,
+                c,
+                || BASE + at * MS
+            ));
+        }
+        fn native_gap(d: &Daemon, cause: GapCause) {
+            let p = d.hands[HAND_LEFT].lock().unwrap();
+            let g = p.hand.classification_history().gap.unwrap();
+            assert_eq!(
+                (g.recording_anchor_ns, g.cause, g.open, g.capture_requested),
+                (BASE, cause, true, false)
+            );
+        }
+        #[test]
+        fn consecutive_stale_engine_snapshots_cannot_end_a_stall_or_arm_radio_capture() {
+            let d = status_daemon();
+            let ownership = HandOwnership::default();
+            let initial = sample(0, false);
+            queue(&d, &initial);
+            preclassify(&d, &ownership, &initial, 0);
+            publish(&d, &initial, 0);
+            publish_unavailable_with_log(&d, BASE + 100 * MS, |_| {});
+            native_gap(&d, GapCause::Stall);
+            for (received, now, moving) in [(40, 200, false), (220, 420, true)] {
+                let c = sample(received, moving);
+                queue(&d, &c);
+                preclassify(&d, &ownership, &c, now);
+                native_gap(&d, GapCause::Stall);
+                publish(&d, &c, now);
+                native_gap(&d, GapCause::Stall);
+            }
+            assert!(d.flight.due(BASE + 11000 * MS).is_empty());
+        }
+        #[test]
+        fn a_stale_multi_sample_drain_establishes_native_cause_before_any_return() {
+            let d = status_daemon();
+            let ownership = HandOwnership::default();
+            publish(&d, &sample(0, false), 0);
+            queue(&d, &sample(200, true));
+            let delayed = sample(1000, false);
+            queue(&d, &delayed);
+            preclassify(&d, &ownership, &delayed, 1150);
+            native_gap(&d, GapCause::Stall);
+            publish(&d, &delayed, 1150);
+            assert!(
+                take_dropouts(&d, BASE + 12000 * MS).is_empty(),
+                "raw returns were classified as Radio before the stale cause was established"
+            );
+        }
+
+        #[test]
+        fn a_two_ms_sample_delayed_to_150_ms_is_a_stall_before_handoff_classification() {
+            let d = status_daemon();
+            let ownership = HandOwnership::default();
+            let initial = sample(0, false);
+            publish(&d, &initial, 0);
+            let delayed = sample(2, true);
+            queue(&d, &delayed);
+            preclassify(&d, &ownership, &delayed, 150);
+            native_gap(&d, GapCause::Stall);
+            publish(&d, &delayed, 150);
+            native_gap(&d, GapCause::Stall);
+            let fresh = sample(800, false);
+            queue(&d, &fresh);
+            preclassify(&d, &ownership, &fresh, 800);
+            native_gap(&d, GapCause::Stall); // only accepted publication may end it
+            publish(&d, &fresh, 800);
+            assert!(d.flight.due(BASE + 11000 * MS).is_empty());
+        }
+    }
+
+    mod reopen_classification_tests {
+        use super::*;
+        const START: u64 = 50_000_000_000;
+        const MS: u64 = 1_000_000;
+        fn sample(ms: u64, device: u64, moving: bool) -> engine::Controller {
+            engine::Controller {
+                calibrated: true,
+                received_host_ns: START + ms * MS,
+                device_time_ns: device,
+                imu_gyro: [if moving { 1.0 } else { 0.0 }, 0.0, 0.0],
+                trigger: 0.8,
+                ..Default::default()
+            }
+        }
+        fn publish(d: &Daemon, c: &engine::Controller, ms: u64) {
+            publish_hand_state(d, HAND_LEFT, c, || START + ms * MS, None);
+        }
+        fn beacon(d: &Daemon, ms: u64) {
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                0,
+                START + ms * MS,
+                true,
+                0.0,
+            );
+        }
+        fn close(d: &Daemon, ms: u64) {
+            engine_unavailable(d, START + ms * MS);
+            drop(ClassificationSession(d, || START + ms * MS));
+        }
+        fn open(d: &Daemon) {
+            start_engine_run(d, 1, &mut None, || ());
+        }
+        fn saved(d: &Daemon, ms: u64) -> Vec<flight::Dropout> {
+            d.flight.due(START + ms * MS)
+        }
+
+        #[test]
+        fn a_confirmed_nap_is_not_recorded_when_the_engine_reopens() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            beacon(&d, 2);
+            publish(&d, &c, 150);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            close(&d, 200);
+            open(&d);
+            // The first view can still be the old report, before the next real sample.
+            publish(&d, &c, 750);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            publish(&d, &sample(800, 4_000_000, false), 800);
+            assert!(saved(&d, 11000).is_empty());
+        }
+
+        fn other(reader: engine::RadioReader) -> engine::RadioReader {
+            match reader {
+                engine::RadioReader::Engine => engine::RadioReader::Radio,
+                engine::RadioReader::Radio => engine::RadioReader::Engine,
+            }
+        }
+
+        fn publish_by(d: &Daemon, reader: engine::RadioReader, c: &engine::Controller, ms: u64) {
+            publish_hand_state_for_reader(
+                d,
+                HAND_LEFT,
+                reader,
+                c,
+                || START + ms * MS,
+                || None,
+                log,
+            );
+        }
+
+        fn decoded(d: &Daemon, reader: engine::RadioReader, device: u64, ms: i64, asleep: bool) {
+            d.activity(
+                reader,
+                calib::DEVICE_LEFT,
+                device,
+                START.checked_add_signed(ms * MS as i64).unwrap(),
+                asleep,
+                0.0,
+            );
+        }
+
+        /// Both readers read every report, each stamping it at its own read: the reader that
+        /// does not publish has its own copy of a nap's last sample, before, with or after the
+        /// publisher's stamp. Teardown classifies that copy; it cannot end the settled nap.
+        #[test]
+        fn another_readers_copy_of_the_last_sample_keeps_a_nap_unrecorded_through_reopen() {
+            for publisher in [engine::RadioReader::Engine, engine::RadioReader::Radio] {
+                for copy_ms in [-3, 0, 3, 60] {
+                    let d = status_daemon();
+                    let c = sample(0, 2_000_000, false);
+                    publish_by(&d, publisher, &c, 0);
+                    decoded(&d, other(publisher), 7_000_000, copy_ms, false);
+                    decoded(&d, publisher, 0, 2, true);
+                    publish_by(&d, publisher, &c, 150);
+                    assert_ne!(
+                        d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                        0
+                    );
+                    close(&d, 200);
+                    let gap = d.hands[HAND_LEFT]
+                        .lock()
+                        .unwrap()
+                        .hand
+                        .classification_history()
+                        .gap
+                        .unwrap();
+                    assert_eq!(
+                        (gap.recording_anchor_ns, gap.open),
+                        (START, true),
+                        "{publisher:?} copy {copy_ms} ms"
+                    );
+                    assert_ne!(
+                        gap.confirmed_sleep_before_ns, 0,
+                        "{publisher:?} copy {copy_ms} ms"
+                    );
+                    open(&d);
+                    publish(&d, &c, 750);
+                    assert_ne!(
+                        d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                        0,
+                        "{publisher:?} copy {copy_ms} ms"
+                    );
+                    publish(&d, &sample(800, 4_000_000, false), 800);
+                    assert!(
+                        saved(&d, 11000).is_empty(),
+                        "{publisher:?} copy {copy_ms} ms"
+                    );
+                }
+            }
+        }
+
+        /// The same copy, discarded by the reader taking a hand over during a gap, in either
+        /// direction: the gap keeps its anchor and ends only at the controller's actual return.
+        #[test]
+        fn another_readers_copy_of_the_last_sample_does_not_end_a_gap_at_a_handoff() {
+            for outgoing in [engine::RadioReader::Engine, engine::RadioReader::Radio] {
+                for copy_ms in [-3, 0, 3, 60] {
+                    let d = status_daemon();
+                    let link = RadioLink::default();
+                    let mut pipe = Pipeline::new(pipeline::Options::default());
+                    let c = sample(0, 2_000_000, false);
+                    let incoming = other(outgoing);
+                    let mut notices = Vec::new();
+                    if matches!(outgoing, engine::RadioReader::Engine) {
+                        publish(&d, &c, 0);
+                        decoded(&d, incoming, 7_000_000, copy_ms, false);
+                        publish(&d, &c, 150);
+                        // The radio thread's passes discard its copy until it is granted the hand.
+                        refresh_radio_hands(
+                            &d,
+                            &link,
+                            &[None; 2],
+                            &mut [0; 2],
+                            &mut pipe,
+                            || START + 160 * MS,
+                            log,
+                        );
+                        link.hands.request(HAND_LEFT);
+                        assert!(!engine_publishes_hand_persistent(
+                            &d,
+                            &link.hands,
+                            HAND_LEFT,
+                            &c,
+                            || START + 200 * MS
+                        ));
+                        refresh_radio_hands(
+                            &d,
+                            &link,
+                            &[None; 2],
+                            &mut [0; 2],
+                            &mut pipe,
+                            || START + 250 * MS,
+                            |n| notices.push(n),
+                        );
+                    } else {
+                        link.hands.request(HAND_LEFT);
+                        assert!(!engine_publishes_hand_persistent(
+                            &d,
+                            &link.hands,
+                            HAND_LEFT,
+                            &c,
+                            || START
+                        ));
+                        publish_radio_hand_state(&d, HAND_LEFT, &c, || START, None, log);
+                        decoded(&d, incoming, 7_000_000, copy_ms, false);
+                        publish_radio_hand_state(&d, HAND_LEFT, &c, || START + 150 * MS, None, log);
+                        // The engine discards its copy while the radio thread publishes the hand.
+                        assert!(!engine_publishes_hand_persistent(
+                            &d,
+                            &link.hands,
+                            HAND_LEFT,
+                            &c,
+                            || START + 160 * MS
+                        ));
+                        link.hands.radio_exit();
+                        assert!(engine_publishes_hand_persistent(
+                            &d,
+                            &link.hands,
+                            HAND_LEFT,
+                            &c,
+                            || START + 250 * MS
+                        ));
+                    }
+                    let gap = d.hands[HAND_LEFT]
+                        .lock()
+                        .unwrap()
+                        .hand
+                        .classification_history()
+                        .gap
+                        .unwrap();
+                    assert_eq!(
+                        (gap.recording_anchor_ns, gap.open, gap.spans_handoff),
+                        (START, true, true),
+                        "{outgoing:?} copy {copy_ms} ms"
+                    );
+                    assert!(
+                        !notices.iter().any(|n: &String| n.contains("back")),
+                        "{outgoing:?} copy {copy_ms} ms: {notices:?}"
+                    );
+                    let wake = sample(800, 4_000_000, false);
+                    publish_hand_state_for_reader(
+                        &d,
+                        HAND_LEFT,
+                        incoming,
+                        &wake,
+                        || wake.received_host_ns,
+                        || None,
+                        |n| notices.push(n),
+                    );
+                    assert_eq!(
+                        notices,
+                        ["left: radio back (gap duration uncertain)"],
+                        "{outgoing:?} copy {copy_ms} ms"
+                    );
+                    assert_eq!(
+                        saved(&d, 11000)
+                            .iter()
+                            .map(|r| r.last_report_ns)
+                            .collect::<Vec<_>>(),
+                        [START],
+                        "{outgoing:?} copy {copy_ms} ms"
+                    );
+                }
+            }
+        }
+
+        /// A still controller goes silent without a sleep beacon and its hold expires; then the
+        /// engine reopens. Its return is recorded while the flight ring can still hold the gap's
+        /// window, and is standby after that, as it would be without the reopen.
+        #[test]
+        fn a_still_gap_through_a_reopen_is_recorded_only_while_the_flight_ring_holds_it() {
+            let latest_ms = flight::LATEST_NS / MS;
+            for (back_ms, recorded) in [(latest_ms - 1, true), (latest_ms, false), (120_000, false)]
+            {
+                let d = status_daemon();
+                let c = sample(0, 2_000_000, false);
+                publish(&d, &c, 0);
+                publish(&d, &c, 150);
+                publish(&d, &c, 10_100);
+                close(&d, 10_200);
+                open(&d);
+                let gap = d.hands[HAND_LEFT]
+                    .lock()
+                    .unwrap()
+                    .hand
+                    .classification_history()
+                    .gap
+                    .unwrap();
+                assert_eq!(
+                    (gap.recording_anchor_ns, gap.expired, gap.spans_handoff),
+                    (START, true, true)
+                );
+                let back = sample(back_ms, 4_000_000, false);
+                let mut notices = Vec::new();
+                publish_hand_state_for_reader(
+                    &d,
+                    HAND_LEFT,
+                    engine::RadioReader::Engine,
+                    &back,
+                    || back.received_host_ns,
+                    || None,
+                    |n| notices.push(n),
+                );
+                let (logged, saved_anchors) = if recorded {
+                    (
+                        vec!["left: radio back (gap duration uncertain)"],
+                        vec![START],
+                    )
+                } else {
+                    (vec![], vec![])
+                };
+                assert_eq!(notices, logged, "back after {back_ms} ms");
+                assert_eq!(
+                    saved(&d, back_ms + 11_000)
+                        .iter()
+                        .map(|r| r.last_report_ns)
+                        .collect::<Vec<_>>(),
+                    saved_anchors,
+                    "back after {back_ms} ms"
+                );
+            }
+        }
+
+        /// A worker's panic can leave a hand half-updated. Teardown then classifies nothing:
+        /// the hand, its queued activity and its recordings are left to the process exit,
+        /// whether teardown runs while that panic unwinds or after the worker failed.
+        #[test]
+        fn teardown_leaves_the_hands_alone_after_a_worker_failure() {
+            for unwinding in [false, true] {
+                let d = status_daemon();
+                let c = sample(0, 2_000_000, false);
+                publish(&d, &c, 0);
+                publish(&d, &c, 150);
+                // A return teardown would classify: it ends the gap after 800 ms, recordable.
+                decoded(&d, engine::RadioReader::Engine, 4_000_000, 800, false);
+                if unwinding {
+                    thread::scope(|scope| {
+                        let worker = scope.spawn(|| {
+                            let _session = ClassificationSession(&d, || START + 900 * MS);
+                            panic!("worker test");
+                        });
+                        assert!(worker.join().is_err());
+                    });
+                } else {
+                    d.failed_worker.store(RADIO_WORKER, Ordering::Release);
+                    drop(ClassificationSession(&d, || START + 900 * MS));
+                }
+                let gap = d.hands[HAND_LEFT]
+                    .lock()
+                    .unwrap()
+                    .hand
+                    .classification_history()
+                    .gap
+                    .unwrap();
+                assert_eq!(
+                    (gap.recording_anchor_ns, gap.open),
+                    (START, true),
+                    "unwinding {unwinding}"
+                );
+                let mut observer = Hand::new(HAND_LEFT, HandConfig::default());
+                d.radio_activity[engine::RadioReader::Engine as usize][HAND_LEFT]
+                    .drain_events(&mut observer, |_| {});
+                assert_eq!(
+                    observer
+                        .classification_history()
+                        .gap
+                        .unwrap()
+                        .recording_anchor_ns,
+                    START + 800 * MS,
+                    "unwinding {unwinding}"
+                );
+                assert!(saved(&d, 11000).is_empty(), "unwinding {unwinding}");
+            }
+        }
+
+        #[test]
+        fn a_preserved_nap_does_not_claim_an_exact_wake_duration() {
+            assert_eq!(
+                gap_notice(
+                    HAND_LEFT,
+                    GapEvent::Ended {
+                        last_sample_host_ns: START,
+                        silent_ns: 800 * MS,
+                        asleep: true,
+                        uncertain: true,
+                        recordable: false,
+                        capture_requested: false,
+                        cause: GapCause::Radio
+                    }
+                ),
+                "left: awake again (gap duration uncertain)"
+            );
+        }
+
+        #[test]
+        fn a_still_radio_dropout_keeps_its_original_anchor_through_reopen() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            open(&d);
+            publish(&d, &sample(800, 4_000_000, false), 800);
+            let recordings = saved(&d, 11000);
+            assert_eq!(recordings.len(), 1);
+            assert_eq!(recordings[0].last_report_ns, START);
+            assert!(!recordings[0].began_in_use);
+        }
+
+        #[test]
+        fn an_in_use_capture_is_not_requested_again_after_reopen_and_save() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, true);
+            publish(&d, &c, 0);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            let history = d.hands[HAND_LEFT]
+                .lock()
+                .unwrap()
+                .hand
+                .classification_history();
+            assert!(
+                history
+                    .gap
+                    .is_some_and(|gap| gap.recording_anchor_ns == START
+                        && gap.capture_requested
+                        && gap.cause == GapCause::Radio),
+                "{history:?}"
+            );
+            publish_unavailable(&d, START + 10000 * MS);
+            let recordings = saved(&d, 10000);
+            assert_eq!(recordings.len(), 1);
+            assert_eq!(
+                (recordings[0].last_report_ns, recordings[0].began_in_use),
+                (START, true)
+            );
+            open(&d);
+            publish(&d, &c, 12000);
+            publish(&d, &sample(12002, 4_000_000, false), 12002);
+            assert!(saved(&d, 13000).is_empty(), "saved window was re-armed");
+        }
+
+        #[test]
+        fn a_nap_between_the_90_ms_refresh_and_105_ms_reopen_stays_a_nap() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            beacon(&d, 2);
+            publish(&d, &c, 90);
+            engine_unavailable(&d, START + 105 * MS);
+            assert_eq!(
+                d.hands[HAND_LEFT]
+                    .lock()
+                    .unwrap()
+                    .hand
+                    .classification_history()
+                    .gap
+                    .unwrap()
+                    .cause,
+                GapCause::Radio
+            );
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            drop(ClassificationSession(&d, || START + 105 * MS));
+            open(&d);
+            publish(&d, &c, 200);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            publish(&d, &sample(800, 4_000_000, false), 800);
+            assert!(saved(&d, 11000).is_empty());
+        }
+
+        #[test]
+        fn a_new_readers_beacon_does_not_prove_the_old_radio_gap_was_sleep() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            open(&d);
+            beacon(&d, 750);
+            publish(&d, &sample(800, 4_000_000, false), 800);
+            let recordings = saved(&d, 11000);
+            assert_eq!(recordings.len(), 1);
+            assert_eq!(recordings[0].last_report_ns, START);
+        }
+
+        #[test]
+        fn a_moving_native_hold_does_not_mark_its_identity_captured() {
+            for cause in [GapCause::Reopen, GapCause::Stall] {
+                let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+                hand.update(&sample(0, 2_000_000, true), START);
+                hand.unavailable(START + 20 * MS, cause);
+                assert!(!hand.classification_history().gap.unwrap().capture_requested);
+            }
+        }
+
+        #[test]
+        fn reopen_and_stall_promotions_never_request_capture() {
+            for cause in [GapCause::Reopen, GapCause::Stall] {
+                let d = status_daemon();
+                let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+                hand.update(&sample(0, 2_000_000, false), START);
+                hand.unavailable(START + 20 * MS, cause);
+                record_test_gap(&d, HAND_LEFT, hand.take_event().unwrap());
+                assert!(!hand.classification_history().gap.unwrap().capture_requested);
+                let queue = cv1touch::hand::RadioActivityQueue::default();
+                queue.push(cv1touch::hand::RadioActivity {
+                    device_time_ns: 1_000_000,
+                    received_host_ns: START - 2 * MS,
+                    asleep: false,
+                    moving: true,
+                });
+                queue.discard();
+                let mut transitions = Vec::new();
+                queue.drain_events(&mut hand, |event| {
+                    transitions.push(event);
+                    record_test_gap(&d, HAND_LEFT, event);
+                });
+                assert!(!transitions
+                    .iter()
+                    .any(|e| matches!(e, GapEvent::InUse { .. })));
+                assert!(!hand.classification_history().gap.unwrap().capture_requested);
+                assert!(
+                    saved(&d, 11000).is_empty(),
+                    "{cause:?} promotion requested capture"
+                );
+            }
+        }
+
+        #[test]
+        fn every_non_radio_capture_transition_is_ignored() {
+            for cause in [GapCause::Reopen, GapCause::Stall] {
+                let d = status_daemon();
+                for event in [
+                    GapEvent::Began {
+                        last_sample_host_ns: START,
+                        moving: true,
+                        asleep: false,
+                        cause,
+                    },
+                    GapEvent::InUse {
+                        last_sample_host_ns: START,
+                        cause,
+                    },
+                    GapEvent::Ended {
+                        last_sample_host_ns: START,
+                        silent_ns: 800 * MS,
+                        asleep: false,
+                        uncertain: true,
+                        recordable: true,
+                        capture_requested: false,
+                        cause,
+                    },
+                ] {
+                    record_test_gap(&d, HAND_LEFT, event);
+                }
+                assert!(saved(&d, 11000).is_empty(), "{cause:?} armed a capture");
+            }
+        }
+
+        #[test]
+        fn non_radio_unknown_returns_stay_non_recordable() {
+            for cause in [GapCause::Reopen, GapCause::Stall] {
+                let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+                hand.update(&sample(0, 2_000_000, false), START);
+                hand.unavailable(START + 20 * MS, cause);
+                hand.take_event();
+                let queue = cv1touch::hand::RadioActivityQueue::default();
+                for i in 0..256 {
+                    queue.push(cv1touch::hand::RadioActivity {
+                        device_time_ns: 0,
+                        received_host_ns: START + i,
+                        asleep: true,
+                        moving: false,
+                    });
+                }
+                queue.push(cv1touch::hand::RadioActivity {
+                    device_time_ns: 4_000_000,
+                    received_host_ns: START + 800 * MS,
+                    asleep: false,
+                    moving: false,
+                });
+                let mut events = Vec::new();
+                queue.drain_events(&mut hand, |e| events.push(e));
+                assert!(
+                    !events.iter().any(|e| matches!(e, GapEvent::Ended { .. })),
+                    "raw report woke {cause:?}: {events:?}"
+                );
+                hand.classify_events(&sample(800, 4_000_000, false), START + 800 * MS, |e| {
+                    events.push(e)
+                });
+                assert!(events.iter().any(|e| matches!(e, GapEvent::Ended { cause: ended, recordable: false, .. } if *ended == cause)), "{cause:?}: {events:?}");
+            }
+        }
+
+        #[test]
+        fn an_older_receive_cannot_rewind_the_classification_anchor() {
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            hand.update(&sample(2, 2_000_000, false), START + 2 * MS);
+            hand.classify_events(&sample(1, 900_000_000, false), START + 3 * MS, |_| {});
+            assert_eq!(
+                hand.classification_history()
+                    .gap
+                    .unwrap()
+                    .recording_anchor_ns,
+                START + 2 * MS
+            );
+        }
+        #[test]
+        fn a_return_queued_before_reopen_cannot_arm_a_successor_radio_gap() {
+            for moving in [false, true] {
+                let d = status_daemon();
+                let c = sample(0, 2_000_000, false);
+                publish_radio_hand_state(&d, HAND_LEFT, &c, || START, None, log);
+                publish_radio_hand_state(&d, HAND_LEFT, &c, || START + 790 * MS, None, log);
+                d.activity(
+                    engine::RadioReader::Radio,
+                    calib::DEVICE_LEFT,
+                    4_000_000,
+                    START + 800 * MS,
+                    false,
+                    if moving { 1.0 } else { 0.0 },
+                );
+                engine_unavailable(&d, START + 850 * MS);
+                drop(ClassificationSession(&d, || START + 850 * MS));
+                let gap = d.hands[HAND_LEFT]
+                    .lock()
+                    .unwrap()
+                    .hand
+                    .classification_history()
+                    .gap
+                    .unwrap();
+                // This is an engine hold of the last published pose; only the Radio gap
+                // that ended at the queued return uses the decoder's sample boundary.
+                assert_eq!(gap.recording_anchor_ns, START);
+                assert_eq!(gap.cause, GapCause::Reopen, "moving return {moving}");
+                open(&d);
+                publish(&d, &sample(1600, 6_000_000, false), 1600);
+                assert_eq!(
+                    saved(&d, 11000)
+                        .iter()
+                        .map(|r| r.last_report_ns)
+                        .collect::<Vec<_>>(),
+                    [START]
+                );
+            }
+        }
+
+        #[test]
+        fn the_real_engine_handoff_drains_motion_before_granting_radio_ownership() {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            publish(&d, &sample(0, 2_000_000, false), 0);
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                START + 2 * MS,
+                false,
+                1.0,
+            );
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                6_000_000,
+                START + 4 * MS,
+                false,
+                0.0,
+            );
+            link.hands.request(HAND_LEFT);
+            assert!(!engine_publishes_hand_persistent(
+                &d,
+                &link.hands,
+                HAND_LEFT,
+                &sample(4, 6_000_000, false),
+                || START + 5 * MS
+            ));
+            let mut pipe = Pipeline::new(pipeline::Options::default());
+            refresh_radio_hands(
+                &d,
+                &link,
+                &[None; 2],
+                &mut [0; 2],
+                &mut pipe,
+                || START + 150 * MS,
+                log,
+            );
+            let recordings = saved(&d, 11000);
+            assert_eq!(recordings.len(), 1);
+            assert_eq!(
+                (recordings[0].last_report_ns, recordings[0].began_in_use),
+                (START + 4 * MS, true)
+            );
+        }
+
+        #[test]
+        fn a_sampleless_radio_takeover_cannot_keep_the_engine_readers_sleep_proof() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            beacon(&d, 2);
+            publish(&d, &c, 150);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            let link = RadioLink::default();
+            link.hands.request(HAND_LEFT);
+            assert!(!engine_publishes_hand_persistent(
+                &d,
+                &link.hands,
+                HAND_LEFT,
+                &c,
+                || START + 200 * MS
+            ));
+            let mut pipe = Pipeline::new(pipeline::Options::default());
+            refresh_radio_hands(
+                &d,
+                &link,
+                &[None; 2],
+                &mut [0; 2],
+                &mut pipe,
+                || START + 250 * MS,
+                log,
+            );
+            assert_eq!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            let wake = sample(800, 4_000_000, false);
+            publish_radio_hand_state(&d, HAND_LEFT, &wake, || wake.received_host_ns, None, log);
+            let recordings = saved(&d, 11000);
+            assert_eq!(recordings.len(), 1);
+            assert_eq!(recordings[0].last_report_ns, START);
+        }
+
+        #[test]
+        fn an_inactive_readers_return_before_sleep_proof_is_not_discarded_at_reopen() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            publish(&d, &c, 150);
+            d.activity(
+                engine::RadioReader::Radio,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                START + 600 * MS,
+                false,
+                0.0,
+            );
+            d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT].discard();
+            beacon(&d, 750);
+            publish(&d, &c, 760);
+            close(&d, 1000);
+            assert!(saved(&d, 11000).iter().any(|r| r.last_report_ns == START));
+        }
+
+        #[test]
+        fn an_inactive_readers_motion_is_kept_before_resetting_reader_evidence() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            d.activity(
+                engine::RadioReader::Radio,
+                calib::DEVICE_LEFT,
+                1_000_000,
+                START - 2 * MS,
+                false,
+                1.0,
+            );
+            d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT].discard();
+            beacon(&d, 2);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            assert!(saved(&d, 11000)
+                .iter()
+                .any(|r| r.last_report_ns == START && r.began_in_use));
+        }
+
+        #[test]
+        fn a_post_reopen_overflow_vetoes_the_settled_nap_before_a_retained_return() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            beacon(&d, 2);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            open(&d);
+            publish(&d, &c, 700);
+            for i in 0..257 {
+                beacon(&d, 750 + i);
+            }
+            publish(&d, &c, 1100);
+            publish(&d, &sample(1200, 4_000_000, false), 1200);
+            assert!(saved(&d, 11000).iter().any(|r| r.last_report_ns == START));
+        }
+
+        #[test]
+        fn a_post_reopen_loss_keeps_a_dropout_after_a_nap() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            beacon(&d, 2);
+            publish(&d, &c, 150);
+            close(&d, 200);
+            open(&d);
+            publish(&d, &c, 700);
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            for i in 0..256 {
+                beacon(&d, 750 + i);
+            }
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                START + 1200 * MS,
+                false,
+                0.0,
+            );
+            // Both the wake and the return after an 800 ms real dropout are lost.
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                6_000_000,
+                START + 2000 * MS,
+                false,
+                0.0,
+            );
+            publish(&d, &sample(2000, 6_000_000, false), 2000);
+            assert!(saved(&d, 11000).iter().any(|r| r.last_report_ns == START));
+        }
+        #[test]
+        fn an_expired_native_hold_does_not_log_a_second_return() {
+            let d = status_daemon();
+            publish(&d, &sample(0, 2_000_000, false), 0);
+            close(&d, 20);
+            publish_unavailable(&d, START + 10000 * MS);
+            open(&d);
+            let mut notices = Vec::new();
+            publish_hand_state_with_log(
+                &d,
+                HAND_LEFT,
+                &sample(12000, 4_000_000, false),
+                || START + 12000 * MS,
+                None,
+                |s| notices.push(s),
+            );
+            assert!(
+                !notices.iter().any(|n| n.contains("back after")),
+                "{notices:?}"
+            );
+            assert!(saved(&d, 13000).is_empty());
+        }
+
+        #[test]
+        fn a_cached_sample_cannot_end_the_reopen_hold_after_evidence_reset() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            close(&d, 20);
+            open(&d);
+            publish(&d, &c, 750);
+            let gap = d.hands[HAND_LEFT]
+                .lock()
+                .unwrap()
+                .hand
+                .classification_history()
+                .gap
+                .unwrap();
+            assert_eq!(
+                (gap.recording_anchor_ns, gap.cause),
+                (START, GapCause::Reopen)
+            );
+            publish(&d, &sample(800, 4_000_000, false), 800);
+            assert!(saved(&d, 11000).is_empty());
+        }
+
+        #[test]
+        fn the_heartbeat_leaves_activity_on_its_acquisition_threads_queue() {
+            let d = status_daemon();
+            publish(&d, &sample(0, 2_000_000, false), 0);
+            engine_unavailable(&d, START + 20 * MS);
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                START + 800 * MS,
+                false,
+                0.0,
+            );
+            publish_unavailable(&d, START + 900 * MS);
+            let mut observer = Hand::new(HAND_LEFT, HandConfig::default());
+            d.radio_activity[engine::RadioReader::Engine as usize][HAND_LEFT]
+                .drain_events(&mut observer, |_| {});
+            assert_eq!(
+                observer
+                    .classification_history()
+                    .gap
+                    .unwrap()
+                    .recording_anchor_ns,
+                START + 800 * MS
+            );
+        }
+
+        #[test]
+        fn raw_reports_cannot_end_a_native_hold_before_accepted_publication() {
+            for cause in [GapCause::Reopen, GapCause::Stall] {
+                let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+                hand.update(&sample(0, 2_000_000, false), START);
+                hand.unavailable(START + 20 * MS, cause);
+                hand.take_event();
+                let queue = cv1touch::hand::RadioActivityQueue::default();
+                queue.push(cv1touch::hand::RadioActivity {
+                    device_time_ns: 4_000_000,
+                    received_host_ns: START + 800 * MS,
+                    asleep: false,
+                    moving: true,
+                });
+                let mut events = Vec::new();
+                queue.drain_events(&mut hand, |e| events.push(e));
+                assert!(events.is_empty(), "{cause:?}: {events:?}");
+                assert_eq!(hand.classification_history().gap.unwrap().cause, cause);
+            }
+        }
+
+        #[test]
+        fn queued_samples_cannot_log_a_wake_while_the_engine_is_unavailable() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, false);
+            publish(&d, &c, 0);
+            engine_unavailable(&d, START + 20 * MS);
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                START + 800 * MS,
+                false,
+                0.0,
+            );
+            let mut notices = Vec::new();
+            publish_unavailable_with_log(&d, START + 900 * MS, |n| notices.push(n));
+            assert!(notices.is_empty(), "{notices:?}");
+            assert_ne!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
+                0
+            );
+        }
+
+        #[test]
+        fn the_heartbeat_cannot_start_the_new_readers_imported_use_window() {
+            let d = status_daemon();
+            let c = sample(0, 2_000_000, true);
+            publish_radio_hand_state(&d, HAND_LEFT, &c, || START, None, log);
+            close(&d, 20);
+            publish_unavailable(&d, START + 2000 * MS);
+            open(&d);
+            publish(&d, &sample(2600, 4_000_000, false), 2600);
+            let mut device = 4_000_000;
+            for ms in (2640..5500).step_by(40) {
+                device += 2_000_000;
+                publish(&d, &sample(ms, device, false), ms);
+            }
+            device += 2_000_000;
+            let still = sample(5500, device, false);
+            publish(&d, &still, 5500);
+            beacon(&d, 5502);
+            publish(&d, &still, 5650);
+            assert_eq!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            assert!(saved(&d, 16500)
+                .iter()
+                .any(|r| r.last_report_ns == START + 5500 * MS && r.began_in_use));
+        }
+    }
+
+    mod handoff_timing_tests {
+        use super::*;
+
+        const START: u64 = 5_000_000_000;
+        const MS: u64 = 1_000_000;
+
+        fn sample(at: u64, device: u64, moving: bool) -> engine::Controller {
+            engine::Controller {
+                calibrated: true,
+                device_time_ns: device,
+                received_host_ns: START + at * MS,
+                imu_gyro: [if moving { 1.0 } else { 0.0 }, 0.0, 0.0],
+                ..Default::default()
+            }
+        }
+
+        fn delayed_publication(tick_ms: u64, published_ms: u64, returned_ms: u64) {
+            let d = status_daemon();
+            let slot = &d.classification[HAND_LEFT];
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            let c = sample(0, 2_000_000, false);
+            outgoing.classify_events(&c, START, |e| note_gap(&d, HAND_LEFT, e));
+            outgoing.tick_events(START + tick_ms * MS, |e| note_gap(&d, HAND_LEFT, e));
+            // The publisher is paused between its classification tick and this publication.
+            slot.publish(engine::RadioReader::Engine, &outgoing);
+            let mut memory = HandMemory {
+                reader: engine::RadioReader::Radio,
+                ..Default::default()
+            };
+            slot.inherit_with_clock(&mut memory, &mut incoming, || START + published_ms * MS);
+            let wake = sample(returned_ms, 4_000_000, false);
+            let mut events = Vec::new();
+            incoming.classify_events(&wake, wake.received_host_ns, |e| {
+                note_gap(&d, HAND_LEFT, e);
+                events.push(e);
+            });
+            assert!(events.iter().any(|e| matches!(e, GapEvent::Ended { last_sample_host_ns, silent_ns, recordable: true, .. }
+                if *last_sample_host_ns == START && *silent_ns == returned_ms * MS)), "{events:?}");
+            let saved = d.flight.due(START + flight::AFTER_NS);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].last_report_ns, START);
+        }
+
+        #[test]
+        fn a_publication_pause_cannot_turn_an_800_ms_dropout_into_a_blip() {
+            delayed_publication(150, 550, 800);
+        }
+
+        #[test]
+        fn a_publication_pause_cannot_turn_a_600_ms_dropout_into_a_blip() {
+            delayed_publication(100, 550, 600);
+        }
+
+        #[test]
+        fn an_inheritance_pause_starts_the_use_window_at_actual_takeover() {
+            let d = status_daemon();
+            let slot = &d.classification[HAND_LEFT];
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            let c = sample(0, 2_000_000, true);
+            outgoing.classify_events(&c, START, |_| {});
+            outgoing.tick_events(START + 150 * MS, |_| {});
+            slot.publish(engine::RadioReader::Engine, &outgoing);
+            let mut memory = HandMemory {
+                reader: engine::RadioReader::Radio,
+                ..Default::default()
+            };
+            // The loop clock was read at 150 ms. Inheritance only runs at 1 s.
+            slot.inherit_with_clock(&mut memory, &mut incoming, || START + 1000 * MS);
+            let c = sample(3900, 4_000_000, false);
+            incoming.classify_events(&c, c.received_host_ns, |_| {});
+            incoming.note_sleep_beacon(START + 3902 * MS);
+            let mut events = Vec::new();
+            incoming.tick_events(START + 4050 * MS, |e| events.push(e));
+            assert!(events.iter().any(|e| matches!(e, GapEvent::Began { last_sample_host_ns, moving: true, asleep: false , cause: GapCause::Radio,}
+                if *last_sample_host_ns == START + 3900 * MS)), "{events:?}");
+        }
+
+        fn pre_takeover_successor(kind: u8, takeover_ms: u64) {
+            let d = status_daemon();
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            let c = sample(0, 2_000_000, false);
+            outgoing.classify_events(&c, START, |e| note_gap(&d, HAND_LEFT, e));
+            outgoing.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+            if kind == 2 {
+                for i in 0..256 {
+                    queue.push(cv1touch::hand::RadioActivity {
+                        device_time_ns: 2_000_000,
+                        received_host_ns: START + i,
+                        asleep: true,
+                        moving: false,
+                    });
+                }
+            }
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns: 4_000_000,
+                received_host_ns: START + 11000 * MS,
+                asleep: false,
+                moving: false,
+            });
+            if kind != 0 {
+                queue.discard();
+            }
+            incoming.inherit_classification_at(
+                outgoing.classification_history(),
+                START + takeover_ms * MS,
+            );
+            queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+            let saved = d.flight.due(START + 12000 * MS);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].last_report_ns, START);
+            incoming.note_sleep_beacon(START + 12100 * MS);
+            let mut events = Vec::new();
+            incoming.tick_events(START + 12100 * MS, |e| {
+                note_gap(&d, HAND_LEFT, e);
+                events.push(e);
+            });
+            let wake = sample(15000, 6_000_000, false);
+            incoming.classify_events(&wake, wake.received_host_ns, |e| {
+                note_gap(&d, HAND_LEFT, e);
+                events.push(e);
+            });
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    GapEvent::Asleep
+                        | GapEvent::Began { asleep: true, .. }
+                        | GapEvent::Ended { asleep: true, .. }
+                )),
+                "{events:?}"
+            );
+            let saved = d.flight.due(START + 25000 * MS);
+            assert_eq!(saved.len(), 1, "{events:?}");
+            assert_eq!(saved[0].last_report_ns, START + 11000 * MS);
+        }
+
+        #[test]
+        fn a_retained_pre_takeover_return_keeps_its_successor_handoff_spanning() {
+            pre_takeover_successor(0, 12000);
+        }
+        #[test]
+        fn a_discarded_pre_takeover_return_keeps_its_successor_handoff_spanning() {
+            pre_takeover_successor(1, 12000);
+        }
+        #[test]
+        fn a_lost_pre_takeover_return_keeps_its_successor_handoff_spanning() {
+            pre_takeover_successor(2, 12000);
+        }
+
+        fn saved_without_expiry(kind: u8, returned_ms: u64) {
+            let d = status_daemon();
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            let c = sample(0, 2_000_000, true);
+            outgoing.classify_events(&c, START, |e| note_gap(&d, HAND_LEFT, e));
+            outgoing.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            let saved = d.flight.due(START + flight::AFTER_NS);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].last_report_ns, START);
+            let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+            if kind == 2 {
+                for i in 0..256 {
+                    queue.push(cv1touch::hand::RadioActivity {
+                        device_time_ns: 2_000_000,
+                        received_host_ns: START + i,
+                        asleep: true,
+                        moving: false,
+                    });
+                }
+            }
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns: 4_000_000,
+                received_host_ns: START + returned_ms * MS,
+                asleep: false,
+                moving: false,
+            });
+            if kind != 0 {
+                queue.discard();
+            }
+            let slot = &d.classification[HAND_LEFT];
+            slot.publish(engine::RadioReader::Engine, &outgoing);
+            let mut memory = HandMemory {
+                reader: engine::RadioReader::Radio,
+                ..Default::default()
+            };
+            slot.inherit_with_clock(&mut memory, &mut incoming, || START + 12100 * MS);
+            queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+            let saved = d.flight.due(START + 12100 * MS);
+            assert!(
+                saved.iter().all(|r| r.last_report_ns != START),
+                "original window was requested twice: {saved:?}"
+            );
+        }
+
+        #[test]
+        fn a_retained_return_cannot_rearm_a_saved_gap_without_an_expiry_tick() {
+            saved_without_expiry(0, 12000);
+        }
+        #[test]
+        fn a_discarded_return_cannot_rearm_a_saved_gap_without_an_expiry_tick() {
+            saved_without_expiry(1, 12000);
+        }
+        #[test]
+        fn a_lost_return_cannot_rearm_a_saved_gap_without_an_expiry_tick() {
+            saved_without_expiry(2, 12000);
+        }
+        #[test]
+        fn a_delayed_short_return_cannot_rearm_a_saved_gap() {
+            saved_without_expiry(0, 800);
+        }
+        #[test]
+        fn a_return_at_takeover_keeps_its_successor_handoff_spanning() {
+            pre_takeover_successor(0, 11000);
+        }
+
+        #[test]
+        fn a_post_takeover_sample_can_establish_uninterrupted_sleep() {
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            outgoing.classify_events(&sample(0, 2_000_000, false), START, |_| {});
+            incoming
+                .inherit_classification_at(outgoing.classification_history(), START + 1000 * MS);
+            let after = sample(1000, 4_000_000, false);
+            incoming.classify_events(&after, after.received_host_ns, |_| {});
+            let after = sample(1000, 6_000_000, false);
+            // Strictly after takeover, including a single nanosecond, clears the precaution.
+            let after = engine::Controller {
+                received_host_ns: after.received_host_ns + 1,
+                ..after
+            };
+            incoming.classify_events(&after, after.received_host_ns, |_| {});
+            incoming.note_sleep_beacon(START + 1002 * MS);
+            let mut events = Vec::new();
+            incoming.tick_events(START + 1150 * MS, |e| events.push(e));
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, GapEvent::Began { asleep: true, .. })),
+                "{events:?}"
+            );
+            assert_eq!(
+                incoming
+                    .classification_history()
+                    .gap
+                    .unwrap()
+                    .recording_anchor_ns,
+                after.received_host_ns
+            );
+        }
+
+        #[test]
+        fn a_saved_gap_does_not_need_a_handoff_to_avoid_a_second_capture() {
+            let d = status_daemon();
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            hand.classify_events(&sample(0, 2_000_000, true), START, |e| {
+                note_gap(&d, HAND_LEFT, e)
+            });
+            hand.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            assert_eq!(d.flight.due(START + flight::AFTER_NS).len(), 1);
+            let wake = sample(12000, 4_000_000, false);
+            hand.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+            assert!(d.flight.due(wake.received_host_ns).is_empty());
+        }
+
+        #[test]
+        fn a_saved_capture_does_not_suppress_a_later_still_dropout() {
+            let d = status_daemon();
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            hand.classify_events(&sample(0, 2_000_000, true), START, |e| {
+                note_gap(&d, HAND_LEFT, e)
+            });
+            hand.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            assert_eq!(d.flight.due(START + flight::AFTER_NS).len(), 1);
+            let wake = sample(12000, 4_000_000, false);
+            hand.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+            hand.tick_events(START + 12150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            let wake = sample(12800, 6_000_000, false);
+            hand.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+            let saved = d.flight.due(START + 22000 * MS);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].last_report_ns, START + 12000 * MS);
+        }
+
+        #[test]
+        fn a_recordable_return_keeps_the_original_pending_capture() {
+            let d = status_daemon();
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            hand.classify_events(&sample(0, 2_000_000, true), START, |e| {
+                note_gap(&d, HAND_LEFT, e)
+            });
+            hand.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            let wake = sample(800, 4_000_000, false);
+            hand.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+            let saved = d.flight.due(START + flight::AFTER_NS);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                (saved[0].last_report_ns, saved[0].began_in_use),
+                (START, true)
+            );
+        }
+
+        #[test]
+        fn a_promoted_saved_gap_cannot_rearm_without_an_expiry_tick() {
+            let d = status_daemon();
+            let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+            outgoing.classify_events(&sample(0, 2_000_000, false), START, |e| {
+                note_gap(&d, HAND_LEFT, e)
+            });
+            outgoing.tick_events(START + 150 * MS, |e| note_gap(&d, HAND_LEFT, e));
+            let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns: 1_000_000,
+                received_host_ns: START - 2 * MS,
+                asleep: false,
+                moving: true,
+            });
+            queue.discard();
+            incoming.inherit_classification_at(outgoing.classification_history(), START + 200 * MS);
+            let mut events = Vec::new();
+            queue.drain_events(&mut incoming, |e| {
+                note_gap(&d, HAND_LEFT, e);
+                events.push(e);
+            });
+            assert!(events.iter().any(|e| matches!(e, GapEvent::InUse { last_sample_host_ns , cause: GapCause::Radio,} if *last_sample_host_ns == START)), "{events:?}");
+            assert_eq!(d.flight.due(START + flight::AFTER_NS).len(), 1);
+            let wake = sample(12000, 4_000_000, false);
+            incoming.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+            assert!(d.flight.due(wake.received_host_ns).is_empty());
+        }
+    }
+
+    // Each trace uses separate readers on the shared host clock and the real recorder consumer.
+    fn receiver_only_motion(handoff_ms: u64, moving_return: bool) {
+        let d = status_daemon();
+        let (a, b) = (5_000_000_000, 5_000_000_000);
+        let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: a,
+            ..Default::default()
+        };
+        outgoing.classify_events(&c, a, |e| note_gap(&d, HAND_LEFT, e));
+        outgoing.classify_events(&c, a + 150_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        outgoing.note_sleep_beacon(a + 750_000_000);
+        outgoing.classify_events(&c, a + 750_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+        for (device_time_ns, received_host_ns, moving) in
+            [(1_000_000, b - 2_000_000, true), (2_000_000, b, false)]
+        {
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns,
+                received_host_ns,
+                moving,
+                asleep: false,
+            });
+        }
+        queue.discard();
+        if moving_return {
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns: 4_000_000,
+                received_host_ns: b + 600_000_000,
+                moving: true,
+                asleep: false,
+            });
+            queue.discard();
+        }
+        incoming.inherit_classification_at(
+            outgoing.classification_history(),
+            b + handoff_ms * 1_000_000,
+        );
+        queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+        incoming.note_sleep_beacon(b + (handoff_ms + 100) * 1_000_000);
+        incoming.tick_events(b + 11_000_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        let due = d.flight.due(a + flight::AFTER_NS);
+        assert_eq!(due.len(), 1, "receiver motion at handoff {handoff_ms} ms");
+        assert_eq!((due[0].last_report_ns, due[0].began_in_use), (a, true));
+    }
+
+    #[test]
+    fn receiver_motion_is_evaluated_at_the_gap_start_after_a_late_handoff() {
+        receiver_only_motion(4_000, false);
+    }
+
+    #[test]
+    fn promotion_of_an_open_sleeping_gap_requests_capture_without_a_return() {
+        receiver_only_motion(1_000, false);
+    }
+
+    #[test]
+    fn later_receiver_motion_cannot_hide_its_use_before_the_gap() {
+        receiver_only_motion(1_000, true);
+    }
+
+    #[test]
+    fn a_discarded_return_completes_the_inherited_gap_without_another_sample() {
+        let d = status_daemon();
+        let (a, b) = (5_000_000_000, 5_000_000_000);
+        let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: a,
+            ..Default::default()
+        };
+        outgoing.classify_events(&c, a, |_| {});
+        outgoing.classify_events(&c, a + 150_000_000, |_| {});
+        let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+        queue.push(cv1touch::hand::RadioActivity {
+            device_time_ns: 4_000_000,
+            received_host_ns: b + 600_000_000,
+            asleep: false,
+            moving: false,
+        });
+        queue.discard();
+        incoming.inherit_classification_at(outgoing.classification_history(), b + 1_000_000_000);
+        queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+        incoming.tick_events(b + 11_000_000_000, |e| note_gap(&d, HAND_LEFT, e));
+        let due = d.flight.due(a + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].last_report_ns, a);
+        assert!(incoming
+            .classification_history()
+            .gap
+            .is_none_or(|g| g.recording_anchor_ns != a));
+    }
+
+    #[test]
+    fn a_lost_return_before_handoff_is_recorded_before_any_late_return() {
+        let d = status_daemon();
+        let (a, b) = (5_000_000_000, 5_000_000_000);
+        let mut outgoing = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut incoming = Hand::new(HAND_LEFT, HandConfig::default());
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: a,
+            ..Default::default()
+        };
+        outgoing.classify_events(&c, a, |_| {});
+        outgoing.classify_events(&c, a + 1_000_000_000, |_| {});
+        let queue = &d.radio_activity[engine::RadioReader::Radio as usize][HAND_LEFT];
+        for i in 0..256 {
+            queue.push(cv1touch::hand::RadioActivity {
+                device_time_ns: i + 1,
+                received_host_ns: b - (255 - i) * 1_000_000,
+                asleep: false,
+                moving: false,
+            });
+        }
+        queue.push(cv1touch::hand::RadioActivity {
+            device_time_ns: 4_000_000,
+            received_host_ns: b + 800_000_000,
+            asleep: false,
+            moving: false,
+        });
+        queue.discard();
+        incoming.inherit_classification_at(outgoing.classification_history(), b + 1_000_000_000);
+        queue.drain_events(&mut incoming, |e| note_gap(&d, HAND_LEFT, e));
+        let due = d.flight.due(a + flight::AFTER_NS);
+        assert_eq!(
+            due.len(),
+            1,
+            "lost first return must end the gap at takeover"
+        );
+        assert_eq!(due[0].last_report_ns, a);
+        let wake = engine::Controller {
+            received_host_ns: b + 12_000_000_000,
+            device_time_ns: 6_000_000,
+            ..c
+        };
+        incoming.classify_events(&wake, wake.received_host_ns, |e| note_gap(&d, HAND_LEFT, e));
+    }
+
+    #[test]
+    fn an_engine_batch_is_classified_before_a_handoff_can_be_requested() {
+        let d = status_daemon();
+        let ownership = HandOwnership::default();
+        let start = 5_000_000_000;
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: start,
+            ..Default::default()
+        };
+        publish_hand_state(&d, HAND_LEFT, &c, || start, None);
+        d.activity(
+            engine::RadioReader::Engine,
+            calib::DEVICE_LEFT,
+            4_000_000,
+            start + 800_000_000,
+            false,
+            0.0,
+        );
+        let wake = engine::Controller {
+            device_time_ns: 4_000_000,
+            received_host_ns: start + 800_000_000,
+            ..c
+        };
+        assert!(engine_publishes_hand_persistent(
+            &d,
+            &ownership,
+            HAND_LEFT,
+            &wake,
+            || wake.received_host_ns
+        ));
+        // A request arriving after the first ownership check cannot strand this batch.
+        ownership.request(HAND_LEFT);
+        assert!(!ownership.engine_publishes(HAND_LEFT));
+        let due = d.flight.due(start + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].last_report_ns, start);
+    }
+
+    // Explicit clock for synthetic publisher handoffs. Subsequent publication runs the same
+    // production consumer with the history already loaded; wall-clock scheduling cannot move
+    // these fixtures' ownership boundary relative to their fictional receive timestamps.
+    fn takeover_at(d: &Daemon, h: usize, hand: &mut Hand, memory: &mut HandMemory, at: u64) {
+        d.classification[h].inherit_with_clock(memory, hand, || at);
+        d.classification[h].publish(memory.reader, hand);
+    }
+
+    fn handoff_dropout(outgoing_radio: bool, uncertain_gap: bool) {
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let d = status_daemon();
+            let ownership = HandOwnership::default();
+            let reader = |radio| {
+                if radio {
+                    engine::RadioReader::Radio
+                } else {
+                    engine::RadioReader::Engine
+                }
+            };
+            let mut outgoing = Hand::new(h, HandConfig::default());
+            let mut incoming = Hand::new(h, HandConfig::default());
+            let mut old_memory = HandMemory {
+                reader: reader(outgoing_radio),
+                ..Default::default()
+            };
+            let mut new_memory = HandMemory {
+                reader: reader(!outgoing_radio),
+                ..Default::default()
+            };
+            let mut old_shaper = VelocityShaper::new(ShapeParams::default());
+            let mut new_shaper = VelocityShaper::new(ShapeParams::default());
+            if outgoing_radio {
+                // Engine fallback reuses its earlier Hand and HandMemory, not a fresh publisher.
+                let first = engine::Controller {
+                    calibrated: true,
+                    device_time_ns: 1_000_000,
+                    received_host_ns: 49_998_000_000,
+                    ..Default::default()
+                };
+                publish_hand_state_legacy(
+                    &d,
+                    h,
+                    &first,
+                    first.received_host_ns,
+                    &mut incoming,
+                    None,
+                    &mut new_shaper,
+                    &mut new_memory,
+                );
+                ownership.request(h);
+                assert!(!ownership.engine_publishes(h));
+            }
+            let old = engine::Controller {
+                calibrated: true,
+                device_time_ns: 50_000_000,
+                received_host_ns: 50_000_000_000,
+                imu_gyro: if uncertain_gap {
+                    [0.01, 0.0, 0.0]
+                } else {
+                    [1.0, 0.0, 0.0]
+                },
+                ..Default::default()
+            };
+            takeover_at(
+                &d,
+                h,
+                &mut outgoing,
+                &mut old_memory,
+                old.received_host_ns - 1,
+            );
+            publish_hand_state_legacy(
+                &d,
+                h,
+                &old,
+                old.received_host_ns,
+                &mut outgoing,
+                None,
+                &mut old_shaper,
+                &mut old_memory,
+            );
+            if uncertain_gap {
+                // Lose this reader's ordered history, then hand off while its gap is unclassified.
+                let device = if h == HAND_LEFT {
+                    calib::DEVICE_LEFT
+                } else {
+                    calib::DEVICE_RIGHT
+                };
+                for i in 0..300 {
+                    d.activity(
+                        reader(outgoing_radio),
+                        device,
+                        old.device_time_ns,
+                        old.received_host_ns + 2_000_000 + i,
+                        true,
+                        0.0,
+                    );
+                }
+                publish_hand_state_legacy(
+                    &d,
+                    h,
+                    &old,
+                    old.received_host_ns + 150_000_000,
+                    &mut outgoing,
+                    None,
+                    &mut old_shaper,
+                    &mut old_memory,
+                );
+            }
+            if outgoing_radio {
+                ownership.radio_exit();
+                assert!(ownership.engine_publishes(h));
+            } else {
+                ownership.request(h);
+                assert!(!ownership.engine_publishes(h));
+                assert!(ownership.radio_publishes(h));
+            }
+            // Separate Hand instance on the same host clock. Only the outgoing publisher saw motion.
+            let takeover = old.received_host_ns + 150_000_000;
+            let start = takeover + 2_000_000;
+            let mut c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 2_000_000,
+                received_host_ns: start,
+                imu_gyro: [0.01, 0.0, 0.0],
+                ..Default::default()
+            };
+            takeover_at(&d, h, &mut incoming, &mut new_memory, takeover);
+            publish_hand_state_legacy(
+                &d,
+                h,
+                &c,
+                start,
+                &mut incoming,
+                None,
+                &mut new_shaper,
+                &mut new_memory,
+            );
+            let device = if h == HAND_LEFT {
+                calib::DEVICE_LEFT
+            } else {
+                calib::DEVICE_RIGHT
+            };
+            d.activity(
+                reader(!outgoing_radio),
+                device,
+                c.device_time_ns,
+                start + 2_000_000,
+                true,
+                0.0,
+            );
+            publish_hand_state_legacy(
+                &d,
+                h,
+                &c,
+                start + 150_000_000,
+                &mut incoming,
+                None,
+                &mut new_shaper,
+                &mut new_memory,
+            );
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns += 800_000_000;
+            publish_hand_state_legacy(
+                &d,
+                h,
+                &c,
+                c.received_host_ns,
+                &mut incoming,
+                None,
+                &mut new_shaper,
+                &mut new_memory,
+            );
+            let anchor = if uncertain_gap {
+                old.received_host_ns
+            } else {
+                start
+            };
+            let due = d.flight.due(anchor + flight::AFTER_NS);
+            assert_eq!(
+                due.len(),
+                usize::from(!uncertain_gap),
+                "outgoing radio {outgoing_radio}, beacon loss {uncertain_gap}, hand {h}"
+            );
+            if let Some(due) = due.first() {
+                assert_eq!(
+                    due.last_report_ns, anchor,
+                    "an unfinished gap keeps its original recording anchor"
+                );
+            }
+            if uncertain_gap {
+                // Its next own sample ended the ambiguous interval. A later known nap is sleep.
+                d.activity(
+                    reader(!outgoing_radio),
+                    device,
+                    c.device_time_ns,
+                    c.received_host_ns + 2_000_000,
+                    true,
+                    0.0,
+                );
+                publish_hand_state_legacy(
+                    &d,
+                    h,
+                    &c,
+                    c.received_host_ns + 150_000_000,
+                    &mut incoming,
+                    None,
+                    &mut new_shaper,
+                    &mut new_memory,
+                );
+                assert_ne!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+                c.device_time_ns += 2_000_000;
+                c.received_host_ns += 800_000_000;
+                publish_hand_state_legacy(
+                    &d,
+                    h,
+                    &c,
+                    c.received_host_ns,
+                    &mut incoming,
+                    None,
+                    &mut new_shaper,
+                    &mut new_memory,
+                );
+                assert!(d
+                    .flight
+                    .due(c.received_host_ns + flight::AFTER_NS)
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_handoff_does_not_log_an_uncertain_duration_as_exact() {
+        assert_eq!(
+            gap_message(
+                "left",
+                GapEvent::Ended {
+                    last_sample_host_ns: 1_000_000_000,
+                    silent_ns: 150_000_000,
+                    asleep: false,
+                    uncertain: true,
+                    recordable: true,
+                    capture_requested: false,
+                    cause: GapCause::Radio,
+                }
+            )
+            .map(|m| m.to_string())
+            .as_deref(),
+            Some("left: radio back (gap duration uncertain)")
+        );
+    }
+
+    #[test]
+    fn drained_motion_reaches_classification_on_both_readers() {
+        for reader in [engine::RadioReader::Engine, engine::RadioReader::Radio] {
+            let d = status_daemon();
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut memory = HandMemory {
+                reader,
+                ..Default::default()
+            };
+            let mut shaper = VelocityShaper::new(ShapeParams::default());
+            let start = 5_000_000_000;
+            let mut c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 2_000_000,
+                received_host_ns: start,
+                ..Default::default()
+            };
+            publish_hand_state_legacy(
+                &d,
+                HAND_LEFT,
+                &c,
+                start,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            );
+            d.activity(
+                reader,
+                calib::DEVICE_LEFT,
+                4_000_000,
+                start + 2_000_000,
+                false,
+                1.0,
+            );
+            d.activity(
+                reader,
+                calib::DEVICE_LEFT,
+                6_000_000,
+                start + 4_000_000,
+                false,
+                0.0,
+            );
+            c.device_time_ns = 6_000_000;
+            c.received_host_ns += 4_000_000;
+            publish_hand_state_legacy(
+                &d,
+                HAND_LEFT,
+                &c,
+                c.received_host_ns,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            );
+            d.activity(
+                reader,
+                calib::DEVICE_LEFT,
+                c.device_time_ns,
+                c.received_host_ns + 2_000_000,
+                true,
+                0.0,
+            );
+            publish_hand_state_legacy(
+                &d,
+                HAND_LEFT,
+                &c,
+                c.received_host_ns + 150_000_000,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            );
+            assert_eq!(
+                d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0
+            );
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns += 800_000_000;
+            publish_hand_state_legacy(
+                &d,
+                HAND_LEFT,
+                &c,
+                c.received_host_ns,
+                &mut hand,
+                None,
+                &mut shaper,
+                &mut memory,
+            );
+            assert_eq!(d.flight.due(start + 4_000_000 + flight::AFTER_NS).len(), 1);
+        }
+    }
+
+    /// The radio thread's first sample after a handoff was read before its takeover; the next
+    /// one starts an interval of its own, which the engine's drained motion makes in use.
+    #[test]
+    fn the_outgoing_engine_finishes_its_drain_before_granting_ownership() {
+        let d = status_daemon();
+        let ownership = HandOwnership::default();
+        let start = 5_000_000_000;
+        let mut c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: start,
+            ..Default::default()
+        };
+        publish_hand_state(&d, HAND_LEFT, &c, || start, None);
+        // Only the outgoing reader sees this motion. The engine's newest snapshot is still.
+        d.activity(
+            engine::RadioReader::Engine,
+            calib::DEVICE_LEFT,
+            4_000_000,
+            start + 2_000_000,
+            false,
+            1.0,
+        );
+        d.activity(
+            engine::RadioReader::Engine,
+            calib::DEVICE_LEFT,
+            6_000_000,
+            start + 4_000_000,
+            false,
+            0.0,
+        );
+        c.device_time_ns = 6_000_000;
+        c.received_host_ns += 4_000_000;
+        ownership.request(HAND_LEFT);
+        assert!(!engine_publishes_hand_persistent(
+            &d,
+            &ownership,
+            HAND_LEFT,
+            &c,
+            || c.received_host_ns
+        ));
+        c.device_time_ns = 20_000_000;
+        c.received_host_ns = start + 6_000_000;
+        publish_radio_hand_state(&d, HAND_LEFT, &c, || start + 6_500_000, None, log);
+        c.device_time_ns += 2_000_000;
+        let anchor = start + 8_000_000;
+        c.received_host_ns = anchor;
+        publish_radio_hand_state(&d, HAND_LEFT, &c, || anchor, None, log);
+        d.activity(
+            engine::RadioReader::Radio,
+            calib::DEVICE_LEFT,
+            c.device_time_ns,
+            anchor + 2_000_000,
+            true,
+            0.0,
+        );
+        publish_radio_hand_state(&d, HAND_LEFT, &c, || anchor + 150_000_000, None, log);
+        assert_eq!(
+            d.shm.hand(HAND_LEFT).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+            0
+        );
+        let gap = d.hands[HAND_LEFT]
+            .lock()
+            .unwrap()
+            .hand
+            .classification_history()
+            .gap
+            .unwrap();
+        assert_eq!(
+            (
+                gap.recording_anchor_ns,
+                gap.spans_handoff,
+                gap.capture_requested
+            ),
+            (anchor, false, true)
+        );
+        c.device_time_ns += 2_000_000;
+        c.received_host_ns += 800_000_000;
+        publish_radio_hand_state(&d, HAND_LEFT, &c, || c.received_host_ns, None, log);
+        assert_eq!(d.flight.due(anchor + flight::AFTER_NS).len(), 1);
+    }
+
+    #[test]
+    fn engine_motion_survives_a_radio_handoff() {
+        handoff_dropout(false, false);
+    }
+
+    #[test]
+    fn radio_motion_survives_engine_fallback() {
+        handoff_dropout(true, false);
+    }
+
+    #[test]
+    fn unclassified_gaps_survive_both_handoff_directions() {
+        handoff_dropout(false, true);
+        handoff_dropout(true, true);
+    }
+
+    fn device(h: usize) -> i32 {
+        if h == HAND_LEFT {
+            calib::DEVICE_LEFT
+        } else {
+            calib::DEVICE_RIGHT
+        }
+    }
+
+    /// A reopened native engine keeps a prior Radio request but not stale motion or overflow.
+    /// Real recent use deliberately buys three seconds after the new publisher takes over.
+    #[test]
+    fn an_engine_session_boundary_is_never_a_radio_dropout() {
+        for (h, before) in [
+            (HAND_LEFT, engine::RadioReader::Engine),
+            (HAND_RIGHT, engine::RadioReader::Radio),
+        ] {
+            for in_use in [false, true] {
+                let d = status_daemon();
+                let start = 300_000_000_000;
+                let mut c = engine::Controller {
+                    calibrated: true,
+                    device_time_ns: 2_000_000,
+                    received_host_ns: start,
+                    imu_gyro: [1.0, 0.0, 0.0],
+                    ..Default::default()
+                };
+                let publish = |c: &engine::Controller, now| {
+                    publish_hand_state_for_reader(&d, h, before, c, || now, || None, log)
+                };
+                publish(&c, start);
+                if in_use {
+                    publish(&c, start + 150_000_000);
+                }
+                let other = if matches!(before, engine::RadioReader::Engine) {
+                    engine::RadioReader::Radio
+                } else {
+                    engine::RadioReader::Engine
+                };
+                for i in 0..300 {
+                    d.activity(
+                        other,
+                        device(h),
+                        2_000_000 + i,
+                        start - 200_000_000_000 + i,
+                        false,
+                        1.0,
+                    );
+                }
+                engine_unavailable(&d, start + if in_use { 200_000_000 } else { 20_000_000 });
+                drop(ClassificationSession(&d, || start + 200_000_000));
+                start_engine_run(&d, 1, &mut None, || ());
+                let reopened = start + 2_000_000_000;
+                c.imu_gyro = [0.0; 3];
+                c.device_time_ns += 2_000_000;
+                c.received_host_ns = reopened;
+                publish(&c, reopened);
+                assert_eq!(
+                    d.shm.hand(h).unwrap().flags
+                        & (ffi::CV1T_FLAG_CONNECTED | ffi::CV1T_FLAG_RADIO_GAP),
+                    ffi::CV1T_FLAG_CONNECTED
+                );
+                assert_eq!(
+                    d.flight
+                        .due(start + flight::AFTER_NS)
+                        .iter()
+                        .map(|d| d.last_report_ns)
+                        .collect::<Vec<_>>(),
+                    if in_use { vec![start] } else { vec![] }
+                );
+                // After the conservative imported-use window, the stale queue cannot resurrect it.
+                for ms in (2040..=5200).step_by(40) {
+                    c.device_time_ns += 2_000_000;
+                    c.received_host_ns = start + ms * 1_000_000;
+                    publish(&c, c.received_host_ns);
+                }
+                d.activity(
+                    before,
+                    device(h),
+                    0,
+                    c.received_host_ns + 2_000_000,
+                    true,
+                    0.0,
+                );
+                publish(&c, c.received_host_ns + 150_000_000);
+                assert_ne!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+                c.device_time_ns += 2_000_000;
+                c.received_host_ns += 800_000_000;
+                publish(&c, c.received_host_ns);
+                assert!(d
+                    .flight
+                    .due(c.received_host_ns + flight::AFTER_NS)
+                    .is_empty());
+            }
+        }
+    }
+
+    /// While the engine publishes a hand, the radio thread discards its own activity for it: an
+    /// overflow minutes before cannot make a controller put down after the handoff look in use.
+    /// The engine does the same while the radio thread publishes, for its fallback. Each first
+    /// sample after a takeover was read before it; the next one starts the interval that naps.
+    #[test]
+    fn a_reader_that_does_not_publish_a_hand_keeps_no_stale_losses_for_it() {
+        for (h, incoming) in [
+            (HAND_LEFT, engine::RadioReader::Radio),
+            (HAND_RIGHT, engine::RadioReader::Engine),
+        ] {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(pipeline::Options::default());
+            let start = 300_000_000_000;
+            let mut c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 2_000_000,
+                received_host_ns: start,
+                ..Default::default()
+            };
+            let overflow = |reader| {
+                for i in 0..300 {
+                    d.activity(
+                        reader,
+                        device(h),
+                        i,
+                        start - 200_000_000_000 + i,
+                        false,
+                        1.0,
+                    );
+                }
+            };
+            if matches!(incoming, engine::RadioReader::Radio) {
+                // Minutes before the handoff, between two of the radio thread's passes.
+                overflow(incoming);
+                refresh_radio_hands(
+                    &d,
+                    &link,
+                    &[None; 2],
+                    &mut [0; 2],
+                    &mut pipe,
+                    || start - 199_990_000_000,
+                    log,
+                );
+                publish_hand_state(&d, h, &c, || start, None);
+                link.hands.request(h);
+                assert!(!engine_publishes_hand_persistent(
+                    &d,
+                    &link.hands,
+                    h,
+                    &c,
+                    || start
+                ));
+            } else {
+                // The engine let the radio thread have the hand; its own queue overflowed after.
+                // It has no calibrated sample yet; there is no earlier radio gap to transfer.
+                let dormant = engine::Controller {
+                    calibrated: false,
+                    ..c
+                };
+                publish_hand_state(&d, h, &dormant, || start - 250_000_000_000, None);
+                link.hands.request(h);
+                assert!(!engine_publishes_hand_persistent(
+                    &d,
+                    &link.hands,
+                    h,
+                    &dormant,
+                    || start - 250_000_000_000
+                ));
+                overflow(incoming);
+                assert!(!engine_publishes_hand_persistent(
+                    &d,
+                    &link.hands,
+                    h,
+                    &dormant,
+                    || start - 199_990_000_000
+                ));
+                publish_radio_hand_state(&d, h, &c, || start, None, log);
+                link.hands.radio_exit();
+            }
+            let publish = |c: &engine::Controller, at| {
+                if matches!(incoming, engine::RadioReader::Radio) {
+                    publish_radio_hand_state(&d, h, c, || at, None, log);
+                } else {
+                    assert!(engine_publishes_hand_persistent(
+                        &d,
+                        &link.hands,
+                        h,
+                        c,
+                        || at
+                    ));
+                    publish_hand_state(&d, h, c, || at, None);
+                }
+            };
+            // The controller is put down: still from its next samples, then asleep.
+            for _ in 0..2 {
+                c.device_time_ns += 2_000_000;
+                c.received_host_ns += 2_000_000;
+                d.activity(
+                    incoming,
+                    device(h),
+                    c.device_time_ns,
+                    c.received_host_ns,
+                    false,
+                    0.0,
+                );
+                publish(&c, c.received_host_ns + 500_000);
+            }
+            let at = c.received_host_ns;
+            d.activity(
+                incoming,
+                device(h),
+                c.device_time_ns,
+                at + 2_000_000,
+                true,
+                0.0,
+            );
+            publish(&c, at + 150_000_000);
+            assert_ne!(
+                d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP,
+                0,
+                "{incoming:?}"
+            );
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns = at + 2_000_000_000;
+            d.activity(
+                incoming,
+                device(h),
+                c.device_time_ns,
+                c.received_host_ns,
+                false,
+                0.0,
+            );
+            publish(&c, c.received_host_ns);
+            assert!(
+                d.flight.due(at + flight::AFTER_NS).is_empty(),
+                "{incoming:?}"
+            );
+        }
+    }
+
+    /// The engine lets go of a hand in use less than 100 ms after its last sample, and the radio
+    /// thread gets no sample of it after: its gap still begins in use, and asks for its recording.
+    #[test]
+    fn a_gap_that_begins_at_a_handoff_is_classified_without_a_new_sample() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let start = 5_000_000_000;
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: start,
+            imu_gyro: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        publish_hand_state(&d, HAND_LEFT, &c, || start, None);
+        link.hands.request(HAND_LEFT);
+        assert!(!engine_publishes_hand_persistent(
+            &d,
+            &link.hands,
+            HAND_LEFT,
+            &c,
+            || start + 50_000_000
+        ));
+        link.engine_view.lock().unwrap()[HAND_LEFT] = Some(c);
+        let mut last = [0; 2];
+        // Only once nothing has published the hand for the connect timeout does it take it.
+        let published = [start + 60_000_000, start + 160_000_000]
+            .map(|at| refresh_radio_hands(&d, &link, &[None; 2], &mut last, &mut pipe, || at, log));
+        assert_eq!(published, [false, true]);
+        let due = d.flight.due(start + flight::AFTER_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].last_report_ns, due[0].began_in_use), (start, true));
+    }
+
+    /// Sleep proof ends at a handoff, even when both readers saw the last sample. Its first
+    /// returning sample keeps the original capture anchor.
+    #[test]
+    fn a_nap_across_a_handoff_is_kept_as_a_conservative_dropout() {
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let d = status_daemon();
+            let link = RadioLink::default();
+            let mut pipe = Pipeline::new(pipeline::Options::default());
+            let start = 5_000_000_000;
+            let mut c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 2_000_000,
+                received_host_ns: start,
+                ..Default::default()
+            };
+            let mut last = [0; 2];
+            let mut refresh = |at| {
+                refresh_radio_hands(&d, &link, &[None; 2], &mut last, &mut pipe, || at, log);
+            };
+            // Both readers decode the last sample; the radio thread does not publish the hand.
+            d.activity(
+                engine::RadioReader::Radio,
+                device(h),
+                c.device_time_ns,
+                start - 1_000_000,
+                false,
+                0.0,
+            );
+            refresh(start);
+            publish_hand_state(&d, h, &c, || start, None);
+            publish_hand_state(&d, h, &c, || start + 150_000_000, None);
+            d.activity(
+                engine::RadioReader::Engine,
+                device(h),
+                c.device_time_ns,
+                start + 750_000_000,
+                true,
+                0.0,
+            );
+            publish_hand_state(&d, h, &c, || start + 750_000_000, None);
+            assert_ne!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+            link.hands.request(h);
+            assert!(!engine_publishes_hand_persistent(
+                &d,
+                &link.hands,
+                h,
+                &c,
+                || start + 800_000_000
+            ));
+            link.engine_view.lock().unwrap()[h] = Some(c);
+            // Nothing has published the hand for the connect timeout: the radio thread takes it.
+            refresh(start + 900_000_000);
+            // The interval carries over; sleep proof and its label do not.
+            let history = d.hands[h].lock().unwrap().hand.classification_history();
+            assert!(history.gap.unwrap().spans_handoff);
+            assert_eq!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+            d.activity(
+                engine::RadioReader::Radio,
+                device(h),
+                c.device_time_ns,
+                start + 1_500_000_000,
+                true,
+                0.0,
+            );
+            refresh(start + 1_500_000_000);
+            assert_eq!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns = start + 5_000_000_000;
+            d.activity(
+                engine::RadioReader::Radio,
+                device(h),
+                c.device_time_ns,
+                c.received_host_ns,
+                false,
+                0.0,
+            );
+            publish_radio_hand_state(&d, h, &c, || c.received_host_ns, None, log);
+            assert!(
+                d.flight.due(start + flight::AFTER_NS).len() == 1,
+                "hand {h}"
+            );
+        }
+    }
+
+    /// A still controller's silence waits 1.25 s for a sleep beacon before it is logged. A gap
+    /// that ends sooner logs its return only when it is recorded or its start was logged.
+    #[test]
+    fn a_blip_whose_silence_was_never_logged_logs_no_return() {
+        for (moving, silent_ms, expected) in [
+            (false, 300, vec![]),
+            (false, 800, vec!["left: radio back after 0.80 s"]),
+            (
+                false,
+                1500,
+                vec![
+                    "left: radio silent (still): holding it as it was, inputs included, for up to 10 s",
+                    "left: radio back after 1.50 s",
+                ],
+            ),
+            (
+                true,
+                300,
+                vec![
+                    "left: radio silent (in use): holding it as it was, inputs included, for up to 10 s",
+                    "left: radio back after 0.30 s",
+                ],
+            ),
+        ] {
+            let d = status_daemon();
+            let start = 5_000_000_000;
+            let mut c = engine::Controller {
+                calibrated: true,
+                device_time_ns: 2_000_000,
+                received_host_ns: start,
+                imu_gyro: [if moving { 1.0 } else { 0.0 }, 0.0, 0.0],
+                ..Default::default()
+            };
+            let mut notices = Vec::new();
+            let mut publish = |c: &engine::Controller, at: u64| {
+                publish_hand_state_with_log(&d, HAND_LEFT, c, || at, None, |n| notices.push(n));
+            };
+            publish(&c, start);
+            for ms in (40..silent_ms).step_by(40) {
+                publish(&c, start + ms * 1_000_000);
+            }
+            c.imu_gyro = [0.0; 3];
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns = start + silent_ms * 1_000_000;
+            publish(&c, c.received_host_ns);
+            assert_eq!(notices, expected, "moving {moving}, {silent_ms} ms");
+        }
+    }
+
+    /// One drain can finish more gaps than fit inline; every one of them is logged, in order.
+    #[test]
+    fn every_gap_a_drain_finishes_is_logged_in_order() {
+        let d = status_daemon();
+        let start = 5_000_000_000;
+        let c = engine::Controller {
+            calibrated: true,
+            device_time_ns: 2_000_000,
+            received_host_ns: start,
+            ..Default::default()
+        };
+        publish_hand_state(&d, HAND_LEFT, &c, || start, None);
+        let returns = 7u64;
+        for i in 1..=returns {
+            d.activity(
+                engine::RadioReader::Engine,
+                calib::DEVICE_LEFT,
+                2_000_000 + i * 2_000_000,
+                start + i * (600 + 10 * i) * 1_000_000,
+                false,
+                0.0,
+            );
+        }
+        let last = engine::Controller {
+            device_time_ns: 2_000_000 + returns * 2_000_000,
+            received_host_ns: start + returns * (600 + 10 * returns) * 1_000_000,
+            ..c
+        };
+        let mut notices = Vec::new();
+        publish_hand_state_with_log(
+            &d,
+            HAND_LEFT,
+            &last,
+            || last.received_host_ns,
+            None,
+            |n| notices.push(n),
+        );
+        let expected: Vec<_> = (1..=returns)
+            .map(|i| {
+                let gap_ms = i * (600 + 10 * i) - (i - 1) * (600 + 10 * (i - 1));
+                format!("left: radio back after {:.2} s", gap_ms as f64 / 1000.0)
+            })
+            .collect();
+        assert_eq!(notices, expected);
+    }
+
+    #[test]
+    fn promotion_logs_classification_without_claiming_a_new_hold() {
+        let text = gap_message(
+            "left",
+            GapEvent::InUse {
+                last_sample_host_ns: 1,
+                cause: GapCause::Radio,
+            },
+        )
+        .unwrap()
+        .to_string();
+        assert_eq!(text, "left: was in use when its samples stopped");
+    }
+
+    #[test]
+    fn gap_logs_name_sleep_and_waking_in_plain_words() {
+        let message = |name, event| gap_message(name, event).unwrap().to_string();
+        assert_eq!(
+            message(
+                "left",
+                GapEvent::Began {
+                    last_sample_host_ns: 1,
+                    moving: false,
+                    asleep: true,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "left: asleep"
+        );
+        assert_eq!(message("left", GapEvent::Asleep), "left: asleep");
+        assert_eq!(
+            message(
+                "left",
+                GapEvent::Ended {
+                    last_sample_host_ns: 1,
+                    silent_ns: 1_250_000_000,
+                    asleep: true,
+                    uncertain: false,
+                    recordable: false,
+                    capture_requested: false,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "left: awake again after 1.25 s"
+        );
+        // A preserved nap after a native reset keeps its verdict, not an exact return boundary.
+        assert_eq!(
+            message(
+                "left",
+                GapEvent::Ended {
+                    last_sample_host_ns: 1,
+                    silent_ns: 2_500_000_000,
+                    asleep: true,
+                    uncertain: true,
+                    recordable: false,
+                    capture_requested: false,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "left: awake again (gap duration uncertain)"
+        );
+        assert_eq!(
+            message(
+                "left",
+                GapEvent::Expired {
+                    silent_ns: 10_000_000_000,
+                    asleep: true,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "left: asleep for 10 s: standby, inputs released"
+        );
+        assert_eq!(
+            message(
+                "right",
+                GapEvent::Began {
+                    last_sample_host_ns: 1,
+                    moving: true,
+                    asleep: false,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "right: radio silent (in use): holding it as it was, inputs included, for up to 10 s"
+        );
+        assert!(gap_message(
+            "right",
+            GapEvent::Began {
+                last_sample_host_ns: 1,
+                moving: false,
+                asleep: false,
+                cause: GapCause::Radio,
+            }
+        )
+        .is_none());
+        assert_eq!(
+            message("right", GapEvent::StillSilent),
+            "right: radio silent (still): holding it as it was, inputs included, for up to 10 s"
+        );
+        assert_eq!(
+            message(
+                "right",
+                GapEvent::Ended {
+                    last_sample_host_ns: 1,
+                    silent_ns: 500_000_000,
+                    asleep: false,
+                    uncertain: false,
+                    recordable: true,
+                    capture_requested: false,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "right: radio back after 0.50 s"
+        );
+        assert_eq!(
+            message(
+                "right",
+                GapEvent::Expired {
+                    silent_ns: 10_000_000_000,
+                    asleep: false,
+                    cause: GapCause::Radio,
+                }
+            ),
+            "right: radio silent for 10 s: standby, inputs released"
+        );
     }
 
     /// A gap shorter than half a second that ends is a blip: not recorded, even in use.

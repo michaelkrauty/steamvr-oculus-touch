@@ -761,3 +761,9 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_conte
 	ctx->cv1touch_report_cb = cb;
 	ctx->cv1touch_report_user = user;
 }
+
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_activity_callback(ohmd_context *ctx, ohmd_cv1touch_activity_cb cb, void *user)
+{
+	ctx->cv1touch_activity_cb = cb;
+	ctx->cv1touch_activity_user = user;
+}

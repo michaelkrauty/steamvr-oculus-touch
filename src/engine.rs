@@ -229,11 +229,31 @@ fn build_sensor_config(opts: &EngineOptions) -> Result<SensorConfig, String> {
     Ok(SensorConfig { ignored, poses })
 }
 
+/// Independent readers of the radio; device and receive clocks must stay with their reader.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RadioReader {
+    #[default]
+    Engine = 0,
+    Radio = 1,
+}
+
 /// Engine callbacks. `frame` runs on sensor analysis threads with the sensor lock held and
 /// `report` on the engine thread: both must only copy data.
 pub trait EngineSink: Send + Sync {
     fn frame(&self, info: &FrameInfo, blobs: &[Blob]);
     fn report(&self, source: i32, host_ns: u64, data: &[u8]);
+    /// Runs in decoded message order on the named reader. Copy and return without waiting.
+    #[allow(clippy::too_many_arguments)]
+    fn activity(
+        &self,
+        _reader: RadioReader,
+        _device: i32,
+        _device_ns: u64,
+        _host_ns: u64,
+        _asleep: bool,
+        _gyro_squared: f32,
+    ) {
+    }
     /// The frame's GRAY8 pixels, just before `frame` for the same frame (valid only for the call).
     fn image(
         &self,
@@ -257,7 +277,7 @@ pub struct Engine {
 #[cfg(feature = "engine")]
 mod callbacks;
 #[cfg(feature = "engine")]
-use callbacks::{frame_cb, image_cb, report_cb};
+use callbacks::{activity_cb, frame_cb, image_cb, report_cb};
 
 /// Run Rust entered from C. A panic must not reach Rust's non-unwinding ABI diagnostic,
 /// which writes directly to stderr. The daemon installs its nonblocking panic hook first.
@@ -319,6 +339,7 @@ impl Engine {
             ffi::ohmd_cv1touch_set_frame_callback(ctx, Some(frame_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_image_callback(ctx, Some(image_cb), sink as *mut c_void);
             ffi::ohmd_cv1touch_set_report_callback(ctx, Some(report_cb), sink as *mut c_void);
+            ffi::ohmd_cv1touch_set_activity_callback(ctx, Some(activity_cb), sink as *mut c_void);
 
             let n = ffi::ohmd_ctx_probe(ctx);
             let settings = ffi::ohmd_device_settings_create(ctx);

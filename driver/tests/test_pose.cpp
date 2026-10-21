@@ -178,6 +178,13 @@ static void a_radio_gap_is_held_connected()
 	const auto boundary = s.sample_host_ns + cv1t::kGapSampleNs;
 	assert(make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary).deviceIsConnected);
 	assert(!make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary + 1).deviceIsConnected);
+	// Sleep is informational: driver connection and held pose rules do not change.
+	s.flags |= CV1T_FLAG_ASLEEP;
+	const auto asleep = make_pose(&s, nullptr, CV1T_HAND_RIGHT, 17'000'000'000);
+	assert(asleep.deviceIsConnected && asleep.poseIsValid && asleep.result == held.result);
+	assert(asleep.vecPosition[1] == held.vecPosition[1] && asleep.qRotation.w == held.qRotation.w);
+	assert(asleep.vecVelocity[0] == 0 && asleep.vecAngularVelocity[2] == 0 && asleep.poseTimeOffset == 0);
+	assert(!make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary + 1).deviceIsConnected);
 }
 
 int main()

@@ -92,6 +92,10 @@ static void a_radio_gap_keeps_the_inputs_held()
     assert(held.a_click && held.trigger == 1 && held.grip == 1 && held.grip_touch);
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).a_click);
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary + 1) == cv1t::InputValues{});
+    // Sleep is informational: the same hold applies with a newer daemon's additive flag.
+    s.flags |= CV1T_FLAG_ASLEEP;
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, s.sample_host_ns + 9'000'000'000) == held);
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary + 1) == cv1t::InputValues{});
 }
 
 int main()

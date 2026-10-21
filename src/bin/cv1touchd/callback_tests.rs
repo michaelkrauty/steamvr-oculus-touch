@@ -24,6 +24,9 @@ impl EngineSink for PoisonedSink {
     fn image(&self, _: &engine::FrameInfo, _: usize, _: usize, _: usize, _: &[u8]) {
         drop(self.0.lock().unwrap());
     }
+    fn activity(&self, _: engine::RadioReader, _: i32, _: u64, _: u64, _: bool, _: f32) {
+        drop(self.0.lock().unwrap());
+    }
 }
 
 fn run(kind: &str, test: &str) {
@@ -45,6 +48,7 @@ fn run(kind: &str, test: &str) {
                 "frame" => callbacks::frame_cb(user, &info, 0, std::ptr::null()),
                 "image" => callbacks::image_cb(user, &info, 1, 1, 1, [0u8].as_ptr()),
                 "report" => callbacks::report_cb(user, 0, 0, std::ptr::null(), 0),
+                "activity" => callbacks::activity_cb(user, 1, 2, 0, 0, false, 0.0),
                 _ => unreachable!(),
             }
         }
@@ -129,5 +133,13 @@ fn report_panic_aborts_with_a_full_pipe() {
     run(
         "report",
         "callback_tests::report_panic_aborts_with_a_full_pipe",
+    );
+}
+
+#[test]
+fn activity_panic_aborts_with_a_full_pipe() {
+    run(
+        "activity",
+        "callback_tests::activity_panic_aborts_with_a_full_pipe",
     );
 }

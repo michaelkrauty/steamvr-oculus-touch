@@ -25,8 +25,18 @@ pub const KEEP_FILES: usize = 10;
 /// A gap shorter than this that ends is no dropout worth a recording of its own (a longer one's
 /// recording shows it, from the 20 s before).
 pub const SHORTEST_NS: u64 = 500_000_000;
-/// Some 66 s of the radio's 490 reports a second.
+/// Some 65.5 s of the radio at the round rate below.
 const SLOTS: usize = 32_768;
+/// A round figure just above the measured sustained rates: six saved dropouts held 441 to 492
+/// a second over their 30 s. Their busiest second reached 501, one slot past this figure.
+const RADIO_REPORTS_PER_S: u64 = 500;
+/// How far back the ring reaches while the radio's reports fill it: 65.5 s.
+const RING_SPAN_NS: u64 = SLOTS as u64 * 1_000_000_000 / RADIO_REPORTS_PER_S;
+/// The latest after a controller's last report that its dropout can still be recorded: 35.5 s.
+/// A window asked for later is due at once, so the ring must then still reach back `BEFORE_NS`
+/// before that report. This keeps `AFTER_NS` of the ring's reach to spare, for the haptic
+/// commands it also keeps (nearly 90 a second on top of the radio's 500) and the save tick.
+pub const LATEST_NS: u64 = RING_SPAN_NS - BEFORE_NS - AFTER_NS;
 /// The largest payload kept: a radio report (u32 source, 64 bytes).
 const PAYLOAD: usize = 68;
 const PREFIX: &str = "dropout-";
@@ -355,6 +365,34 @@ mod tests {
         f.note(recorder::RAW_REPORT, last, &[&[0u8; 69]]);
         f.dropout(0, last, true);
         assert_eq!(f.due(last + AFTER_NS)[0].records.len(), times.len());
+    }
+
+    /// A dropout asked for as late as `LATEST_NS` after its last report is taken at the next save
+    /// tick with its whole window still in the ring, even with 85 haptic commands a second
+    /// sharing the ring with the radio's 500 reports.
+    #[test]
+    fn a_window_asked_for_at_the_latest_is_still_whole() {
+        const MS: u64 = 1_000_000;
+        let f = FlightRecorder::new();
+        let last = 30 * S;
+        let taken = last + LATEST_NS + 200 * MS;
+        let mut haptic = 0;
+        for t in (0..=taken).step_by(2 * MS as usize) {
+            f.note(recorder::RAW_REPORT, t, &[&1u32.to_le_bytes(), &report(1)]);
+            if t * 85 / S != haptic {
+                haptic = t * 85 / S;
+                f.note(
+                    recorder::HAPTIC,
+                    t,
+                    &[&recorder::haptic_payload(0, 0.1, 100.0, 0.5)],
+                );
+            }
+        }
+        f.dropout(0, last, false);
+        let d = f.due(taken);
+        let times: Vec<u64> = d[0].records.iter().map(|r| r.1).collect();
+        assert_eq!(times.first(), Some(&(last - BEFORE_NS)));
+        assert_eq!(times.last(), Some(&(last + AFTER_NS)));
     }
 
     /// A recording is what `recorder::Reader` reads back, and the directory keeps the newest ten.

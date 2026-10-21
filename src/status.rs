@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 
 use crate::hand::{
-    BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, FLAG_CALIBRATED, FLAG_CONNECTED,
-    FLAG_POSITION, FLAG_RADIO_GAP, TOUCH_A, TOUCH_B, TOUCH_STICK, TOUCH_THUMBREST, TOUCH_TRIGGER,
-    TOUCH_X, TOUCH_Y,
+    BTN_A, BTN_B, BTN_STICK, BTN_SYSTEM, BTN_X, BTN_Y, FLAG_ASLEEP, FLAG_CALIBRATED,
+    FLAG_CONNECTED, FLAG_POSITION, FLAG_RADIO_GAP, TOUCH_A, TOUCH_B, TOUCH_STICK, TOUCH_THUMBREST,
+    TOUCH_TRIGGER, TOUCH_X, TOUCH_Y,
 };
 use crate::shm::{serial_str, ControllerState, SensorStatus};
 
@@ -332,6 +332,8 @@ pub fn sensors_from_status(value: &serde_json::Value) -> Result<Vec<SensorStatus
 fn state_text(s: &ControllerState) -> &'static str {
     if s.flags & FLAG_CALIBRATED == 0 {
         "not paired / never seen"
+    } else if s.flags & FLAG_ASLEEP != 0 {
+        "asleep"
     } else if s.flags & FLAG_CONNECTED == 0 {
         "STANDBY / out of range"
     } else if s.flags & FLAG_RADIO_GAP != 0 {
@@ -557,6 +559,24 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[2].contains("left") && lines[2].contains("radio silent: held as it was"));
         assert!(lines[3].contains("right") && lines[3].contains("rotation only"));
+    }
+
+    #[test]
+    fn render_sleep_during_the_hold_and_after_expiry() {
+        let text = render(
+            &[
+                state(FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_RADIO_GAP | FLAG_ASLEEP),
+                state(FLAG_CALIBRATED | FLAG_ASLEEP),
+            ],
+            &[],
+            &HashMap::new(),
+            0.004,
+            0x2A,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].contains("left") && lines[2].contains("asleep"));
+        assert!(lines[3].contains("right") && lines[3].contains("asleep"));
+        assert!(!text.contains("radio silent") && !text.contains("STANDBY"));
     }
 
     /// Sensor counters are published every 250 ms but the board samples every 200 ms; rates must
