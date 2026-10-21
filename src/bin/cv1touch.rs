@@ -3994,24 +3994,73 @@ fn landmarks_check(rec: &Path) -> i32 {
 /// are left as they are.
 /// A capture's Lighthouse track by serial, or the headset's with "hmd" (the capture's own
 /// reference when None): (serial, samples).
+fn resolve_lighthouse_serial<'a>(
+    requested: &str,
+    serials: impl Iterator<Item = &'a str>,
+) -> Result<Option<&'a str>, String> {
+    let mut candidates = Vec::new();
+    for serial in serials {
+        if serial == requested {
+            return Ok(Some(serial));
+        }
+        if serial.eq_ignore_ascii_case(requested) && !candidates.contains(&serial) {
+            candidates.push(serial);
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(format!(
+            "Lighthouse serial {requested} matches more than one recorded device: {}; use one of those exact spellings",
+            candidates.join(", ")
+        ));
+    }
+    Ok(candidates.first().copied())
+}
+
 fn truth_track(
     tf: &eval::TruthFile,
     which: Option<&str>,
 ) -> Result<(String, Vec<eval::TruthSample>), String> {
-    match which {
-        None => Ok((tf.reference.clone(), tf.truth())),
-        Some(w) if w == tf.reference => Ok((tf.reference.clone(), tf.truth())),
-        // the headset is always recorded, so when it is not among the others it is the reference
-        // (a capture made with no controller on)
-        Some("hmd") if !tf.others.iter().any(|o| o.kind == "hmd") => {
-            Ok((tf.reference.clone(), tf.truth()))
+    let Some(which) = which else {
+        return Ok((tf.reference.clone(), tf.truth()));
+    };
+    let selected = resolve_lighthouse_serial(
+        which,
+        std::iter::once(tf.reference.as_str()).chain(tf.others.iter().map(|o| o.serial.as_str())),
+    )?;
+    if selected == Some(tf.reference.as_str()) {
+        return Ok((tf.reference.clone(), tf.truth()));
+    }
+    let track = match selected {
+        Some(serial) => tf.others.iter().find(|o| o.serial == serial),
+        None if which == "hmd" => tf.others.iter().find(|o| o.kind == "hmd"),
+        None => None,
+    };
+    match track {
+        Some(track) => Ok((track.serial.clone(), eval::truth_samples(&track.samples))),
+        // The headset is always recorded; when absent from others it is the reference.
+        None if which == "hmd" => Ok((tf.reference.clone(), tf.truth())),
+        None => Err(format!("the capture has no Lighthouse track {which}")),
+    }
+}
+
+// Resolve typed names at the capture boundary; saved SteamVR names keep their spelling.
+fn capture_tracking_base(
+    tf: &eval::TruthFile,
+    requested: Option<&str>,
+    reference: &str,
+) -> Result<Option<String>, String> {
+    match requested {
+        Some(serial) => {
+            let selected = resolve_lighthouse_serial(
+                serial,
+                tf.others
+                    .iter()
+                    .filter(|o| o.kind == "base")
+                    .map(|o| o.serial.as_str()),
+            )?;
+            Ok(Some(selected.unwrap_or(serial).to_string()))
         }
-        Some(w) => tf
-            .others
-            .iter()
-            .find(|o| o.serial == w || (w == "hmd" && o.kind == "hmd"))
-            .map(|o| (o.serial.clone(), eval::truth_samples(&o.samples)))
-            .ok_or_else(|| format!("the capture has no Lighthouse track {w}")),
+        None => Ok(tf.tracking_bases.get(reference).cloned()),
     }
 }
 
@@ -4231,9 +4280,7 @@ fn register_from_capture_with(
         let (had_registration, mut reg) = registration_seed(&reg_path, tf.universe_id, reuse)?;
         let (ref_serial, ref_samples) = truth_track(&tf, reference)?;
         println!("reference {ref_serial}");
-        let tracking_base = tracking_base
-            .map(str::to_string)
-            .or_else(|| tf.tracking_bases.get(&ref_serial).cloned());
+        let tracking_base = capture_tracking_base(&tf, tracking_base, &ref_serial)?;
         let holds = calib::rig::holds(&ref_samples, 1_500_000_000);
         let published = capture_poses(base)?;
         // the registration as the daemon applied it during the capture: followed through any
@@ -6388,6 +6435,113 @@ mod tests {
         );
         let sampled = sampled.finish(|i| (i == 0).then(|| unknown.clone()));
         assert!(sampled.tracks.is_empty());
+    }
+
+    fn lighthouse_case_collisions() -> eval::TruthFile {
+        serde_json::from_value(serde_json::json!({
+            "format": eval::TRUTH_FORMAT, "version": 1, "reference": "REFERENCE", "universe_id": 1,
+            "windows": [], "samples": [[1,0,0,0,1,0,0,0]],
+            "others": [
+                {"serial": "reference", "kind": "controller", "samples": [[2,0,0,0,1,0,0,0]]},
+                {"serial": "BASE-A", "kind": "base", "samples": [[3,0,0,0,1,0,0,0]]},
+                {"serial": "BASE-a", "kind": "base", "samples": [[4,0,0,0,1,0,0,0]]}
+            ],
+            "tracking_bases": {"REFERENCE": "BASE-A", "reference": "BASE-a"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn lighthouse_reference_prefers_exact_spelling_and_refuses_ambiguous_case() {
+        let tf = lighthouse_case_collisions();
+        let (reference, samples) = truth_track(&tf, Some("reference")).unwrap();
+        assert_eq!(reference, "reference");
+        assert_eq!(samples[0].t_ns, 2);
+        let (reference, samples) = truth_track(&tf, Some("REFERENCE")).unwrap();
+        assert_eq!(reference, "REFERENCE");
+        assert_eq!(samples[0].t_ns, 1);
+        assert_eq!(truth_track(&tf, None).unwrap().0, "REFERENCE");
+        let error = truth_track(&tf, Some("Reference")).unwrap_err();
+        assert!(
+            error.contains("REFERENCE") && error.contains("reference"),
+            "{error}"
+        );
+        assert!(
+            error.contains("more than one") && error.contains("exact"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lighthouse_tracking_base_prefers_exact_spelling_and_refuses_ambiguous_case() {
+        let tf = lighthouse_case_collisions();
+        assert_eq!(
+            capture_tracking_base(&tf, Some("BASE-a"), "REFERENCE")
+                .unwrap()
+                .as_deref(),
+            Some("BASE-a")
+        );
+        assert_eq!(
+            capture_tracking_base(&tf, Some("BASE-A"), "REFERENCE")
+                .unwrap()
+                .as_deref(),
+            Some("BASE-A")
+        );
+        assert_eq!(
+            capture_tracking_base(&tf, None, "reference")
+                .unwrap()
+                .as_deref(),
+            Some("BASE-a")
+        );
+        let error = capture_tracking_base(&tf, Some("base-a"), "REFERENCE").unwrap_err();
+        assert!(
+            error.contains("BASE-A") && error.contains("BASE-a"),
+            "{error}"
+        );
+        assert!(
+            error.contains("more than one") && error.contains("exact"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lighthouse_cli_serials_resolve_to_recorded_spelling() {
+        let tf: eval::TruthFile = serde_json::from_value(serde_json::json!({
+            "format": eval::TRUTH_FORMAT, "version": 1, "reference": "REFERENCE", "universe_id": 1,
+            "windows": [], "samples": [[1,0,0,0,1,0,0,0]],
+            "others": [
+                {"serial": "HEADSET", "kind": "hmd", "samples": [[2,0,0,0,1,0,0,0]]},
+                {"serial": "BASE-A", "kind": "base", "samples": [[3,0,0,0,1,0,0,0]]}
+            ],
+            "tracking_bases": {"REFERENCE": "BASE-B"}
+        }))
+        .unwrap();
+        let (reference, samples) = truth_track(&tf, Some("reference")).unwrap();
+        assert_eq!(reference, "REFERENCE");
+        assert_eq!(samples[0].t_ns, 1);
+        let (headset, samples) = truth_track(&tf, Some("headset")).unwrap();
+        assert_eq!(headset, "HEADSET");
+        assert_eq!(samples[0].t_ns, 2);
+        assert_eq!(truth_track(&tf, Some("hmd")).unwrap().0, "HEADSET");
+        assert!(truth_track(&tf, Some("missing")).is_err());
+        assert_eq!(
+            capture_tracking_base(&tf, Some("base-a"), &reference)
+                .unwrap()
+                .as_deref(),
+            Some("BASE-A")
+        );
+        assert_eq!(
+            capture_tracking_base(&tf, None, &reference)
+                .unwrap()
+                .as_deref(),
+            Some("BASE-B")
+        );
+        assert_eq!(
+            capture_tracking_base(&tf, Some("unknown"), &reference)
+                .unwrap()
+                .as_deref(),
+            Some("unknown")
+        );
     }
 
     #[test]
