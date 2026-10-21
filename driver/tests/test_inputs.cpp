@@ -44,8 +44,19 @@ static void left_hand_uses_x_and_y()
 	const auto n = cv1t::face_names(CV1T_HAND_LEFT);
 	assert(std::strcmp(n.a_click, "/input/x/click") == 0 && std::strcmp(n.b_touch, "/input/y/touch") == 0);
 	assert(std::strcmp(n.system_click, "/input/system/click") == 0);
-	assert(cv1t::face_names(CV1T_HAND_RIGHT).system_click == nullptr);
 	assert(std::strcmp(cv1t::face_names(CV1T_HAND_RIGHT).a_click, "/input/a/click") == 0);
+}
+
+// The right Oculus button is a source of its own, which games can bind: SteamVR keeps
+// /input/system, the left Menu button's, for its dashboard.
+static void the_right_oculus_button_is_bindable()
+{
+	cv1t_controller_state s = awake();
+	assert(!map_inputs(&s, CV1T_HAND_RIGHT, 0).system_click);
+	s.buttons = CV1T_BTN_SYSTEM;
+	const auto v = map_inputs(&s, CV1T_HAND_RIGHT, 0);
+	assert(v.system_click && !v.a_click && !v.b_click && !v.joy_click);
+	assert(std::strcmp(cv1t::face_names(CV1T_HAND_RIGHT).system_click, "/input/home/click") == 0);
 }
 
 static void asleep_or_missing_releases_everything()
@@ -66,12 +77,13 @@ static void a_dead_sample_releases_everything()
     auto s = awake();
     s.sample_host_ns = 1'000'000'000;
     s.orient[3] = 1;
-    s.buttons = CV1T_BTN_A | CV1T_BTN_STICK;
+    s.buttons = CV1T_BTN_A | CV1T_BTN_STICK | CV1T_BTN_SYSTEM;
     s.touches = 0xff;
     s.trigger = s.grip = 1;
     s.stick[0] = s.stick[1] = 0.5f;
     const auto boundary = s.sample_host_ns + cv1t::kDeadSampleNs;
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).a_click);
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).system_click);
     assert(map_inputs(&s, CV1T_HAND_RIGHT, s.sample_host_ns - 1).a_click);
     const auto pose = cv1t::make_pose(&s, nullptr, CV1T_HAND_RIGHT, boundary + 1);
     assert(!pose.deviceIsConnected);
@@ -85,12 +97,13 @@ static void a_radio_gap_keeps_the_inputs_held()
     auto s = awake();
     s.flags |= CV1T_FLAG_RADIO_GAP;
     s.sample_host_ns = 1'000'000'000;
-    s.buttons = CV1T_BTN_A;
+    s.buttons = CV1T_BTN_A | CV1T_BTN_SYSTEM;
     s.trigger = s.grip = 1;
     const auto boundary = s.sample_host_ns + cv1t::kGapSampleNs;
     const auto held = map_inputs(&s, CV1T_HAND_RIGHT, s.sample_host_ns + 9'000'000'000);
-    assert(held.a_click && held.trigger == 1 && held.grip == 1 && held.grip_touch);
+    assert(held.a_click && held.system_click && held.trigger == 1 && held.grip == 1 && held.grip_touch);
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).a_click);
+    assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary).system_click);
     assert(map_inputs(&s, CV1T_HAND_RIGHT, boundary + 1) == cv1t::InputValues{});
     // Sleep is informational: the same hold applies with a newer daemon's additive flag.
     s.flags |= CV1T_FLAG_ASLEEP;
@@ -102,6 +115,7 @@ int main()
 {
 	right_hand_bits();
 	left_hand_uses_x_and_y();
+	the_right_oculus_button_is_bindable();
 	asleep_or_missing_releases_everything();
 	a_dead_sample_releases_everything();
 	a_radio_gap_keeps_the_inputs_held();

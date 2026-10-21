@@ -26,7 +26,7 @@ With a focused VR app running, use:
 cv1touch input-test
 ```
 
-The tool checks the specific supported inputs delivered to SteamVR and asks whether each haptic pulse was felt. Menu/thumb-rest delivery needs a manual check in an app because those paths are not exposed by Valve's legacy controller-state binding. Check that both controllers' rendered triggers/grips reach their stops and their sticks return to center.
+The tool checks the specific supported inputs delivered to SteamVR and asks whether each haptic pulse was felt. Menu and thumb-rest delivery needs a manual check in an app, because those paths are not exposed by Valve's legacy controller-state binding. The right Oculus button is not exposed there either: bind it first in SteamVR with the game running (Settings, Controllers, Manage Controller Bindings, the game, right hand, the button named Oculus Button), then check it in that game. Nothing is bound to it until you do, so pressing it shows nothing. Check that both controllers' rendered triggers/grips reach their stops and their sticks return to center.
 
 To remove this input correction and reload factory defaults:
 
