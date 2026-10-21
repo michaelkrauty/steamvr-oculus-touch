@@ -1256,6 +1256,14 @@ int rift_tracker_get_sensor_video(rift_tracker_ctx *ctx, int index, ohmd_cv1touc
 	return 0;
 }
 
+int rift_tracker_get_sensor_video_quality(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor_video_quality *out)
+{
+	if (index < 0 || (size_t)index >= ctx->n_sensors || out == NULL)
+		return -1;
+	rift_sensor_get_video_quality(ctx->sensors[index], out);
+	return 0;
+}
+
 int rift_tracker_get_sensor_info(rift_tracker_ctx *ctx, int index, ohmd_cv1touch_sensor *out)
 {
 	if (index < 0 || index >= ctx->n_sensors)

@@ -312,6 +312,35 @@ static void raw_overrun_report(void)
     finish();
 }
 
+static void quality_counts(void)
+{
+    uint64_t rejected = UINT64_C(4294967295), other_rejected = 0;
+    start();
+    stream.frames_dropped = &rejected;
+    feed(1, 1000, 2, image, 100);
+    CHECK(rejected == UINT64_C(4294967296));
+    for (int i = 0; i < 5; i++) feed(1, 1000, 0x40, NULL, 0);
+    CHECK(rejected == UINT64_C(4294967296));
+    full(0, 2000);
+    for (int i = 0; i < 100; i++) feed(0, 2000, 0, image, 1);
+    CHECK(rejected == UINT64_C(4294967297));
+    stream.discard_window_start = uvc_now(&stream) - UVC_DISCARD_REPORT_NS;
+    feed(0, 2000, 0, image, 1); /* Reporting clears only its window counters. */
+    CHECK(rejected == UINT64_C(4294967297) && stream.n_discards == 0);
+    feed(1, 3000, 0, image, FRAME_BYTES);
+    CHECK(callbacks == 1 && rejected == UINT64_C(4294967297));
+    full(0, 4000);
+    struct rift_sensor_uvc_stream other = { .frames_dropped = &other_rejected };
+    count_discard(&other, UVC_DISCARD_INCOMPLETE, true);
+    CHECK(other_rejected == 1 && rejected == UINT64_C(4294967297));
+    CHECK(rift_sensor_uvc_stream_stop(&stream) == 0);
+    CHECK(rift_sensor_uvc_stream_clear(&stream) == 0);
+    stream.frames_lock = (void *)1; /* Recreate the fixture lock after clear. */
+    CHECK(rift_sensor_uvc_stream_start(&stream, 1, captured, NULL) == 0);
+    CHECK(stream.frames_dropped == &rejected && rejected == UINT64_C(4294967297));
+    finish();
+}
+
 static void truncated_header(void)
 {
     const unsigned char header[12] = {12, 0x8d, 0xe8, 0x03};
@@ -658,6 +687,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "bad-traffic-start")) bad_traffic(false);
     else if (!strcmp(argv[1], "bad-traffic-rejected")) bad_traffic(true);
     else if (!strcmp(argv[1], "raw-overrun-report")) raw_overrun_report();
+    else if (!strcmp(argv[1], "quality-counts")) quality_counts();
     else if (!strcmp(argv[1], "latency")) latency();
     else CHECK(false);
     return 0;

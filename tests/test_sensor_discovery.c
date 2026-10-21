@@ -29,6 +29,7 @@ static void *test_realloc(void *p, size_t n) {
 #define rift_sensor_retry fake_sensor_retry
 #define rift_sensor_get_cv1touch_info fake_sensor_info
 #define rift_sensor_get_stream_info fake_sensor_stream_info
+#define rift_sensor_get_video_quality fake_sensor_quality
 #define rift_sensor_serial_no fake_sensor_serial
 #include "rift-tracker.c"
 #include "test_util.h"
@@ -188,6 +189,13 @@ void ohmd_destroy_mutex(ohmd_mutex *mutex) { (void)mutex; }
 void led_search_model_free(led_search_model_t *model) { (void)model; }
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state) { (void)state; }
 void rift_pose_finder_cv1touch_reset(void) {}
+void fake_sensor_quality(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_video_quality *out) {
+  struct fake_sensor *fake = (struct fake_sensor *)sensor;
+  memset(out, 0, sizeof *out);
+  snprintf(out->serial, sizeof out->serial, "%s", fake->serial);
+  out->video_format = OHMD_CV1TOUCH_VIDEO_RAW;
+  out->frames_dropped = UINT64_C(4294967296) + fake->id;
+}
 int main(void) {
   ohmd_context *ctx = ohmd_ctx_create();
   CHECK(ctx);
@@ -200,10 +208,18 @@ int main(void) {
     CHECK(tr);
     CHECK(rift_tracker_get_sensor_count(tr) == requested);
     CHECK(starts == requested && live == requested);
+    ohmd_cv1touch_sensor_video_quality quality;
+    CHECK(rift_tracker_get_sensor_video_quality(tr, -1, &quality) == -1);
+    CHECK(rift_tracker_get_sensor_video_quality(tr, requested, &quality) == -1);
+    CHECK(rift_tracker_get_sensor_video_quality(tr, 0, NULL) == -1);
     for (int i = 0; i < requested; i++) {
       ohmd_cv1touch_sensor info;
       CHECK(rift_tracker_get_sensor_info(tr, i, &info) == 0);
       CHECK(info.serial[0]);
+      CHECK(rift_tracker_get_sensor_video_quality(tr, i, &quality) == 0);
+      CHECK(!strcmp(info.serial, quality.serial));
+      CHECK(quality.video_format == OHMD_CV1TOUCH_VIDEO_RAW);
+      CHECK(quality.frames_dropped == UINT64_C(4294967296) + i);
     }
     retries = 0;
     rift_tracker_retry_video(tr, 123);

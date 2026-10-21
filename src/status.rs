@@ -61,12 +61,221 @@ pub fn has_received_frame_counters(value: &serde_json::Value) -> bool {
             .is_some_and(|sensors| sensors.iter().any(|s| s.get("frames_received").is_some()))
 }
 
-/// The board shows received video when available, with released-buffer rates for older daemons.
-pub fn board_frame_counters(value: &serde_json::Value) -> HashMap<String, u64> {
-    if has_received_frame_counters(value) {
-        received_frame_counters(value)
-    } else {
-        frame_counters(value)
+/// The producing stage matters: counts from different stages are never comparable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoCounterKind {
+    RawReceived,
+    JpegDecoded,
+    LegacyReceived,
+    LegacyReleased,
+}
+
+impl VideoCounterKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RawReceived => "received frames/s",
+            Self::JpegDecoded => "decoded frames/s",
+            Self::LegacyReceived => "legacy payloads/s",
+            Self::LegacyReleased => "legacy released buffers/s",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoFrameCounter {
+    pub kind: VideoCounterKind,
+    pub value: u64,
+}
+
+impl VideoFrameCounter {
+    pub fn advanced_from(self, previous: Self) -> bool {
+        self.kind == previous.kind && frames_advanced(previous.value, self.value)
+    }
+}
+
+/// Raw capture or accepted JPEG decoding, selected only by explicit format metadata.
+/// Unknown formats and unavailable JPEG decoding never fall back to payload counts.
+pub fn video_frame_counters(value: &serde_json::Value) -> HashMap<String, VideoFrameCounter> {
+    value["sensors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let (kind, field) = match s["video_format"].as_str()? {
+                "raw" => (VideoCounterKind::RawReceived, "frames_received"),
+                "jpeg" => (VideoCounterKind::JpegDecoded, "frames_decoded"),
+                _ => return None,
+            };
+            Some((
+                sensor_identity(s["serial"].as_str()?),
+                VideoFrameCounter {
+                    kind,
+                    value: s[field].as_u64()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Legacy rates remain visible, explicitly labelled, but never prove usable video.
+/// A modern camera with an unavailable counter stays unavailable rather than showing zero.
+pub fn board_frame_counters(value: &serde_json::Value) -> HashMap<String, VideoFrameCounter> {
+    let mut counters = video_frame_counters(value);
+    let received = has_received_frame_counters(value);
+    for sensor in value["sensors"].as_array().into_iter().flatten() {
+        if value["sensor_video_quality"] == true || sensor.get("video_format").is_some() {
+            continue;
+        }
+        let (kind, field) = if received {
+            (VideoCounterKind::LegacyReceived, "frames_received")
+        } else {
+            (VideoCounterKind::LegacyReleased, "frames")
+        };
+        if let (Some(serial), Some(count)) = (sensor["serial"].as_str(), sensor[field].as_u64()) {
+            counters.insert(
+                sensor_identity(serial),
+                VideoFrameCounter { kind, value: count },
+            );
+        }
+    }
+    counters
+}
+
+fn video_context(value: &serde_json::Value) -> serde_json::Value {
+    let calibrated = value["calibrated_sensors"].as_array().map(|s| {
+        s.iter()
+            .filter_map(|s| s.as_str())
+            .map(sensor_identity)
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+    serde_json::json!([
+        value["generation"],
+        value["mode"],
+        value["engine_ready"],
+        calibrated
+    ])
+}
+
+pub struct VideoDropNote {
+    pub serial: String,
+    pub count: u64,
+}
+
+impl VideoDropNote {
+    pub fn warning(&self) -> bool {
+        self.count >= 3
+    }
+
+    pub fn text(&self) -> String {
+        let cause = if self.warning() {
+            " (check the USB cable and available USB bandwidth)"
+        } else {
+            ""
+        };
+        format!(
+            "{} discarded {} damaged image{} between video samples{cause}",
+            self.serial,
+            self.count,
+            if self.count == 1 { "" } else { "s" }
+        )
+    }
+}
+
+/// Independent candidate rejection deltas. Never subtract them from capture/decode counts.
+pub fn video_drop_notes(
+    previous: &serde_json::Value,
+    current: &serde_json::Value,
+) -> Vec<VideoDropNote> {
+    if previous["engine_ready"] == false
+        || current["engine_ready"] == false
+        || video_context(previous) != video_context(current)
+    {
+        return Vec::new();
+    }
+    let old = video_frame_counters(previous);
+    let new = video_frame_counters(current);
+    let before = sensor_counters(previous, "frames_dropped");
+    sensor_counters(current, "frames_dropped")
+        .into_iter()
+        .filter_map(|(serial, count)| {
+            let (a, b) = old.get(&serial).zip(new.get(&serial))?;
+            if a.kind != b.kind || b.value < a.value {
+                return None;
+            }
+            let delta = count.checked_sub(*before.get(&serial)?)?;
+            (delta != 0).then_some(VideoDropNote {
+                serial,
+                count: delta,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SensorRates {
+    pub video: Option<(VideoCounterKind, f64)>,
+    pub fixes: [f64; 2],
+}
+
+#[derive(Default)]
+pub struct VideoRateHistory {
+    context: Option<serde_json::Value>,
+    sensors: HashMap<String, (Option<VideoCounterKind>, RateTracker)>,
+}
+
+impl VideoRateHistory {
+    pub fn update(
+        &mut self,
+        now_ns: u64,
+        generation: u64,
+        sensors: &[SensorStatus],
+        status: Option<&serde_json::Value>,
+    ) -> HashMap<String, SensorRates> {
+        let context = status.map_or_else(|| serde_json::json!([generation, "shm"]), video_context);
+        if self.context.as_ref() != Some(&context) {
+            self.sensors.clear();
+            self.context = Some(context);
+        }
+        let counters = status.map(board_frame_counters);
+        let mut rates = HashMap::new();
+        let mut active = std::collections::HashSet::new();
+        for sensor in sensors {
+            let serial = serial_str(sensor);
+            let key = sensor_identity(&serial);
+            active.insert(key.clone());
+            let counter = counters.as_ref().map_or(
+                Some(VideoFrameCounter {
+                    kind: VideoCounterKind::LegacyReleased,
+                    value: u64::from(sensor.frames),
+                }),
+                |c| c.get(&key).copied(),
+            );
+            let kind = counter.map(|c| c.kind);
+            let entry = self
+                .sensors
+                .entry(key)
+                .or_insert_with(|| (kind, RateTracker::new(2_000_000_000)));
+            if entry.0 != kind {
+                *entry = (kind, RateTracker::new(2_000_000_000));
+            }
+            let [video, left, right] = entry.1.update(
+                now_ns,
+                [
+                    counter.map_or(0, |c| c.value),
+                    u64::from(sensor.pose_fixes[0]),
+                    u64::from(sensor.pose_fixes[1]),
+                ],
+            );
+            rates.insert(
+                serial,
+                SensorRates {
+                    video: kind.map(|kind| (kind, video)),
+                    fixes: [left, right],
+                },
+            );
+        }
+        self.sensors.retain(|serial, _| active.contains(serial));
+        rates
     }
 }
 
@@ -150,7 +359,7 @@ fn names(mask: u32, table: &[(&str, u32)]) -> String {
 pub fn render(
     hands: &[ControllerState; 2],
     sensors: &[SensorStatus],
-    rates: &HashMap<String, (f64, f64, f64)>,
+    rates: &HashMap<String, SensorRates>,
     heartbeat_age_s: f64,
     generation: u64,
 ) -> String {
@@ -189,14 +398,19 @@ pub fn render(
     lines.push(String::new());
     for s in sensors {
         let serial = serial_str(s);
-        let (frames, left, right) = rates.get(&serial).copied().unwrap_or((0.0, 0.0, 0.0));
+        let rate = rates.get(&serial).copied().unwrap_or_default();
+        let [left, right] = rate.fixes;
+        let video = rate.video.map_or_else(
+            || "video frames/s    --".into(),
+            |(kind, rate)| format!("{} {rate:5.1}", kind.label()),
+        );
         let placed = if s.placed != 0 {
             "placed"
         } else {
             "NOT placed"
         };
         lines.push(format!(
-            "sensor {serial}: {placed}  frames/s {frames:5.1}  fixes/s L {left:5.1} R {right:5.1}"
+            "sensor {serial}: {placed}  {video}  fixes/s L {left:5.1} R {right:5.1}"
         ));
     }
     lines.join("\n")
@@ -301,9 +515,15 @@ mod tests {
     #[test]
     fn render_states_and_rates() {
         let mut sensor = SensorStatus::default();
-        crate::shm::set_serial(&mut sensor, "WMTD000000001");
+        crate::shm::set_serial(&mut sensor, "CAMERA1");
         sensor.placed = 1;
-        let rates = HashMap::from([("WMTD000000001".to_string(), (50.0, 0.0, 48.5))]);
+        let rates = HashMap::from([(
+            "CAMERA1".to_string(),
+            SensorRates {
+                video: Some((VideoCounterKind::RawReceived, 50.0)),
+                fixes: [0.0, 48.5],
+            },
+        )]);
         let text = render(
             &[
                 state(FLAG_CALIBRATED),
@@ -319,7 +539,7 @@ mod tests {
         assert!(lines[3].contains("right") && lines[3].contains("6DoF"));
         assert!(text.contains("+100.0") && text.contains("-200.0"));
         assert!(text.contains("buttons A") && text.contains("touch trigger"));
-        assert!(text.contains("WMTD000000001: placed") && text.contains("R  48.5"));
+        assert!(text.contains("CAMERA1: placed") && text.contains("R  48.5"));
     }
 
     #[test]
@@ -398,9 +618,171 @@ mod tests {
                     value["sensors"][0]["frames_received"] = received.into();
                 }
                 let counts = board_frame_counters(&value);
-                rate = tracker.update(step * 1_000_000_000, [counts["CAMERA1"], 0, 0]);
+                rate = tracker.update(step * 1_000_000_000, [counts["CAMERA1"].value, 0, 0]);
             }
             assert_eq!(rate[0], expected);
+        }
+    }
+    fn quality_snapshot(
+        format: serde_json::Value,
+        received: u64,
+        decoded: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({"generation":1,"mode":"calibrated","engine_ready":true,
+            "calibrated_sensors":["Camera1"],"sensor_video_quality":true,
+            "sensors":[{"serial":"Camera1","frames":1,"frames_received":received,
+                "video_format":format,"frames_decoded":decoded,"frames_dropped":0}]})
+    }
+
+    #[test]
+    fn quality_selector_keeps_kinds_zero_null_and_unknown_distinct() {
+        use serde_json::json;
+        for (format, decoded, expected) in [
+            (
+                json!("raw"),
+                json!(null),
+                Some(VideoFrameCounter {
+                    kind: VideoCounterKind::RawReceived,
+                    value: u64::MAX,
+                }),
+            ),
+            (
+                json!("jpeg"),
+                json!(0),
+                Some(VideoFrameCounter {
+                    kind: VideoCounterKind::JpegDecoded,
+                    value: 0,
+                }),
+            ),
+            (json!("jpeg"), json!(null), None),
+            (json!("other"), json!(30), None),
+            (json!(null), json!(30), None),
+        ] {
+            let value = quality_snapshot(format, u64::MAX, decoded);
+            assert_eq!(
+                video_frame_counters(&value).get("CAMERA1").copied(),
+                expected
+            );
+            assert_eq!(
+                board_frame_counters(&value).get("CAMERA1").copied(),
+                expected
+            );
+            assert_eq!(received_frame_counters(&value)["CAMERA1"], u64::MAX);
+            assert_eq!(frame_counters(&value)["CAMERA1"], 1);
+        }
+    }
+
+    #[test]
+    fn quality_board_labels_usable_and_legacy_video_and_shows_unavailable() {
+        use serde_json::json;
+        let mut sensor = SensorStatus::default();
+        crate::shm::set_serial(&mut sensor, "Camera1");
+        for (format, decoded, expected) in [
+            (json!("raw"), json!(null), "received frames/s   0.0"),
+            (json!("jpeg"), json!(0), "decoded frames/s   0.0"),
+            (json!("jpeg"), json!(null), "video frames/s    --"),
+            (json!(null), json!(null), "video frames/s    --"),
+        ] {
+            let value = quality_snapshot(format, 0, decoded);
+            let rates =
+                VideoRateHistory::default().update(1_000_000_000, 1, &[sensor], Some(&value));
+            let text = render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0, 1);
+            assert!(text.contains(expected), "{text}");
+        }
+        for (field, expected) in [
+            ("frames", "legacy released buffers/s"),
+            ("frames_received", "legacy payloads/s"),
+        ] {
+            let value = json!({"sensors":[{"serial":"camera1",field:0}]});
+            let rates =
+                VideoRateHistory::default().update(1_000_000_000, 1, &[sensor], Some(&value));
+            assert!(
+                render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0, 1)
+                    .contains(expected)
+            );
+            assert!(video_frame_counters(&value).is_empty());
+        }
+    }
+
+    #[test]
+    fn quality_rate_history_resets_for_format_context_counter_and_removal() {
+        use serde_json::json;
+        let mut sensor = SensorStatus::default();
+        crate::shm::set_serial(&mut sensor, "Camera1");
+        let mut history = VideoRateHistory::default();
+        let mut step = 0;
+        let mut sample = |value: &serde_json::Value| {
+            step += 1;
+            history.update(step * 1_000_000_000, 1, &[sensor], Some(value))["Camera1"].video
+        };
+        let raw = quality_snapshot(json!("raw"), 100, json!(null));
+        assert_eq!(sample(&raw), Some((VideoCounterKind::RawReceived, 0.0)));
+        let raw_next = quality_snapshot(json!("raw"), 152, json!(null));
+        assert_eq!(
+            sample(&raw_next),
+            Some((VideoCounterKind::RawReceived, 52.0))
+        );
+        let mut jpeg = quality_snapshot(json!("jpeg"), 500, json!(1_000_000));
+        assert_eq!(sample(&jpeg), Some((VideoCounterKind::JpegDecoded, 0.0)));
+        jpeg["sensors"][0]["frames_decoded"] = json!(1_000_052);
+        assert_eq!(sample(&jpeg), Some((VideoCounterKind::JpegDecoded, 52.0)));
+        jpeg["sensors"][0]["frames_decoded"] = json!(0);
+        assert_eq!(sample(&jpeg), Some((VideoCounterKind::JpegDecoded, 0.0)));
+        for (field, value) in [
+            ("generation", json!(2)),
+            ("mode", json!("paused")),
+            ("calibrated_sensors", json!(["CAMERA1", "CAMERA2"])),
+        ] {
+            jpeg[field] = value;
+            jpeg["sensors"][0]["frames_decoded"] = json!(2_000_000);
+            assert_eq!(sample(&jpeg), Some((VideoCounterKind::JpegDecoded, 0.0)));
+        }
+        jpeg["sensors"][0]["frames_decoded"] = json!(null);
+        assert_eq!(sample(&jpeg), None);
+        jpeg["sensors"][0]["frames_decoded"] = json!(3_000_000);
+        assert_eq!(sample(&jpeg), Some((VideoCounterKind::JpegDecoded, 0.0)));
+        let now = (step + 1) * 1_000_000_000;
+        history.update(now, 1, &[], Some(&jpeg));
+        assert!(history.sensors.is_empty());
+        assert_eq!(
+            history.update(now + 1_000_000_000, 1, &[sensor], Some(&jpeg))["Camera1"].video,
+            Some((VideoCounterKind::JpegDecoded, 0.0))
+        );
+        assert_eq!(
+            history.update(now + 2_000_000_000, 1, &[sensor], None)["Camera1"].video,
+            Some((VideoCounterKind::LegacyReleased, 0.0))
+        );
+    }
+
+    #[test]
+    fn quality_drop_notes_require_comparable_counters_and_context() {
+        use serde_json::json;
+        let old = quality_snapshot(json!("jpeg"), 10, json!(20));
+        let mut new = quality_snapshot(json!("jpeg"), 62, json!(20));
+        new["sensors"][0]["frames_dropped"] = json!(7);
+        let notes = video_drop_notes(&old, &new);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].count, 7);
+        assert!(notes[0].warning());
+        for (field, value) in [
+            ("generation", json!(2)),
+            ("mode", json!("paused")),
+            ("engine_ready", json!(false)),
+            ("calibrated_sensors", json!([])),
+        ] {
+            let mut changed = new.clone();
+            changed[field] = value;
+            assert!(video_drop_notes(&old, &changed).is_empty());
+        }
+        for (field, value) in [
+            ("frames_decoded", json!(null)),
+            ("frames_decoded", json!(0)),
+            ("frames_dropped", json!(null)),
+            ("video_format", json!("raw")),
+        ] {
+            let mut changed = new.clone();
+            changed["sensors"][0][field] = value;
+            assert!(video_drop_notes(&old, &changed).is_empty());
         }
     }
 }

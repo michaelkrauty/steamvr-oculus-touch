@@ -485,7 +485,17 @@ fn doctor(json: bool) -> i32 {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "checks": checks.iter().map(|(name, ok, detail)| serde_json::json!({"name": name, "ok": ok, "detail": detail})).collect::<Vec<_>>(), "daemon": daemon, "note": "Wake sleeping controllers before checking tracking; calibration and registration require physical capture." })).unwrap());
     } else {
         for (name, ok, detail) in &checks {
-            println!("{} {name}: {detail}", if *ok { "ok" } else { "FAIL" });
+            let label = if !ok {
+                "FAIL"
+            } else if detail.starts_with("warning: ") {
+                "warning"
+            } else {
+                "ok"
+            };
+            println!(
+                "{label} {name}: {}",
+                detail.strip_prefix("warning: ").unwrap_or(detail)
+            );
         }
         #[cfg(unix)]
         println!("Wake sleeping controllers before checking tracking. USB access needs active-session udev permissions; logs: journalctl --user _COMM=cv1touchd.");
@@ -548,7 +558,7 @@ fn status_board(shm_name: &str) -> i32 {
         return 1;
     }
     let mut reader: Option<ShmReader> = None;
-    let mut trackers: HashMap<String, status::RateTracker> = HashMap::new();
+    let mut video_rates = status::VideoRateHistory::default();
     let mut stream_sample: Option<(u64, serde_json::Value)> = None;
     let mut stream_note = "sensor_streams: skipped: waiting for video samples".to_string();
     loop {
@@ -586,31 +596,7 @@ fn status_board(shm_name: &str) -> i32 {
             board_sensors(complete.as_ref(), unavailable.as_deref(), || {
                 r.sensors().unwrap_or_default()
             });
-        let received = complete
-            .as_ref()
-            .is_some_and(status::has_received_frame_counters);
-        let frame_counts = complete.as_ref().map(status::board_frame_counters);
-        let mut rates = HashMap::new();
-        for s in &sensors {
-            let key = shm::serial_str(s);
-            let tracker = trackers
-                .entry(key.clone())
-                .or_insert_with(|| status::RateTracker::new(2_000_000_000));
-            let [frames, left, right] = tracker.update(
-                now,
-                [
-                    frame_counts.as_ref().map_or(u64::from(s.frames), |counts| {
-                        counts
-                            .get(&status::sensor_identity(&key))
-                            .copied()
-                            .unwrap_or(0)
-                    }),
-                    u64::from(s.pose_fixes[HAND_LEFT]),
-                    u64::from(s.pose_fixes[HAND_RIGHT]),
-                ],
-            );
-            rates.insert(key, (frames, left, right));
-        }
+        let rates = video_rates.update(now, r.generation(), &sensors, complete.as_ref());
         let hands = [
             r.hand(HAND_LEFT).unwrap_or_default(),
             r.hand(HAND_RIGHT).unwrap_or_default(),
@@ -620,11 +606,6 @@ fn status_board(shm_name: &str) -> i32 {
             "\x1b[H\x1b[2J{}",
             status::render(&hands, &sensors, &rates, age, r.generation())
         );
-        if !received {
-            println!(
-                "Received-video counters unavailable; frames/s shows released analysis buffers."
-            );
-        }
         if !sensor_note.is_empty() {
             println!("{sensor_note}");
         }

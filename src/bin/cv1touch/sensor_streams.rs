@@ -24,6 +24,7 @@ pub(super) struct Check {
     detail: String,
     // A confirmed failure can coexist with cameras that need another sample.
     pending: bool,
+    drop_notes: Vec<status::VideoDropNote>,
 }
 
 impl Check {
@@ -32,28 +33,46 @@ impl Check {
             outcome,
             detail: detail.into(),
             pending: outcome == Outcome::Pending,
+            drop_notes: Vec::new(),
         }
+    }
+
+    fn has_warning(&self) -> bool {
+        self.drop_notes.iter().any(status::VideoDropNote::warning)
+    }
+
+    fn description(self) -> String {
+        let mut detail = self.detail;
+        for note in self.drop_notes {
+            detail.push_str("; ");
+            detail.push_str(&note.text());
+        }
+        detail
     }
 
     fn board_line(self) -> String {
         let label = match self.outcome {
             Outcome::Pending => "checking",
+            Outcome::Pass if self.has_warning() => "warning",
             Outcome::Pass | Outcome::Skipped => "ok",
             Outcome::Fail => "FAIL",
             Outcome::NotVerified => "not verified",
         };
-        format!("{label} sensor_streams: {}", self.detail)
+        format!("{label} sensor_streams: {}", self.description())
     }
 
     pub(super) fn conclusion(self) -> (bool, String) {
-        match self.outcome {
-            Outcome::Pass | Outcome::Skipped => (true, self.detail),
-            Outcome::Fail | Outcome::NotVerified => (false, self.detail),
+        let outcome = self.outcome;
+        let warning = self.has_warning();
+        let detail = self.description();
+        match outcome {
+            Outcome::Pass if warning => (true, format!("warning: {detail}")),
+            Outcome::Pass | Outcome::Skipped => (true, detail),
+            Outcome::Fail | Outcome::NotVerified => (false, detail),
             Outcome::Pending => (
                 false,
                 format!(
-                    "not verified: {}; run cv1touch doctor again after the daemon settles",
-                    self.detail
+                    "not verified: {detail}; run cv1touch doctor again after the daemon settles"
                 ),
             ),
         }
@@ -113,15 +132,21 @@ fn sample(
 ) -> ((bool, String), Option<serde_json::Value>) {
     let mut current = read();
     let mut result = inspect(None, current.as_ref());
+    let mut drop_notes = Vec::new();
     for _ in 1..MAX_SAMPLES {
         if !result.pending {
             break;
         }
+        // Adjacent intervals do not overlap. Preserve only rejection observations,
+        // not a camera's transient Pending/failure description or an assumed rate.
+        drop_notes.append(&mut result.drop_notes);
         wait(SAMPLE_INTERVAL);
         let previous = current;
         current = read();
         result = inspect(previous.as_ref(), current.as_ref());
     }
+    drop_notes.append(&mut result.drop_notes);
+    result.drop_notes = drop_notes;
     (result.conclusion(), current)
 }
 
@@ -229,7 +254,12 @@ fn with_sources(
         }
         return pending("the tracking engine isn't running, so camera video couldn't be checked: check the headset's USB connection and power; check daemon logs for an engine open error");
     }
-    if !status::has_received_frame_counters(current) {
+    if !status::has_received_frame_counters(current)
+        && current["sensor_video_quality"] != true
+        && !current["sensors"]
+            .as_array()
+            .is_some_and(|sensors| sensors.iter().any(|s| s.get("video_format").is_some()))
+    {
         return Check::new(
             Outcome::NotVerified,
             format!(
@@ -269,8 +299,8 @@ fn with_sources(
     // samples need it; per-camera decisions still need fresh USB presence so an
     // unplugged native object cannot pass on retained counters or errors.
     let connected = connected().map(|serials| identities(&serials));
-    let old = status::received_frame_counters(previous);
-    let new = status::received_frame_counters(current);
+    let old = status::video_frame_counters(previous);
+    let new = status::video_frame_counters(current);
     let reported: BTreeSet<_> = current["sensors"]
         .as_array()
         .into_iter()
@@ -292,7 +322,7 @@ fn with_sources(
         } else if old
             .get(serial)
             .zip(new.get(serial))
-            .is_some_and(|(&a, &b)| status::frames_advanced(a, b))
+            .is_some_and(|(&a, &b)| b.advanced_from(a))
         {
             detail.push(format!("{serial} is streaming"));
         } else if let Some(reason) = stream_failure(current, serial) {
@@ -307,7 +337,27 @@ fn with_sources(
             let connection = connected.as_ref().err().map_or(String::new(), |error| {
                 format!("; its USB connection couldn't be checked: {error}")
             });
-            detail.push(format!("{serial}: video not verified (received-frame counter unavailable){connection}; check daemon logs; {}", RESTART.trim_start_matches("then ")));
+            let counter = current["sensors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| {
+                    s["serial"]
+                        .as_str()
+                        .is_some_and(|s| status::sensor_identity(s) == *serial)
+                })
+                .map_or(
+                    "video format unavailable (older daemon or unknown input)",
+                    |s| match s["video_format"].as_str() {
+                        Some("raw") => "received-frame counter unavailable",
+                        Some("jpeg") => "decoded-frame counter unavailable",
+                        _ => "video format unavailable (older daemon or unknown input)",
+                    },
+                );
+            detail.push(format!(
+                "{serial}: video not verified ({counter}){connection}; check daemon logs; {}",
+                RESTART.trim_start_matches("then ")
+            ));
         } else if !old.contains_key(serial) && new.contains_key(serial) {
             pending = true;
             detail.push(match &connected {
@@ -317,7 +367,7 @@ fn with_sources(
         } else if old
             .get(serial)
             .zip(new.get(serial))
-            .is_some_and(|(&a, &b)| b < a && !status::frames_advanced(a, b))
+            .is_some_and(|(&a, &b)| b.kind != a.kind || b.value < a.value)
         {
             pending = true;
             detail.push(format!(
@@ -325,7 +375,26 @@ fn with_sources(
             ));
         } else {
             failed = true;
-            if connected.as_ref().is_ok_and(|list| list.contains(serial)) {
+            if new
+                .get(serial)
+                .is_some_and(|c| c.kind == status::VideoCounterKind::JpegDecoded)
+            {
+                let received = status::received_frame_counters(current);
+                let before = status::received_frame_counters(previous);
+                let capture = if before
+                    .get(serial)
+                    .zip(received.get(serial))
+                    .is_some_and(|(a, b)| b > a)
+                {
+                    "encoded video is arriving but no usable decoded image advanced"
+                } else {
+                    "no usable decoded image advanced"
+                };
+                let connection = connected.as_ref().err().map_or(String::new(), |error| {
+                    format!("; its USB connection couldn't be checked: {error}")
+                });
+                detail.push(format!("{serial}: {capture}; check daemon logs for JPEG decode errors or delayed analysis{connection}"));
+            } else if connected.as_ref().is_ok_and(|list| list.contains(serial)) {
                 detail.push(format!("{serial} is connected but sending no video; USB bandwidth may be exhausted: plug it into a different USB controller, {RESTART}; also check USB access and daemon logs"));
             } else if new.contains_key(serial) {
                 detail.push(format!("{serial}'s video counter is stalled; its USB connection couldn't be checked: {}; check its USB cable, USB access and daemon logs; after reconnecting, {RESTART}", connected.as_ref().unwrap_err()));
@@ -350,6 +419,10 @@ fn with_sources(
     if active.is_none() {
         detail.push("older daemon: using the default calibration file".into());
     }
+    let drop_notes = status::video_drop_notes(previous, current)
+        .into_iter()
+        .filter(|note| calibrated.contains(&note.serial) && !ignored.contains(&note.serial))
+        .collect();
     Check {
         outcome: if failed {
             Outcome::Fail
@@ -362,6 +435,7 @@ fn with_sources(
         },
         detail: detail.join("; "),
         pending,
+        drop_notes,
     }
 }
 
@@ -389,7 +463,7 @@ mod tests {
         json!({"generation": 1, "mode": "calibrated", "engine_ready": true,
             "ignored_sensors": [], "sensor_frames_received": true, "sensor_total": sensors.len(),
             "sensors": sensors.iter().map(|(serial, frames)| json!({
-                "serial": serial, "frames": frames, "frames_received": frames, "placed": 1, "fixes": [0, 0]
+                "serial": serial, "frames": frames, "frames_received": frames, "video_format": "raw", "frames_decoded": null, "frames_dropped": 0, "placed": 1, "fixes": [0, 0]
             })).collect::<Vec<_>>()})
     }
 
@@ -1169,7 +1243,14 @@ mod tests {
                 .unwrap()
                 .remove("sensor_frames_received");
             for sensor in value["sensors"].as_array_mut().unwrap() {
-                sensor.as_object_mut().unwrap().remove("frames_received");
+                for key in [
+                    "frames_received",
+                    "video_format",
+                    "frames_decoded",
+                    "frames_dropped",
+                ] {
+                    sensor.as_object_mut().unwrap().remove(key);
+                }
             }
         }
         let (result, fallback_reads, usb_lists) = probed(Some(&old), Some(&new));
@@ -1438,5 +1519,283 @@ mod tests {
             !line.contains("is connected") && !line.contains("sending no video"),
             "{line}"
         );
+    }
+    fn quality_sample(received: u64, decoded: Value, format: Value, dropped: Value) -> Value {
+        let mut sample = snapshot(&[("CAMERA1", 0)]);
+        sample["sensors"][0]["frames_received"] = received.into();
+        sample["sensors"][0]["frames_decoded"] = decoded;
+        sample["sensors"][0]["video_format"] = format;
+        sample["sensors"][0]["frames_dropped"] = dropped;
+        sample["sensor_video_quality"] = json!(true);
+        sample
+    }
+
+    #[test]
+    fn quality_jpeg_capture_without_decoding_cannot_pass() {
+        let cameras = cameras(&["CAMERA1"]);
+        let old = quality_sample(10, json!(0), json!("jpeg"), json!(0));
+        let new = quality_sample(62, json!(0), json!("jpeg"), json!(7));
+        let (ok, detail) = check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras));
+        assert!(!ok && detail.contains("decoded"), "{detail}");
+        assert!(!detail.contains("bandwidth may be exhausted"), "{detail}");
+    }
+
+    #[test]
+    fn quality_jpeg_decode_progress_is_independent_of_capture_and_released_buffers() {
+        let cameras = cameras(&["CAMERA1"]);
+        let old = quality_sample(100, json!(4_294_967_296u64), json!("jpeg"), json!(1000));
+        let new = quality_sample(100, json!(4_294_967_348u64), json!("jpeg"), json!(1000));
+        assert!(check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras)).0);
+    }
+
+    #[test]
+    fn quality_unavailable_decoding_and_unknown_format_are_not_received_fallbacks() {
+        let cameras = cameras(&["CAMERA1"]);
+        for format in [json!("jpeg"), Value::Null, json!("other")] {
+            let old = quality_sample(10, Value::Null, format.clone(), json!(0));
+            let new = quality_sample(62, Value::Null, format, json!(0));
+            let result = with_sources(
+                || Some(cameras.clone()),
+                || Ok(cameras.clone()),
+                Some(&old),
+                Some(&new),
+            );
+            assert_eq!(result.outcome, Outcome::NotVerified, "{}", result.detail);
+        }
+        let mut old = snapshot(&[("CAMERA1", 10)]);
+        let mut new = snapshot(&[("CAMERA1", 62)]);
+        old["sensors"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("video_format");
+        new["sensors"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("video_format");
+        assert!(!check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras)).0);
+    }
+
+    #[test]
+    fn quality_format_switch_starts_a_new_baseline_even_when_values_rise() {
+        let cameras = cameras(&["CAMERA1"]);
+        let old = quality_sample(10, Value::Null, json!("raw"), json!(0));
+        let new = quality_sample(62, json!(1000), json!("jpeg"), json!(0));
+        let result = with_sources(
+            || Some(cameras.clone()),
+            || Ok(cameras.clone()),
+            Some(&old),
+            Some(&new),
+        );
+        assert_eq!(result.outcome, Outcome::Pending, "{}", result.detail);
+        let later = quality_sample(62, json!(1052), json!("jpeg"), json!(0));
+        assert!(check(Some(&cameras), Some(&new), Some(&later), Ok(&cameras)).0);
+    }
+
+    #[test]
+    fn quality_rejections_warn_without_failing_and_never_use_received_minus_dropped() {
+        let cameras = cameras(&["CAMERA1"]);
+        for rejected in [0, 1, 2, 3, 7] {
+            let old = quality_sample(10, Value::Null, json!("raw"), json!(1000));
+            let new = quality_sample(62, Value::Null, json!("raw"), json!(1000 + rejected));
+            let result = with_sources(
+                || Some(cameras.clone()),
+                || Ok(cameras.clone()),
+                Some(&old),
+                Some(&new),
+            );
+            assert_eq!(result.outcome, Outcome::Pass, "{}", result.detail);
+            let line = result.board_line();
+            assert_eq!(line.starts_with("warning "), rejected >= 3, "{line}");
+            if rejected > 0 {
+                assert!(line.contains(&format!("discarded {rejected} ")), "{line}");
+            }
+        }
+        let old = quality_sample(10, Value::Null, json!("raw"), json!(1000));
+        let reset = quality_sample(62, Value::Null, json!("raw"), json!(0));
+        let (ok, detail) = check(Some(&cameras), Some(&old), Some(&reset), Ok(&cameras));
+        assert!(ok && !detail.contains("discarded"), "{detail}");
+    }
+
+    #[test]
+    fn quality_missing_jpeg_metadata_keeps_another_sensors_known_failure() {
+        let cameras = cameras(&["CAMERA1", "CAMERA2"]);
+        let old = quality_sample(10, Value::Null, json!("jpeg"), json!(0));
+        let mut new = quality_sample(62, Value::Null, json!("jpeg"), json!(0));
+        new["sensor_streams"] = json!([{"serial":"camera2", "error_kind":"likely_usb_bandwidth", "error_code":-99, "os_error":28}]);
+        let (ok, detail) = check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras));
+        assert!(
+            !ok && detail.contains("CAMERA1")
+                && detail.contains("decoded-frame counter unavailable"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("CAMERA2") && detail.contains("most likely not enough USB bandwidth"),
+            "{detail}"
+        );
+    }
+    #[test]
+    fn quality_mixed_video_is_matched_by_serial_and_uses_each_producing_stage() {
+        let cameras = cameras(&["CAMERA1", "CAMERA2"]);
+        let mut old = quality_sample(10, Value::Null, json!("raw"), json!(0));
+        old["calibrated_sensors"] = json!(cameras);
+        old["sensors"].as_array_mut().unwrap().push(json!({"serial":"camera2",
+            "video_format":"jpeg", "frames_received":100, "frames_decoded":4294967296u64,"frames_dropped":0}));
+        let mut new = old.clone();
+        new["sensors"][0]["frames_received"] = json!(62);
+        new["sensors"][1]["frames_decoded"] = json!(4294967348u64);
+        new["sensors"].as_array_mut().unwrap().reverse();
+        let (ok, detail) = check(None, Some(&old), Some(&new), Ok(&cameras));
+        assert!(
+            ok && detail.contains("CAMERA1 is streaming")
+                && detail.contains("CAMERA2 is streaming"),
+            "{detail}"
+        );
+        new["sensors"][0]["frames_decoded"] = json!(0);
+        assert_eq!(
+            with_sources(|| None, || Ok(cameras.clone()), Some(&old), Some(&new)).outcome,
+            Outcome::Pending
+        );
+    }
+
+    #[test]
+    fn quality_decode_unavailability_keeps_connection_errors_and_requires_a_new_sample() {
+        let cameras = cameras(&["CAMERA1"]);
+        let old = quality_sample(10, Value::Null, json!("jpeg"), json!(0));
+        let mut new = quality_sample(62, Value::Null, json!("jpeg"), json!(0));
+        let result = with_sources(
+            || Some(cameras.clone()),
+            || Err("USB enumeration denied".into()),
+            Some(&old),
+            Some(&new),
+        );
+        assert_eq!(result.outcome, Outcome::NotVerified);
+        assert!(result.detail.contains("USB enumeration denied"));
+        new["sensors"][0]["frames_decoded"] = json!(0);
+        assert_eq!(
+            with_sources(
+                || Some(cameras.clone()),
+                || Ok(cameras.clone()),
+                Some(&old),
+                Some(&new)
+            )
+            .outcome,
+            Outcome::Pending
+        );
+    }
+
+    #[test]
+    fn quality_warning_is_non_failing_but_never_hides_other_failures_or_ignored_sensors() {
+        let cameras = cameras(&["CAMERA1", "CAMERA2"]);
+        let old = quality_sample(10, Value::Null, json!("raw"), json!(0));
+        let mut new = quality_sample(62, Value::Null, json!("raw"), json!(7));
+        let (ok, detail) = check(Some(&cameras[..1]), Some(&old), Some(&new), Ok(&cameras));
+        assert!(
+            ok && detail.starts_with("warning: ") && detail.contains("discarded 7"),
+            "{detail}"
+        );
+        let result = with_sources(
+            || Some(cameras.clone()),
+            || Ok(cameras[..1].to_vec()),
+            Some(&old),
+            Some(&new),
+        );
+        assert!(result.board_line().starts_with("FAIL "));
+        let (ok, detail) = check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras[..1]));
+        assert!(
+            !ok && detail.contains("CAMERA2 isn't connected") && detail.contains("discarded 7")
+        );
+        new["ignored_sensors"] = json!(["camera1"]);
+        let (_, detail) = check(Some(&cameras), Some(&old), Some(&new), Ok(&cameras[..1]));
+        assert!(!detail.contains("discarded"));
+    }
+    #[test]
+    fn quality_sampling_retains_rejections_across_pending_then_pass() {
+        let cameras = cameras(&["CAMERA1", "CAMERA2"]);
+        let mut reads = 0;
+        let mut waits = Vec::new();
+        let mut outcomes = Vec::new();
+        let ((ok, detail), _) = sample(
+            || {
+                let (a, b, dropped) = [(10, 100, 0), (62, 0, 7), (114, 52, 7)][reads];
+                let mut value = snapshot(&[("CAMERA1", a), ("CAMERA2", b)]);
+                value["calibrated_sensors"] = json!(cameras);
+                value["sensors"][0]["frames_dropped"] = json!(dropped);
+                reads += 1;
+                Some(value)
+            },
+            |interval| waits.push(interval),
+            |previous, current| {
+                let result = with_sources(|| None, || Ok(cameras.clone()), previous, current);
+                outcomes.push(result.outcome);
+                result
+            },
+        );
+        assert_eq!(
+            outcomes,
+            [Outcome::Pending, Outcome::Pending, Outcome::Pass]
+        );
+        assert_eq!(waits, [SAMPLE_INTERVAL; 2]);
+        assert!(ok && detail.starts_with("warning: "), "{detail}");
+        assert_eq!(
+            detail.matches("CAMERA1 discarded 7 damaged images").count(),
+            1,
+            "{detail}"
+        );
+        assert!(
+            detail.contains("CAMERA1 is streaming") && detail.contains("CAMERA2 is streaming"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("since the previous video sample"),
+            "an earlier interval must not be presented as the latest one: {detail}"
+        );
+        assert!(
+            !detail.contains("counter restarted"),
+            "only rejection observations survive: {detail}"
+        );
+    }
+    #[test]
+    fn quality_sampling_keeps_each_intervals_count_and_warning_threshold() {
+        let cameras = cameras(&["CAMERA1", "CAMERA2"]);
+        for drops in [vec![2u64, 2], vec![7, 2, 1]] {
+            let mut reads = 0;
+            let ((ok, detail), _) = sample(
+                || {
+                    let b = if reads == drops.len() {
+                        100 - (reads as u32 - 1) * 20 + 1
+                    } else {
+                        100 - reads as u32 * 20
+                    };
+                    let mut value =
+                        snapshot(&[("CAMERA1", 10 + reads as u32 * 52), ("CAMERA2", b)]);
+                    value["calibrated_sensors"] = json!(cameras);
+                    value["sensors"][0]["frames_dropped"] =
+                        json!(drops[..reads].iter().sum::<u64>());
+                    reads += 1;
+                    Some(value)
+                },
+                |_| {},
+                |previous, current| {
+                    with_sources(|| None, || Ok(cameras.clone()), previous, current)
+                },
+            );
+            assert!(ok, "{detail}");
+            assert_eq!(reads, drops.len() + 1);
+            assert_eq!(
+                detail.starts_with("warning: "),
+                drops.iter().any(|n| *n >= 3),
+                "warnings use individual intervals, not their sum: {detail}"
+            );
+            assert_eq!(detail.matches("discarded").count(), drops.len(), "{detail}");
+            for count in &drops {
+                assert_eq!(
+                    detail
+                        .matches(&format!("discarded {count} damaged image"))
+                        .count(),
+                    drops.iter().filter(|n| *n == count).count(),
+                    "{detail}"
+                );
+            }
+        }
     }
 }

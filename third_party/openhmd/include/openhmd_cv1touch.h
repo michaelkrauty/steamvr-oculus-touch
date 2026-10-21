@@ -90,6 +90,23 @@ typedef struct ohmd_cv1touch_sensor_video {
 	uint64_t frames_received;
 } ohmd_cv1touch_sensor_video;
 
+#define OHMD_CV1TOUCH_VIDEO_UNKNOWN 0
+#define OHMD_CV1TOUCH_VIDEO_RAW 1
+#define OHMD_CV1TOUCH_VIDEO_JPEG 2
+
+/* Independent quality diagnostics; does not extend the 40-byte acquisition record.
+ * USB3 uses raw video; USB2 uses JPEG in normal tracking and calibration too.
+ * Decoded counts JPEG images accepted as packed GRAY8, not raw images. Dropped
+ * counts rejected image candidates, excluding queue eviction/buffer starvation.
+ * Counters are cumulative for this native device's lifetime, not logging windows. */
+typedef struct ohmd_cv1touch_sensor_video_quality {
+	char serial[32];
+	uint64_t frames_decoded;
+	uint64_t frames_dropped;
+	uint32_t video_format;             /* OHMD_CV1TOUCH_VIDEO_* */
+	uint32_t reserved;                 /* zero */
+} ohmd_cv1touch_sensor_video_quality;
+
 typedef struct ohmd_cv1touch_sensor {
 	char serial[32];
 	bool have_camera_pose;
@@ -220,6 +237,9 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device,
 /* Current sensor acquisition counters; indices can change after discovery.
  * Returns -1 past the last record. Engine thread only; counters are atomic. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video(ohmd_device *device, int index, ohmd_cv1touch_sensor_video *out);
+/* Current quality counters and negotiated input format. Same enumeration and
+ * engine-thread-only rules as acquisition; no locks or device I/O. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video_quality(ohmd_device *device, int index, ohmd_cv1touch_sensor_video_quality *out);
 /* Last start-attempt results, keyed by serial, including failed starts. Indices
  * may change after device discovery; returns -1 past the last record. Engine thread only. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_stream(ohmd_device *device, int index, ohmd_cv1touch_sensor_stream *out);

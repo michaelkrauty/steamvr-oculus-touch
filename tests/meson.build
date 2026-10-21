@@ -94,7 +94,7 @@ foreach scenario : ['stale-tail', 'nearly-complete', 'header-only', 'fid-sequenc
                     'packet-error', 'timestamp', 'jpeg', 'missing-pts', 'missing-header-end',
                     'same-fid-after-stall', 'gap-damage', 'discard-summary', 'starvation-log',
                     'opening-error-raw', 'opening-error-jpeg', 'bad-traffic-start', 'bad-traffic-rejected',
-                    'raw-overrun-report', 'latency']
+                    'raw-overrun-report', 'quality-counts', 'latency']
   test('uvc_frames_' + scenario, test_uvc_frames, args: [scenario])
 endforeach
 test_jpeg_dep = dependency('libjpeg', required: false)
@@ -109,10 +109,22 @@ endforeach
 if test_jpeg_dep.found()
   foreach scenario : ['jpeg', 'jpeg-corrupt', 'jpeg-padding', 'jpeg-extraneous', 'jpeg-extraneous-header',
                       'jpeg-truncated', 'jpeg-missing-eoi', 'jpeg-bad-code', 'jpeg-resync', 'jpeg-warning-codes',
-                      'jpeg-summary', 'jpeg-embedded-eoi', 'jpeg-progression']
+                      'jpeg-summary', 'jpeg-embedded-eoi', 'jpeg-progression', 'jpeg-counters']
     test('sensor_frame_' + scenario.underscorify(), test_sensor_frame_quality, args: [scenario])
   endforeach
 endif
+# Constructor-installed format and counters, with the actual packet assembler.
+test_sensor_usb_quality = executable('test_sensor_usb_quality', 'test_sensor_usb_quality.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'] +
+    (test_jpeg_dep.found() ? ['-DHAVE_LIBJPEG=1'] : []),
+  dependencies: [dependency('libusb-1.0'), test_jpeg_dep], link_args: ['-Wl,--gc-sections', '-lm'])
+test('sensor_usb_quality_raw', test_sensor_usb_quality, args: ['raw'])
+if test_jpeg_dep.found()
+  test('sensor_usb_quality_jpeg', test_sensor_usb_quality, args: ['jpeg'])
+else
+  test('sensor_usb_quality_jpeg_unavailable', test_sensor_usb_quality, args: ['jpeg'])
+endif
+
 # Hardware-free discovery/lifetime regression using the actual native tracker.
 test_sensor_discovery = executable('test_sensor_discovery', 'test_sensor_discovery.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],

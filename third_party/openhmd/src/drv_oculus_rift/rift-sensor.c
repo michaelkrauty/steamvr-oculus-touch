@@ -280,16 +280,17 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	rift_sensor_ctx *sensor = cb_data;
 	rift_sensor_analysis_frame *frame;
 	OHMD_ASSERT(sensor);
-	/* Acquisition progresses even when analysis is still releasing older frames. */
-	__atomic_fetch_add(&sensor->cv1touch_frames_received, 1, __ATOMIC_RELAXED);
-	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
-
 	/* The UVC assembler checks raw frames before delivery. Also protect callers
 	 * using a different capture backend before taking ownership or queueing work. */
 	if (vframe->format != OHMD_VIDEO_FRAME_FORMAT_JPEG && !valid_raw_frame(dev, vframe)) {
+		__atomic_fetch_add(&dev->cv1touch_frames_dropped, 1, __ATOMIC_RELAXED);
 		ohmd_video_frame_release(vframe);
 		return;
 	}
+	/* Complete capture progresses before any analysis lock or queue. JPEG is
+	 * still encoded here; its usable-image counter advances after validation. */
+	__atomic_fetch_add(&sensor->cv1touch_frames_received, 1, __ATOMIC_RELAXED);
+	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 
 	ohmd_lock_mutex (sensor->sensor_lock);
 
@@ -703,12 +704,20 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 	}
 	frame->n_devices = exposure_info->n_devices;
 
+	bool jpeg = frame->vframe->format == OHMD_VIDEO_FRAME_FORMAT_JPEG;
 #if HAVE_LIBJPEG
-	if (!decode_frame(sensor, frame))
+	if (!decode_frame(sensor, frame)) {
+		__atomic_fetch_add(&sensor->dev->cv1touch_frames_dropped, 1, __ATOMIC_RELAXED);
 		return false;
+	}
 #endif
-
-	return valid_raw_frame(sensor->dev, frame->vframe);
+	if (!valid_raw_frame(sensor->dev, frame->vframe)) {
+		__atomic_fetch_add(&sensor->dev->cv1touch_frames_dropped, 1, __ATOMIC_RELAXED);
+		return false;
+	}
+	if (jpeg)
+		__atomic_fetch_add(&sensor->dev->cv1touch_frames_decoded, 1, __ATOMIC_RELAXED);
+	return true;
 }
 
 static unsigned int fast_analysis_thread(void *arg)
@@ -846,6 +855,15 @@ void rift_sensor_get_video_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_vi
 	memset(out, 0, sizeof *out);
 	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);
 	out->frames_received = __atomic_load_n(&sensor->cv1touch_frames_received, __ATOMIC_RELAXED);
+}
+
+void rift_sensor_get_video_quality(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_video_quality *out)
+{
+	memset(out, 0, sizeof *out);
+	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);
+	out->video_format = sensor->dev->cv1touch_video_format;
+	out->frames_decoded = __atomic_load_n(&sensor->dev->cv1touch_frames_decoded, __ATOMIC_RELAXED);
+	out->frames_dropped = __atomic_load_n(&sensor->dev->cv1touch_frames_dropped, __ATOMIC_RELAXED);
 }
 
 void rift_sensor_get_cv1touch_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor *out)

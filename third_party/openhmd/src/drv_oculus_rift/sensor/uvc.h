@@ -67,6 +67,8 @@ struct rift_sensor_uvc_stream {
 	/* Damaged packets seen while no new image could be identified. */
 	uint32_t bad_packets;
 	uint64_t discard_window_start;
+	/* Optional device-owned lifetime counter; outlives all streaming callbacks. */
+	uint64_t *frames_dropped;
 
 	/* USB streaming alt_setting */
 	int alt_setting;

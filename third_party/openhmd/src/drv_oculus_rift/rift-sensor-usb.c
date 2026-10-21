@@ -193,6 +193,9 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	dev->uvc_stream.sensor_id = id;
 	ret = rift_sensor_uvc_stream_setup (ohmd_ctx, usb_ctx, dev->usb_devh, &desc, &dev->uvc_stream);
 	ASSERT_MSG(ret >= 0, fail, "could not prepare for streaming\n");
+	dev->base.cv1touch_video_format = dev->uvc_stream.format == OHMD_VIDEO_FRAME_FORMAT_JPEG ?
+		OHMD_CV1TOUCH_VIDEO_JPEG : OHMD_CV1TOUCH_VIDEO_RAW;
+	dev->uvc_stream.frames_dropped = &dev->base.cv1touch_frames_dropped;
 
 #if !HAVE_LIBJPEG
 	if (dev->uvc_stream.format == OHMD_VIDEO_FRAME_FORMAT_JPEG) {

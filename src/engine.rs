@@ -57,6 +57,40 @@ impl From<ffi::ohmd_cv1touch_sensor_video> for SensorVideo {
     }
 }
 
+/// Negotiated camera input; JPEG frames become GRAY8 only after decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoFormat {
+    Raw,
+    Jpeg,
+}
+
+/// Independent quality stages. Raw video has no JPEG-decoded counter.
+#[derive(Clone, Debug)]
+pub struct SensorVideoQuality {
+    pub serial: String,
+    pub video_format: Option<VideoFormat>,
+    pub frames_decoded: Option<u64>,
+    pub frames_dropped: u64,
+}
+
+impl From<ffi::ohmd_cv1touch_sensor_video_quality> for SensorVideoQuality {
+    fn from(quality: ffi::ohmd_cv1touch_sensor_video_quality) -> Self {
+        let video_format = match quality.video_format {
+            ffi::OHMD_CV1TOUCH_VIDEO_RAW => Some(VideoFormat::Raw),
+            ffi::OHMD_CV1TOUCH_VIDEO_JPEG => Some(VideoFormat::Jpeg),
+            _ => None,
+        };
+        Self {
+            serial: cstr_field(&quality.serial),
+            frames_decoded: (video_format == Some(VideoFormat::Jpeg))
+                .then_some(quality.frames_decoded),
+            frames_dropped: quality.frames_dropped,
+            video_format,
+        }
+    }
+}
+
 /// Last USB video start attempt, retained through cleanup and until detach is reported.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SensorStreamStart {
@@ -397,6 +431,24 @@ impl Engine {
             .collect()
     }
 
+    /// Enumerate quality afresh and join by serial: native indices can change.
+    pub fn sensor_video_quality(&self) -> Vec<SensorVideoQuality> {
+        (0..c_int::MAX)
+            .map_while(|index| {
+                let mut quality = ffi::ohmd_cv1touch_sensor_video_quality::default();
+                // SAFETY: this engine owns the device and the output matches the native ABI.
+                (unsafe {
+                    ffi::ohmd_cv1touch_get_sensor_video_quality(
+                        self.hands[HAND_RIGHT],
+                        index,
+                        &mut quality,
+                    )
+                } == 0)
+                    .then(|| quality.into())
+            })
+            .collect()
+    }
+
     /// Read the complete last-start table each time: discovery changes its set/order.
     /// These records can outlive unplugging; they do not establish current USB presence.
     pub fn sensor_streams(&self) -> Vec<SensorStreamStart> {
@@ -576,6 +628,39 @@ impl Drop for RadioDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_mapping_preserves_unknown_raw_jpeg_and_u64_values() {
+        for (format, expected) in [
+            (ffi::OHMD_CV1TOUCH_VIDEO_RAW, Some(VideoFormat::Raw)),
+            (ffi::OHMD_CV1TOUCH_VIDEO_JPEG, Some(VideoFormat::Jpeg)),
+            (ffi::OHMD_CV1TOUCH_VIDEO_UNKNOWN, None),
+            (99, None),
+        ] {
+            for count in [0, u64::MAX] {
+                let mut native = ffi::ohmd_cv1touch_sensor_video_quality {
+                    video_format: format,
+                    frames_decoded: count,
+                    frames_dropped: count,
+                    ..Default::default()
+                };
+                native.serial[0] = b'X' as _;
+                let q = SensorVideoQuality::from(native);
+                assert_eq!(q.serial, "X");
+                assert_eq!(q.video_format, expected);
+                assert_eq!(
+                    q.frames_decoded,
+                    (expected == Some(VideoFormat::Jpeg)).then_some(count)
+                );
+                assert_eq!(q.frames_dropped, count);
+            }
+        }
+        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_video>(), 40);
+        assert_eq!(
+            std::mem::size_of::<ffi::ohmd_cv1touch_sensor_video_quality>(),
+            56
+        );
+    }
 
     #[test]
     fn the_search_skip_mask_names_controllers_by_engine_device_id() {

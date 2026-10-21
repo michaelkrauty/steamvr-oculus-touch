@@ -44,6 +44,7 @@ static void released(ohmd_video_frame *frame, void *owner)
 
 int main(void)
 {
+    CHECK(sizeof(ohmd_cv1touch_sensor_video) == 40);
     ohmd_context ctx = {0};
     rift_sensor_device device = {0};
     device.calib.width = device.calib.height = 128;
@@ -82,6 +83,41 @@ int main(void)
     release_capture_frame(&sensor, &analysis);
     rift_sensor_get_video_info(&sensor, &video);
     CHECK(video.frames_received == UINT64_C(4294967297) && releases == 2);
+    /* Invalid raw input must be rejected before acquisition progress or any lock. */
+    frame.data_size--;
+    frame_captured_cb(&device, &frame, &sensor);
+    rift_sensor_get_video_info(&sensor, &video);
+    CHECK(video.frames_received == UINT64_C(4294967297) && releases == 3);
+    CHECK(POP_QUEUE(&sensor.fast_analysis_q) == NULL);
+    /* JPEG acquisition still precedes decoding and the analysis lock. */
+    frame.format = OHMD_VIDEO_FRAME_FORMAT_JPEG;
+    expected_received = UINT64_C(4294967298);
+    frame_captured_cb(&device, &frame, &sensor);
+    rift_sensor_get_video_info(&sensor, &video);
+    CHECK(video.frames_received == expected_received && releases == 3);
+    CHECK(POP_QUEUE(&sensor.fast_analysis_q) == &analysis);
+    release_capture_frame(&sensor, &analysis);
+    CHECK(releases == 4);
+    ohmd_cv1touch_sensor_video_quality quality;
+    device.cv1touch_video_format = OHMD_CV1TOUCH_VIDEO_JPEG;
+    __atomic_store_n(&device.cv1touch_frames_decoded, UINT64_C(4294967296), __ATOMIC_RELAXED);
+    __atomic_store_n(&device.cv1touch_frames_dropped, UINT64_C(4294967303), __ATOMIC_RELAXED);
+    memset(&quality, 0xff, sizeof quality);
+    rift_sensor_get_video_quality(&sensor, &quality);
+    CHECK(!strcmp(quality.serial, "CAMERA1") && quality.reserved == 0);
+    CHECK(quality.video_format == OHMD_CV1TOUCH_VIDEO_JPEG);
+    CHECK(quality.frames_decoded == UINT64_C(4294967296));
+    CHECK(quality.frames_dropped == UINT64_C(4294967303));
+    rift_sensor_device other_device = {0};
+    rift_sensor_ctx other = {.dev = &other_device};
+    snprintf(other.serial_no, sizeof other.serial_no, "%s", "CAMERA2");
+    rift_sensor_get_video_quality(&other, &quality);
+    CHECK(!strcmp(quality.serial, "CAMERA2") && quality.video_format == OHMD_CV1TOUCH_VIDEO_UNKNOWN);
+    CHECK(quality.frames_decoded == 0 && quality.frames_dropped == 0);
+    device.cv1touch_video_format = OHMD_CV1TOUCH_VIDEO_RAW;
+    rift_sensor_get_video_quality(&sensor, &quality);
+    CHECK(quality.video_format == OHMD_CV1TOUCH_VIDEO_RAW);
+    CHECK(quality.frames_dropped == UINT64_C(4294967303));
     puts("test_sensor_video ok");
     return 0;
 }

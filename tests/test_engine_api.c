@@ -46,6 +46,12 @@ int main(void)
 	CHECK(sizeof(ohmd_cv1touch_blob) == 20);
 	CHECK(frames_seen == 0);
 	CHECK(sizeof(ohmd_cv1touch_sensor_video) == 40);
+    CHECK(sizeof(ohmd_cv1touch_sensor_video_quality) == 56);
+    CHECK(offsetof(ohmd_cv1touch_sensor_video_quality, frames_decoded) == 32);
+    CHECK(offsetof(ohmd_cv1touch_sensor_video_quality, video_format) == 48);
+    ohmd_cv1touch_sensor_video_quality quality;
+    CHECK(ohmd_cv1touch_get_sensor_video_quality(NULL, 0, &quality) == -1);
+    CHECK(ohmd_cv1touch_get_sensor_video_quality(NULL, -1, NULL) == -1);
 	ohmd_cv1touch_sensor_video video;
 	CHECK(ohmd_cv1touch_get_sensor_video(NULL, 0, &video) == -1);
 	CHECK(sizeof(ohmd_cv1touch_sensor_stream) == 64);

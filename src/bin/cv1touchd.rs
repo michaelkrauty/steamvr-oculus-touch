@@ -191,6 +191,7 @@ struct Daemon {
     sensor_streams: Mutex<Vec<engine::SensorStreamStart>>,
     /// Acquisition counters from the same publication, separate from released analysis buffers.
     sensor_video: Mutex<Vec<engine::SensorVideo>>,
+    sensor_video_quality: Mutex<Vec<engine::SensorVideoQuality>>,
     track_stats: Mutex<[(Stats, bool); 2]>,
     pending_frames_dropped: std::sync::atomic::AtomicU64,
     /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
@@ -619,7 +620,7 @@ fn clear_engine_snapshot(d: &Daemon) {
     d.engine_applied.store(0, Ordering::Release);
     d.track_in.lock().unwrap().register([]);
     d.pending_frames_dropped.store(0, Ordering::Relaxed);
-    publish_sensor_snapshot(d, &[], &[], &[]);
+    publish_sensor_snapshot(d, &[], &[], &[], &[]);
 }
 
 /// A native engine may be open but still blocked in its first update. Only an actual recent
@@ -752,8 +753,9 @@ fn publish_sensor_snapshot(
     sensors: &[SensorStatus],
     streams: &[engine::SensorStreamStart],
     video: &[engine::SensorVideo],
+    quality: &[engine::SensorVideoQuality],
 ) {
-    publish_sensor_snapshot_with(d, sensors, streams, video, |snapshot| {
+    publish_sensor_snapshot_with(d, sensors, streams, video, quality, |snapshot| {
         d.shm.publish_sensors(snapshot)
     });
 }
@@ -763,6 +765,7 @@ fn publish_sensor_snapshot_with(
     sensors: &[SensorStatus],
     streams: &[engine::SensorStreamStart],
     video: &[engine::SensorVideo],
+    quality: &[engine::SensorVideoQuality],
     publish: impl FnOnce(&[SensorStatus]),
 ) {
     // Status takes these locks in the same order. Retain the writer lock through the SHM
@@ -770,14 +773,17 @@ fn publish_sensor_snapshot_with(
     let mut snapshot = d.sensors.lock().unwrap();
     let mut current_streams = d.sensor_streams.lock().unwrap();
     let mut current_video = d.sensor_video.lock().unwrap();
+    let mut current_quality = d.sensor_video_quality.lock().unwrap();
     if d.quit.load(Ordering::Acquire) {
         snapshot.clear();
         current_streams.clear();
         current_video.clear();
+        current_quality.clear();
     } else {
         *snapshot = sensors.to_vec();
         *current_streams = streams.to_vec();
         *current_video = video.to_vec();
+        *current_quality = quality.to_vec();
     }
     publish(&snapshot);
 }
@@ -2516,7 +2522,13 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         if now >= next_sensors {
             let sensors: Vec<SensorStatus> =
                 e.sensors().iter().map(|s| sensor_status(d, s)).collect();
-            publish_sensor_snapshot(d, &sensors, &e.sensor_streams(), &e.sensor_video());
+            publish_sensor_snapshot(
+                d,
+                &sensors,
+                &e.sensor_streams(),
+                &e.sensor_video(),
+                &e.sensor_video_quality(),
+            );
             next_sensors = now + SENSOR_PUBLISH_NS;
             if d.rec.active() {
                 write_session_info(d, e);
@@ -3394,12 +3406,13 @@ fn status_json(d: &Daemon) -> String {
         )
     };
     let hands = [HAND_LEFT, HAND_RIGHT].map(|h| d.shm.hand(h).unwrap_or_default());
-    let (sensors, sensor_streams, sensor_video) = {
+    let (sensors, sensor_streams, sensor_video, sensor_video_quality) = {
         let sensors = d.sensors.lock().unwrap();
         (
             sensors.clone(),
             d.sensor_streams.lock().unwrap().clone(),
             d.sensor_video.lock().unwrap().clone(),
+            d.sensor_video_quality.lock().unwrap().clone(),
         )
     };
     let recording = d.rec.status();
@@ -3430,6 +3443,10 @@ fn status_json(d: &Daemon) -> String {
             )
         })
         .collect();
+    let quality: std::collections::HashMap<_, _> = sensor_video_quality
+        .iter()
+        .map(|q| (cv1touch::status::sensor_identity(&q.serial), q))
+        .collect();
     let sensors_json: Vec<serde_json::Value> = sensors
         .iter()
         .map(|s| {
@@ -3445,7 +3462,11 @@ fn status_json(d: &Daemon) -> String {
                 serde_json::json!({"median_px": a.median_px, "bias_px": a.bias_px.norm(),
                 "samples": a.samples, "checks": a.checks, "misses": a.misses})
             });
+            let quality = quality.get(&cv1touch::status::sensor_identity(&serial));
             serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
+            "video_format": quality.and_then(|q| q.video_format),
+            "frames_decoded": quality.and_then(|q| q.frames_decoded),
+            "frames_dropped": quality.map(|q| q.frames_dropped),
             "frames_received": received.get(&cv1touch::status::sensor_identity(&serial)).copied(),
             "fixes": s.pose_fixes, "camera_orient": s.camera_orient, "camera_pos": s.camera_pos,
             "landmark_shift": shift, "pose": pose, "agreement": agreement})
@@ -3458,7 +3479,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_frames_received\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -4633,6 +4654,7 @@ fn main() {
         sensors: Mutex::new(Vec::new()),
         sensor_streams: Mutex::new(Vec::new()),
         sensor_video: Mutex::new(Vec::new()),
+        sensor_video_quality: Mutex::new(Vec::new()),
         track_stats: Mutex::new([(Stats::default(), false); 2]),
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
@@ -5883,6 +5905,7 @@ mod tests {
             sensors: Mutex::new(Vec::new()),
             sensor_streams: Mutex::new(Vec::new()),
             sensor_video: Mutex::new(Vec::new()),
+            sensor_video_quality: Mutex::new(Vec::new()),
             track_stats: Mutex::new([(Stats::default(), false); 2]),
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
@@ -9969,6 +9992,65 @@ mod tests {
     }
 
     #[test]
+    fn quality_status_is_nullable_serial_keyed_and_replaced_with_the_snapshot() {
+        let d = status_daemon();
+        let make_sensor = |serial: &str| {
+            let mut sensor = SensorStatus::default();
+            shm::set_serial(&mut sensor, serial);
+            sensor
+        };
+        let sensors = [
+            make_sensor("Camera1"),
+            make_sensor("Camera2"),
+            make_sensor("Camera3"),
+        ];
+        let quality = [
+            engine::SensorVideoQuality {
+                serial: "CAMERA2".into(),
+                video_format: Some(engine::VideoFormat::Jpeg),
+                frames_decoded: Some(u64::MAX),
+                frames_dropped: 4_294_967_297,
+            },
+            engine::SensorVideoQuality {
+                serial: "cAMERA1".into(),
+                video_format: Some(engine::VideoFormat::Raw),
+                frames_decoded: None,
+                frames_dropped: 0,
+            },
+        ];
+        let read = || -> serde_json::Value {
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap()
+        };
+        assert_eq!(read()["sensor_video_quality"], true);
+        publish_sensor_snapshot(&d, &sensors, &[], &[], &quality);
+        let value = read();
+        assert_eq!(value["sensors"][0]["video_format"], "raw");
+        assert!(value["sensors"][0]["frames_decoded"].is_null());
+        assert_eq!(value["sensors"][0]["frames_dropped"], 0);
+        assert_eq!(value["sensors"][1]["video_format"], "jpeg");
+        assert_eq!(value["sensors"][1]["frames_decoded"], u64::MAX);
+        assert_eq!(value["sensors"][1]["frames_dropped"], 4_294_967_297u64);
+        for key in ["video_format", "frames_decoded", "frames_dropped"] {
+            assert!(value["sensors"][2]
+                .get(key)
+                .is_some_and(serde_json::Value::is_null));
+        }
+        let mut jpeg = quality[0].clone();
+        jpeg.frames_decoded = Some(0);
+        publish_sensor_snapshot(&d, &[sensors[1]], &[], &[], &[jpeg]);
+        let value = read();
+        assert_eq!(value["sensors"][0]["serial"], "Camera2");
+        assert_eq!(value["sensors"][0]["frames_decoded"], 0);
+        publish_sensor_snapshot(&d, &sensors, &[], &[], &[]);
+        assert!(read()["sensors"][1]["frames_dropped"].is_null());
+        publish_sensor_snapshot(&d, &sensors, &[], &[], &quality);
+        assert_eq!(d.sensor_video_quality.lock().unwrap().len(), 2);
+        publish_disconnected(&d);
+        assert!(d.sensor_video_quality.lock().unwrap().is_empty());
+        assert_eq!(read()["sensors"], serde_json::json!([]));
+    }
+
+    #[test]
     fn status_publishes_received_video_by_serial_at_full_u64_width() {
         let d = status_daemon();
         let mut sensor = SensorStatus {
@@ -9980,7 +10062,7 @@ mod tests {
             serial: "CAMERA1".into(),
             frames_received: 4_294_967_348,
         };
-        publish_sensor_snapshot(&d, &[sensor], &[], &[video]);
+        publish_sensor_snapshot(&d, &[sensor], &[], &[video], &[]);
         let value: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
         assert_eq!(value["sensors"][0]["frames"], 41);
@@ -9995,7 +10077,7 @@ mod tests {
         let d = status_daemon();
         let mut sensor = SensorStatus::default();
         shm::set_serial(&mut sensor, "CAMERA1");
-        publish_sensor_snapshot(&d, &[sensor], &[], &[]);
+        publish_sensor_snapshot(&d, &[sensor], &[], &[], &[]);
         let value: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
         assert!(value["sensors"][0]["frames_received"].is_null());
@@ -10031,7 +10113,7 @@ mod tests {
         }
         let mut sensor = SensorStatus::default();
         shm::set_serial(&mut sensor, "LOWER");
-        publish_sensor_snapshot(&d, &[sensor], &[failed.into(), active.into()], &[]);
+        publish_sensor_snapshot(&d, &[sensor], &[failed.into(), active.into()], &[], &[]);
         let value: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
         assert_eq!(value["sensor_total"], 1);
@@ -10090,11 +10172,18 @@ mod tests {
         thread::scope(|scope| {
             let d = &d;
             let first = scope.spawn(move || {
-                publish_sensor_snapshot_with(d, &[SensorStatus::default()], &[], &[], |snapshot| {
-                    entered.send(()).unwrap();
-                    released.recv().unwrap();
-                    d.shm.publish_sensors(snapshot);
-                });
+                publish_sensor_snapshot_with(
+                    d,
+                    &[SensorStatus::default()],
+                    &[],
+                    &[],
+                    &[],
+                    |snapshot| {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        d.shm.publish_sensors(snapshot);
+                    },
+                );
                 finished.send(()).unwrap();
             });
             writing.recv().unwrap();
@@ -10127,6 +10216,7 @@ mod tests {
         assert!(d.shm.sensors().unwrap().is_empty());
         assert!(d.sensor_streams.lock().unwrap().is_empty());
         assert!(d.sensor_video.lock().unwrap().is_empty());
+        assert!(d.sensor_video_quality.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -10139,11 +10229,13 @@ mod tests {
             &[SensorStatus::default()],
             &[ffi::ohmd_cv1touch_sensor_stream::default().into()],
             &[ffi::ohmd_cv1touch_sensor_video::default().into()],
+            &[ffi::ohmd_cv1touch_sensor_video_quality::default().into()],
         );
         assert!(d.sensors.lock().unwrap().is_empty());
         assert!(d.shm.sensors().unwrap().is_empty());
         assert!(d.sensor_streams.lock().unwrap().is_empty());
         assert!(d.sensor_video.lock().unwrap().is_empty());
+        assert!(d.sensor_video_quality.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -10159,7 +10251,7 @@ mod tests {
                 s
             })
             .collect();
-        publish_sensor_snapshot(&d, &sensors, &[], &[]);
+        publish_sensor_snapshot(&d, &sensors, &[], &[], &[]);
         let reply = status_json(&d);
         let v: serde_json::Value =
             serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();

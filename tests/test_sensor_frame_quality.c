@@ -76,6 +76,7 @@ static void raw_layout(void)
 	video.height = 128;
 	video.data_size = sizeof pixels;
 	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(dev.cv1touch_frames_dropped == 5 && dev.cv1touch_frames_decoded == 0);
 }
 
 /* A short raw image is released before the capture callback queues it for analysis. */
@@ -101,6 +102,7 @@ static void capture_guard(void)
 		.releasefn = count_release };
 	frame_captured_cb(&dev, &video, &sensor);
 	CHECK(releases == 1 && tracker_frames == 0);
+	CHECK(sensor.cv1touch_frames_received == 0 && dev.cv1touch_frames_dropped == 1);
 	CHECK(POP_QUEUE(&sensor.fast_analysis_q) == NULL);
 	video.data_size = sizeof pixels;
 	frame_captured_cb(&dev, &video, &sensor);
@@ -416,6 +418,46 @@ static void keep_input(ohmd_video_frame *frame, void *owner)
 { (void)frame; (void)owner; }
 
 /* Decode failures and accepted warnings: at most one line per sensor every 10 s. */
+static void jpeg_counters(void)
+{
+	ohmd_context ctx = {0};
+	ohmd_monotonic_init(&ctx);
+	rift_sensor_device dev = {0};
+	dev.calib.width = dev.calib.height = 128;
+	dev.cv1touch_video_format = OHMD_CV1TOUCH_VIDEO_JPEG;
+	rift_sensor_ctx sensor = { .ohmd_ctx = &ctx, .dev = &dev };
+	unsigned long size = 0;
+	unsigned char *data = encode_image(&size, 0);
+	ohmd_video_frame input = { .format = OHMD_VIDEO_FRAME_FORMAT_JPEG,
+		.width = 128, .height = 128, .stride = 128, .data = data,
+		.data_size = size / 2, .data_block_size = size, .releasefn = count_release };
+	rift_sensor_analysis_frame frame = { .vframe = &input };
+	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(dev.cv1touch_frames_dropped == 1 && dev.cv1touch_frames_decoded == 0);
+	CHECK(frame.vframe == &input && releases == 0);
+	input.data_size = size;
+	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(dev.cv1touch_frames_dropped == 1 && dev.cv1touch_frames_decoded == 1);
+	CHECK(frame.vframe->format == OHMD_VIDEO_FRAME_FORMAT_GRAY8 && releases == 1);
+	CHECK(dev.cv1touch_video_format == OHMD_CV1TOUCH_VIDEO_JPEG);
+	ohmd_video_frame_release(frame.vframe);
+	/* Decodable pixels with the wrong camera layout must not count as decoded. */
+	dev.calib.width = 127;
+	frame.vframe = &input;
+	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(dev.cv1touch_frames_dropped == 2 && dev.cv1touch_frames_decoded == 1);
+	CHECK(frame.vframe != &input && releases == 2);
+	ohmd_video_frame_release(frame.vframe);
+	dev.calib.width = 128;
+	frame.vframe = &input;
+	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(dev.cv1touch_frames_dropped == 2 && dev.cv1touch_frames_decoded == 2 && releases == 3);
+	ohmd_video_frame_release(frame.vframe);
+	CHECK(sensor.cv1touch_frames_received == 0); /* Analysis is not acquisition. */
+	ohmd_jpeg_decoder_free(sensor.jpeg_decoder);
+	free(data);
+}
+
 static void jpeg_summary(void)
 {
 	ohmd_context ctx = {0};
@@ -510,6 +552,7 @@ int main(int argc, char **argv)
 	else if (!strcmp(argv[1], "jpeg-resync")) jpeg_edit(RESYNC);
 	else if (!strcmp(argv[1], "jpeg-warning-codes")) jpeg_warning_codes();
 	else if (!strcmp(argv[1], "jpeg-summary")) jpeg_summary();
+	else if (!strcmp(argv[1], "jpeg-counters")) jpeg_counters();
 	else if (!strcmp(argv[1], "jpeg-embedded-eoi")) jpeg_embedded_eoi();
 	else if (!strcmp(argv[1], "jpeg-progression")) jpeg_edit(PROGRESSION);
 #endif

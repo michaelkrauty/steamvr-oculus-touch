@@ -185,6 +185,8 @@ static void count_discard(struct rift_sensor_uvc_stream *stream, enum rift_senso
 	if (stream->n_discards == 0 && stream->bad_packets == 0)
 		stream->discard_window_start = now;
 	if (image) {
+		if (stream->frames_dropped != NULL)
+			__atomic_fetch_add(stream->frames_dropped, 1, __ATOMIC_RELAXED);
 		stream->n_discards++;
 		stream->discards[reason]++;
 	} else {
