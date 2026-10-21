@@ -665,6 +665,14 @@ fn rec_summary(path: &Path, windows: &[Window]) -> i32 {
         return 1;
     }
     println!("records by type (1 state, 2 raw report, 4 frame obs, 5 sensor info, 6 LED model, 7 raw frame, 8 haptic): {by_type:?}");
+    if reader.flight_skipped_records == recorder::UNKNOWN_FLIGHT_SKIPS {
+        println!("flight recorder: some reports or commands may be missing from the saved window");
+    } else if reader.flight_skipped_records != 0 {
+        println!(
+            "flight recorder: {} reports or commands skipped in the saved window",
+            reader.flight_skipped_records
+        );
+    }
     for (serial, (n, first, last, poses)) in &frames {
         let span = (*last - *first) as f64 / 1e9;
         println!(

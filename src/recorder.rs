@@ -2,7 +2,12 @@
 // Copyright 2026 michaelkrauty
 
 //! Session recordings, format v2 (little-endian).
-//! File header (32 B): magic "CV1TREC\0", u32 version, u32 header_size = 32, u64 start_host_ns, u64 0.
+//! File header (32 B): magic "CV1TREC\0", u32 version, u32 header_size = 32, u64 start_host_ns,
+//! u64 flight_skipped_records.
+//! The last field was reserved (zero): reports/commands skipped in the saved flight-recorder
+//! window, including its tail through the ring snapshot; zero in other recordings. Old readers
+//! ignore it and all record offsets and the version stay the same. u64::MAX means the count
+//! is unknown because relevant skip history was unavailable.
 //! Record: u16 type, u16 flags = 0, u32 payload_len, u64 host_ns, payload.
 //! CONTROLLER_STATE = u32 hand, u32 0, cv1t_controller_state; RAW_REPORT = u32 source, bytes;
 //! FRAME_OBS = ohmd_cv1touch_frame_info, n x ohmd_cv1touch_blob; SENSOR_INFO = ohmd_cv1touch_sensor;
@@ -29,6 +34,8 @@ use crate::shm::ControllerState;
 
 pub const MAGIC: &[u8; 8] = b"CV1TREC\0";
 pub const VERSION: u32 = 2;
+/// The v2 header's skip count when lost timestamp history prevents an exact count.
+pub const UNKNOWN_FLIGHT_SKIPS: u64 = u64::MAX;
 pub const CONTROLLER_STATE: u16 = 1;
 pub const RAW_REPORT: u16 = 2;
 pub const FRAME_OBS: u16 = 4;
@@ -960,6 +967,9 @@ pub struct Record {
 pub struct Reader {
     file: BufReader<File>,
     pub start_host_ns: u64,
+    /// Flight recorder contention losses in the saved window; zero in old/other recordings,
+    /// UNKNOWN_FLIGHT_SKIPS when relevant timestamp history is unavailable.
+    pub flight_skipped_records: u64,
     error: Option<String>,
 }
 
@@ -981,6 +991,7 @@ impl Reader {
         Ok(Self {
             file,
             start_host_ns: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+            flight_skipped_records: u64::from_le_bytes(header[24..32].try_into().unwrap()),
             error: None,
         })
     }
@@ -1874,6 +1885,7 @@ mod tests {
 
         let reader = Reader::open(&path).unwrap();
         assert_eq!(reader.start_host_ns, 111);
+        assert_eq!(reader.flight_skipped_records, 0);
         let recs: Vec<Record> = reader.collect();
         assert_eq!(
             recs.iter()

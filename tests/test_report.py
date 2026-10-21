@@ -3,6 +3,7 @@
 """`cv1touch report` with private directories, its zip read back by Python's own zipfile."""
 import os
 from pathlib import Path
+import struct
 import subprocess
 from socket_dir import SocketDirectory
 import unittest
@@ -137,6 +138,31 @@ class ReportTests(unittest.TestCase):
                 finally:
                     stub.write_bytes(contents)
                     stub.chmod(0o755)
+
+    def test_recording_summaries_read_old_and_skip_count_headers(self):
+        path = self.root / "synthetic.rec"
+        payload = struct.pack("<I", 1) + bytes([12]) + bytes(63)
+        record = struct.pack("<HHIQ", 2, 0, len(payload), 1000) + payload
+        for skipped in (0, 7):
+            with self.subTest(skipped=skipped):
+                path.write_bytes(struct.pack("<8sIIQQ", b"CV1TREC\0", 2, 32, 1000, skipped) + record)
+                result = subprocess.run([BINARY, "rec-summary", str(path)], env=self.env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("{2: 1}", result.stdout)
+                if skipped:
+                    self.assertIn("flight recorder: 7 reports or commands skipped in the saved window", result.stdout)
+                else:
+                    self.assertNotIn("skipped", result.stdout)
+
+    def test_an_unknown_skip_count_is_labelled_in_summaries(self):
+        path = self.root / "unknown-skips.rec"
+        path.write_bytes(struct.pack("<8sIIQQ", b"CV1TREC\0", 2, 32, 1000, (1 << 64) - 1))
+        result = subprocess.run([BINARY, "rec-summary", str(path)], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("flight recorder: some reports or commands may be missing from the saved window", result.stdout)
+        self.assertNotIn(str((1 << 64) - 1), result.stdout)
 
     def test_an_existing_file_is_left_alone(self):
         out = self.root / "report.zip"

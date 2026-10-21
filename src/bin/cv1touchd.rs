@@ -275,14 +275,17 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// The report as the radio thread read it, or the fallback engine delivered it.
-    fn radio_report(&self, report: &[u8], at: u64) {
+    /// The report as the radio thread read it, or the fallback engine delivered it, stamped now:
+    /// its flight producer registers before that clock read (see `FlightRecorder::stamp`).
+    /// Returns the stamp.
+    fn radio_report(&self, report: &[u8]) -> u64 {
+        let (producer, at) = self.flight.stamp(shm::now_ns);
+        producer.note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
         if self.rec.active() {
             self.rec
                 .write(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
         }
-        self.flight
-            .note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), report]);
+        at
     }
 
     fn wake_radio(&self) {
@@ -601,10 +604,12 @@ impl EngineSink for Daemon {
     }
 
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
-        // the radio thread records its own copy of the radio's reports, stamped as they land
+        // The radio thread records its own copy of the radio's reports, stamped as they land.
+        // The fallback engine's copies are stamped as they reach the daemon: the engine read
+        // `ts` before their flight producer could register (see `FlightRecorder::stamp`).
         let radio_thread = source == 1 && self.radio_on.load(Ordering::Acquire);
         if source == 1 && !radio_thread {
-            self.radio_report(data, ts);
+            self.radio_report(data);
         } else if self.rec.active() && !radio_thread {
             self.rec.write(
                 recorder::RAW_REPORT,
@@ -2694,9 +2699,8 @@ fn radio_main(
                     break;
                 }
             };
-            let at = shm::now_ns();
             let report = &buf[..n];
-            d.radio_report(report, at);
+            let at = d.radio_report(report);
             let (samples, k) = dec.decode(report, at);
             for s in &samples[..k] {
                 let Some(h) = pipeline::device_hand(s.device_id) else {
@@ -3343,7 +3347,14 @@ fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
     let unix_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |t| t.as_secs());
-    for dropout in take_dropouts(d, shm::now_ns()) {
+    let now = shm::now_ns();
+    for dropout in take_dropouts(d, now) {
+        // The ring holds nothing of this window: an empty recording would only push out one
+        // that holds something. Returns later than `flight::LATEST_NS` already ask for none.
+        if dropout.records.is_empty() {
+            log(too_old_notice(&dropout, now));
+            continue;
+        }
         let Some(writer) = writer else {
             log("could not record a dropout: the recording thread did not start");
             continue;
@@ -3357,6 +3368,15 @@ fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
             Err(e) => log!("could not record a dropout: {e}"),
         }
     }
+}
+
+/// The log line for a due dropout whose window the ring no longer holds anything of.
+fn too_old_notice(dropout: &flight::Dropout, now: u64) -> String {
+    format!(
+        "{}: its dropout {:.0} s ago was too old to record: only the radio's last minute is kept",
+        ["left", "right"][dropout.hand],
+        now.saturating_sub(dropout.last_report_ns) as f64 * 1e-9
+    )
 }
 
 fn take_dropouts(d: &Daemon, now: u64) -> Vec<flight::Dropout> {
@@ -4096,9 +4116,9 @@ fn handle(d: &Daemon, line: &str) -> String {
             amplitude,
         }) => {
             let payload = recorder::haptic_payload(hand, duration_s, frequency_hz, amplitude);
-            let now = shm::now_ns();
+            let (producer, now) = d.flight.stamp(shm::now_ns);
+            producer.note(recorder::HAPTIC, now, &[&payload]);
             d.rec.write(recorder::HAPTIC, now, &[&payload]);
-            d.flight.note(recorder::HAPTIC, now, &[&payload]);
             d.haptics.lock().unwrap()[hand] = Some(Haptic {
                 duration_s,
                 frequency_hz,
@@ -6459,7 +6479,7 @@ mod tests {
             // Publication retries while the older window still waits to be saved.
             publish(&d, &b, 10150);
             if return_before_save {
-                d.flight.note(
+                d.flight.stamp(|| BASE + 10610 * MS).0.note(
                     recorder::RAW_REPORT,
                     BASE + 10610 * MS,
                     &[&1u32.to_le_bytes(), &[0u8; 64]],
@@ -6475,7 +6495,7 @@ mod tests {
             // No new gap event is needed to retry. Publication/heartbeat already owns the lock.
             publish_unavailable_with_log(&d, BASE + (at + 120) * MS, |_| {});
             if !return_before_save {
-                d.flight.note(
+                d.flight.stamp(|| BASE + 10610 * MS).0.note(
                     recorder::RAW_REPORT,
                     BASE + 10610 * MS,
                     &[&1u32.to_le_bytes(), &[0u8; 64]],
@@ -6537,6 +6557,50 @@ mod tests {
                 ]
             );
             assert!(take_dropouts(&d, BASE + 50000 * MS).is_empty());
+        }
+
+        /// A due window the ring holds nothing of, older than its reach, is not saved: an empty
+        /// recording would push a real one out of the ten kept. A real one due with it is saved.
+        #[test]
+        fn a_dropout_the_ring_no_longer_holds_is_not_saved() {
+            const S: u64 = 1_000_000_000;
+            let d = status_daemon();
+            let dir = std::env::temp_dir().join(format!("cv1t-too-old-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let (saved, reports) = std::sync::mpsc::channel();
+            let writer = flight_writer::Writer::start(dir.clone(), move |m| {
+                let _ = saved.send(m);
+            })
+            .unwrap();
+            let now = shm::now_ns();
+            let held = now.saturating_sub(15 * S);
+            let (producer, at) = d.flight.stamp(|| held);
+            producer.note(recorder::RAW_REPORT, at, &[&1u32.to_le_bytes(), &[0u8; 64]]);
+            d.flight
+                .dropout(HAND_LEFT, now.saturating_sub(120 * S).max(1), false);
+            d.flight.dropout(HAND_RIGHT, held, true);
+            save_dropouts(&d, Some(&writer));
+            // One writer, in order: the left recording would have been reported first.
+            let report = reports.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(report.starts_with("right: recorded the radio"), "{report}");
+            let files = flight::recordings(&dir);
+            assert_eq!(files.len(), 1, "{files:?}");
+            assert!(files[0].to_string_lossy().ends_with("-right.rec"));
+            drop(writer);
+            fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                too_old_notice(
+                    &flight::Dropout {
+                        hand: HAND_LEFT,
+                        last_report_ns: 30 * S,
+                        began_in_use: false,
+                        skipped_records: 0,
+                        records: Vec::new(),
+                    },
+                    150 * S
+                ),
+                "left: its dropout 120 s ago was too old to record: only the radio's last minute is kept"
+            );
         }
 
         #[test]
@@ -7486,6 +7550,24 @@ mod tests {
         }
     }
 
+    /// The fallback engine read its radio report before the report's flight producer could
+    /// register, so the daemon's copies take their own time, read after registering.
+    #[test]
+    fn the_fallback_engines_reports_are_stamped_as_they_reach_the_daemon() {
+        let d = status_daemon();
+        let before = shm::now_ns();
+        d.report(1, 5, &[0x0c; 64]);
+        let after = shm::now_ns();
+        d.flight.dropout(HAND_LEFT, before, true);
+        let saved = d.flight.due(before + flight::AFTER_NS);
+        let times: Vec<u64> = saved[0].records.iter().map(|r| r.1).collect();
+        assert_eq!(times.len(), 1);
+        assert!(
+            (before..=after).contains(&times[0]),
+            "{times:?}, not in {before}..={after}"
+        );
+    }
+
     #[test]
     fn a_late_beacon_reclassifies_the_gap_on_either_radio_path() {
         for radio_thread in [false, true] {
@@ -7528,7 +7610,7 @@ mod tests {
             );
             let at = now + 750_000_000;
             if radio_thread {
-                d.radio_report(&sleep_report(HAND_LEFT), at);
+                d.radio_report(&sleep_report(HAND_LEFT));
                 d.activity(
                     engine::RadioReader::Radio,
                     calib::DEVICE_LEFT,
@@ -7608,7 +7690,7 @@ mod tests {
                     wake[6] = 1;
                     for (report, at) in [(wake, c.received_host_ns), (sleep_report(h), beacon_at)] {
                         if radio_thread {
-                            d.radio_report(&report, at);
+                            d.radio_report(&report);
                         } else {
                             d.report(1, at, &report);
                         }
@@ -7711,7 +7793,7 @@ mod tests {
                 engine::RadioReader::Engine
             };
             if radio {
-                d.radio_report(&r, at);
+                d.radio_report(&r);
             } else {
                 d.report(1, at, &r);
             }

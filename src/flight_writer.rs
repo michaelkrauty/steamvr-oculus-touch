@@ -6,11 +6,12 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::flight::{self, Dropout};
+use crate::recorder;
 
 const PENDING: usize = 2;
 type Job = (Dropout, u64);
@@ -37,12 +38,7 @@ impl Writer {
         Self::with_writer(move |dropout, unix_s| {
             let name = ["left", "right"][dropout.hand];
             match flight::save(&dir, &dropout, unix_s) {
-                Ok(path) => report(format!(
-                    "{name}: recorded the radio from {} s before its dropout to {} s after: {}",
-                    flight::BEFORE_NS / 1_000_000_000,
-                    flight::AFTER_NS / 1_000_000_000,
-                    path.display()
-                )),
+                Ok(path) => report(saved_message(&dropout, &path)),
                 Err(e) => report(format!("{name}: could not record its dropout: {e}")),
             }
         })
@@ -93,6 +89,24 @@ impl Writer {
     }
 }
 
+fn saved_message(dropout: &Dropout, path: &Path) -> String {
+    let name = ["left", "right"][dropout.hand];
+    let skipped = if dropout.skipped_records == recorder::UNKNOWN_FLIGHT_SKIPS {
+        "; some reports or commands may be missing from it".to_owned()
+    } else {
+        format!(
+            " ({} reports or commands skipped in the saved window)",
+            dropout.skipped_records
+        )
+    };
+    format!(
+        "{name}: recorded the radio from {} s before its dropout to {} s after{skipped}: {}",
+        flight::BEFORE_NS / 1_000_000_000,
+        flight::AFTER_NS / 1_000_000_000,
+        path.display()
+    )
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
         self.shared.queue.lock().unwrap().closed = true;
@@ -113,8 +127,35 @@ mod tests {
             hand: 0,
             last_report_ns: n,
             began_in_use: true,
+            skipped_records: 0,
             records: Vec::new(),
         }
+    }
+
+    #[test]
+    fn saved_dropout_logs_include_zero_and_nonzero_skip_counts() {
+        for skipped_records in [0, 7] {
+            let d = Dropout {
+                skipped_records,
+                ..dropout(1)
+            };
+            assert_eq!(
+                saved_message(&d, Path::new("dropout-1000-left.rec")),
+                format!("left: recorded the radio from 20 s before its dropout to 10 s after ({skipped_records} reports or commands skipped in the saved window): dropout-1000-left.rec")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_skip_count_is_labelled_in_the_save_log() {
+        let d = Dropout {
+            skipped_records: recorder::UNKNOWN_FLIGHT_SKIPS,
+            ..dropout(1)
+        };
+        assert_eq!(
+            saved_message(&d, Path::new("dropout-1000-left.rec")),
+            "left: recorded the radio from 20 s before its dropout to 10 s after; some reports or commands may be missing from it: dropout-1000-left.rec"
+        );
     }
 
     #[test]
