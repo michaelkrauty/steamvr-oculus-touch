@@ -289,15 +289,17 @@ static void process_scanline(uint8_t *frame, uint8_t *line, blobwatch *bw, int y
 			    struct extent_line *el, struct extent_line *prev_el,
 			    blobservation *ob)
 {
-	struct extent *le_end = prev_el->extents;
-	struct extent *le = prev_el->extents;
+	struct extent *le = el->extents;
+	struct extent *le_end = le;
 	struct extent *extent = el->extents;
 	int num_extents = MAX_EXTENTS_PER_LINE;
 	float center;
 	int x, e = 0;
 
-	if (prev_el)
-		le_end += prev_el->num;
+	if (prev_el) {
+		le = prev_el->extents;
+		le_end = le + prev_el->num;
+	}
 
 	for (x = skip_dark(line, 0, bw->width, bw->threshold); x < bw->width;
 	     x = skip_dark(line, x + 1, bw->width, bw->threshold)) {

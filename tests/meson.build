@@ -67,6 +67,13 @@ if windows
   subdir_done()
 endif
 
+# Instrument the unity build itself so an ordinary native test run catches null member access.
+blobwatch_ubsan_args = ['-fsanitize=undefined', '-fno-sanitize-recover=undefined']
+test_blobwatch_ubsan = executable('test_blobwatch_ubsan', 'test_blobwatch_ubsan.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')] + blobwatch_ubsan_args,
+  dependencies: [openhmd_dep], link_args: blobwatch_ubsan_args)
+test('blobwatch_ubsan', test_blobwatch_ubsan)
+
 # A dlopen-only test seam for the daemon's real logger and the engine's math assertion.
 shared_library('test_native_assert_bridge', 'native_assert_bridge.c',
   c_args: ['-DOHMD_NONBLOCK_LOG'], dependencies: [openhmd_dep], link_args: libm)
