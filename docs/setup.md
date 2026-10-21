@@ -78,6 +78,10 @@ After setup, check both hands in SteamVR: position, buttons, haptics, recovery f
 
 The manual commands below remain available for explicit recordings, inspection, alternative registration paths, and expert control.
 
+After an upgrade, automatic captures ask you to restart an older running daemon before preparing a capture. On Linux, use `systemctl --user restart cv1touchd`; on Windows, choose **Stop cv1touch**, then **Start cv1touch** in the Start menu. Update the CLI and daemon together: an older CLI can use an unfinished file if storage stalls beyond its five-second request timeout.
+
+Recordings keep 2 to 20 GiB of disk space free (5% of the disk, within those bounds) and stop at 8 GiB, or 16 GiB with `--frames`. If a recording ends early at either limit, the command says so and setup does not fit the shortened capture. If `record stop` says the file is still finishing, check `cv1touch status` and try the stop again once storage responds; use the file only after it reports completion. Existing recordings are kept.
+
 ## Calibrate and align
 
 Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. A previously paired CV1 headset supplies the radio link; your other SteamVR headset supplies the reference pose.

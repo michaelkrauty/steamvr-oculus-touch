@@ -4,10 +4,11 @@ The inventory below lists the tests that bind or connect a Unix socket under the
 temporary base, by file and test name. Lengths are bytes, excluding the
 terminating NUL. `T` is the temporary base length without a trailing slash; `P`
 is the PID digit count (at most 7 on Linux); `R` is the random suffix (6 for
-native `mkdtemp`, 8 for Python); `U` is the UID digit count (at most 10). The
-before column evaluates `T=80`, `P=7`, and the largest applicable suffix/UID. All
-`T`-dependent paths were unbounded by the tests. Linux's `sun_path[108]` permits
-107 pathname bytes.
+native `mkdtemp`, 8 for Python); `U` is the UID digit count (at most 10);
+`N` is a host timestamp's decimal digit count (at most 20 for `u64`). The
+before column evaluates `T=80`, `P=7`, `N=20`, and the largest applicable
+suffix/UID. All `T`-dependent paths were unbounded by the tests. Linux's
+`sun_path[108]` permits 107 pathname bytes.
 
 ## Fixture ownership and bounds
 
@@ -38,9 +39,9 @@ The helper's own regression,
 through the short view, verifies real-directory ownership and `0700`
 permissions, checks that the socket stays beneath that base, and confirms
 cleanup removes only its own tree. It is a `cfg(test)` module, so it runs in the
-library and `cv1touchd` test binaries and, under `cargo test --all-targets`
-(what `scripts/check.sh` and CI run), in the driver contract example's test
-build; a plain `cargo test` builds that example without `cfg(test)`.
+library, `cv1touch` and `cv1touchd` test binaries and, under
+`cargo test --all-targets` (what `scripts/check.sh` and CI run), in the driver
+contract example's test build; a plain `cargo test` builds that example without `cfg(test)`.
 
 `scripts/check.sh` also reruns the Rust and native suites, driver contract, and
 Python setup and report suites with an explicitly long `TMPDIR`. It creates a
@@ -101,6 +102,18 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `tests/test_report.py` | `ReportTests.test_logs_settings_and_a_summary_in_one_zip` | T + R + 43 = 131 | 55 |
 | `tests/test_report.py` | `ReportTests.test_a_missing_or_non_executable_stub_cannot_reach_the_host_journal` | T + R + 43 = 131 | 55 |
 | `tests/test_report.py` | `ReportTests.test_an_existing_file_is_left_alone` | T + R + 43 = 131 | 55 |
+| `src/bin/cv1touch.rs` | `another_clients_early_end_acknowledgement_never_completes_our_capture` | T + N + 31 = 131 | 42 |
+| `src/bin/cv1touchd.rs` | `blocked_recording_storage_does_not_block_control_commands` | T + N + 40 = 140 | 42 |
+| `src/bin/cv1touchd.rs` | `scoped_stop_cancels_an_opening_recording_without_holding_up_status` | T + N + 35 = 135 | 42 |
+| `src/bin/cv1touchd.rs` | `a_dispatched_recording_is_reserved_before_shutdown_can_pass_it` | T + N + 43 = 143 | 52 |
+| `src/bin/cv1touchd.rs` | `a_control_record_start_opens_the_file_and_prepares_its_session` | T + N + 33 = 133 | 42 |
+| `tests/test_setup.py` | `SetupTests.test_a_long_control_socket_is_explained_before_guide_state_is_created` | mock: T + R + 46 = 134 | 55 for mock; oversized endpoint rejected |
+| `tests/test_setup.py` | `SetupTests.test_old_running_daemon_is_refused_before_capture_preparation` | T + R + 46 = 134 | 55 |
+| `tests/test_setup.py` | `SetupTests.test_a_daemon_that_is_not_running_is_left_to_the_guided_checks` | T + R + 46 = 134 | 55 |
+| `tests/test_setup.py` | `SetupTests.test_a_busy_daemon_is_left_to_the_guided_checks` | T + R + 46 = 134 | 55 |
+| `tests/test_setup.py` | `SetupTests.test_pending_recording_blocks_idle_and_stages_with_other_checks_ready` | T + R + 46 = 134 | 55 |
+| `tests/test_setup.py` | `SetupTests.test_pending_recording_offers_retry_without_stage_mutations` | T + R + 46 = 134 | 55 |
+| `tests/test_setup.py` | `SetupTests.test_a_second_setup_names_the_running_guide_not_a_recording_to_stop` | T + R + 46 = 134 | 55 |
 
 `test_control_client.cpp` uses its legacy/shared fixture from
 `runtime_is_tried_first_and_an_explicit_path_stays_exact`,

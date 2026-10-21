@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 michaelkrauty
 """Setup CLI regressions using only isolated files and a mock control socket."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,9 @@ class SetupTests(unittest.TestCase):
         self.configured = False
         self.loaded_configuration = True
         self.engine_ready = True
+        self.durable_stop = True
+        self.recording = False
+        self.recording_pending = False
         self.awake = False
         self.counter = 10
         self.extra_sensor = False
@@ -52,6 +56,11 @@ class SetupTests(unittest.TestCase):
         self.thread.join(timeout=3)
         self.server.close()
 
+    def stop_daemon(self):
+        """As if cv1touchd had not been started: nothing listens at the control socket."""
+        self.shutdown()
+        self.socket_path.unlink()
+
     def serve(self):
         while not self.stop.is_set():
             try:
@@ -69,7 +78,7 @@ class SetupTests(unittest.TestCase):
                         sensors.append({"serial": "CAMNEW", "placed": 0, "frames": self.counter,
                                         "fixes": [0, 0]})
                     reply = {"generation": 1, "engine_ready": self.engine_ready, "mode": "calibrated" if self.configured else "provisional",
-                             "recording_scoped_stop": True, "recording": False, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
+                             "recording_scoped_stop": True, "recording_durable_stop": self.durable_stop, "recording": self.recording, "recording_status": {"pending": self.recording_pending}, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
                              "alignment": {"registration": self.configured and self.loaded_configuration,
                                            "render": [self.configured and self.loaded_configuration] * 2},
                              "input_calibration": {"calibrated": [self.configured and self.loaded_configuration] * 2}}
@@ -167,6 +176,101 @@ class SetupTests(unittest.TestCase):
         self.assertIn("interactive terminal", result.stderr)
         self.assertEqual(self.commands, [])
         self.assertFalse((self.root / "state").exists())
+
+    def test_a_long_control_socket_is_explained_before_guide_state_is_created(self):
+        runtime = self.root / ("r" * 95)
+        endpoint = runtime / "cv1touch/control.sock"
+        self.env["XDG_RUNTIME_DIR"] = str(runtime)
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("too long", output)
+        self.assertIn(f"{len(os.fsencode(endpoint))} bytes", output)
+        self.assertIn("at most 107 bytes", output)
+        self.assertIn("XDG_RUNTIME_DIR", output)
+        self.assertIn(str(endpoint), output)
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.root / "state").exists())
+
+    def test_old_running_daemon_is_refused_before_capture_preparation(self):
+        self.durable_stop = None  # An installed update still meets the old running daemon.
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("older than this cv1touch", output)
+        self.assertIn("systemctl --user restart cv1touchd", output)
+        self.assertNotIn("Sensor positions (~2 min)", output)
+        for command in [("calibrate",), ("eval-capture",), ("eval-capture", "--free", "1")]:
+            with self.subTest(command=command):
+                result = subprocess.run([BINARY, *command], env=self.env, cwd=self.root,
+                                        input="", capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("older than this cv1touch", result.stderr)
+                self.assertIn("systemctl --user restart cv1touchd", result.stderr)
+                self.assertNotIn("press Enter", result.stdout)
+        self.assertTrue(self.commands)
+        self.assertEqual(set(self.commands), {"status"}, self.commands)
+        self.assertFalse((self.root / "state").exists())
+
+    def test_a_daemon_that_is_not_running_is_left_to_the_guided_checks(self):
+        self.stop_daemon()
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("Start cv1touchd", output)
+        self.assertIn("os error 2", output)
+        self.assertIn("press Enter to check again", output)
+        self.assertNotIn("before recording", output)
+        self.assertNotIn("cannot reach", output)
+
+    def test_a_busy_daemon_is_left_to_the_guided_checks(self):
+        self.recording = True
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("finish any active recording", output)
+        self.assertIn("press Enter to check again", output)
+        self.assertNotIn("record stop", output)
+        self.assertEqual(self.mutation_checkpoints, [])
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_pending_recording_blocks_idle_and_stages_with_other_checks_ready(self):
+        self.fixtures()
+        self.recording_pending = True
+        result = self.cli("--check", "--json")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(next(check for check in report["checks"] if check["name"] == "idle")["ok"])
+        self.assertTrue(all(check["ok"] for check in report["checks"] if check["name"] != "idle"))
+        for stage in report["stages"]:
+            if stage["stage"] != "inputs":
+                self.assertEqual(stage["state"], "blocked", stage)
+                self.assertIn("daemon is busy", stage["reason"])
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+        self.assertFalse((self.root / "state").exists())
+
+    def test_pending_recording_offers_retry_without_stage_mutations(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        self.commands.clear()
+        self.mutation_checkpoints.clear()
+        self.recording_pending = True
+
+        output = self.terminal_guide("\nq\n", expected_code=1, args=("--redo", "headset"))
+
+        self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertEqual(self.mutation_checkpoints, [])
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+        self.assertIn("finish any active recording", output)
+        self.assertIn("press Enter to check again", output)
+
+    def test_a_second_setup_names_the_running_guide_not_a_recording_to_stop(self):
+        self.recording = True  # the first guide's capture is running
+        lock = self.root / "state/cv1touch/setup.lock"
+        lock.parent.mkdir(parents=True)
+        with lock.open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("another setup guide is running; finish it first", output)
+        self.assertNotIn("record stop", output)
+        self.assertEqual(self.mutation_checkpoints, [])
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
     def test_corrupt_checkpoint_is_not_overwritten_or_silently_ignored(self):
         journal = self.root / "state/cv1touch/setup.json"

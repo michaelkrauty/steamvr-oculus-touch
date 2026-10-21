@@ -58,6 +58,8 @@ const DEFAULT_HMD_LEDS_OFF: bool = true;
 const IO_FAILURES_BEFORE_REOPEN: u32 = 50;
 const SENSOR_PUBLISH_NS: u64 = 250_000_000;
 const RECORDER_RING_BYTES: usize = 64 << 20;
+const RECORD_STOP_WAIT: Duration = Duration::from_secs(30);
+const RECORD_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 /// Pixels at or below this are treated as sensor dark noise and are not recorded;
 /// blobs start at the engine's threshold of 36, so their halos are kept.
 const RAW_FRAME_FLOOR: u8 = 7;
@@ -163,6 +165,8 @@ fn reload_inputs(runtime: &Mutex<InputRuntime>, path: &std::path::Path) -> Resul
 struct Daemon {
     shm: ShmWriter,
     rec: Recorder,
+    /// Recording I/O never holds the global control lock; competing recording commands refuse.
+    record_command: Mutex<()>,
     /// The radio's recent traffic, recorded around a controller's dropout.
     flight: FlightRecorder,
     quit: AtomicBool,
@@ -3004,7 +3008,10 @@ fn status_json(d: &Daemon) -> String {
             d.sensor_video.lock().unwrap().clone(),
         )
     };
-    let st = d.rec.stats();
+    let recording = d.rec.status();
+    let st = recording.stats;
+    let mut recording_json = serde_json::to_value(&recording).unwrap();
+    recording_json["message"] = serde_json::json!(recording.message());
     let al = d.shm.alignment().unwrap_or_default();
     let hands_json: Vec<String> = hands
         .iter()
@@ -3057,7 +3064,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_frames_received\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_frames_received\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -3070,7 +3077,8 @@ fn status_json(d: &Daemon) -> String {
         al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
         al.universe_id,
-        d.rec.active(),
+        recording_json,
+        recording.state == recorder::State::Recording,
         st.records,
         st.dropped,
         st.write_errors,
@@ -3085,6 +3093,19 @@ fn status_json(d: &Daemon) -> String {
         serde_json::to_string(&calibrated_sensors).unwrap(),
         serde_json::to_string(&sensor_streams).unwrap(),
     )
+}
+
+/// The reply to `record start`. A recording that opened also keeps the sensors' pixels when it
+/// asked for them, and gets its own session info (sensor intrinsics, LED models) written.
+fn recording_started(d: &Daemon, frames: bool, started: Result<(), String>) -> String {
+    match started {
+        Ok(()) => {
+            d.record_frames.store(frames, Ordering::Release);
+            d.session.lock().unwrap().reset();
+            "ok".into()
+        }
+        Err(error) => format!("err {error}"),
+    }
 }
 
 fn handle(d: &Daemon, line: &str) -> String {
@@ -3111,35 +3132,29 @@ fn handle(d: &Daemon, line: &str) -> String {
             });
             "ok".into()
         }
-        Ok(Command::RecordStart(path, frames)) => match d.rec.start(&path, shm::now_ns()) {
-            Ok(()) => {
-                d.record_frames.store(frames, Ordering::Release);
-                d.session.lock().unwrap().reset();
-                "ok".into()
-            }
-            Err(e) => format!("err {e}"),
-        },
-        Ok(Command::RecordStop) => {
-            if !d.rec.has_session() {
-                return "err not recording".into();
-            }
-            d.record_frames.store(false, Ordering::Release);
-            let s = d.rec.stop();
-            format!(
-                "ok records={} dropped={} write_errors={} bytes={}",
-                s.records, s.dropped, s.write_errors, s.bytes
-            )
-        }
-        Ok(Command::RecordStopIf(path)) => match d.rec.stop_if(&path) {
-            Some(s) => {
+        // Control requests start recordings in `handle_control_recording`, which reserves the
+        // session under the dispatch turn; this is the same start in one step.
+        Ok(Command::RecordStart(path, frames)) => recording_started(
+            d,
+            frames,
+            d.rec.start_with_frames(&path, shm::now_ns(), frames),
+        ),
+        Ok(Command::RecordStop) => match d.rec.stop_timeout(None, RECORD_STOP_WAIT) {
+            Some(status) => {
                 d.record_frames.store(false, Ordering::Release);
-                format!(
-                    "ok stopped records={} dropped={} write_errors={} bytes={}",
-                    s.records, s.dropped, s.write_errors, s.bytes
-                )
+                record_stop_reply(&status, false)
             }
-            None => "ok not-matching".into(),
+            None => "err not recording".into(),
         },
+        Ok(Command::RecordStopIf(path)) => {
+            match d.rec.stop_timeout(Some(&path), RECORD_STOP_WAIT) {
+                Some(status) => {
+                    d.record_frames.store(false, Ordering::Release);
+                    record_stop_reply(&status, true)
+                }
+                None => "ok not-matching".into(),
+            }
+        }
         Ok(Command::Status) => status_json(d),
         Ok(Command::Inputs) => {
             let inputs = d.inputs.lock().unwrap();
@@ -3639,12 +3654,82 @@ fn serve_control(d: Arc<Daemon>, listeners: Vec<ipc::Listener>) -> ControlServer
     server
 }
 
-/// Both endpoints use the same bounded reader and serialize complete requests through one lock.
-fn serve_client(d: &Daemon, conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
-    control::serve_client(conn, |line| {
-        let _turn = one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
+fn record_stop_reply(status: &recorder::Status, scoped: bool) -> String {
+    let stats = status.stats;
+    let counts = format!(
+        "records={} dropped={} write_errors={} bytes={}",
+        stats.records, stats.dropped, stats.write_errors, stats.bytes
+    );
+    if !status.finished || status.error.is_some() || status.reason.is_some() {
+        return format!("err {}; {counts}", status.message());
+    }
+    format!("ok {}{counts}", if scoped { "stopped " } else { "" })
+}
+
+/// Recording open/drain/sync can wait for storage. Only its own commands serialize, and a
+/// competing recording command refuses at once. Status, haptics and daemon stop stay available.
+fn handle_control(d: &Daemon, line: &str, one_at_a_time: &Mutex<()>) -> String {
+    handle_control_recording(
+        d,
+        line,
+        one_at_a_time,
+        Recorder::reserve_with_frames,
+        |reserved| reserved.start(shm::now_ns()),
+    )
+}
+
+fn handle_control_recording<'a>(
+    d: &'a Daemon,
+    line: &str,
+    one_at_a_time: &Mutex<()>,
+    reserve: impl FnOnce(
+        &'a Recorder,
+        &std::path::Path,
+        bool,
+    ) -> Result<recorder::ReservedRecording<'a>, String>,
+    start: impl FnOnce(recorder::ReservedRecording<'a>) -> Result<(), String>,
+) -> String {
+    let turn = one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
+    if d.quit.load(Ordering::Acquire) {
+        return "err daemon is stopping".into();
+    }
+    let command = control::parse(line);
+    if matches!(
+        &command,
+        Ok(Command::RecordStart(..) | Command::RecordStop | Command::RecordStopIf(_))
+    ) {
+        let Ok(_record) = d.record_command.try_lock() else {
+            // In particular, a lost start reply must not leave its recording active once a
+            // blocked header write returns. Request the matching stop without waiting for I/O.
+            let requested = match &command {
+                Ok(Command::RecordStop) => d.rec.request_stop(None),
+                Ok(Command::RecordStopIf(path)) => d.rec.request_stop(Some(path)),
+                _ => false,
+            };
+            return if requested {
+                "err recording stop requested; another recording command is still pending; check status and try again"
+            } else {
+                "err another recording command is still pending; check status and try again"
+            }.into();
+        };
+        if let Ok(Command::RecordStart(path, frames)) = command {
+            let reserved = match reserve(&d.rec, &path, frames) {
+                Ok(reserved) => reserved,
+                Err(error) => return format!("err {error}"),
+            };
+            drop(turn);
+            return recording_started(d, frames, start(reserved));
+        }
+        drop(turn);
         handle(d, line)
-    });
+    } else {
+        handle(d, line)
+    }
+}
+
+/// Both endpoints use the same bounded reader and shared dispatch lock.
+fn serve_client(d: &Daemon, conn: ipc::Connection, one_at_a_time: &Mutex<()>) {
+    control::serve_client(conn, |line| handle_control(d, line, one_at_a_time));
 }
 
 const USAGE: &str = "usage: cv1touchd [--tracker cv1touch|openhmd] [--radio-wait-ms N] [--hmd-leds on|off] [--ignore-sensor SERIAL]... [--calibration PATH | --provisional] [--record PATH] [--shm-name NAME] [--runtime-dir DIR]\n       cv1touchd --supervise [OPTIONS]   run it as a child process, restarted after a failure, its output in a log file\n       cv1touchd --help | --version\nAffinity: inherit by default; CV1TOUCH_CPUS=2,4-6 explicitly selects allowed CPUs.";
@@ -3745,6 +3830,14 @@ fn random_u64() -> u64 {
         .ok()
         .filter(|&v| v != 0)
         .unwrap_or_else(shm::now_ns)
+}
+
+fn finish_recording_shutdown(rec: &Recorder) {
+    if let Some(status) = rec.stop_timeout(None, RECORD_SHUTDOWN_WAIT) {
+        if !status.finished {
+            log("recording is still waiting for storage; file may be incomplete");
+        }
+    }
 }
 
 fn main() {
@@ -3937,7 +4030,7 @@ fn main() {
         with_tilt(alignment, &fitted_render_orient, start_tilt_deg),
         start_prediction(&settings),
     ));
-    let rec = Recorder::new(RECORDER_RING_BYTES);
+    let rec = Recorder::with_diagnostics(RECORDER_RING_BYTES, |message| log(message));
     if let Some(path) = &record {
         if let Err(e) = rec.start(path, shm::now_ns()) {
             log(e);
@@ -3967,6 +4060,7 @@ fn main() {
     let d = Arc::new(Daemon {
         shm,
         rec,
+        record_command: Mutex::new(()),
         flight: FlightRecorder::new(),
         quit: AtomicBool::new(false),
         failed_worker: AtomicU8::new(0),
@@ -4075,7 +4169,7 @@ fn main() {
     d.quit.store(true, Ordering::Release);
     let _ = engine_thread.join();
     let _ = universe_thread.join();
-    d.rec.stop();
+    finish_recording_shutdown(&d.rec);
     let _ = fs::remove_file(&sock_path);
     #[cfg(unix)]
     if let Some(path) = container_socket {
@@ -4091,6 +4185,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[cfg(unix)]
     #[test]
@@ -5121,7 +5216,8 @@ mod tests {
         );
         Daemon {
             shm: ShmWriter::create(&name, 1).unwrap(),
-            rec: Recorder::new(4096),
+            rec: Recorder::with_diagnostics(4096, |message| log(message)),
+            record_command: Mutex::new(()),
             flight: FlightRecorder::new(),
             quit: AtomicBool::new(false),
             failed_worker: AtomicU8::new(0),
@@ -6376,6 +6472,574 @@ mod tests {
         );
     }
 
+    struct BlockedSink {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        sync: bool,
+        header_written: bool,
+        block_header: bool,
+    }
+
+    impl BlockedSink {
+        fn block(&mut self) {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                // Dropping the test's sender also releases storage on assertion failure.
+                let _ = self.release.recv();
+            }
+        }
+    }
+    impl Write for BlockedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if (self.header_written || self.block_header) && !self.sync {
+                self.block();
+            }
+            self.header_written = true;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl recorder::RecordingSink for BlockedSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            if self.sync {
+                self.block();
+            }
+            Ok(())
+        }
+        fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+            Ok(recorder::DiskSpace {
+                available: 100 << 30,
+                capacity: 200 << 30,
+            })
+        }
+    }
+
+    /// Both a blocked write and a blocked sync leave status/haptics/daemon stop responsive, and
+    /// neither a premature success reply nor a replacement writer may escape while finishing.
+    #[test]
+    fn blocked_recording_storage_does_not_block_control_commands() {
+        for (sync, scoped) in [(false, false), (true, false), (false, true), (true, true)] {
+            let d = Arc::new(status_daemon());
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let path = dir.join("capture.rec");
+            let endpoint = dir.join("control.sock");
+            let driver_endpoint = dir.join("driver.sock");
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            d.rec
+                .start_with_sink(
+                    &path,
+                    1,
+                    false,
+                    Box::new(BlockedSink {
+                        entered: Some(entered_tx),
+                        release: release_rx,
+                        sync,
+                        header_written: false,
+                        block_header: false,
+                    }),
+                )
+                .unwrap();
+            d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
+            if !sync {
+                entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let _server = serve_control(
+                Arc::clone(&d),
+                vec![
+                    ipc::Listener::bind(&endpoint).unwrap(),
+                    ipc::Listener::bind(&driver_endpoint).unwrap(),
+                ],
+            );
+            let stop_endpoint = endpoint.clone();
+            let stop_command = if scoped {
+                control::record_stop_if_line(&path).unwrap()
+            } else {
+                "record stop".into()
+            };
+            let (answered_tx, answered) = std::sync::mpsc::channel();
+            let stop = thread::spawn(move || {
+                // Old callers only checked `ok`, with a five-second request timeout.
+                let result =
+                    control::request(&stop_endpoint, &stop_command, Duration::from_secs(5));
+                answered_tx.send(result).unwrap();
+            });
+            if sync {
+                entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while d.rec.active() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!d.rec.active(), "stop did not reach the recorder");
+            let request = |line: &str| {
+                control::request(&driver_endpoint, line, Duration::from_millis(200)).unwrap()
+            };
+            let reply = request("status");
+            let value: serde_json::Value =
+                serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+            assert_eq!(value["recording_status"]["state"], "finishing");
+            assert_eq!(value["recording_status"]["finished"], false);
+            assert_eq!(request("haptic left 0.1 80 0.5"), "ok");
+            assert!(d.haptics.lock().unwrap()[HAND_LEFT].is_some());
+            assert_eq!(request("stop"), "ok stopping");
+            let start = control::record_start_line(&dir.join("replacement.rec"), false).unwrap();
+            assert!(request(&start).starts_with("err "));
+            assert!(!dir.join("replacement.rec").exists());
+            let premature = answered.recv_timeout(Duration::from_millis(600));
+            let pending = d.rec.has_session();
+            let waited_for_storage = premature.is_err();
+            // Always release before asserting so a mutation cannot strand a test writer.
+            release.send(()).unwrap();
+            let reply = match premature {
+                Ok(reply) => reply,
+                Err(_) => answered.recv_timeout(Duration::from_secs(2)).unwrap(),
+            }
+            .unwrap();
+            stop.join().unwrap();
+            assert!(pending);
+            assert!(
+                waited_for_storage,
+                "record stop answered before storage completed"
+            );
+            assert!(
+                reply.starts_with(if scoped {
+                    "ok stopped records="
+                } else {
+                    "ok records="
+                }),
+                "a slow completed stop must keep the old success shape: {reply}"
+            );
+            assert!(d.rec.status().finished);
+            assert!(!d.rec.has_session());
+        }
+    }
+
+    #[test]
+    fn a_recording_stop_timeout_is_bounded_while_sync_is_blocked() {
+        let d = Arc::new(status_daemon());
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        d.rec
+            .start_with_sink(
+                &std::env::temp_dir().join("cv1t-bounded-stop.rec"),
+                1,
+                false,
+                Box::new(BlockedSink {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                    sync: true,
+                    header_written: false,
+                    block_header: false,
+                }),
+            )
+            .unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let stopping = Arc::clone(&d);
+        let stopper = thread::spawn(move || {
+            let result = stopping.rec.stop_timeout(None, Duration::from_millis(20));
+            done_tx.send(result).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let timed_out = done.recv_timeout(Duration::from_millis(200));
+        release.send(()).unwrap();
+        stopper.join().unwrap();
+        let status = timed_out
+            .expect("a bounded stop waited indefinitely for storage")
+            .unwrap();
+        assert!(!status.finished);
+    }
+
+    #[test]
+    fn scoped_stop_cancels_an_opening_recording_without_holding_up_status() {
+        let d = Arc::new(status_daemon());
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path();
+        let path = dir.join("capture.rec");
+        let endpoint = dir.join("control.sock");
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let start_daemon = Arc::clone(&d);
+        let start_path = path.clone();
+        let start = thread::spawn(move || {
+            // The dispatcher holds the recording guard while start writes its header. Inject
+            // that storage operation here; the stop/status requests use the real endpoint.
+            let _record = start_daemon.record_command.lock().unwrap();
+            start_daemon.rec.start_with_sink(
+                &start_path,
+                1,
+                false,
+                Box::new(BlockedSink {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                    sync: false,
+                    header_written: false,
+                    block_header: true,
+                }),
+            )
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _server = serve_control(
+            Arc::clone(&d),
+            vec![ipc::Listener::bind(&endpoint).unwrap()],
+        );
+        let request =
+            |line: &str| control::request(&endpoint, line, Duration::from_millis(200)).unwrap();
+        let reply = request("status");
+        let value: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["recording_status"]["state"], "starting");
+        // Cleanup for another capture must never cancel this one.
+        let other_stop = control::record_stop_if_line(&dir.join("another.rec")).unwrap();
+        assert!(request(&other_stop).starts_with("err "));
+        assert_eq!(d.rec.status().state, recorder::State::Starting);
+        let stop = control::record_stop_if_line(&path).unwrap();
+        assert!(request(&stop).starts_with("err "));
+        release.send(()).unwrap();
+        start.join().unwrap().unwrap();
+        assert!(
+            !d.rec.active(),
+            "a timed-out start continued recording after its scoped cleanup"
+        );
+        let reply = control::request(&endpoint, &stop, Duration::from_secs(2)).unwrap();
+        assert!(reply.starts_with("ok stopped records="), "{reply}");
+    }
+
+    #[test]
+    fn a_dispatched_recording_is_reserved_before_shutdown_can_pass_it() {
+        let d = Arc::new(status_daemon());
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path();
+        let path = dir.join("capture.rec");
+        let runtime = dir.join("control.sock");
+        let listeners = vec![ipc::Listener::bind(&runtime).unwrap()];
+        #[cfg(unix)]
+        let (listeners, _) = with_container_control(listeners, &dir.join("container/control.sock"));
+        let server = Arc::new(serve_control(Arc::clone(&d), listeners));
+        let (paused_tx, paused) = std::sync::mpsc::channel();
+        let (reserve_tx, reserve_rx) = std::sync::mpsc::channel();
+        let (opening_tx, opening) = std::sync::mpsc::channel();
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        let request_daemon = Arc::clone(&d);
+        let request_lock = Arc::clone(&server.one_at_a_time);
+        let check_lock = Arc::clone(&request_lock);
+        let line = control::record_start_line(&path, false).unwrap();
+        let request = thread::spawn(move || {
+            handle_control_recording(
+                &request_daemon,
+                &line,
+                &request_lock,
+                |rec, path, frames| {
+                    // Pause immediately before the actual reservation. Shutdown must still be
+                    // excluded by the shared turn until that reservation has become visible.
+                    paused_tx.send(check_lock.try_lock().is_err()).unwrap();
+                    reserve_rx.recv().unwrap();
+                    rec.reserve_with_frames(path, frames)
+                },
+                |reserved| {
+                    opening_tx.send(()).unwrap();
+                    open_rx.recv().unwrap();
+                    reserved.start(shm::now_ns())
+                },
+            )
+        });
+        let protected = paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stopping = Arc::clone(&d);
+        let stop_server = Arc::clone(&server);
+        let (stopped_tx, stopped) = std::sync::mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            let _turn = stop_server.stop();
+            stopping.quit.store(true, Ordering::Release);
+            finish_recording_shutdown(&stopping.rec);
+            stopped_tx.send(()).unwrap();
+        });
+        if protected {
+            reserve_tx.send(()).unwrap();
+        }
+        stopped.recv_timeout(Duration::from_secs(2)).unwrap();
+        if !protected {
+            reserve_tx.send(()).unwrap();
+        }
+        opening.recv_timeout(Duration::from_secs(2)).unwrap();
+        open_tx.send(()).unwrap();
+        let reply = request.join().unwrap();
+        shutdown.join().unwrap();
+        let created = path.exists();
+        let _ = d.rec.stop_timeout(None, Duration::from_secs(2));
+        d.shm.retire();
+        assert!(protected, "reservation happened after releasing the shared dispatch lock: created={created}, reply={reply}");
+        assert!(
+            !created,
+            "a recording file was created after shutdown finished: {reply}"
+        );
+        assert!(
+            reply.starts_with("err ") && reply.contains("cancelled"),
+            "{reply}"
+        );
+    }
+
+    struct ReserveStopSink(std::sync::atomic::AtomicUsize);
+    impl Write for ReserveStopSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl recorder::RecordingSink for ReserveStopSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+            Ok(recorder::DiskSpace {
+                available: if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    100 << 30
+                } else {
+                    1 << 30
+                },
+                capacity: 40 << 30,
+            })
+        }
+    }
+
+    fn recording_test_logger() -> daemon_log::Guard {
+        struct DeferredStderr;
+        impl Write for DeferredStderr {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                // A missing exit drain must lose the diagnostic even if the writer runs first.
+                thread::sleep(Duration::from_millis(30));
+                Write::write(&mut io::stderr(), bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Write::flush(&mut io::stderr())
+            }
+        }
+        daemon_log::init_with_writer(DeferredStderr).unwrap()
+    }
+
+    #[test]
+    fn normal_shutdown_reports_each_recording_outcome_once() {
+        const CHILD: &str = "CV1TOUCH_TEST_NORMAL_RECORD_SHUTDOWN";
+        if let Ok(kind) = std::env::var(CHILD) {
+            let _logging = recording_test_logger();
+            static REPORTED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let mut d = status_daemon();
+            d.rec = Recorder::with_diagnostics(4096, |message| {
+                log(message);
+                REPORTED.fetch_add(1, Ordering::Release);
+            });
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let sink: Box<dyn recorder::RecordingSink> = match kind.as_str() {
+                "error" => Box::new(FailedSink {
+                    sync: false,
+                    header_written: false,
+                }),
+                "reserve" => Box::new(ReserveStopSink(std::sync::atomic::AtomicUsize::new(0))),
+                "pending" => Box::new(BlockedSink {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                    sync: false,
+                    header_written: false,
+                    block_header: false,
+                }),
+                _ => unreachable!(),
+            };
+            d.rec
+                .start_with_sink(std::path::Path::new("unused.rec"), 1, false, sink)
+                .unwrap();
+            d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
+            if kind == "pending" {
+                entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            } else {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !d.rec.status().finished || REPORTED.load(Ordering::Acquire) == 0 {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            finish_recording_shutdown(&d.rec);
+            if kind == "pending" {
+                release.send(()).unwrap();
+                assert!(
+                    d.rec
+                        .stop_timeout(None, Duration::from_secs(2))
+                        .unwrap()
+                        .finished
+                );
+            }
+            return;
+        }
+        for kind in ["error", "reserve", "pending"] {
+            let output = process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::normal_shutdown_reports_each_recording_outcome_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, kind)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{kind}: {text}");
+            let diagnostics: Vec<_> = text
+                .lines()
+                .filter(|line| line.starts_with("cv1touchd: recording "))
+                .collect();
+            assert_eq!(diagnostics.len(), 1, "{kind}: {text}");
+            if kind == "pending" {
+                assert!(diagnostics[0].contains("file may be incomplete"), "{text}");
+            }
+        }
+    }
+
+    struct FailedSink {
+        sync: bool,
+        header_written: bool,
+    }
+    impl Write for FailedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.header_written && !self.sync {
+                return Err(io::Error::other("test storage write failed"));
+            }
+            self.header_written = true;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl recorder::RecordingSink for FailedSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            if self.sync {
+                Err(io::Error::other("test storage sync failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+            Ok(recorder::DiskSpace {
+                available: 100 << 30,
+                capacity: 200 << 30,
+            })
+        }
+    }
+
+    #[test]
+    fn failed_recording_write_or_sync_never_gets_a_success_reply() {
+        for sync in [false, true] {
+            let d = status_daemon();
+            let path = std::env::temp_dir().join("cv1t-failed-sink.rec");
+            d.rec
+                .start_with_sink(
+                    &path,
+                    1,
+                    false,
+                    Box::new(FailedSink {
+                        sync,
+                        header_written: false,
+                    }),
+                )
+                .unwrap();
+            d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
+            let reason = if sync {
+                "test storage sync failed"
+            } else {
+                "test storage write failed"
+            };
+            if !sync {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while d.rec.status().error.is_none() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let value: serde_json::Value =
+                    serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+                assert_eq!(value["recording_status"]["state"], "failed");
+                assert_eq!(value["recording_status"]["pending"], true);
+                assert!(value["recording_status"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(reason));
+            }
+            let reply = handle(&d, "record stop");
+            assert!(
+                reply.starts_with("err ") && reply.contains(reason),
+                "{reply}"
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+            assert_eq!(value["recording_status"]["state"], "failed");
+            assert!(value["recording_status"]["error"]
+                .as_str()
+                .unwrap()
+                .contains(reason));
+            assert_eq!(value["write_errors"], 1);
+        }
+    }
+
+    struct ReserveSink {
+        header_written: bool,
+    }
+    impl Write for ReserveSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.header_written = true;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl recorder::RecordingSink for ReserveSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+            Ok(recorder::DiskSpace {
+                available: if self.header_written {
+                    1 << 30
+                } else {
+                    100 << 30
+                },
+                capacity: 40 << 30,
+            })
+        }
+    }
+
+    #[test]
+    fn reserve_ended_recording_reports_its_complete_file_but_not_a_successful_capture() {
+        let d = status_daemon();
+        let path = std::env::temp_dir().join("cv1t-reserve-sink.rec");
+        d.rec
+            .start_with_sink(
+                &path,
+                1,
+                false,
+                Box::new(ReserveSink {
+                    header_written: false,
+                }),
+            )
+            .unwrap();
+        d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
+        let reply = handle(&d, &control::record_stop_if_line(&path).unwrap());
+        assert!(reply.starts_with("err recording ended early:"), "{reply}");
+        assert!(
+            reply.contains("1.00 GiB free; keeping 2.00 GiB free"),
+            "{reply}"
+        );
+        assert!(reply.contains("file is complete and synced"), "{reply}");
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["recording_status"]["state"], "complete");
+        assert_eq!(value["recording_status"]["finished"], true);
+        assert!(value["recording_status"]["reason"].is_string());
+        assert_eq!(value["write_errors"], 0);
+    }
+
     #[test]
     fn scoped_record_stop_reports_outcome_and_preserves_unrelated_session() {
         let d = status_daemon();
@@ -6384,12 +7048,14 @@ mod tests {
         let status: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
         assert_eq!(status["recording_scoped_stop"], true);
+        assert_eq!(status["recording_durable_stop"], true);
         let stop = control::record_stop_if_line(&path).unwrap();
         assert_eq!(handle(&d, &stop), "ok not-matching");
         assert_eq!(
             handle(&d, &control::record_start_line(&path, true).unwrap()),
             "ok"
         );
+        assert_eq!(d.rec.status().byte_limit, 16 << 30);
         assert_eq!(
             handle(&d, &control::record_stop_if_line(&other).unwrap()),
             "ok not-matching"
@@ -6401,6 +7067,48 @@ mod tests {
         assert!(!d.record_frames.load(Ordering::Acquire));
         assert_eq!(handle(&d, &stop), "ok not-matching");
         fs::remove_file(path).unwrap();
+    }
+
+    /// A control client's `record start` is what every capture sends. The recording must open
+    /// for the sensors' pixels when asked, and a second recording in one daemon's lifetime must
+    /// write its sensor and LED model records again.
+    #[test]
+    fn a_control_record_start_opens_the_file_and_prepares_its_session() {
+        let d = Arc::new(status_daemon());
+        let fixture = socket_dir::SocketDir::new();
+        let dir = fixture.path();
+        let path = dir.join("capture.rec");
+        let endpoint = dir.join("control.sock");
+        let _server = serve_control(
+            Arc::clone(&d),
+            vec![ipc::Listener::bind(&endpoint).unwrap()],
+        );
+        let request = |line: &str| control::request(&endpoint, line, Duration::from_secs(5));
+        // The previous recording already wrote its session info.
+        assert_eq!(
+            d.session.lock().unwrap().plan(true, &[(7, true)]),
+            (true, vec![7])
+        );
+        assert!(d.session.lock().unwrap().complete(1));
+        assert!(!d.record_frames.load(Ordering::Acquire));
+
+        let reply = request(&control::record_start_line(&path, true).unwrap()).unwrap();
+
+        assert_eq!(reply, "ok");
+        assert!(d.rec.active());
+        assert!(d.record_frames.load(Ordering::Acquire));
+        assert_eq!(d.rec.status().byte_limit, 16 << 30);
+        assert_eq!(
+            d.session.lock().unwrap().plan(true, &[(7, true)]),
+            (true, vec![7]),
+            "the new recording must get its own sensor and LED model records"
+        );
+        let stopped = request(&control::record_stop_if_line(&path).unwrap()).unwrap();
+        let written = fs::metadata(&path).map(|m| m.len());
+        d.shm.retire();
+        assert!(stopped.starts_with("ok stopped records="), "{stopped}");
+        assert!(written.unwrap() > 0, "the recording file has its header");
+        assert!(!d.record_frames.load(Ordering::Acquire));
     }
 
     #[test]

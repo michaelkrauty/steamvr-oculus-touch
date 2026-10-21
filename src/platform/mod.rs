@@ -21,6 +21,25 @@ pub mod fs {
 
     use super::os;
 
+    /// Space available to this user, and the filesystem's capacity, in bytes.
+    #[derive(Clone, Copy, Debug)]
+    pub struct DiskSpace {
+        pub available: u64,
+        pub capacity: u64,
+    }
+
+    /// A file's containing directory, including a bare name in the current directory.
+    pub fn parent_dir(path: &Path) -> &Path {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    /// Queries the filesystem holding an open file. `path` names that same file.
+    pub fn disk_space(file: &File, path: &Path) -> io::Result<DiskSpace> {
+        os::disk_space(file, path)
+    }
+
     /// Opens `path` for reading without following a link at its end and without blocking on a
     /// special file; the caller checks it is a regular file.
     pub fn open_read_nofollow(path: &Path) -> io::Result<File> {
@@ -1077,6 +1096,16 @@ mod tests {
         let error = connect(nul);
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), "invalid control socket path");
+    }
+
+    #[test]
+    fn a_bare_filename_belongs_to_the_current_directory() {
+        use std::path::Path;
+        assert_eq!(fs::parent_dir(Path::new("capture.rec")), Path::new("."));
+        assert_eq!(
+            fs::parent_dir(Path::new("room/capture.rec")),
+            Path::new("room")
+        );
     }
 
     #[test]

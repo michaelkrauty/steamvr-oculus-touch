@@ -11,13 +11,15 @@
 //! Tracking threads only copy into a ring under a mutex (no I/O); a writer thread does the file I/O.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+pub use crate::platform::fs::DiskSpace;
 
 pub use crate::ffi::ohmd_cv1touch_blob as Blob;
 pub use crate::ffi::ohmd_cv1touch_frame_info as FrameInfo;
@@ -107,7 +109,7 @@ impl SessionInfo {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub records: u64,
     pub dropped: u64,
@@ -115,15 +117,164 @@ pub struct Stats {
     pub bytes: u64,
 }
 
+/// Absolute ceilings leave room for long evaluation captures; free space is checked separately.
+pub const RECORDING_BYTES: u64 = 8 << 30;
+pub const FRAME_RECORDING_BYTES: u64 = 16 << 30;
+
+fn disk_reserve(space: DiskSpace) -> u64 {
+    // More than thirty 64 MiB rings even on a small disk; at most 20 GiB on a large one.
+    (space.capacity / 20).clamp(2 << 30, 20 << 30)
+}
+
+fn space_reason(available: u64, reserve: u64) -> String {
+    format!(
+        "too little disk space: {:.2} GiB free; keeping {:.2} GiB free",
+        available as f64 / (1u64 << 30) as f64,
+        reserve as f64 / (1u64 << 30) as f64
+    )
+}
+
+/// Storage operations run without the recorder's ring lock. Implementations must not buffer a
+/// successful sync: that acknowledgement means all preceding writes have reached storage.
+pub trait RecordingSink: Write + Send {
+    fn sync_all(&mut self) -> io::Result<()>;
+    fn disk_space(&self) -> io::Result<DiskSpace>;
+}
+
+struct FileSink {
+    file: File,
+    path: PathBuf,
+}
+
+impl Write for FileSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl RecordingSink for FileSink {
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.file.sync_all()?;
+        crate::platform::fs::sync_dir(crate::platform::fs::parent_dir(&self.path))
+    }
+    fn disk_space(&self) -> io::Result<DiskSpace> {
+        crate::platform::fs::disk_space(&self.file, &self.path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Idle,
+    Starting,
+    Recording,
+    Finishing,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Status {
+    pub state: State,
+    pub path: Option<PathBuf>,
+    /// A session owns the writer until a stop acknowledges its outcome.
+    pub pending: bool,
+    /// The writer has closed and synced the file (or finished reporting its failure).
+    pub finished: bool,
+    pub stats: Stats,
+    pub byte_limit: u64,
+    pub free_bytes: Option<u64>,
+    pub reserve_bytes: Option<u64>,
+    pub reason: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Status {
+    pub fn message(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!(
+                "recording failed: {error}{}",
+                if self.finished {
+                    ""
+                } else {
+                    "; file is still finishing"
+                }
+            );
+        }
+        if let Some(reason) = &self.reason {
+            return format!(
+                "recording ended early: {reason}; {}",
+                if self.finished {
+                    "file is complete and synced"
+                } else {
+                    "file is still finishing"
+                }
+            );
+        }
+        if !self.finished && self.state == State::Finishing {
+            return "recording is still finishing; waiting for storage; check status and try record stop again".into();
+        }
+        match self.state {
+            State::Idle => String::new(),
+            State::Starting => "recording is opening its file".into(),
+            State::Recording => "recording".into(),
+            State::Complete => "recording is complete and synced".into(),
+            _ => "recording is still finishing".into(),
+        }
+    }
+}
+
 struct Ring {
     buf: Vec<u8>,
     head: usize,
     used: usize,
+    queued_records: u64,
     stop: bool,
+    opening: bool,
+    session: bool,
+    finished: bool,
+    path: Option<PathBuf>,
+    accepted_bytes: u64,
+    byte_limit: u64,
+    free_bytes: Option<u64>,
+    reserve_bytes: Option<u64>,
+    reason: Option<String>,
+    error: Option<String>,
     stats: Stats,
 }
 
 impl Ring {
+    fn status(&self) -> Status {
+        let state = if self.error.is_some() {
+            State::Failed
+        } else if self.path.is_none() {
+            State::Idle
+        } else if self.finished {
+            State::Complete
+        } else if self.stop {
+            State::Finishing
+        } else if self.opening {
+            State::Starting
+        } else {
+            State::Recording
+        };
+        Status {
+            state,
+            path: self.path.clone(),
+            pending: self.session,
+            finished: self.finished,
+            stats: self.stats,
+            byte_limit: self.byte_limit,
+            free_bytes: self.free_bytes,
+            reserve_bytes: self.reserve_bytes,
+            reason: self.reason.clone(),
+            error: self.error.clone(),
+        }
+    }
+
     fn put(&mut self, src: &[u8]) {
         let cap = self.buf.len();
         let first = (cap - self.head).min(src.len());
@@ -144,20 +295,123 @@ impl Ring {
         self.used -= n;
         out
     }
+
+    /// Batches whole records, including one larger than CHUNK. A disk-reserve stop can discard
+    /// this batch and the remaining ring without leaving half a record in the file.
+    fn take_records(&mut self) -> (Vec<u8>, u64) {
+        let cap = self.buf.len();
+        let tail = (self.head + cap - self.used) % cap;
+        let (mut bytes, mut records) = (0, 0);
+        while bytes < self.used {
+            let length = std::array::from_fn(|i| self.buf[(tail + bytes + 4 + i) % cap]);
+            let n = RECORD_HEADER_LEN + u32::from_le_bytes(length) as usize;
+            if bytes > 0 && bytes + n > CHUNK {
+                break;
+            }
+            bytes += n;
+            records += 1;
+        }
+        self.queued_records -= records;
+        (self.take(bytes), records)
+    }
+
+    fn fail(&mut self, error: String) {
+        self.stats.write_errors += 1;
+        self.error = Some(match self.error.take() {
+            Some(first) => format!("{first}; {error}"),
+            None => error,
+        });
+        self.stop = true;
+    }
 }
 
 struct Shared {
     ring: Mutex<Ring>,
     cond: Condvar,
     active: AtomicBool,
+    diagnostic: fn(&str),
+}
+
+impl Shared {
+    fn report_diagnostic(&self, message: &str) {
+        // A diagnostic failure must not lose the header outcome or leave a session unfinished.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.diagnostic)(message);
+        }));
+    }
 }
 
 pub struct Recorder {
     shared: Arc<Shared>,
-    writer: Mutex<Option<(PathBuf, JoinHandle<()>)>>,
 }
 
-fn writer_main(shared: Arc<Shared>, mut file: File) {
+/// A session slot reserved before storage I/O. An abandoned start releases its slot.
+pub struct ReservedRecording<'a> {
+    recorder: &'a Recorder,
+    path: PathBuf,
+    started: bool,
+}
+
+impl ReservedRecording<'_> {
+    pub fn start(mut self, start_host_ns: u64) -> Result<(), String> {
+        let path = &self.path;
+        let result = self
+            .recorder
+            .start_reserved_session(path, start_host_ns, || {
+                let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+                Ok(Box::new(FileSink {
+                    file,
+                    path: path.to_path_buf(),
+                }))
+            });
+        self.started = true;
+        result
+    }
+}
+
+impl Drop for ReservedRecording<'_> {
+    fn drop(&mut self) {
+        if !self.started {
+            self.recorder.cancel_start();
+        }
+    }
+}
+
+// Avoid a filesystem query for each small radio batch. A fresh query also checks what other
+// disk users consumed; our own writes spend the cached allowance between those observations.
+#[derive(Default)]
+struct DiskAllowance {
+    available: u64,
+    reserve: u64,
+    checked: Option<Instant>,
+    written: u64,
+}
+
+impl DiskAllowance {
+    fn permits(&mut self, sink: &dyn RecordingSink, bytes: u64, now: Instant) -> io::Result<bool> {
+        if self
+            .checked
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+            || self.written >= 16 << 20
+            || self.available.saturating_sub(self.reserve) < bytes
+        {
+            let space = sink.disk_space()?;
+            self.available = space.available;
+            self.reserve = disk_reserve(space);
+            self.checked = Some(now);
+            self.written = 0;
+        }
+        Ok(self.available.saturating_sub(self.reserve) >= bytes)
+    }
+
+    fn wrote(&mut self, bytes: u64) {
+        self.available = self.available.saturating_sub(bytes);
+        self.written += bytes;
+    }
+}
+
+fn writer_main(shared: &Shared, file: &mut dyn RecordingSink) {
+    let mut allowance = DiskAllowance::default();
     let mut ring = shared.ring.lock().unwrap();
     loop {
         while ring.used == 0 && !ring.stop {
@@ -166,103 +420,306 @@ fn writer_main(shared: Arc<Shared>, mut file: File) {
         if ring.used == 0 && ring.stop {
             break;
         }
-        let chunk = ring.take(CHUNK);
+        let (chunk, records) = ring.take_records();
+        drop(ring);
+        let permitted = allowance.permits(file, chunk.len() as u64, Instant::now());
+        ring = shared.ring.lock().unwrap();
+        ring.free_bytes = Some(allowance.available);
+        ring.reserve_bytes = Some(allowance.reserve);
+        match permitted {
+            Ok(true) => {}
+            Ok(false) => {
+                let discarded = records + ring.queued_records;
+                ring.stats.records -= discarded;
+                ring.stats.dropped += discarded;
+                ring.used = 0;
+                ring.queued_records = 0;
+                ring.stop = true;
+                ring.reason = Some(space_reason(allowance.available, allowance.reserve));
+                shared.active.store(false, Ordering::Release);
+                break;
+            }
+            Err(error) => {
+                ring.fail(format!("cannot check free disk space: {error}"));
+                shared.active.store(false, Ordering::Release);
+                ring.used = 0;
+                ring.queued_records = 0;
+                break;
+            }
+        }
         drop(ring);
         let result = file.write_all(&chunk);
         ring = shared.ring.lock().unwrap();
         match result {
-            Ok(()) => ring.stats.bytes += chunk.len() as u64,
-            Err(_) => {
-                ring.stats.write_errors += 1;
-                // A partial write can end inside a record: appending later chunks would make
-                // the file unparseable. Leave a recoverable truncated tail and stop.
+            Ok(()) => {
+                ring.stats.bytes += chunk.len() as u64;
+                allowance.wrote(chunk.len() as u64);
+                ring.free_bytes = Some(allowance.available);
+            }
+            Err(error) => {
+                ring.fail(format!("cannot write the recording: {error}"));
+                // A partial write can end inside a record. Never append after it.
                 shared.active.store(false, Ordering::Release);
                 ring.used = 0;
+                ring.queued_records = 0;
                 break;
             }
         }
     }
     drop(ring);
-    if file.sync_all().is_err() {
-        shared.ring.lock().unwrap().stats.write_errors += 1;
+    if let Err(error) = file.sync_all() {
+        shared
+            .ring
+            .lock()
+            .unwrap()
+            .fail(format!("cannot sync the recording to disk: {error}"));
     }
 }
 
 impl Recorder {
     pub fn new(ring_bytes: usize) -> Self {
+        Self::with_diagnostics(ring_bytes, |_| {})
+    }
+
+    /// The writer calls `diagnostic` without holding a recorder lock. The sink must not block.
+    pub fn with_diagnostics(ring_bytes: usize, diagnostic: fn(&str)) -> Self {
         Self {
             shared: Arc::new(Shared {
                 ring: Mutex::new(Ring {
                     buf: vec![0; ring_bytes],
                     head: 0,
                     used: 0,
+                    queued_records: 0,
                     stop: false,
+                    opening: false,
+                    session: false,
+                    finished: true,
+                    path: None,
+                    accepted_bytes: 0,
+                    byte_limit: RECORDING_BYTES,
+                    free_bytes: None,
+                    reserve_bytes: None,
+                    reason: None,
+                    error: None,
                     stats: Stats::default(),
                 }),
                 cond: Condvar::new(),
                 active: AtomicBool::new(false),
+                diagnostic,
             }),
-            writer: Mutex::new(None),
         }
     }
 
-    /// Creates `path` exclusively (never overwrites) and starts the writer thread.
+    /// Creates `path` exclusively (never overwrites). Opening and writing its header can block:
+    /// callers must not hold the daemon's control lock here.
     pub fn start(&self, path: &Path, start_host_ns: u64) -> Result<(), String> {
-        let mut writer = self.writer.lock().unwrap();
-        if writer.is_some() {
-            return Err("already recording".into());
+        self.start_with_frames(path, start_host_ns, false)
+    }
+
+    pub fn start_with_frames(
+        &self,
+        path: &Path,
+        start_host_ns: u64,
+        frames: bool,
+    ) -> Result<(), String> {
+        self.reserve_with_frames(path, frames)?.start(start_host_ns)
+    }
+
+    /// Reserve under the control lock; `ReservedRecording::start` must run after releasing it.
+    pub fn reserve_with_frames(
+        &self,
+        path: &Path,
+        frames: bool,
+    ) -> Result<ReservedRecording<'_>, String> {
+        self.reserve_session(
+            path,
+            if frames {
+                FRAME_RECORDING_BYTES
+            } else {
+                RECORDING_BYTES
+            },
+        )?;
+        Ok(ReservedRecording {
+            recorder: self,
+            path: path.to_path_buf(),
+            started: false,
+        })
+    }
+
+    /// Records into an already opened sink, with the same lifecycle and policy as a file.
+    pub fn start_with_sink(
+        &self,
+        path: &Path,
+        start_host_ns: u64,
+        frames: bool,
+        sink: Box<dyn RecordingSink>,
+    ) -> Result<(), String> {
+        self.start_session(
+            path,
+            start_host_ns,
+            if frames {
+                FRAME_RECORDING_BYTES
+            } else {
+                RECORDING_BYTES
+            },
+            || Ok(sink),
+        )
+    }
+
+    fn start_session(
+        &self,
+        path: &Path,
+        start_host_ns: u64,
+        byte_limit: u64,
+        open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>>,
+    ) -> Result<(), String> {
+        self.reserve_session(path, byte_limit)?;
+        self.start_reserved_session(path, start_host_ns, open)
+    }
+
+    fn start_reserved_session(
+        &self,
+        path: &Path,
+        start_host_ns: u64,
+        open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>>,
+    ) -> Result<(), String> {
+        let cancelled = self.shared.ring.lock().unwrap().stop;
+        if cancelled {
+            self.cancel_start();
+            return Err("recording start was cancelled before its file was opened".into());
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut header = [0u8; FILE_HEADER_LEN];
-        header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        header[12..16].copy_from_slice(&(FILE_HEADER_LEN as u32).to_le_bytes());
-        header[16..24].copy_from_slice(&start_host_ns.to_le_bytes());
-        file.write_all(&header)
-            .map_err(|e| format!("write {}: {e}", path.display()))?;
-        {
+        let start = || -> Result<(), String> {
+            let mut file = open().map_err(|e| format!("open {}: {e}", path.display()))?;
+            let space = file
+                .disk_space()
+                .map_err(|e| format!("cannot check free disk space: {e}"))?;
+            let reserve = disk_reserve(space);
+            {
+                let mut ring = self.shared.ring.lock().unwrap();
+                ring.free_bytes = Some(space.available);
+                ring.reserve_bytes = Some(reserve);
+            }
+            if space.available.saturating_sub(reserve) < FILE_HEADER_LEN as u64 {
+                return Err(space_reason(space.available, reserve));
+            }
+            let mut header = [0u8; FILE_HEADER_LEN];
+            header[..8].copy_from_slice(MAGIC);
+            header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+            header[12..16].copy_from_slice(&(FILE_HEADER_LEN as u32).to_le_bytes());
+            header[16..24].copy_from_slice(&start_host_ns.to_le_bytes());
+            file.write_all(&header)
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            {
+                let mut ring = self.shared.ring.lock().unwrap();
+                ring.stats.bytes = FILE_HEADER_LEN as u64;
+                ring.opening = false;
+                self.shared.active.store(!ring.stop, Ordering::Release);
+            }
+            let shared = Arc::clone(&self.shared);
+            let _writer = std::thread::Builder::new()
+                .name("cv1t-recorder".into())
+                .spawn(move || {
+                    // A panicking sink must not leave a session waiting forever. File close happens
+                    // before `finished`, too, and never under a ring or control lock.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        writer_main(&shared, &mut *file)
+                    }));
+                    drop(file);
+                    let mut ring = shared.ring.lock().unwrap();
+                    if result.is_err() {
+                        ring.fail("recording writer stopped unexpectedly".into());
+                    }
+                    shared.active.store(false, Ordering::Release);
+                    let note = (ring.error.is_some() || ring.reason.is_some()).then(|| {
+                        let mut status = ring.status();
+                        status.finished = true;
+                        status.message()
+                    });
+                    drop(ring);
+                    if let Some(note) = note {
+                        shared.report_diagnostic(&note);
+                    }
+                    shared.ring.lock().unwrap().finished = true;
+                    shared.cond.notify_all();
+                })
+                .map_err(|e| format!("cannot start recorder thread: {e}"))?;
+            Ok(())
+        };
+        if let Err(error) = start() {
+            self.shared.active.store(false, Ordering::Release);
             let mut ring = self.shared.ring.lock().unwrap();
-            ring.head = 0;
-            ring.used = 0;
-            ring.stop = false;
-            ring.stats = Stats {
-                bytes: FILE_HEADER_LEN as u64,
-                ..Stats::default()
-            };
+            ring.fail(error.clone());
+            ring.session = false;
+            ring.finished = true;
+            drop(ring);
+            self.shared.cond.notify_all();
+            return Err(error);
         }
-        self.shared.active.store(true, Ordering::Release);
-        let shared = Arc::clone(&self.shared);
-        let handle = std::thread::Builder::new()
-            .name("cv1t-recorder".into())
-            .spawn(move || writer_main(shared, file))
-            .map_err(|e| {
-                self.shared.active.store(false, Ordering::Release);
-                format!("cannot start recorder thread: {e}")
-            })?;
-        *writer = Some((path.to_path_buf(), handle));
         Ok(())
     }
 
-    /// Includes a failed recording awaiting `stop()` to reap its writer and report errors.
-    pub fn has_session(&self) -> bool {
-        self.writer.lock().unwrap().is_some()
+    fn reserve_session(&self, path: &Path, byte_limit: u64) -> Result<(), String> {
+        {
+            let mut ring = self.shared.ring.lock().unwrap();
+            if ring.session {
+                let message = if ring.finished {
+                    "previous recording ended; run record stop to see its result before starting another"
+                } else if ring.stop {
+                    "recording is still finishing; check status and stop it before starting another"
+                } else {
+                    "already recording"
+                };
+                return Err(message.into());
+            }
+            ring.head = 0;
+            ring.used = 0;
+            ring.queued_records = 0;
+            ring.stop = false;
+            ring.opening = true;
+            ring.session = true;
+            ring.finished = false;
+            ring.path = Some(path.to_path_buf());
+            ring.accepted_bytes = FILE_HEADER_LEN as u64;
+            ring.byte_limit = byte_limit;
+            ring.free_bytes = None;
+            ring.reserve_bytes = None;
+            ring.reason = None;
+            ring.error = None;
+            ring.stats = Stats::default();
+        }
+        Ok(())
     }
 
+    fn cancel_start(&self) {
+        self.shared.active.store(false, Ordering::Release);
+        let mut ring = self.shared.ring.lock().unwrap();
+        ring.stop = true;
+        ring.opening = false;
+        ring.finished = true;
+        ring.session = false;
+        ring.error = Some("recording start was cancelled before its file was opened".into());
+        drop(ring);
+        self.shared.cond.notify_all();
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.shared.ring.lock().unwrap().session
+    }
     pub fn active(&self) -> bool {
         self.shared.active.load(Ordering::Acquire)
     }
+    pub fn status(&self) -> Status {
+        self.shared.ring.lock().unwrap().status()
+    }
 
-    /// Thread-safe and I/O-free: copies one record (payload parts concatenated) into the ring, or
-    /// counts it as dropped if it does not fit. A no-op while inactive.
+    /// Thread-safe and I/O-free. The byte ceiling includes the header, queued records and any
+    /// batch the writer has taken, so even a stalled writer cannot overshoot it.
     pub fn write(&self, rtype: u16, host_ns: u64, parts: &[&[u8]]) {
         if !self.active() {
             return;
         }
         let payload_len: usize = parts.iter().map(|p| p.len()).sum();
+        let len = RECORD_HEADER_LEN + payload_len;
         let mut header = [0u8; RECORD_HEADER_LEN];
         header[..2].copy_from_slice(&rtype.to_le_bytes());
         header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
@@ -271,53 +728,101 @@ impl Recorder {
         if !self.active() {
             return;
         }
-        if ring.buf.len() - ring.used < RECORD_HEADER_LEN + payload_len {
+        if ring.accepted_bytes.saturating_add(len as u64) > ring.byte_limit {
+            self.limit_reached(&mut ring);
+        } else if ring.buf.len() - ring.used < len {
             ring.stats.dropped += 1;
             return;
+        } else {
+            ring.put(&header);
+            for p in parts {
+                ring.put(p);
+            }
+            ring.stats.records += 1;
+            ring.queued_records += 1;
+            ring.accepted_bytes += len as u64;
+            if ring.accepted_bytes == ring.byte_limit {
+                self.limit_reached(&mut ring);
+            }
         }
-        ring.put(&header);
-        for p in parts {
-            ring.put(p);
-        }
-        ring.stats.records += 1;
         drop(ring);
-        self.shared.cond.notify_one();
+        self.shared.cond.notify_all();
+    }
+
+    fn limit_reached(&self, ring: &mut Ring) {
+        let limit = if ring.byte_limit >= 1 << 30 {
+            format!("{} GiB", ring.byte_limit >> 30)
+        } else {
+            format!("{} bytes", ring.byte_limit)
+        };
+        ring.reason = Some(format!("{limit} recording size limit reached"));
+        ring.stop = true;
+        self.shared.active.store(false, Ordering::Release);
     }
 
     pub fn stats(&self) -> Stats {
         self.shared.ring.lock().unwrap().stats
     }
 
-    /// Drains the ring, closes the file and returns the session's stats.
+    /// Offline callers may wait for all storage. Daemon control/shutdown use `stop_timeout`.
     pub fn stop(&self) -> Stats {
-        let mut writer = self.writer.lock().unwrap();
-        self.stop_locked(&mut writer)
+        self.stop_wait(None, None)
+            .map_or_else(|| self.stats(), |s| s.stats)
+    }
+    pub fn stop_if(&self, path: &Path) -> Option<Stats> {
+        self.stop_wait(Some(path), None).map(|s| s.stats)
     }
 
-    /// Exact-path ownership check and drain happen under the same session lock. A failed
-    /// writer remains a matching session until it is joined; another session is untouched.
-    pub fn stop_if(&self, path: &Path) -> Option<Stats> {
-        let mut writer = self.writer.lock().unwrap();
-        if writer.as_ref().is_none_or(|(owned, _)| owned != path) {
+    /// Requests a drain without waiting for opening or storage. This also cancels a start
+    /// whose header write has not returned yet; it must not become active afterward.
+    pub fn request_stop(&self, path: Option<&Path>) -> bool {
+        let mut ring = self.shared.ring.lock().unwrap();
+        if !ring.session || path.is_some_and(|p| ring.path.as_deref() != Some(p)) {
+            return false;
+        }
+        self.shared.active.store(false, Ordering::Release);
+        ring.stop = true;
+        self.shared.cond.notify_all();
+        true
+    }
+
+    /// Stops accepting records immediately. A timeout retains ownership and the outcome for a
+    /// later stop; a new start is refused until a completed stop acknowledges this session.
+    pub fn stop_timeout(&self, path: Option<&Path>, timeout: Duration) -> Option<Status> {
+        self.stop_wait(path, Some(timeout))
+    }
+
+    fn stop_wait(&self, path: Option<&Path>, timeout: Option<Duration>) -> Option<Status> {
+        let mut ring = self.shared.ring.lock().unwrap();
+        if !ring.session || path.is_some_and(|p| ring.path.as_deref() != Some(p)) {
             return None;
         }
-        Some(self.stop_locked(&mut writer))
-    }
-
-    fn stop_locked(&self, writer: &mut Option<(PathBuf, JoinHandle<()>)>) -> Stats {
-        if let Some((_, handle)) = writer.take() {
-            self.shared.active.store(false, Ordering::Release);
-            self.shared.ring.lock().unwrap().stop = true;
-            self.shared.cond.notify_one();
-            let _ = handle.join();
+        self.shared.active.store(false, Ordering::Release);
+        ring.stop = true;
+        self.shared.cond.notify_all();
+        ring = if let Some(timeout) = timeout {
+            self.shared
+                .cond
+                .wait_timeout_while(ring, timeout, |r| !r.finished)
+                .unwrap()
+                .0
+        } else {
+            self.shared.cond.wait_while(ring, |r| !r.finished).unwrap()
+        };
+        if ring.finished {
+            ring.session = false;
         }
-        self.stats()
+        Some(ring.status())
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        self.stop();
+        // A blocked filesystem cannot be interrupted safely. Its one writer owns Shared until it
+        // finishes; dropping the recorder must not join it or delay daemon shutdown.
+        self.shared.active.store(false, Ordering::Release);
+        self.shared.ring.lock().unwrap().stop = true;
+        self.shared.cond.notify_all();
     }
 }
 
@@ -627,6 +1132,475 @@ mod tests {
         info.serial[..3].copy_from_slice(&[b'W' as c_char, b'M' as c_char, b'T' as c_char]);
         let b = blobs();
         r.write(FRAME_OBS, 444, &[as_bytes(&info), slice_bytes(&b)]);
+    }
+
+    #[test]
+    fn a_cancelled_start_never_claims_a_completed_file() {
+        for stopped in [false, true] {
+            let r = Recorder::new(4096);
+            let path = std::env::temp_dir().join(format!(
+                "cv1t-cancelled-{}-{}.rec",
+                std::process::id(),
+                crate::shm::now_ns()
+            ));
+            let reserved = r.reserve_with_frames(&path, false).unwrap();
+            if stopped {
+                assert!(r.request_stop(None));
+                assert!(reserved.start(1).unwrap_err().contains("cancelled"));
+            } else {
+                drop(reserved);
+            }
+            let status = r.status();
+            assert!(!path.exists());
+            assert!(!r.has_session());
+            assert_eq!(status.stats.write_errors, 0);
+            assert!(
+                status.message().contains("cancelled"),
+                "{}",
+                status.message()
+            );
+            assert!(
+                !status.message().contains("complete and synced"),
+                "{}",
+                status.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_recording_filename_syncs_and_reads_back() {
+        let path = PathBuf::from(format!(
+            "cv1t-bare-{}-{}.rec",
+            std::process::id(),
+            crate::shm::now_ns()
+        ));
+        let r = Recorder::new(4096);
+        r.start(&path, 1).unwrap();
+        r.write(HAPTIC, 2, &[&[0; 16]]);
+        let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
+        let mut reader = Reader::open(&path).unwrap();
+        let count = reader.by_ref().count();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            status.finished && status.error.is_none(),
+            "{}",
+            status.message()
+        );
+        assert_eq!(count, 1);
+        assert!(reader.error().is_none());
+    }
+
+    struct CountingSpace {
+        queries: Arc<std::sync::atomic::AtomicU64>,
+        available: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Write for CountingSpace {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl RecordingSink for CountingSpace {
+        fn sync_all(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disk_space(&self) -> io::Result<DiskSpace> {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            Ok(DiskSpace {
+                available: self.available.load(Ordering::Relaxed),
+                capacity: 40 << 30,
+            })
+        }
+    }
+
+    #[test]
+    fn disk_queries_follow_time_bytes_and_remaining_allowance() {
+        let queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let available = Arc::new(std::sync::atomic::AtomicU64::new(100 << 30));
+        let sink = CountingSpace {
+            queries: Arc::clone(&queries),
+            available: Arc::clone(&available),
+        };
+        let mut allowance = DiskAllowance::default();
+        let now = Instant::now();
+        for _ in 0..1000 {
+            assert!(allowance.permits(&sink, 48, now).unwrap());
+            allowance.wrote(48);
+        }
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert_eq!(allowance.available, (100 << 30) - 48_000);
+        available.store(1 << 30, Ordering::Relaxed);
+        assert!(allowance
+            .permits(&sink, 48, now + Duration::from_millis(999))
+            .unwrap());
+        assert!(!allowance
+            .permits(&sink, 48, now + Duration::from_secs(1))
+            .unwrap());
+        assert_eq!(queries.load(Ordering::Relaxed), 2);
+        available.store(100 << 30, Ordering::Relaxed);
+        assert!(allowance
+            .permits(&sink, 48, now + Duration::from_secs(1))
+            .unwrap());
+        assert_eq!(
+            queries.load(Ordering::Relaxed),
+            3,
+            "crossing the cached reserve refreshes immediately"
+        );
+        allowance.wrote(16 << 20);
+        assert!(allowance
+            .permits(&sink, 48, now + Duration::from_secs(1))
+            .unwrap());
+        assert_eq!(
+            queries.load(Ordering::Relaxed),
+            4,
+            "16 MiB refreshes without waiting a second"
+        );
+    }
+
+    #[test]
+    fn small_drained_batches_do_not_query_disk_space_per_sample() {
+        let queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let r = Recorder::new(4096);
+        let begun = Instant::now();
+        r.start_with_sink(
+            &tmp("query-cadence"),
+            1,
+            false,
+            Box::new(CountingSpace {
+                queries: Arc::clone(&queries),
+                available: Arc::new(std::sync::atomic::AtomicU64::new(100 << 30)),
+            }),
+        )
+        .unwrap();
+        for i in 1..=100 {
+            r.write(HAPTIC, i, &[&[0; 16]]);
+            wait_until(|| r.stats().bytes == 32 + i * 32);
+        }
+        r.stop();
+        let calls = queries.load(Ordering::Relaxed);
+        assert!(
+            calls <= 3 + begun.elapsed().as_secs(),
+            "{calls} filesystem queries for 100 small batches"
+        );
+    }
+
+    struct SpaceSink {
+        file: File,
+        available: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Write for SpaceSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let n = self.file.write(bytes)?;
+            self.available.fetch_sub(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+    impl RecordingSink for SpaceSink {
+        fn sync_all(&mut self) -> io::Result<()> {
+            self.file.sync_all()
+        }
+        fn disk_space(&self) -> io::Result<DiskSpace> {
+            Ok(DiskSpace {
+                available: self.available.load(Ordering::Relaxed),
+                capacity: 40 << 30,
+            })
+        }
+    }
+    fn state_record(r: &Recorder, time: u64) {
+        let state = ControllerState {
+            flags: crate::hand::FLAG_CONNECTED,
+            device_time_ns: time,
+            received_host_ns: time,
+            publish_host_ns: time + 10,
+            ..Default::default()
+        };
+        r.write(
+            CONTROLLER_STATE,
+            time,
+            &[&0u32.to_le_bytes(), &0u32.to_le_bytes(), as_bytes(&state)],
+        );
+    }
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer did not progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn size_limit_finishes_a_readable_recording_for_summary_and_replay() {
+        for limit in [872, 900] {
+            let path = tmp(&format!("capped-{limit}"));
+            let r = Recorder::new(4096);
+            let available = Arc::new(std::sync::atomic::AtomicU64::new(100 << 30));
+            r.start_session(&path, 1, limit, || {
+                Ok(Box::new(SpaceSink {
+                    file: File::create(&path)?,
+                    available,
+                }))
+            })
+            .unwrap();
+            for time in 1..=3 {
+                state_record(&r, time);
+            }
+            if limit == 872 {
+                assert!(
+                    !r.active(),
+                    "an exactly full file must stop without a fourth sample"
+                );
+            }
+            state_record(&r, 4);
+            wait_until(|| r.status().finished);
+            assert!(!r.active());
+            // A capped session retains its reason until stop acknowledges it.
+            assert!(r.start(&tmp("capped-replacement"), 2).is_err());
+            let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
+            assert_eq!(status.state, State::Complete);
+            assert!(status.reason.unwrap().contains("size limit"));
+            assert_eq!(status.stats.bytes, 872); // 32-byte header + 3 x (16 + 8 + 256).
+            assert_eq!(status.stats.write_errors, 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 872);
+            let mut reader = Reader::open(&path).unwrap();
+            let states: Vec<_> = reader
+                .by_ref()
+                .map(|r| {
+                    let (hand, state) = decode_state(&r.payload).unwrap();
+                    (r.host_ns, hand, state)
+                })
+                .collect();
+            assert_eq!(states.len(), 3);
+            assert!(reader.error().is_none());
+            let window = crate::summary::Window {
+                name: "capture".into(),
+                start_ns: 1,
+                end_ns: 4,
+            };
+            let summary = crate::summary::window_stats(&states, 0, &window);
+            assert_eq!(summary.n, 3);
+            assert_eq!(summary.connected, 1.0);
+            // No camera/model metadata in this small fixture: replay accepts the capped file
+            // but has no optical track to publish. The pipeline's full replay regression covers
+            // the sensor/model/frame records in this same unchanged format.
+            let calibration = crate::calib::file::CalibrationFile {
+                format: crate::calib::file::FORMAT.into(),
+                version: 1,
+                created_unix_s: 0,
+                world: String::new(),
+                source: String::new(),
+                sensors: Vec::new(),
+                stats: crate::calib::file::Stats {
+                    reference: String::new(),
+                    gravity_mps2: 9.81,
+                    gravity_spread_deg: None,
+                    motion_segments: 0,
+                    samples: 0,
+                    rejected_views: 0,
+                },
+            };
+            let replay =
+                crate::track::replay::replay(&path, &calibration, &|_| None, &Default::default())
+                    .unwrap();
+            assert!(replay.hands.iter().all(Vec::is_empty));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn low_disk_space_finishes_only_whole_records_and_says_how_much_is_kept() {
+        let path = tmp("disk-reserve");
+        let r = Recorder::new(4096);
+        let available = Arc::new(std::sync::atomic::AtomicU64::new((2 << 30) + 591));
+        r.start_session(&path, 1, RECORDING_BYTES, || {
+            Ok(Box::new(SpaceSink {
+                file: File::create(&path)?,
+                available: Arc::clone(&available),
+            }))
+        })
+        .unwrap();
+        state_record(&r, 1);
+        wait_until(|| r.stats().bytes == 312);
+        // Header and first record spent 312 bytes: one byte short of another whole record.
+        assert_eq!(available.load(Ordering::Relaxed), (2 << 30) + 279);
+        state_record(&r, 2);
+        wait_until(|| r.status().finished);
+        let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
+        assert_eq!(status.state, State::Complete);
+        assert!(status.message().contains("GiB free; keeping 2.00 GiB free"));
+        assert_eq!(status.stats.bytes, 312);
+        assert_eq!(status.stats.records, 1);
+        assert_eq!(status.stats.write_errors, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 312);
+        let mut reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.by_ref().count(), 1);
+        assert!(reader.error().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reserve_refuses_a_start_without_enough_space_and_is_capped_on_large_disks() {
+        let path = tmp("reserve-refusal");
+        let r = Recorder::new(4096);
+        let available = Arc::new(std::sync::atomic::AtomicU64::new(1 << 30));
+        let error = r
+            .start_session(&path, 1, RECORDING_BYTES, || {
+                Ok(Box::new(SpaceSink {
+                    file: File::create(&path)?,
+                    available,
+                }))
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("1.00 GiB free; keeping 2.00 GiB free"),
+            "{error}"
+        );
+        assert!(!r.active());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(&path).unwrap();
+        struct CapacitySink(SpaceSink, u64);
+        impl Write for CapacitySink {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        impl RecordingSink for CapacitySink {
+            fn sync_all(&mut self) -> io::Result<()> {
+                self.0.sync_all()
+            }
+            fn disk_space(&self) -> io::Result<DiskSpace> {
+                Ok(DiskSpace {
+                    available: self.0.available.load(Ordering::Relaxed),
+                    capacity: self.1,
+                })
+            }
+        }
+        // The middle of the policy keeps 5%; a multi-terabyte disk keeps at most 20 GiB,
+        // admitting a recording with either 21 GiB or hundreds of GiB still free.
+        for (free, capacity, reserve, admitted) in [
+            (9 << 30, 200 << 30, 10 << 30, false),
+            (21 << 30, 8 << 40, 20 << 30, true),
+            (420 << 30, 8 << 40, 20 << 30, true),
+        ] {
+            let available = Arc::new(std::sync::atomic::AtomicU64::new(free));
+            let result = r.start_with_sink(
+                &path,
+                1,
+                false,
+                Box::new(CapacitySink(
+                    SpaceSink {
+                        file: File::create(&path).unwrap(),
+                        available,
+                    },
+                    capacity,
+                )),
+            );
+            assert_eq!(r.status().reserve_bytes, Some(reserve));
+            if admitted {
+                result.unwrap();
+                assert_eq!(r.status().byte_limit, 8 << 30);
+                state_record(&r, 1);
+                let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
+                assert_eq!(status.stats.records, 1);
+                assert!(status.error.is_none() && status.reason.is_none());
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("9.00 GiB free; keeping 10.00 GiB free"),
+                    "{error}"
+                );
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    struct SyncGate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Write for SyncGate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl RecordingSink for SyncGate {
+        fn sync_all(&mut self) -> io::Result<()> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Ok(())
+        }
+        fn disk_space(&self) -> io::Result<DiskSpace> {
+            Ok(DiskSpace {
+                available: 100 << 30,
+                capacity: 200 << 30,
+            })
+        }
+    }
+
+    #[test]
+    fn dropping_a_recorder_does_not_wait_for_a_blocked_sync() {
+        let r = Recorder::new(4096);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        r.start_with_sink(
+            &tmp("drop-blocked"),
+            1,
+            false,
+            Box::new(SyncGate {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        )
+        .unwrap();
+        assert!(!r.stop_timeout(None, Duration::ZERO).unwrap().finished);
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(r);
+            done_tx.send(()).unwrap();
+        });
+        let dropped = done.recv_timeout(Duration::from_millis(200));
+        let _ = release.send(());
+        dropper.join().unwrap();
+        assert!(dropped.is_ok(), "dropping the recorder waited for storage");
+    }
+
+    #[test]
+    fn writer_batches_end_at_record_boundaries_even_when_the_ring_wraps() {
+        let r = Recorder::new(2 * CHUNK);
+        let (first, n) = {
+            let mut ring = r.shared.ring.lock().unwrap();
+            ring.head = ring.buf.len() - 7;
+            for payload_len in [CHUNK - 24, 32] {
+                let mut header = [0u8; 16];
+                header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                ring.put(&header);
+                ring.put(&vec![0u8; payload_len]);
+                ring.queued_records += 1;
+            }
+            ring.take_records()
+        };
+        assert_eq!((first.len(), n), (CHUNK - 8, 1));
+        let (second, n, left) = {
+            let mut ring = r.shared.ring.lock().unwrap();
+            let (second, n) = ring.take_records();
+            (second, n, (ring.used, ring.queued_records))
+        };
+        assert_eq!((second.len(), n), (48, 1));
+        assert_eq!(left, (0, 0));
     }
 
     #[test]

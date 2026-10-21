@@ -75,6 +75,35 @@ pub fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn disk_space(_file: &File, path: &Path) -> io::Result<super::fs::DiskSpace> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let dir = super::fs::parent_dir(path);
+    let mut dir: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    // Network share roots require a trailing separator, including when the file is at the root.
+    if !dir.ends_with(&[u16::from(b'\\')]) && !dir.ends_with(&[u16::from(b'/')]) {
+        dir.push(u16::from(b'\\'));
+    }
+    dir.push(0);
+    let (mut available, mut capacity) = (0, 0);
+    // SAFETY: a terminated directory name and valid result pointers.
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            dir.as_ptr(),
+            &mut available,
+            &mut capacity,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(super::fs::DiskSpace {
+        available,
+        capacity,
+    })
+}
+
 fn retrying<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut wait = Duration::from_millis(10);
     loop {

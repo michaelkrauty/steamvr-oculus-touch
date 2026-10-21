@@ -159,7 +159,13 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
     let second = read_status();
     let daemon_detail = second.as_ref().err().map_or_else(
         || "Start cv1touchd with access to the CV1 USB devices.".to_string(),
-        ToString::to_string,
+        |error| {
+            if error.kind() == io::ErrorKind::InvalidInput {
+                error.to_string()
+            } else {
+                format!("Start cv1touchd with access to the CV1 USB devices. ({error})")
+            }
+        },
     );
     let second = second.ok().flatten();
     let streaming = first.as_ref().zip(second.as_ref()).is_some_and(|(a, b)| {
@@ -189,7 +195,9 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         .and_then(|v| status::sensors_from_status(v).ok())
         .unwrap_or_default();
     let unplaced = unplaced_sensors(calibration.as_ref(), &sensors);
-    let recording = second.as_ref().is_some_and(|v| v["recording"] == true);
+    let recording = second
+        .as_ref()
+        .is_some_and(|v| v["recording"] == true || v["recording_status"]["pending"] == true);
     let normal_mode = second
         .as_ref()
         .is_some_and(|v| matches!(v["mode"].as_str(), Some("calibrated" | "provisional")));
@@ -568,7 +576,7 @@ fn timed_capture(
     gravity: bool,
 ) -> Result<PathBuf, String> {
     let rec = capture_path(stage, checkpoint)?;
-    let mut guard = guided_start_recording(&rec, false)?;
+    let mut guard = start_recording(&rec, false)?;
     let result = if gravity {
         human_action(GRAVITY_HOLDS);
         (1..=12).try_for_each(|hold| -> Result<(), String> {
@@ -582,8 +590,8 @@ fn timed_capture(
     } else {
         go_signal(&format!("{CAMERA_MOTION}\n{START}")).and_then(|()| timed_window(60))
     };
-    let stopped = daemon_request(&guard.command, Duration::from_millis(750))
-        .map_err(|error| error.to_string());
+    let stopped =
+        daemon_request(&guard.command, RECORD_STOP_TIMEOUT).map_err(|error| error.to_string());
     let stopped_ok = stopped
         .as_ref()
         .is_ok_and(|reply| reply.starts_with("ok stopped "));
@@ -1495,6 +1503,22 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
     if !check_only && !io::stdin().is_terminal() {
         eprintln!("cv1touch: setup needs an interactive terminal. Use setup --check [--json] for a read-only report.");
         return 2;
+    }
+    // Refuse an unaddressable endpoint or an older running daemon before preparation. A daemon
+    // that is not running or is busy is for the guide's own checks to explain and retry, and
+    // every capture looks again before it starts.
+    if !check_only {
+        let status = match status_json() {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                eprintln!("{}", cannot_reach(&control::socket_path(), &error));
+                return 1;
+            }
+            result => result.ok().flatten(),
+        };
+        if let Some(Err(error)) = status.map(|s| recording_capability(&s, cfg!(windows))) {
+            eprintln!("cv1touch: {error}");
+            return 1;
+        }
     }
     let mut checkpoint = match setup::load(&journal_path()) {
         Ok(value) => value.unwrap_or_default(),

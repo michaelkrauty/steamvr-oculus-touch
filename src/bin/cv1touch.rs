@@ -4,6 +4,10 @@
 //! cv1touch: CLI for cv1touchd. Subcommands: status, haptic, record, rec-summary, pace, calibration,
 //! calibrate, consistency.
 
+#[cfg(test)]
+#[path = "../../tests/support/socket_dir.rs"]
+mod socket_dir;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -129,8 +133,18 @@ fn cannot_reach(socket: &Path, error: &io::Error) -> String {
     )
 }
 
+const RECORD_STOP_TIMEOUT: Duration = Duration::from_secs(35);
+
 fn send(line: &str) -> i32 {
-    match daemon_request(line, Duration::from_secs(5)) {
+    let timeout = if matches!(
+        control::parse(line),
+        Ok(control::Command::RecordStop | control::Command::RecordStopIf(_))
+    ) {
+        RECORD_STOP_TIMEOUT
+    } else {
+        Duration::from_secs(5)
+    };
+    match daemon_request(line, timeout) {
         Ok(reply) => {
             println!("{reply}");
             if reply.starts_with("err") {
@@ -503,6 +517,14 @@ fn status_board(shm_name: &str) -> i32 {
             println!("{sensor_note}");
         }
         println!("{stream_note}");
+        if let Some(message) = complete
+            .as_ref()
+            .and_then(|v| v["recording_status"]["message"].as_str())
+        {
+            if !message.is_empty() {
+                println!("{message}");
+            }
+        }
         let _ = io::stdout().flush();
         thread::sleep(Duration::from_millis(200));
     }
@@ -880,6 +902,10 @@ fn restore_mode(out: &Path) -> i32 {
 }
 
 fn calibrate(out: &Path) -> i32 {
+    if let Err(error) = recording_preflight() {
+        eprintln!("cv1touch: {error}");
+        return 1;
+    }
     catch_interrupts();
     println!("{CALIBRATION_BRIEFING}\n");
     if send("calibration capture") != 0 {
@@ -900,12 +926,20 @@ fn calibrate(out: &Path) -> i32 {
         return 1;
     }
     let rec = dir.join(format!("calib-{}.rec", unix_now()));
-    if send_path(control::record_start_line(&rec, false)) != 0 {
+    let mut guard = match start_recording(&rec, false) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            restore_mode(out);
+            return 1;
+        }
+    };
+    let paced = pace(&["wave:60".to_string()]);
+    if let Err(error) = guard.finish() {
+        eprintln!("cv1touch: {error}");
         restore_mode(out);
         return 1;
     }
-    let paced = pace(&["wave:60".to_string()]);
-    send("record stop");
     if paced != 0 {
         eprintln!(
             "cv1touch: calibration interrupted (recording kept at {})",
@@ -1481,18 +1515,6 @@ Accuracy and latency capture: 80 s against Lighthouse truth, paced by beeps (pre
                 turn your wrist, fast and slow, high and low.
   still (10 s): set it down again, hands off.";
 
-/// Stops the daemon's recording when dropped unless disarmed: a terminal closed mid-capture makes
-/// printing fail, and the panic must not leave the daemon recording.
-struct StopRecordingGuard(bool);
-
-impl Drop for StopRecordingGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = daemon_request("record stop", Duration::from_secs(5));
-        }
-    }
-}
-
 fn paced_truth_file(
     reference: String,
     universe_id: u64,
@@ -1527,14 +1549,14 @@ fn truth_stations(tf: &eval::TruthFile) -> align::Stations {
 }
 
 fn eval_capture() -> i32 {
-    catch_interrupts();
-    let status = match status_json() {
-        Ok(status) => status,
+    let status = match recording_preflight() {
+        Ok(status) => Some(status),
         Err(error) => {
-            eprintln!("{}", cannot_reach(&control::socket_path(), &error));
+            eprintln!("cv1touch: {error}");
             return 1;
         }
     };
+    catch_interrupts();
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return 1;
@@ -1567,10 +1589,13 @@ fn eval_capture() -> i32 {
         "reference: Index controller {} (device {})\n\n{EVAL_BRIEFING}\n",
         reference.serial, reference.index
     );
-    if send_path(control::record_start_line(&rec, false)) != 0 {
-        return 1;
-    }
-    let mut guard = StopRecordingGuard(true);
+    let mut guard = match start_recording(&rec, false) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            return 1;
+        }
+    };
     let bases = cv1touch::steamvr_log::Span::begin(&cv1touch::steamvr_log::server_log());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -1596,8 +1621,10 @@ fn eval_capture() -> i32 {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let sampled = sampler.join().unwrap_or_default();
     let tracking_bases = bases.finish();
-    guard.0 = false;
-    send("record stop");
+    if let Err(error) = guard.finish() {
+        eprintln!("cv1touch: {error}");
+        return 1;
+    }
     let windows = match paced {
         Ok(w) => w,
         Err(code) => {
@@ -2737,10 +2764,35 @@ fn guided_record_start_with(
     ))
 }
 
+/// Cleans up this capture only, including when stop is still pending or its reply was lost.
 struct ScopedRecordingGuard {
     command: String,
     armed: bool,
 }
+impl ScopedRecordingGuard {
+    fn finish(&mut self) -> Result<(), String> {
+        self.finish_with(|command, within| {
+            daemon_request(command, within).map_err(|e| e.to_string())
+        })
+    }
+
+    fn finish_with(
+        &mut self,
+        request: impl FnOnce(&str, Duration) -> Result<String, String>,
+    ) -> Result<(), String> {
+        let reply = request(&self.command, RECORD_STOP_TIMEOUT)?;
+        if !reply.starts_with("ok stopped ") {
+            return Err(if reply.trim() == "ok not-matching" {
+                "recording completion was already acknowledged by another client; capture was not used".into()
+            } else {
+                format!("recording did not complete: {reply}")
+            });
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
 impl Drop for ScopedRecordingGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -2753,17 +2805,61 @@ fn scoped_cleanup_reply(reply: &str) -> bool {
     reply.trim() == "ok not-matching" || reply.starts_with("ok stopped ")
 }
 
-fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGuard, String> {
-    let reply =
-        daemon_request("status", Duration::from_millis(750)).map_err(|error| error.to_string())?;
+/// Refuses a running daemon that predates confirmed recordings; it needs a restart onto the
+/// installed version before any capture.
+fn recording_capability(status: &serde_json::Value, windows: bool) -> Result<(), String> {
+    if status["recording_scoped_stop"] == true && status["recording_durable_stop"] == true {
+        return Ok(());
+    }
+    let restart = if windows {
+        "choose Stop cv1touch, then Start cv1touch in the Start menu"
+    } else {
+        "systemctl --user restart cv1touchd"
+    };
+    Err(format!("the cv1touch daemon is older than this cv1touch and can't confirm recordings; restart it: {restart}"))
+}
+
+fn recording_daemon_status(
+    status: Option<serde_json::Value>,
+    windows: bool,
+) -> Result<serde_json::Value, String> {
+    let status = status
+        .ok_or_else(|| "cannot reach the cv1touch daemon; start it before recording".to_string())?;
+    recording_capability(&status, windows)?;
+    if status["recording"] != false || status["recording_status"]["pending"] == true {
+        return Err(
+            "another recording is in progress; run cv1touch record stop before starting a capture"
+                .into(),
+        );
+    }
+    Ok(status)
+}
+
+fn recording_preflight() -> Result<serde_json::Value, String> {
+    recording_daemon_status(
+        status_json().map_err(|error| error.to_string())?,
+        cfg!(windows),
+    )
+}
+
+fn start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGuard, String> {
+    start_recording_with(rec, frames, |line, within| {
+        daemon_request(line, within).map_err(|error| error.to_string())
+    })
+}
+
+fn start_recording_with(
+    rec: &Path,
+    frames: bool,
+    request: impl FnMut(&str, Duration) -> Result<String, String>,
+) -> Result<ScopedRecordingGuard, String> {
+    let request = std::cell::RefCell::new(request);
+    let reply = request.borrow_mut()("status", Duration::from_millis(750))?;
     let capability = reply
         .strip_prefix("ok ")
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
-    if capability.as_ref().is_none_or(|status| {
-        status["recording_scoped_stop"] != true || status["recording"] != false
-    }) {
-        return Err("guided capture requires an idle matching daemon with scoped recording cleanup; no recording started".into());
-    }
+        .and_then(|json| serde_json::from_str(json).ok());
+    // Repeat the entry-point preflight in case the daemon changed during preparation.
+    recording_daemon_status(capability, cfg!(windows))?;
     let command = control::record_stop_if_line(rec)?;
     let start_command = control::record_start_line(rec, frames)?;
     let mut scoped = ScopedRecordingGuard {
@@ -2782,14 +2878,12 @@ fn guided_start_recording(rec: &Path, frames: bool) -> Result<ScopedRecordingGua
             cancelled
         },
         || {
-            let reply = daemon_request(&command, Duration::from_millis(750))
-                .map_err(|error| error.to_string());
+            let reply = request.borrow_mut()(&command, Duration::from_millis(750));
             rejected.set(reply.as_ref().is_ok_and(|reply| reply.starts_with("err ")));
             reply
         },
         || {
-            let reply = daemon_request(&scoped.command, Duration::from_millis(750))
-                .map_err(|error| error.to_string())?;
+            let reply = request.borrow_mut()(&scoped.command, Duration::from_millis(750))?;
             if !scoped_cleanup_reply(&reply) {
                 return Err(reply);
             }
@@ -2845,13 +2939,10 @@ fn capture_free_named_with_feedback(
     mut feedback: Option<&mut dyn CaptureFeedback>,
 ) -> Result<PathBuf, i32> {
     catch_interrupts();
-    let status = match status_json() {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("{}", cannot_reach(&control::socket_path(), &error));
-            return Err(1);
-        }
-    };
+    let status = Some(recording_preflight().map_err(|error| {
+        eprintln!("cv1touch: {error}");
+        1
+    })?);
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return Err(1);
@@ -2900,18 +2991,10 @@ fn capture_free_named_with_feedback(
             return Err(130);
         }
     }
-    let mut scoped_guard = if feedback.is_some() {
-        Some(guided_start_recording(&rec, frames).map_err(|error| {
-            eprintln!("cv1touch: {error}; no registration fit installed");
-            1
-        })?)
-    } else {
-        if send_path(control::record_start_line(&rec, frames)) != 0 {
-            return Err(1);
-        }
-        None
-    };
-    let mut guard = StopRecordingGuard(scoped_guard.is_none());
+    let mut guard = start_recording(&rec, frames).map_err(|error| {
+        eprintln!("cv1touch: {error}");
+        1
+    })?;
     let bases = cv1touch::steamvr_log::Span::begin(&cv1touch::steamvr_log::server_log());
     let start = shm::now_ns();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2997,22 +3080,12 @@ fn capture_free_named_with_feedback(
     let tracking_bases = bases.finish();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
-    let stop_command = scoped_guard
+    let stopped = daemon_request(&guard.command, RECORD_STOP_TIMEOUT);
+    let stopped_ok = stopped
         .as_ref()
-        .map_or("record stop", |guard| guard.command.as_str());
-    let stopped = daemon_request(stop_command, Duration::from_secs(5));
-    let stopped_ok = stopped.as_ref().is_ok_and(|reply| {
-        if scoped_guard.is_some() {
-            reply.starts_with("ok stopped ")
-        } else {
-            reply.starts_with("ok")
-        }
-    });
+        .is_ok_and(|reply| reply.starts_with("ok stopped "));
     if stopped_ok {
-        guard.0 = false;
-        if let Some(scoped) = scoped_guard.as_mut() {
-            scoped.armed = false;
-        }
+        guard.armed = false;
         if let Some(hook) = feedback.as_mut() {
             if let Err(error) = hook.stopped() {
                 feedback_error.get_or_insert(error);
@@ -3025,8 +3098,11 @@ fn capture_free_named_with_feedback(
         Ok(reply) if chatty => {
             let _ = writeln!(out, "\n{reply}");
         }
-        Ok(_) => {
+        Ok(reply) => {
             let _ = writeln!(out);
+            if !stopped_ok {
+                let _ = writeln!(io::stderr(), "cv1touch: {reply}");
+            }
         }
         Err(e) => {
             let _ = writeln!(io::stderr(), "\ncv1touch: record stop failed: {e}");
@@ -6915,6 +6991,93 @@ mod tests {
         assert_eq!(requests.get(), 0);
         assert_eq!(cleanup.get(), 0);
     }
+    #[test]
+    fn another_clients_early_end_acknowledgement_never_completes_our_capture() {
+        use std::io::{BufRead, BufReader};
+        for outcome in [
+            "err recording failed: test write failed",
+            "err recording ended early: disk reserve",
+        ] {
+            let fixture = socket_dir::SocketDir::new();
+            let dir = fixture.path();
+            let endpoint = dir.join("control.sock");
+            let mut listener = platform::ipc::Listener::bind(&endpoint).unwrap();
+            let server = thread::spawn(move || {
+                for reply in [outcome, "ok not-matching"] {
+                    let mut reader = BufReader::new(listener.accept(true).unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    writeln!(reader.get_mut(), "{reply}").unwrap();
+                }
+            });
+            // Another connection gets and acknowledges the failure before this capture stops.
+            let other = control::request(&endpoint, "record stop", Duration::from_secs(2)).unwrap();
+            let mut guard = ScopedRecordingGuard {
+                command: control::record_stop_if_line(&dir.join("capture.rec")).unwrap(),
+                armed: true,
+            };
+            let result = guard.finish_with(|line, within| {
+                control::request(&endpoint, line, within).map_err(|e| e.to_string())
+            });
+            let still_armed = guard.armed;
+            // Tests never let a cleanup guard contact the installed daemon.
+            guard.armed = false;
+            server.join().unwrap();
+            assert!(other.starts_with("err "));
+            assert!(result.unwrap_err().contains("already acknowledged"));
+            assert!(still_armed);
+        }
+    }
+
+    #[test]
+    fn recording_start_keeps_the_status_request_error() {
+        for reason in [
+            "control socket path is too long",
+            "control request timed out",
+        ] {
+            let mut commands = Vec::new();
+            let result = start_recording_with(Path::new("capture.rec"), false, |line, _| {
+                commands.push(line.to_string());
+                Err(reason.to_string())
+            });
+            let error = match result {
+                Err(error) => error,
+                Ok(mut guard) => {
+                    guard.armed = false;
+                    panic!("a failed status request started a recording");
+                }
+            };
+            assert_eq!(error, reason);
+            assert_eq!(commands, ["status"]);
+        }
+    }
+
+    #[test]
+    fn older_daemon_is_refused_before_record_start_with_platform_restart_steps() {
+        let old = serde_json::json!({"recording_scoped_stop": true, "recording": false});
+        for (windows, remedy) in [
+            (false, "systemctl --user restart cv1touchd"),
+            (true, "Stop cv1touch, then Start cv1touch in the Start menu"),
+        ] {
+            let error = recording_daemon_status(Some(old.clone()), windows).unwrap_err();
+            assert!(error.contains("older than this cv1touch"));
+            assert!(error.contains(remedy), "{error}");
+        }
+        let mut requests = Vec::new();
+        let result = start_recording_with(
+            &std::env::temp_dir().join("capture.rec"),
+            false,
+            |line, _| {
+                requests.push(line.to_string());
+                Ok(format!("ok {old}"))
+            },
+        );
+        assert!(result.err().unwrap().contains("can't confirm recordings"));
+        assert_eq!(requests, ["status"]);
+        let new = serde_json::json!({"recording_scoped_stop":true,"recording_durable_stop":true,"recording":false});
+        assert!(recording_daemon_status(Some(new), false).is_ok());
+    }
+
     #[test]
     fn scoped_cleanup_accepts_stopped_or_absent_but_not_empty_or_rejection() {
         assert!(scoped_cleanup_reply(

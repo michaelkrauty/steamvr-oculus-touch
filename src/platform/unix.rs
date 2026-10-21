@@ -59,6 +59,20 @@ pub fn sync_file(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+pub fn disk_space(file: &File, _path: &Path) -> io::Result<super::fs::DiskSpace> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: an open descriptor and storage for the result; read only on success.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(super::fs::DiskSpace {
+        available: stat.f_bavail.saturating_mul(stat.f_frsize),
+        capacity: stat.f_blocks.saturating_mul(stat.f_frsize),
+    })
+}
+
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
