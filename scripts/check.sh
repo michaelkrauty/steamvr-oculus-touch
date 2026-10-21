@@ -12,6 +12,50 @@ cargo test --locked --all-targets
 messages=$(mktemp)
 socket_tests=
 trap 'rm -f -- "$messages"; rm -rf -- "${socket_tests:-}"' EXIT
+# On Linux, audit every intentional abort. The cargo test above already built the
+# test harness; --no-run only reprints its artifact path and the native directory
+# its build script compiled in (CV1TOUCH_NATIVE_DIR), so the audit runs the native
+# abort fixtures from the same engine build the harness uses.
+if [ "$(uname -s)" = Linux ]; then
+  cargo test --locked --all-targets --no-run --message-format=json > "$messages"
+  audit=$(python3 - "$messages" <<'PY'
+import json, sys
+from pathlib import Path
+harnesses, natives = set(), set()
+for line in Path(sys.argv[1]).read_text().splitlines():
+    event = json.loads(line)
+    target = event.get("target", {})
+    if (event.get("reason") == "compiler-artifact"
+            and target.get("name") == "cv1touchd"
+            and "bin" in target.get("kind", [])
+            and event.get("profile", {}).get("test") is True
+            and event.get("executable")):
+        harnesses.add(event["executable"])
+    if event.get("reason") == "build-script-executed":
+        natives.update(value for name, value in event.get("env", [])
+                       if name == "CV1TOUCH_NATIVE_DIR")
+if len(harnesses) != 1:
+    raise SystemExit("Cargo did not report exactly one cv1touchd test executable")
+if len(natives) != 1:
+    raise SystemExit("Cargo did not report exactly one native directory for the tests")
+print(harnesses.pop())
+print(natives.pop())
+PY
+)
+  daemon_test=${audit%%$'\n'*}
+  native_test=${audit#*$'\n'}
+  for native_bin in \
+    tests/test_native_log_reentry \
+    tests/test_native_assert_routed \
+    tests/test_native_assert_standalone
+  do
+    if [ ! -x "$native_test/$native_bin" ]; then
+      echo "expected-abort audit: missing $native_test/$native_bin" >&2
+      exit 1
+    fi
+  done
+  python3 tests/check_expected_aborts.py "$daemon_test" "$native_test"
+fi
 cargo build --locked --release --bins --message-format=json > "$messages"
 # Cargo reports the actual executable location, including custom target directories
 # and an explicitly selected native target triple.
