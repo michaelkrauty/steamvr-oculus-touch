@@ -63,9 +63,11 @@ impl Check {
 pub(super) fn doctor(
     calibration: Option<&file::CalibrationFile>,
 ) -> ((bool, String), io::Result<Option<serde_json::Value>>) {
-    sample_status(status_json, thread::sleep, |first, second| {
-        from_snapshots(|| calibration.map(calibration_serials), first, second)
-    })
+    sample_status(
+        || daemon_status(Duration::from_secs(5), DaemonPurpose::Check),
+        thread::sleep,
+        |first, second| from_snapshots(|| calibration.map(calibration_serials), first, second),
+    )
 }
 
 // Preserve request errors alongside the sampled status, as the other CLI status helpers do.

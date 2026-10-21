@@ -50,10 +50,7 @@ fn artifact(path: &Path, validate: impl FnOnce() -> Result<(), String>) -> Artif
 }
 
 fn read_status() -> io::Result<Option<serde_json::Value>> {
-    let reply = daemon_request("status", Duration::from_millis(750))?;
-    Ok(reply
-        .strip_prefix("ok ")
-        .and_then(|json| serde_json::from_str(json).ok()))
+    daemon_status(Duration::from_millis(750), DaemonPurpose::Command)
 }
 
 /// Connected sensors the calibration has no pose for. It may spell a serial in another letter
@@ -154,9 +151,11 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         Ok(()) => Artifact::Valid(format!("{:x}", source_hash.finalize())),
         Err(error) => Artifact::Invalid(error),
     };
-    let first = read_status().ok().flatten();
+    let first = daemon_status(Duration::from_millis(750), DaemonPurpose::Check)
+        .ok()
+        .flatten();
     thread::sleep(Duration::from_millis(300));
-    let second = read_status();
+    let second = daemon_status(Duration::from_millis(750), DaemonPurpose::Check);
     let daemon_detail = second.as_ref().err().map_or_else(
         || "Start cv1touchd with access to the CV1 USB devices.".to_string(),
         |error| {

@@ -52,6 +52,7 @@ mkdir -m 700 "$long_tmp"
     cargo test --locked --all-targets
     meson test -C "$native" --no-rebuild --print-errorlogs
     cargo run --locked --release --example driver_contract -- "$native/driver/test_daemon_contract"
+    CV1TOUCH_TEST_DAEMON="$daemon" CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_runtime_dir.py
     CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_setup.py
     CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_report.py
 )

@@ -96,33 +96,95 @@ fn send_path(line: Result<String, String>) -> i32 {
     }
 }
 
-/// Explain a rejected endpoint using the setting available to the CLI and SteamVR. Library
-/// callers may use other paths, so the transport error itself does not prescribe XDG settings.
-fn daemon_error(error: io::Error) -> io::Error {
-    let Some(long) = error
+#[derive(Clone, Copy)]
+enum DaemonPurpose {
+    Command,
+    Check,
+}
+
+const DAEMON_NOT_RUNNING: &str = "cv1touchd isn't running";
+
+fn daemon_log_hint() -> String {
+    #[cfg(unix)]
+    {
+        "Check the daemon log: journalctl --user _COMM=cv1touchd.".into()
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "Check the daemon log at {}.",
+            cv1touch::supervise::log_file().display()
+        )
+    }
+}
+
+/// Explain CLI control failures using the request's endpoint and budget. Library errors stay
+/// neutral because callers may use other paths or start the daemon in other ways.
+fn daemon_error(
+    error: io::Error,
+    socket: &Path,
+    timeout: Duration,
+    purpose: DaemonPurpose,
+) -> io::Error {
+    if let Some(long) = error
         .get_ref()
         .and_then(|e| e.downcast_ref::<platform::ipc::PathTooLong>())
-    else {
-        return error;
+    {
+        let message = format!(
+            "the path of its control socket is too long ({} bytes; Linux allows at most {} bytes). \
+             Use a shorter XDG_RUNTIME_DIR for cv1touch, cv1touchd and SteamVR. The path is {}",
+            long.bytes,
+            long.limit,
+            long.path.display()
+        );
+        return io::Error::new(error.kind(), message);
+    }
+    let message = match error.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+            if matches!(purpose, DaemonPurpose::Check) {
+                return io::Error::new(error.kind(), DAEMON_NOT_RUNNING);
+            }
+            #[cfg(unix)]
+            let start = "Start it with systemctl --user start cv1touchd.";
+            #[cfg(windows)]
+            let start = "Choose Start cv1touch in the Start menu.";
+            format!("{DAEMON_NOT_RUNNING}. {start} ({error})")
+        }
+        io::ErrorKind::PermissionDenied => format!(
+            "cannot access cv1touchd's control socket at {}: it belongs to another user or has the wrong permissions ({error})",
+            socket.display()
+        ),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+            let log = daemon_log_hint();
+            format!("cv1touchd didn't answer within {} s. {log} ({error})", timeout.as_secs_f64())
+        }
+        _ => return error,
     };
-    let message = format!(
-        "the path of its control socket is too long ({} bytes; Linux allows at most {} bytes). \
-         Use a shorter XDG_RUNTIME_DIR for cv1touch, cv1touchd and SteamVR. The path is {}",
-        long.bytes,
-        long.limit,
-        long.path.display()
-    );
     io::Error::new(error.kind(), message)
 }
 
 /// A request from any CLI command, with actionable transport errors.
 fn daemon_request(line: &str, timeout: Duration) -> io::Result<String> {
-    control::request(&control::socket_path(), line, timeout).map_err(daemon_error)
+    daemon_request_for(line, timeout, DaemonPurpose::Command)
+}
+
+fn daemon_request_for(line: &str, timeout: Duration, purpose: DaemonPurpose) -> io::Result<String> {
+    let socket = control::socket_path();
+    control::request(&socket, line, timeout)
+        .map_err(|error| daemon_error(error, &socket, timeout, purpose))
 }
 
 fn socket_path_problem(socket: &Path) -> Option<String> {
     let long = platform::ipc::path_too_long(socket)?;
-    Some(daemon_error(io::Error::new(io::ErrorKind::InvalidInput, long)).to_string())
+    Some(
+        daemon_error(
+            io::Error::new(io::ErrorKind::InvalidInput, long),
+            socket,
+            Duration::ZERO,
+            DaemonPurpose::Command,
+        )
+        .to_string(),
+    )
 }
 
 /// What is printed when the daemon cannot be reached at `socket`.
@@ -182,13 +244,10 @@ fn stop() -> i32 {
         asked = ask_to_stop();
     }
     match asked {
-        Err(e) if running() => {
-            eprintln!("cv1touch: cv1touchd runs but did not answer within 10 s: {e}");
-            STILL_RUNNING
-        }
-        Err(e) => {
-            eprintln!("{}", cannot_reach(&control::socket_path(), &e));
-            1
+        Err(error) => {
+            let (code, message) = stop_failure(&control::socket_path(), error, running());
+            eprintln!("{message}");
+            code
         }
         Ok(reply) if reply.starts_with("err") => {
             println!("{reply}");
@@ -207,8 +266,33 @@ fn stop() -> i32 {
     }
 }
 
+fn stop_failure(socket: &Path, error: io::Error, running: bool) -> (i32, String) {
+    let absent = matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    );
+    if running {
+        let message = if absent {
+            format!(
+                "cv1touch: cv1touchd is running but isn't answering its control socket at {}. {}",
+                socket.display(),
+                daemon_log_hint()
+            )
+        } else {
+            format!(
+                "cv1touch: cv1touchd is running but isn't answering its control socket: {error}"
+            )
+        };
+        (STILL_RUNNING, message)
+    } else if absent {
+        (1, format!("cv1touch: {DAEMON_NOT_RUNNING}"))
+    } else {
+        (1, cannot_reach(socket, &error))
+    }
+}
+
 fn ask_to_stop() -> io::Result<String> {
-    daemon_request("stop", Duration::from_secs(5))
+    daemon_request_for("stop", Duration::from_secs(5), DaemonPurpose::Check)
 }
 
 /// Whether another process holds the lock file `path`.
@@ -419,6 +503,45 @@ fn doctor(json: bool) -> i32 {
     }
 }
 
+fn board_status(
+    generation: u64,
+    request: impl FnOnce(&str, Duration) -> io::Result<String>,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let reply = match request("status", Duration::from_millis(200)) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return (
+                None,
+                Some(format!(
+                    "{error}; showing the SHM compatibility prefix (at most eight sensors)."
+                )),
+            )
+        }
+    };
+    let complete = reply
+        .strip_prefix("ok ")
+        .and_then(|reply| serde_json::from_str::<serde_json::Value>(reply).ok())
+        .filter(|v| v["generation"].as_u64() == Some(generation));
+    (complete, None)
+}
+
+fn board_sensors<'a>(
+    complete: Option<&serde_json::Value>,
+    unavailable: Option<&'a str>,
+    prefix: impl FnOnce() -> Vec<shm::SensorStatus>,
+) -> (Vec<shm::SensorStatus>, &'a str) {
+    match complete.map(status::sensors_from_status) {
+            Some(Ok(sensors)) => {
+                let note = if complete.unwrap()["sensor_total"].as_u64().is_none() {
+                    "Legacy daemon diagnostics may show only the first eight sensors."
+                } else { "" };
+                (sensors, note)
+            }
+            _ => (prefix(),
+                unavailable.unwrap_or("Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors).")),
+    }
+}
+
 fn status_board(shm_name: &str) -> i32 {
     if let Some(problem) = socket_path_problem(&control::socket_path()) {
         eprintln!("cv1touch: cannot reach cv1touchd: {problem}");
@@ -442,12 +565,7 @@ fn status_board(shm_name: &str) -> i32 {
             };
         }
         let r = reader.as_ref().unwrap();
-        let complete = daemon_request("status", Duration::from_millis(200))
-            .ok()
-            .and_then(|reply| {
-                serde_json::from_str::<serde_json::Value>(reply.strip_prefix("ok ")?).ok()
-            })
-            .filter(|v| v["generation"].as_u64() == Some(r.generation()));
+        let (complete, unavailable) = board_status(r.generation(), daemon_request);
         if let Some(current) = &complete {
             match &stream_sample {
                 Some((then, previous))
@@ -464,16 +582,10 @@ fn status_board(shm_name: &str) -> i32 {
             stream_sample = None;
             stream_note = "sensor_streams: skipped: control diagnostics unavailable".into();
         }
-        let (sensors, sensor_note) = match complete.as_ref().map(status::sensors_from_status) {
-            Some(Ok(sensors)) => {
-                let note = if complete.as_ref().unwrap()["sensor_total"].as_u64().is_none() {
-                    "Legacy daemon diagnostics may show only the first eight sensors."
-                } else { "" };
-                (sensors, note)
-            }
-            _ => (r.sensors().unwrap_or_default(),
-                "Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors)."),
-        };
+        let (sensors, sensor_note) =
+            board_sensors(complete.as_ref(), unavailable.as_deref(), || {
+                r.sensors().unwrap_or_default()
+            });
         let received = complete
             .as_ref()
             .is_some_and(status::has_received_frame_counters);
@@ -773,7 +885,14 @@ fn state_dir() -> PathBuf {
 }
 
 fn status_json() -> io::Result<Option<serde_json::Value>> {
-    let reply = daemon_request("status", Duration::from_secs(5))?;
+    daemon_status(Duration::from_secs(5), DaemonPurpose::Command)
+}
+
+fn daemon_status(
+    timeout: Duration,
+    purpose: DaemonPurpose,
+) -> io::Result<Option<serde_json::Value>> {
+    let reply = daemon_request_for("status", timeout, purpose)?;
     Ok(reply
         .strip_prefix("ok ")
         .and_then(|json| serde_json::from_str(json).ok()))
@@ -6800,6 +6919,264 @@ mod tests {
         eprintln!("delayed inventory (250 us/index): full scan {:.3} ms wall / 16.000 ms injected; incremental max {:.3} ms wall work per tick / 0.250 ms injected; max modeled pose gap {:.3} ms", full_scan.as_secs_f64() * 1000., max_wall_step.as_secs_f64() * 1000., max_gap as f64 * 1e-6);
     }
 
+    fn control_error_board_note(kind: io::ErrorKind) -> String {
+        let socket = Path::new("/fixture/run/cv1touch/control.sock");
+        let mut description = None;
+        let (complete, note) = board_status(42, |line, timeout| {
+            assert_eq!(line, "status");
+            assert_eq!(timeout, Duration::from_millis(200));
+            let error = daemon_error(
+                io::Error::new(kind, "fixture OS detail"),
+                socket,
+                timeout,
+                DaemonPurpose::Command,
+            );
+            assert_eq!(error.kind(), kind);
+            description = Some(error.to_string());
+            Err(error)
+        });
+        assert!(complete.is_none());
+        let note = note.expect("the board discarded the request failure");
+        let (sensors, note) = board_sensors(complete.as_ref(), Some(&note), || {
+            vec![shm::SensorStatus {
+                frames: 77,
+                ..Default::default()
+            }]
+        });
+        assert_eq!(sensors[0].frames, 77);
+        assert!(note.starts_with(&description.unwrap()), "{note}");
+        assert!(note.contains("fixture OS detail"), "{note}");
+        assert!(
+            note.ends_with("showing the SHM compatibility prefix (at most eight sensors)."),
+            "{note}"
+        );
+        note.to_owned()
+    }
+
+    #[test]
+    fn missing_and_refused_control_errors_name_the_start_command() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            let note = control_error_board_note(kind);
+            assert!(note.contains("cv1touchd isn't running"), "{note}");
+            #[cfg(unix)]
+            assert!(note.contains("systemctl --user start cv1touchd"), "{note}");
+            #[cfg(windows)]
+            assert!(note.contains("Start cv1touch in the Start menu"), "{note}");
+            assert!(note.contains("(fixture OS detail)"), "{note}");
+        }
+    }
+
+    #[test]
+    fn denied_control_errors_name_the_socket_and_permissions() {
+        let note = control_error_board_note(io::ErrorKind::PermissionDenied);
+        assert!(
+            note.contains("/fixture/run/cv1touch/control.sock"),
+            "{note}"
+        );
+        assert!(note.contains("another user"), "{note}");
+        assert!(note.contains("wrong permissions"), "{note}");
+        assert!(note.contains("(fixture OS detail)"), "{note}");
+    }
+
+    #[test]
+    fn timed_out_control_errors_name_the_budget_and_logs() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            let note = control_error_board_note(kind);
+            assert!(
+                note.contains("cv1touchd didn't answer within 0.2 s"),
+                "{note}"
+            );
+            #[cfg(unix)]
+            assert!(note.contains("journalctl --user _COMM=cv1touchd"), "{note}");
+            #[cfg(windows)]
+            assert!(
+                note.contains(&cv1touch::supervise::log_file().display().to_string()),
+                "{note}"
+            );
+            assert!(note.contains("(fixture OS detail)"), "{note}");
+            for (timeout, seconds) in [
+                (Duration::from_millis(750), "0.75"),
+                (Duration::from_secs(1), "1"),
+                (Duration::from_secs(5), "5"),
+            ] {
+                let error = daemon_error(
+                    io::Error::new(kind, "fixture OS detail"),
+                    Path::new("/fixture/control.sock"),
+                    timeout,
+                    DaemonPurpose::Command,
+                );
+                assert_eq!(error.kind(), kind);
+                assert!(
+                    error.to_string().contains(&format!("within {seconds} s")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_control_errors_keep_their_details() {
+        let note = control_error_board_note(io::ErrorKind::InvalidData);
+        assert!(note.starts_with("fixture OS detail;"), "{note}");
+        assert!(!note.contains("isn't running"), "{note}");
+        assert!(!note.contains("permissions"), "{note}");
+    }
+
+    #[test]
+    fn control_error_messages_keep_the_raw_os_detail() {
+        #[cfg(unix)]
+        let error = io::Error::from_raw_os_error(13);
+        #[cfg(windows)]
+        let error = io::Error::from_raw_os_error(5);
+        let raw = error.to_string();
+        let error = daemon_error(
+            error,
+            Path::new("/fixture/control.sock"),
+            Duration::from_secs(1),
+            DaemonPurpose::Command,
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().ends_with(&format!("({raw})")), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_board_keeps_the_control_path_length_error() {
+        let path = format!("/{}/control.sock", "r".repeat(94));
+        let socket = Path::new(&path);
+        let (complete, note) = board_status(42, |_, timeout| {
+            let long = platform::ipc::path_too_long(socket).unwrap();
+            Err(daemon_error(
+                io::Error::new(io::ErrorKind::InvalidInput, long),
+                socket,
+                timeout,
+                DaemonPurpose::Command,
+            ))
+        });
+        assert!(complete.is_none());
+        let unavailable = note.unwrap();
+        let (_, note) = board_sensors(complete.as_ref(), Some(&unavailable), Vec::new);
+        for expected in [
+            "too long (108 bytes",
+            "at most 107 bytes",
+            "XDG_RUNTIME_DIR",
+            &path,
+        ] {
+            assert!(note.contains(expected), "{note}");
+        }
+        assert!(!note.contains("isn't running"), "{note}");
+    }
+
+    #[test]
+    fn the_board_status_read_keeps_the_budget_and_generation_filter() {
+        for (reply, expected) in [
+            ("ok {\"generation\":42}", true),
+            ("ok {\"generation\":41}", false),
+            ("ok {\"generation\":\"42\"}", false),
+            ("err unavailable", false),
+            ("ok {", false),
+            ("{\"generation\":42}", false),
+        ] {
+            let mut calls = 0;
+            let (complete, problem) = board_status(42, |line, timeout| {
+                calls += 1;
+                assert_eq!(line, "status");
+                assert_eq!(timeout, Duration::from_millis(200));
+                Ok(reply.into())
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(complete.is_some(), expected, "{reply}");
+            assert!(
+                problem.is_none(),
+                "a protocol response was diagnosed as a transport error"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_reports_an_absent_daemon_without_start_advice() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            let (code, message) = stop_failure(
+                Path::new("/fixture/control.sock"),
+                io::Error::new(kind, "fixture OS detail"),
+                false,
+            );
+            assert_eq!(code, 1);
+            assert_eq!(message, "cv1touch: cv1touchd isn't running");
+        }
+    }
+
+    #[test]
+    fn stop_reports_a_running_daemon_with_an_unreachable_socket_consistently() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            let (code, message) = stop_failure(
+                Path::new("/fixture/control.sock"),
+                io::Error::new(kind, "fixture OS detail"),
+                true,
+            );
+            assert_eq!(code, 2);
+            assert!(
+                message.contains("cv1touchd is running but isn't answering its control socket"),
+                "{message}"
+            );
+            assert!(message.contains("/fixture/control.sock"), "{message}");
+            #[cfg(unix)]
+            assert!(
+                message.contains("journalctl --user _COMM=cv1touchd"),
+                "{message}"
+            );
+            #[cfg(windows)]
+            assert!(message.contains("cv1touchd.log"), "{message}");
+            assert!(!message.contains("isn't running"), "{message}");
+            assert!(!message.contains("start cv1touchd"), "{message}");
+            assert!(!message.contains("Start cv1touch"), "{message}");
+        }
+    }
+
+    #[test]
+    fn checks_report_expected_absence_without_start_advice() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            let error = daemon_error(
+                io::Error::new(kind, "fixture OS detail"),
+                Path::new("/fixture/control.sock"),
+                Duration::from_secs(5),
+                DaemonPurpose::Check,
+            );
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "cv1touchd isn't running");
+        }
+    }
+
+    #[test]
+    fn board_sensor_selection_keeps_complete_legacy_and_fallback_diagnostics() {
+        for (value, expected) in [
+            (serde_json::json!({"sensors": [], "sensor_total": 0}), ""),
+            (
+                serde_json::json!({"sensors": []}),
+                "Legacy daemon diagnostics may show only the first eight sensors.",
+            ),
+        ] {
+            let (sensors, note) = board_sensors(Some(&value), Some("unused failure"), || {
+                panic!("complete diagnostics must not read the prefix")
+            });
+            assert!(sensors.is_empty());
+            assert_eq!(note, expected);
+        }
+        for value in [
+            None,
+            Some(serde_json::json!({"sensors": [] , "sensor_total": 1})),
+        ] {
+            let (sensors, note) = board_sensors(value.as_ref(), None, || {
+                vec![shm::SensorStatus {
+                    frames: 77,
+                    ..Default::default()
+                }]
+            });
+            assert_eq!(sensors[0].frames, 77);
+            assert_eq!(note, "Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors).");
+        }
+    }
+
     /// A control socket path Linux cannot address is named as the reason the daemon cannot be
     /// reached, with the remedy; one it can address keeps the connection error.
     #[cfg(unix)]
@@ -6827,7 +7204,12 @@ mod tests {
             assert_eq!(socket.len(), 108);
             let socket = Path::new(&socket);
             let long = platform::ipc::path_too_long(socket).unwrap();
-            let error = daemon_error(io::Error::new(io::ErrorKind::InvalidInput, long));
+            let error = daemon_error(
+                io::Error::new(io::ErrorKind::InvalidInput, long),
+                socket,
+                Duration::from_secs(5),
+                DaemonPurpose::Command,
+            );
             let line = cannot_reach(socket, &error);
             assert!(
                 line.starts_with("cv1touch: cannot reach cv1touchd at "),

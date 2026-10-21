@@ -104,7 +104,8 @@ library, `cv1touch` and `cv1touchd` test binaries and, under
 contract example's test build; a plain `cargo test` builds that example without `cfg(test)`.
 
 `scripts/check.sh` also reruns the Rust and native suites, driver contract, and
-Python setup and report suites with an explicitly long `TMPDIR`. It creates a
+Python setup, report and control-error suites with an explicitly long `TMPDIR`.
+It creates a
 private tree under the build output, adds an 80-byte directory component, and
 removes that tree on exit, including when a test fails. This catches a reverted helper or
 caller even when the check script itself was started with a short temporary base.
@@ -186,6 +187,14 @@ exercise length rejection instead of the intended `ENOENT` retry.
 | `src/bin/cv1touchd.rs` | `a_startup_recording_open_or_header_error_is_fatal_and_retires_ipc` | T + N + 50 = 150 | 52 |
 | `src/bin/cv1touchd.rs` | `startup_recording_cleanup_reports_its_final_storage_outcome` | T + N + 62 = 162 | 52 |
 | `src/bin/cv1touchd.rs` | `a_startup_error_queued_during_the_shutdown_wait_remains_fatal` | T + N + 42 = 142 | 52 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_a_missing_control_socket_explains_how_to_start_the_daemon` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_a_refused_control_socket_explains_how_to_start_the_daemon` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_a_denied_control_socket_names_the_path_and_permissions` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_an_unanswered_control_request_names_its_budget_and_the_log` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_stop_without_a_daemon_does_not_suggest_starting_it` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_stop_with_a_held_lock_reports_running_without_a_control_socket` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_setup_daemon_check_reports_expected_absence_without_start_advice` | fixture introduced with short paths | 55 |
+| `tests/test_runtime_dir.py` | `CliControlErrorTests.test_doctor_daemon_check_and_video_skip_do_not_suggest_starting` | fixture introduced with short paths | 55 |
 
 `test_control_client.cpp` uses its legacy/shared fixture from
 `runtime_is_tried_first_and_an_explicit_path_stays_exact`,

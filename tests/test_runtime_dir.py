@@ -2,6 +2,9 @@
 # Copyright 2026 michaelkrauty
 """Exercise startup diagnostics before the daemon creates state or opens hardware."""
 import os
+import json
+import socket
+from socket_dir import SocketDirectory
 from pathlib import Path
 import subprocess
 import tempfile
@@ -208,3 +211,105 @@ class CliSocketPathTests(unittest.TestCase):
                 result = self.run_cli(*command)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assert_explains(result.stdout)
+
+
+@unittest.skipUnless(CLI and LIBRARY_PATH and os.name == "posix",
+                     "requires built CLI, native library path and Unix sockets")
+class CliControlErrorTests(unittest.TestCase):
+    """Real CLI request failures against private endpoints, never the installed daemon."""
+
+    def setUp(self):
+        temporary = SocketDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.endpoint = self.root / "run/cv1touch/control.sock"
+        self.endpoint.parent.mkdir(parents=True)
+        self.env = dict(os.environ, HOME=str(self.root / "home"),
+                        XDG_CONFIG_HOME=str(self.root / "config"),
+                        XDG_DATA_HOME=str(self.root / "data"),
+                        XDG_CACHE_HOME=str(self.root / "cache"),
+                        XDG_STATE_HOME=str(self.root / "state"),
+                        XDG_RUNTIME_DIR=str(self.root / "run"), LD_LIBRARY_PATH=LIBRARY_PATH)
+
+    def bind(self):
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(self.endpoint))
+        return server
+
+    def run_cli(self, *command, timeout=10, exit_code=1):
+        result = subprocess.run([CLI, *command], env=self.env, capture_output=True,
+                                text=True, timeout=timeout)
+        self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+        return result.stderr
+
+    def assert_start_advice(self, text):
+        self.assertIn("cv1touchd isn't running", text)
+        self.assertIn("systemctl --user start cv1touchd", text)
+        self.assertIn("os error", text)
+
+    def test_a_missing_control_socket_explains_how_to_start_the_daemon(self):
+        for command in (["status", "--json"], ["inputs", "--json"], ["prediction"]):
+            with self.subTest(command=command):
+                self.assert_start_advice(self.run_cli(*command))
+
+    def test_a_refused_control_socket_explains_how_to_start_the_daemon(self):
+        self.bind().close()
+        self.assert_start_advice(self.run_cli("inputs", "--json"))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root bypasses the socket's permission check")
+    def test_a_denied_control_socket_names_the_path_and_permissions(self):
+        self.bind()
+        self.endpoint.chmod(0)
+        text = self.run_cli("inputs", "--json")
+        self.assertIn(str(self.endpoint), text)
+        self.assertIn("another user", text)
+        self.assertIn("wrong permissions", text)
+        self.assertIn("os error", text)
+
+    def test_an_unanswered_control_request_names_its_budget_and_the_log(self):
+        # A listener that never accepts cannot answer; no reply thread must win a deadline.
+        self.bind().listen()
+        text = self.run_cli("inputs", "--json")
+        self.assertIn("cv1touchd didn't answer within 5 s", text)
+        self.assertIn("journalctl --user _COMM=cv1touchd", text)
+
+    def test_stop_without_a_daemon_does_not_suggest_starting_it(self):
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                if refused:
+                    self.bind().close()
+                text = self.run_cli("stop")
+                self.assertEqual(text, "cv1touch: cv1touchd isn't running\n")
+
+    def test_stop_with_a_held_lock_reports_running_without_a_control_socket(self):
+        import fcntl
+        with (self.endpoint.parent / "daemon.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            text = self.run_cli("stop", timeout=20, exit_code=2)
+        self.assertIn("cv1touchd is running but isn't answering its control socket", text)
+        self.assertIn(str(self.endpoint), text)
+        self.assertIn("journalctl --user _COMM=cv1touchd", text)
+        self.assertNotIn("isn't running", text)
+        self.assertNotIn("start cv1touchd", text)
+
+    def check_absent_daemon(self, command, detail="cv1touchd isn't running"):
+        result = subprocess.run([CLI, *command, "--json"], env=self.env, capture_output=True,
+                                text=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        checks = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["daemon"]["detail"], detail)
+        self.assertFalse(checks["daemon"]["ok"])
+        return checks
+
+    def test_setup_daemon_check_reports_expected_absence_without_start_advice(self):
+        # The guide gives its own instruction; the shared formatter adds no platform start advice.
+        self.check_absent_daemon(
+            ["setup", "--check"],
+            "Start cv1touchd with access to the CV1 USB devices. (cv1touchd isn't running)")
+
+    def test_doctor_daemon_check_and_video_skip_do_not_suggest_starting(self):
+        checks = self.check_absent_daemon(["doctor"])
+        self.assertTrue(checks["sensor_streams"]["ok"])
+        self.assertEqual(checks["sensor_streams"]["detail"], "skipped: daemon isn't running")

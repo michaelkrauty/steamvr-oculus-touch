@@ -212,7 +212,7 @@ class SetupTests(unittest.TestCase):
         self.stop_daemon()
         output = self.terminal_guide("q\n", expected_code=1)
         self.assertIn("Start cv1touchd", output)
-        self.assertIn("os error 2", output)
+        self.assertIn("cv1touchd isn't running", output)
         self.assertIn("press Enter to check again", output)
         self.assertNotIn("before recording", output)
         self.assertNotIn("cannot reach", output)
