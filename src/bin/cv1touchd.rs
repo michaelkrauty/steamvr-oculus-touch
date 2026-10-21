@@ -2922,9 +2922,43 @@ struct HandMemory {
     last_seen: Option<[f32; 3]>,
     /// The state last published while the controller's samples arrived: what a radio gap holds.
     last_live: Option<ControllerState>,
+    /// Requests beyond a still-pending window's cutoff. They survive returns and reopens;
+    /// only acceptance/coverage or cancellation removes one. Empty in ordinary operation.
+    deferred_captures: std::collections::VecDeque<(u64, bool)>,
 }
 
 impl HandMemory {
+    fn retry_captures(&mut self, flight: &FlightRecorder, h: usize) {
+        while let Some(&(anchor, in_use)) = self.deferred_captures.front() {
+            if !flight.dropout(h, anchor, in_use) {
+                break;
+            }
+            self.deferred_captures.pop_front();
+        }
+    }
+
+    fn cancel_capture(&mut self, flight: &FlightRecorder, h: usize, anchor: u64) {
+        self.deferred_captures
+            .retain(|&(pending, _)| pending != anchor);
+        flight.cancel(h, anchor);
+    }
+
+    fn request_capture(&mut self, flight: &FlightRecorder, h: usize, anchor: u64, in_use: bool) {
+        self.retry_captures(flight, h);
+        // Retain at most one request per window. These exceptional metadata allocations occur
+        // only after an older window's cutoff, under the existing hand lock, never in callbacks.
+        if self
+            .deferred_captures
+            .iter()
+            .any(|&(last, _)| (last..=last.saturating_add(flight::AFTER_NS)).contains(&anchor))
+        {
+            return;
+        }
+        if !self.deferred_captures.is_empty() || !flight.dropout(h, anchor, in_use) {
+            self.deferred_captures.push_back((anchor, in_use));
+        }
+    }
+
     /// Notes whether the controller is connected and has a position at `now`; returns what
     /// changed for the log: a loss, or a position regained and how long that took. A controller
     /// going to sleep is not losing its position, and one waking is without one from then.
@@ -2978,27 +3012,30 @@ fn apply_tracker(
     }
 }
 
-/// Record changes in publication order under the hand lock. These operations are atomic and
-/// perform no I/O. A radio gap of at least `flight::SHORTEST_NS` is recorded if it began in use or
-/// ends; a shorter one that ends is a blip and is cancelled. A gap an engine reopen or a stalled
-/// thread began is no radio dropout and is never recorded.
-fn record_gap(d: &Daemon, h: usize, event: GapEvent) {
+/// Record changes in publication order under the hand lock, without I/O. A radio gap of at
+/// least `flight::SHORTEST_NS` is recorded if it began in use or ends; a shorter one that ends is
+/// a blip and is cancelled. A request the recorder rejects, because an older recording's window
+/// ends before it, is kept for retry. A gap an engine reopen or a stalled thread began is no
+/// radio dropout and is never recorded.
+fn record_gap(d: &Daemon, h: usize, event: GapEvent, memory: &mut HandMemory) {
     match event {
         GapEvent::Began {
             last_sample_host_ns,
             moving: true,
             cause: GapCause::Radio,
-        } => d.flight.dropout(h, last_sample_host_ns, true),
+        } => memory.request_capture(&d.flight, h, last_sample_host_ns, true),
         GapEvent::Ended {
             last_sample_host_ns,
             silent_ns,
             cause: GapCause::Radio,
-        } if silent_ns >= flight::SHORTEST_NS => d.flight.dropout(h, last_sample_host_ns, false),
+        } if silent_ns >= flight::SHORTEST_NS => {
+            memory.request_capture(&d.flight, h, last_sample_host_ns, false)
+        }
         GapEvent::Ended {
             last_sample_host_ns,
             cause: GapCause::Radio,
             ..
-        } => d.flight.cancel(h, last_sample_host_ns),
+        } => memory.cancel_capture(&d.flight, h, last_sample_host_ns),
         _ => {}
     }
 }
@@ -3044,7 +3081,7 @@ fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
     let unix_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |t| t.as_secs());
-    for dropout in d.flight.due(shm::now_ns()) {
+    for dropout in take_dropouts(d, shm::now_ns()) {
         let Some(writer) = writer else {
             log("could not record a dropout: the recording thread did not start");
             continue;
@@ -3058,6 +3095,20 @@ fn save_dropouts(d: &Daemon, writer: Option<&flight_writer::Writer>) {
             Err(e) => log!("could not record a dropout: {e}"),
         }
     }
+}
+
+fn take_dropouts(d: &Daemon, now: u64) -> Vec<flight::Dropout> {
+    let retry = || {
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            if let Ok(mut publisher) = d.hands[h].try_lock() {
+                publisher.memory.retry_captures(&d.flight, h);
+            }
+        }
+    };
+    retry();
+    let due = d.flight.due(now);
+    retry();
+    due
 }
 
 /// What a controller in a radio gap is published as: the state last published while its samples
@@ -3289,6 +3340,7 @@ impl HandPublisher {
         mut state: ControllerState,
         now: u64,
     ) -> Option<GapEvent> {
+        self.memory.retry_captures(&d.flight, h);
         if state.flags & ffi::CV1T_FLAG_RADIO_GAP != 0 {
             if let Some(last) = &self.memory.last_live {
                 state = held_through_gap(last, now);
@@ -3299,7 +3351,7 @@ impl HandPublisher {
         let notice = self.hand.take_event();
         d.shm.publish_hand(h, &state);
         if let Some(event) = notice {
-            record_gap(d, h, event);
+            record_gap(d, h, event, &mut self.memory);
         }
         if d.rec.active() {
             d.rec.write(
@@ -4773,6 +4825,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    fn record_test_gap(d: &Daemon, h: usize, event: GapEvent) {
+        let mut publisher = d.hands[h].lock().unwrap();
+        super::record_gap(d, h, event, &mut publisher.memory);
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -5823,12 +5880,261 @@ mod tests {
         }
     }
 
+    mod capture_admission_tests {
+        use super::*;
+        const BASE: u64 = 80_000_000_000;
+        const MS: u64 = 1_000_000;
+        fn sample(at: u64, moving: bool) -> engine::Controller {
+            engine::Controller {
+                calibrated: true,
+                received_host_ns: BASE + at * MS,
+                device_time_ns: (at + 1) * MS,
+                imu_gyro: [if moving { 1.0 } else { 0.0 }, 0.0, 0.0],
+                trigger: 0.8,
+                ..Default::default()
+            }
+        }
+        fn publish(d: &Daemon, c: &engine::Controller, at: u64) {
+            publish_hand_state(d, HAND_LEFT, c, || BASE + at * MS, None);
+        }
+        fn delayed_save_keeps_second_gap(return_before_save: bool) {
+            let d = status_daemon();
+            let a = sample(0, true);
+            publish(&d, &a, 0);
+            publish(&d, &a, 150);
+            publish(&d, &sample(800, true), 800);
+            for at in (840..10000).step_by(40) {
+                publish(&d, &sample(at, true), at);
+            }
+            let b = sample(10010, true);
+            publish(&d, &b, 10010);
+            publish(&d, &b, 10110);
+            // Publication retries while the older window still waits to be saved.
+            publish(&d, &b, 10150);
+            if return_before_save {
+                d.flight.note(
+                    recorder::RAW_REPORT,
+                    BASE + 10610 * MS,
+                    &[&1u32.to_le_bytes(), &[0u8; 64]],
+                );
+                publish(&d, &sample(10810, false), 10810);
+            }
+            let at = if return_before_save { 10900 } else { 10200 };
+            let first = d.flight.due(BASE + at * MS);
+            assert_eq!(
+                first.iter().map(|r| r.last_report_ns).collect::<Vec<_>>(),
+                [BASE]
+            );
+            // No new gap event is needed to retry. Publication/heartbeat already owns the lock.
+            publish_unavailable_with_log(&d, BASE + (at + 120) * MS, |_| {});
+            if !return_before_save {
+                d.flight.note(
+                    recorder::RAW_REPORT,
+                    BASE + 10610 * MS,
+                    &[&1u32.to_le_bytes(), &[0u8; 64]],
+                );
+                publish(&d, &sample(10810, false), 10810);
+            }
+            let second = d.flight.due(BASE + 20010 * MS);
+            assert_eq!(
+                second
+                    .iter()
+                    .map(|r| (r.last_report_ns, r.began_in_use))
+                    .collect::<Vec<_>>(),
+                [(BASE + 10010 * MS, true)],
+                "second identity was rejected and forgotten"
+            );
+            assert!(
+                second[0].records.iter().any(|r| r.1 == BASE + 10610 * MS),
+                "the later gap's radio traffic is outside the older recording"
+            );
+        }
+        #[test]
+        fn an_in_use_request_after_a_pending_windows_cutoff_is_retried() {
+            delayed_save_keeps_second_gap(false);
+        }
+        #[test]
+        fn a_rejected_request_survives_its_gap_ending_before_the_save_tick() {
+            delayed_save_keeps_second_gap(true);
+        }
+        #[test]
+        fn a_save_tick_retries_multiple_uncovered_windows_without_a_reader_event() {
+            let d = status_daemon();
+            for at in [0, 10010, 20020, 30030] {
+                record_test_gap(
+                    &d,
+                    HAND_LEFT,
+                    GapEvent::Began {
+                        last_sample_host_ns: BASE + at * MS,
+                        moving: true,
+                        cause: GapCause::Radio,
+                    },
+                );
+            }
+            let mut anchors = Vec::new();
+            for _ in 0..4 {
+                anchors.extend(
+                    take_dropouts(&d, BASE + 40030 * MS)
+                        .iter()
+                        .map(|r| r.last_report_ns),
+                );
+            }
+            assert_eq!(
+                anchors,
+                [
+                    BASE,
+                    BASE + 10010 * MS,
+                    BASE + 20020 * MS,
+                    BASE + 30030 * MS
+                ]
+            );
+            assert!(take_dropouts(&d, BASE + 50000 * MS).is_empty());
+        }
+
+        #[test]
+        fn cancelling_a_deferred_blip_keeps_the_older_recording() {
+            let d = status_daemon();
+            for at in [0, 10010] {
+                record_test_gap(
+                    &d,
+                    HAND_LEFT,
+                    GapEvent::Began {
+                        last_sample_host_ns: BASE + at * MS,
+                        moving: true,
+                        cause: GapCause::Radio,
+                    },
+                );
+            }
+            record_test_gap(
+                &d,
+                HAND_LEFT,
+                GapEvent::Ended {
+                    last_sample_host_ns: BASE + 10010 * MS,
+                    silent_ns: 300 * MS,
+                    cause: GapCause::Radio,
+                },
+            );
+            let first = take_dropouts(&d, BASE + 11000 * MS);
+            assert_eq!(
+                first.iter().map(|r| r.last_report_ns).collect::<Vec<_>>(),
+                [BASE]
+            );
+            assert!(take_dropouts(&d, BASE + 21000 * MS).is_empty());
+        }
+
+        #[test]
+        fn a_gap_on_the_pending_window_boundary_is_covered_once() {
+            let d = status_daemon();
+            for at in [0, 10000] {
+                record_test_gap(
+                    &d,
+                    HAND_LEFT,
+                    GapEvent::Began {
+                        last_sample_host_ns: BASE + at * MS,
+                        moving: true,
+                        cause: GapCause::Radio,
+                    },
+                );
+            }
+            assert_eq!(take_dropouts(&d, BASE + 11000 * MS).len(), 1);
+            assert!(take_dropouts(&d, BASE + 21000 * MS).is_empty());
+        }
+
+        // Ground truth folds requests only into a pending window containing their anchor.
+        // Saving removes one ready window; a cancelled blip removes only its own anchor.
+        // The real recorder and persistent publisher metadata handle admission and retry.
+        #[test]
+        fn seeded_capture_admission_keeps_every_uncovered_window() {
+            use std::collections::VecDeque;
+            let seeds = std::env::var("CV1TOUCH_CAPTURE_SEEDS").map_or(64, |n| n.parse().unwrap());
+            let flight = FlightRecorder::new();
+            let mut windows = 0;
+            for seed in 0..seeds {
+                let mut rng = seed + 1;
+                let mut random = || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                let mut memory = HandMemory::default();
+                let mut oracle = VecDeque::<u64>::new();
+                let mut at = BASE + seed * 1_000_000_000_000;
+                for _ in 0..16 {
+                    at += [
+                        300 * MS,
+                        500 * MS,
+                        9999 * MS,
+                        10000 * MS,
+                        10000 * MS + 1,
+                        21000 * MS,
+                    ][random() as usize % 6];
+                    memory.request_capture(&flight, HAND_LEFT, at, random() & 1 != 0);
+                    if !oracle
+                        .iter()
+                        .any(|&start| start <= at && at <= start + 10_000_000_000)
+                    {
+                        oracle.push_back(at);
+                    }
+                    if random() % 4 == 0 {
+                        memory.cancel_capture(&flight, HAND_LEFT, at);
+                        oracle.retain(|&start| start != at);
+                    }
+                    if random() % 3 == 0 {
+                        let now = at + 200 * MS;
+                        memory.retry_captures(&flight, HAND_LEFT);
+                        let got: Vec<_> =
+                            flight.due(now).iter().map(|r| r.last_report_ns).collect();
+                        memory.retry_captures(&flight, HAND_LEFT);
+                        let want: Vec<_> = if oracle
+                            .front()
+                            .is_some_and(|&start| start + 10_000_000_000 <= now)
+                        {
+                            oracle.pop_front().into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        assert_eq!(got, want, "seed {seed}, at {at}");
+                        windows += got.len();
+                    }
+                }
+                while let Some(want) = oracle.pop_front() {
+                    memory.retry_captures(&flight, HAND_LEFT);
+                    let got: Vec<_> = flight
+                        .due(at + 11_000_000_000)
+                        .iter()
+                        .map(|r| r.last_report_ns)
+                        .collect();
+                    memory.retry_captures(&flight, HAND_LEFT);
+                    assert_eq!(
+                        got,
+                        [want],
+                        "seed {seed}: deferred identity lost or duplicated"
+                    );
+                    windows += 1;
+                }
+                memory.retry_captures(&flight, HAND_LEFT);
+                assert!(
+                    flight.due(at + 11_000_000_000).is_empty(),
+                    "seed {seed}: extra window"
+                );
+                assert!(
+                    memory.deferred_captures.is_empty(),
+                    "seed {seed}: stranded request"
+                );
+            }
+            eprintln!(
+                "capture admission model: {seeds} traces, {windows} expected windows retained"
+            );
+        }
+    }
+
     #[test]
     fn a_gap_recording_keeps_its_initial_use_priority_when_the_radio_returns() {
         let d = status_daemon();
         let last = 1_000_000_000;
         for (hand, moving) in [(0, true), (1, false)] {
-            record_gap(
+            record_test_gap(
                 &d,
                 hand,
                 GapEvent::Began {
@@ -5837,7 +6143,7 @@ mod tests {
                     cause: GapCause::Radio,
                 },
             );
-            record_gap(
+            record_test_gap(
                 &d,
                 hand,
                 GapEvent::Ended {

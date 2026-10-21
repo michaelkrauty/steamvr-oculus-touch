@@ -112,20 +112,18 @@ impl FlightRecorder {
         }
     }
 
-    /// The controller of `hand` dropped out, its last report at `last_report_ns` (not 0): its
-    /// recording is taken once `AFTER_NS` have passed. A second dropout of the same hand before
-    /// then is in that recording.
-    pub fn dropout(&self, hand: usize, last_report_ns: u64, began_in_use: bool) {
-        if self.pending[hand].load(Ordering::Acquire) != 0 {
-            return;
+    /// Request a window for this hand. True: accepted, or covered by the pending window.
+    /// False: an older window stops before this gap; the caller must retain and retry it.
+    /// Each hand has one publisher, serialized by the daemon's existing publication lock.
+    pub fn dropout(&self, hand: usize, last_report_ns: u64, began_in_use: bool) -> bool {
+        let pending = self.pending[hand].load(Ordering::Acquire);
+        if pending != 0 {
+            return (pending..=pending.saturating_add(AFTER_NS)).contains(&last_report_ns);
         }
         self.began_in_use[hand].store(began_in_use, Ordering::Relaxed);
-        let _ = self.pending[hand].compare_exchange(
-            0,
-            last_report_ns,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.pending[hand]
+            .compare_exchange(0, last_report_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// The dropout whose last report was at `last_report_ns` was only a blip: not recorded, unless
