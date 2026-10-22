@@ -3867,18 +3867,26 @@ mod tests {
         let d = dir("waiting");
         std::fs::create_dir_all(&d).unwrap();
         let mut log = Writer::open(&d);
-        // the stop comes once the supervisor waits to start the daemon again: a stop after a
-        // fixed time came while the daemon still ran on a loaded machine, which stops it instead
+        // The stop comes once the supervisor is waiting to start the daemon again. A stop after
+        // a fixed time arrived while the daemon still ran on a loaded machine, and stopped that
+        // run instead. Counting starts checks the restart did not happen: a wall-clock bound
+        // under the restart delay fails when the machine is slow, which this test is not about.
         let mut stopping = stop_once_logged(log.path().to_owned(), "starting it again in");
-        let started = Instant::now();
+        let mut starts = 0;
         let code = run(
-            || shell("exit 1"),
+            || {
+                starts += 1;
+                shell("exit 1")
+            },
             &mut log,
             quick(20_000, 5),
             &mut stopping,
         );
         assert_eq!(code, 0);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            starts, 1,
+            "a stop during the restart wait started the daemon again"
+        );
         assert_eq!(
             texts(log.path()).last().unwrap(),
             "cv1touchd supervisor: Ctrl+C: not starting the daemon again"
@@ -4005,22 +4013,44 @@ mod tests {
     }
 
     /// Something the daemon started that still holds its output does not keep the supervisor
-    /// from seeing the daemon end.
+    /// from seeing the daemon end. The holder writes `late` after the supervisor's drain of the
+    /// daemon's last lines; waiting for that output would record the line.
     #[test]
     fn the_daemon_ending_is_seen_while_its_output_is_still_held() {
         let d = dir("held");
+        std::fs::create_dir_all(&d).unwrap();
         let mut log = Writer::open(&d);
-        let script = if cfg!(windows) {
-            "start /b ping -n 30 127.0.0.1 && exit 0"
-        } else {
-            "sleep 30 & exit 0"
-        };
-        let started = Instant::now();
+        #[cfg(windows)]
+        std::fs::write(
+            d.join("hold.cmd"),
+            "@echo off\r\nstart /b cmd /c \"ping -n 30 127.0.0.1 >nul & echo late\"\r\nexit /b 0\r\n",
+        )
+        .unwrap();
         assert_eq!(
-            run(|| shell(script), &mut log, quick(10, 5), &mut never()),
+            run(
+                || {
+                    #[cfg(windows)]
+                    {
+                        let mut command = Command::new("cmd");
+                        command.arg("/C").arg(d.join("hold.cmd"));
+                        command
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        shell("(sleep 30; echo late) & exit 0")
+                    }
+                },
+                &mut log,
+                quick(10, 5),
+                &mut never(),
+            ),
             0
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
+        let lines = texts(log.path());
+        assert!(
+            !lines.iter().any(|line| line.trim_end() == "late"),
+            "the supervisor waited for output that outlived the daemon: {lines:?}"
+        );
         drop(log);
         std::fs::remove_dir_all(d).unwrap();
     }
