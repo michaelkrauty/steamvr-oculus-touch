@@ -143,14 +143,6 @@ impl InputRuntime {
         };
         (state.trigger, state.grip, state.stick) = values;
     }
-
-    fn status(&self) -> serde_json::Value {
-        serde_json::json!({
-            "configured": self.calibration.is_some(),
-            "calibrated": [self.calibration_applies(0), self.calibration_applies(1)],
-            "error": self.error,
-        })
-    }
 }
 
 fn reload_inputs(runtime: &Mutex<InputRuntime>, path: &std::path::Path) -> Result<(), String> {
@@ -550,6 +542,16 @@ impl LandmarkWatch {
     }
 }
 
+/// Locks `queue` only for the push. Analysis threads call this, and the radio thread locks
+/// the same queues on every pass. The serial, timestamp and frame are arguments, so the
+/// caller builds them before this function runs and takes the lock.
+fn enqueue_frame<T>(queue: &Mutex<FrameQueue<T>>, serial: String, timestamp_ns: u64, frame: T) {
+    queue
+        .lock()
+        .unwrap()
+        .push_frame(&serial, timestamp_ns, frame);
+}
+
 impl EngineSink for Daemon {
     #[allow(clippy::too_many_arguments)]
     fn activity(
@@ -587,8 +589,9 @@ impl EngineSink for Daemon {
 
     fn search_started(&self, info: &engine::FrameInfo, remaining_ns: u64) {
         if self.tracker == TrackerKind::Rust {
-            self.track_searches.lock().unwrap().push_frame(
-                &engine::cstr_field(&info.serial),
+            enqueue_frame(
+                &self.track_searches,
+                engine::cstr_field(&info.serial),
                 info.frame_start_host_ns,
                 (Box::new(*info), remaining_ns),
             );
@@ -605,8 +608,9 @@ impl EngineSink for Daemon {
             );
         }
         if self.tracker == TrackerKind::Rust {
-            self.track_in.lock().unwrap().push_frame(
-                &engine::cstr_field(&info.serial),
+            enqueue_frame(
+                &self.track_in,
+                engine::cstr_field(&info.serial),
                 info.frame_start_host_ns,
                 (Box::new(*info), blobs.to_vec()),
             );
@@ -1661,10 +1665,7 @@ fn engine_session(
             }
         });
     });
-    let biases = link.biases.lock().unwrap().take();
-    if let Some(f) = biases {
-        save_biases(&f);
-    }
+    deliver_pending_biases(&link, save_biases);
 }
 
 /// Mark startup and loop panics before the scope can wait for a radio thread to finish.
@@ -2746,6 +2747,49 @@ fn acknowledge_restored(
     });
 }
 
+/// Hands each queued pose change to `handle` after `RadioLink::reposed` is released. A `for`
+/// keeps the temporaries of its iterator expression until the loop ends, in every edition, so
+/// locking in that expression would hold the radio thread's queue across the engine call and
+/// the calibration write.
+fn deliver_pose_changes(link: &RadioLink, mut handle: impl FnMut(PoseChange)) {
+    let changes = mem::take(&mut *link.reposed.lock().unwrap());
+    for change in changes {
+        handle(change);
+    }
+}
+
+/// Writes a queued bias file after `RadioLink::biases` is released. An `if let` keeps its
+/// scrutinee's temporaries through the then-body in every edition, and edition 2021 also keeps
+/// them through `else`, so locking in the scrutinee would hold the hand-off across the write.
+fn deliver_pending_biases(link: &RadioLink, save: impl FnOnce(&track::biases::BiasFile)) {
+    let pending = link.biases.lock().unwrap().take();
+    if let Some(file) = pending {
+        save(&file);
+    }
+}
+
+/// One engine-loop pass of queued radio work: the bias file, then pose changes. `engine_loop`
+/// calls this. `save` and `handle` run only after those locks are released.
+fn deliver_engine_queues(
+    link: &RadioLink,
+    save: impl FnOnce(&track::biases::BiasFile),
+    handle: impl FnMut(PoseChange),
+) {
+    deliver_pending_biases(link, save);
+    deliver_pose_changes(link, handle);
+}
+
+/// Installs each queued controller body after the queue lock is released. The engine thread
+/// pushes the next body on that lock. A `for` keeps its iterator temporaries until the loop
+/// ends, in every edition, so a `for` over the locked queue would keep it through tracker setup
+/// and the log line.
+fn deliver_new_bodies(queued: &Mutex<Vec<NewBody>>, mut install: impl FnMut(NewBody)) {
+    let queued = mem::take(&mut *queued.lock().unwrap());
+    for body in queued {
+        install(body);
+    }
+}
+
 /// The engine thread's loop for one open engine: OpenHMD's update (its own filter, the acquisition
 /// the tracker relies on, the headset, haptics), each controller's engine view for the radio
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
@@ -2805,32 +2849,27 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         }
         d.shm.heartbeat(now);
         holds.note(arrived, shm::now_ns());
-        if let Some(f) = link.biases.lock().unwrap().take() {
-            save_biases(&f);
-        }
-        for change in std::mem::take(&mut *link.reposed.lock().unwrap()) {
-            match change {
-                PoseChange::Inspect(serial, hands) => {
-                    match e.inspect_sensor(&serial, hands, repose::INSPECTION_NS) {
-                        Ok(()) => {
-                            log!("sensor {serial}: the engine is looking for its controller LEDs")
-                        }
-                        Err(err) => log!("sensor {serial}: {err}"),
+        deliver_engine_queues(link, save_biases, |change| match change {
+            PoseChange::Inspect(serial, hands) => {
+                match e.inspect_sensor(&serial, hands, repose::INSPECTION_NS) {
+                    Ok(()) => {
+                        log!("sensor {serial}: the engine is looking for its controller LEDs")
                     }
-                }
-                PoseChange::Placing(serial) => {
-                    match e.inspect_sensor(&serial, [true; 2], repose::PATIENCE_NS) {
-                        Ok(()) => {
-                            log!("sensor {serial}: the engine is looking for its controller LEDs")
-                        }
-                        Err(err) => log!("sensor {serial}: {err}"),
-                    }
-                }
-                PoseChange::Set(r) => {
-                    set_engine_pose(&mut restoring, r, |r| apply_reposed(d, e, r));
+                    Err(err) => log!("sensor {serial}: {err}"),
                 }
             }
-        }
+            PoseChange::Placing(serial) => {
+                match e.inspect_sensor(&serial, [true; 2], repose::PATIENCE_NS) {
+                    Ok(()) => {
+                        log!("sensor {serial}: the engine is looking for its controller LEDs")
+                    }
+                    Err(err) => log!("sensor {serial}: {err}"),
+                }
+            }
+            PoseChange::Set(r) => {
+                set_engine_pose(&mut restoring, r, |r| apply_reposed(d, e, r));
+            }
+        });
         acknowledge_restored(&mut restoring, &link.restored, |serial| {
             e.sensor_pose_applied(serial)
         });
@@ -3006,7 +3045,7 @@ fn radio_main(
             d.shm.signal();
             holds.note(arrived, shm::now_ns());
         }
-        for b in link.bodies.lock().unwrap().drain(..) {
+        deliver_new_bodies(&link.bodies, |b| {
             pipe.body(b.device_id, b.leds.clone(), b.imu);
             log!(
                 "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
@@ -3018,7 +3057,7 @@ fn radio_main(
             );
             biases.seed(pipe, b.hand, &b.leds);
             link.hands.request(b.hand);
-        }
+        });
         let identities = d.track_identities.lock().unwrap().take();
         for (serial, evidence) in identities {
             pipe.inspection_lifecycle(&serial, &evidence);
@@ -4251,6 +4290,69 @@ fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
     )
 }
 
+/// Fields a status reply reads off locks the radio thread also takes. The copies are short.
+/// Cloning the maps still allocates while their locks are held. Building and formatting the
+/// reply happens after those locks are released, so that work does not hold them. The three
+/// sensor maps are copied together so one reply still sees one moment.
+struct StatusShared {
+    input_calibration: serde_json::Value,
+    track_stats: [(Stats, bool); 2],
+    shifts: std::collections::BTreeMap<String, (f64, f64, usize)>,
+    poses: std::collections::BTreeMap<String, PoseNote>,
+    agreements: std::collections::BTreeMap<String, track::tracker::CameraAgreement>,
+    queue: serde_json::Value,
+}
+
+fn status_shared(d: &Daemon) -> StatusShared {
+    let (configured, calibrated, error) = {
+        let inputs = d.inputs.lock().unwrap();
+        (
+            inputs.calibration.is_some(),
+            [inputs.calibration_applies(0), inputs.calibration_applies(1)],
+            inputs.error.clone(),
+        )
+    };
+    let input_calibration = serde_json::json!({
+        "configured": configured,
+        "calibrated": calibrated,
+        "error": error,
+    });
+    let track_stats = *d.track_stats.lock().unwrap();
+    let queue_stats = d.track_in.lock().unwrap().stats();
+    let queue = serde_json::to_value(queue_stats).unwrap();
+    let (shifts, poses, agreements) = {
+        let shifts = d.landmark_shifts.lock().unwrap();
+        let poses = d.sensor_poses.lock().unwrap();
+        let agreements = d.sensor_agreement.lock().unwrap();
+        (shifts.clone(), poses.clone(), agreements.clone())
+    };
+    StatusShared {
+        input_calibration,
+        track_stats,
+        shifts,
+        poses,
+        agreements,
+        queue,
+    }
+}
+
+/// Latest samples copied out of the publication lock. The inputs reply's JSON is built after
+/// that lock is released. The radio thread takes it on every sample.
+struct InputsShared {
+    latest: [RawInputs; 2],
+    calibrated: [bool; 2],
+    error: Option<String>,
+}
+
+fn inputs_shared(d: &Daemon) -> InputsShared {
+    let inputs = d.inputs.lock().unwrap();
+    InputsShared {
+        latest: inputs.latest.clone(),
+        calibrated: [inputs.calibration_applies(0), inputs.calibration_applies(1)],
+        error: inputs.error.clone(),
+    }
+}
+
 fn status_json(d: &Daemon) -> String {
     let (engine_ready, mode, calibrated_sensors, ignored_sensors) = {
         let opts = d.opts.lock().unwrap();
@@ -4285,10 +4387,11 @@ fn status_json(d: &Daemon) -> String {
     let mut recording_json = serde_json::to_value(&recording).unwrap();
     recording_json["message"] = serde_json::json!(recording.message());
     let al = d.shm.alignment().unwrap_or_default();
+    let shared = status_shared(d);
     let hands_json: Vec<String> = hands
         .iter()
         .zip(["left", "right"])
-        .zip(d.track_stats.lock().unwrap().iter())
+        .zip(shared.track_stats.iter())
         .map(|((s, name), (t, tracking))| {
             format!(
                 "{{\"hand\":\"{name}\",\"flags\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
@@ -4296,9 +4399,6 @@ fn status_json(d: &Daemon) -> String {
             )
         })
         .collect();
-    let shifts = d.landmark_shifts.lock().unwrap();
-    let poses = d.sensor_poses.lock().unwrap();
-    let agreements = d.sensor_agreement.lock().unwrap();
     let received: std::collections::HashMap<_, _> = sensor_video
         .iter()
         .map(|video| {
@@ -4316,32 +4416,47 @@ fn status_json(d: &Daemon) -> String {
         .iter()
         .map(|s| {
             let serial = shm::serial_str(s);
-            let shift = shifts
+            let shift = shared
+                .shifts
                 .iter()
                 .find(|(s, _)| cv1touch::status::same_sensor(s, &serial))
                 .map(|(_, (x, y, n))| serde_json::json!({"dx": x, "dy": y, "landmarks": n}));
-            let pose = poses
+            let pose = shared
+                .poses
                 .get(&serial)
                 .map(|note| serde_json::to_value(note).unwrap_or_default());
-            let agreement = agreements.get(&serial).map(|a| {
-                serde_json::json!({"median_px": a.median_px, "bias_px": a.bias_px.norm(),
-                "samples": a.samples, "checks": a.checks, "misses": a.misses,
-                "observed_checks": a.observed_checks, "observed_misses": a.observed_misses})
+            let agreement = shared.agreements.get(&serial).map(|a| {
+                serde_json::json!({
+                    "median_px": a.median_px,
+                    "bias_px": a.bias_px.norm(),
+                    "samples": a.samples,
+                    "checks": a.checks,
+                    "misses": a.misses,
+                    "observed_checks": a.observed_checks,
+                    "observed_misses": a.observed_misses,
+                })
             });
             let quality = quality.get(&cv1touch::status::sensor_identity(&serial));
-            serde_json::json!({"serial": serial, "placed": s.placed, "frames": s.frames,
-            "video_format": quality.and_then(|q| q.video_format),
-            "frames_decoded": quality.and_then(|q| q.frames_decoded),
-            "frames_dropped": quality.map(|q| q.frames_dropped),
-            "frames_received": received.get(&cv1touch::status::sensor_identity(&serial)).copied(),
-            "fixes": s.pose_fixes, "camera_orient": s.camera_orient, "camera_pos": s.camera_pos,
-            "landmark_shift": shift, "pose": pose, "agreement": agreement})
+            serde_json::json!({
+                "serial": serial,
+                "placed": s.placed,
+                "frames": s.frames,
+                "video_format": quality.and_then(|q| q.video_format),
+                "frames_decoded": quality.and_then(|q| q.frames_decoded),
+                "frames_dropped": quality.map(|q| q.frames_dropped),
+                "frames_received": received
+                    .get(&cv1touch::status::sensor_identity(&serial))
+                    .copied(),
+                "fixes": s.pose_fixes,
+                "camera_orient": s.camera_orient,
+                "camera_pos": s.camera_pos,
+                "landmark_shift": shift,
+                "pose": pose,
+                "agreement": agreement,
+            })
         })
         .collect();
-    drop(agreements);
-    drop(poses);
-    drop(shifts);
-    let mut queue = serde_json::to_value(d.track_in.lock().unwrap().stats()).unwrap();
+    let mut queue = shared.queue;
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
@@ -4353,7 +4468,7 @@ fn status_json(d: &Daemon) -> String {
         d.extra_latency_ns.load(Ordering::Relaxed) as f64 / 1e6,
         tilt_deg(d),
         engine_ready,
-        d.inputs.lock().unwrap().status(),
+        shared.input_calibration,
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
@@ -4438,12 +4553,12 @@ fn handle(d: &Daemon, line: &str) -> String {
         }
         Ok(Command::Status) => status_json(d),
         Ok(Command::Inputs) => {
-            let inputs = d.inputs.lock().unwrap();
+            let inputs = inputs_shared(d);
             format!(
                 "ok {}",
                 serde_json::json!({
                     "hands": inputs.latest,
-                    "calibrated": [inputs.calibration_applies(0), inputs.calibration_applies(1)],
+                    "calibrated": inputs.calibrated,
                     "error": inputs.error,
                 })
             )
@@ -8217,6 +8332,240 @@ mod tests {
         acknowledge_restored(&mut restoring, &restored, |serial| serial == "C");
         acknowledge_restored(&mut restoring, &restored, |_| true);
         assert_eq!(*restored.lock().unwrap(), ["C"]);
+    }
+
+    /// The radio thread pushes pose changes and bias files for the engine thread to apply, and
+    /// the engine thread pushes controller bodies for the radio thread to install. Disk writes
+    /// and engine calls run only after those locks are released. A pose save or an inspection
+    /// could stall the radio thread. The bias hand-off is the same release: the radio thread
+    /// next takes that lock about 30 s later. Installing a body could stall the engine thread,
+    /// which is waiting to hand the next model over. `engine_loop` applies one pass through
+    /// `deliver_engine_queues`.
+    #[test]
+    fn queued_radio_work_is_applied_after_its_lock_is_released() {
+        let link = RadioLink::default();
+        deliver_engine_queues(
+            &link,
+            |_| panic!("nothing was queued"),
+            |_| panic!("nothing was queued"),
+        );
+        link.reposed
+            .lock()
+            .unwrap()
+            .push(PoseChange::Inspect("CAM".into(), [true, false]));
+        link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+            serial: "CAM".into(),
+            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.1, 0.0, 0.0],
+            median_px: 0.2,
+            matches: 4,
+            moved_mm: 3.0,
+            turned_deg: 1.0,
+            write: true,
+        }));
+        *link.biases.lock().unwrap() = Some(track::biases::BiasFile::default());
+        let applied = std::cell::RefCell::new(Vec::new());
+        deliver_engine_queues(
+            &link,
+            |file| {
+                assert!(
+                    link.biases.try_lock().is_ok(),
+                    "biases stays locked while the file is saved"
+                );
+                assert!(
+                    link.reposed.try_lock().is_ok(),
+                    "reposed stays locked while the bias file is saved"
+                );
+                assert_eq!(file.format, track::biases::FORMAT);
+                applied.borrow_mut().push("bias".into());
+            },
+            |change| {
+                assert!(
+                    link.reposed.try_lock().is_ok(),
+                    "reposed stays locked while a pose change is applied"
+                );
+                assert!(
+                    link.biases.try_lock().is_ok(),
+                    "biases stays locked while a pose change is applied"
+                );
+                applied.borrow_mut().push(match change {
+                    PoseChange::Inspect(serial, hands) => format!("inspect {serial} {hands:?}"),
+                    PoseChange::Placing(serial) => format!("placing {serial}"),
+                    PoseChange::Set(r) => format!("set {} {}", r.serial, r.write),
+                });
+            },
+        );
+        assert_eq!(
+            applied.borrow().as_slice(),
+            ["bias", "inspect CAM [true, false]", "set CAM true"]
+        );
+        assert!(link.reposed.lock().unwrap().is_empty());
+        assert!(link.biases.lock().unwrap().is_none());
+
+        deliver_new_bodies(&link.bodies, |_| panic!("no body was queued"));
+        link.bodies.lock().unwrap().push(NewBody {
+            hand: HAND_LEFT,
+            device_id: 1,
+            leds: Vec::new(),
+            imu: nalgebra::Vector3::zeros(),
+        });
+        let mut installed = 0;
+        deliver_new_bodies(&link.bodies, |body| {
+            assert!(
+                link.bodies.try_lock().is_ok(),
+                "bodies stays locked while a controller body is installed"
+            );
+            assert_eq!(body.hand, HAND_LEFT);
+            installed += 1;
+        });
+        assert_eq!(installed, 1);
+        assert!(link.bodies.lock().unwrap().is_empty());
+    }
+
+    fn assert_status_locks_free(d: &Daemon) {
+        assert!(
+            d.inputs.try_lock().is_ok(),
+            "input lock held after the status copy"
+        );
+        assert!(
+            d.track_stats.try_lock().is_ok(),
+            "tracker-stats lock held after the status copy"
+        );
+        assert!(
+            d.track_in.try_lock().is_ok(),
+            "camera-queue lock held after the status copy"
+        );
+        assert!(
+            d.landmark_shifts.try_lock().is_ok(),
+            "landmark lock held after the status copy"
+        );
+        assert!(
+            d.sensor_poses.try_lock().is_ok(),
+            "sensor-pose lock held after the status copy"
+        );
+        assert!(
+            d.sensor_agreement.try_lock().is_ok(),
+            "agreement lock held after the status copy"
+        );
+    }
+
+    /// `copy` blocks while `mutex` is held and finishes once that lock is released.
+    /// The lock is free again when `copy` returns.
+    fn copy_waits_only_while_held<T: Send>(mutex: &Mutex<T>, copy: impl FnOnce() + Send) {
+        let guard = mutex.lock().unwrap();
+        let started = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                started.store(true, Ordering::Release);
+                copy();
+                finished.store(true, Ordering::Release);
+            });
+            while !started.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert!(
+                !finished.load(Ordering::Acquire),
+                "copy finished while the lock was still held"
+            );
+            drop(guard);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !finished.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "copy did not finish after the lock was released"
+                );
+                thread::yield_now();
+            }
+            assert!(
+                mutex.try_lock().is_ok(),
+                "lock still held after copy returned"
+            );
+        });
+    }
+
+    /// Building a status or inputs reply allocates. The radio thread takes these locks on its
+    /// own loop, so that work runs only after the copies are out of them.
+    #[test]
+    fn status_reply_releases_radio_locks_before_it_is_built() {
+        let d = status_daemon();
+        let shared = status_shared(&d);
+        assert_status_locks_free(&d);
+        assert!(shared.queue.is_object());
+        assert!(shared.input_calibration.is_object());
+        copy_waits_only_while_held(&d.inputs, || {
+            let shared = status_shared(&d);
+            assert_status_locks_free(&d);
+            assert!(shared.input_calibration["configured"].is_boolean());
+        });
+        {
+            let mut inputs = d.inputs.lock().unwrap();
+            inputs.latest[0].identity = "left-device".into();
+            inputs.latest[0].trigger = 0.25;
+            inputs.error = Some("no file".into());
+        }
+        let inputs = inputs_shared(&d);
+        assert!(
+            d.inputs.try_lock().is_ok(),
+            "inputs lock held after the inputs copy"
+        );
+        assert_eq!(inputs.latest[0].identity, "left-device");
+        assert_eq!(inputs.latest[0].trigger, 0.25);
+        assert_eq!(inputs.calibrated, [false, false]);
+        assert_eq!(inputs.error.as_deref(), Some("no file"));
+        let reply = format!(
+            "ok {}",
+            serde_json::json!({
+                "hands": inputs.latest,
+                "calibrated": inputs.calibrated,
+                "error": inputs.error,
+            })
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(parsed["hands"][0]["identity"], "left-device");
+        assert_eq!(parsed["hands"][0]["trigger"], 0.25);
+        assert_eq!(parsed["calibrated"], serde_json::json!([false, false]));
+        assert_eq!(parsed["error"], "no file");
+        copy_waits_only_while_held(&d.inputs, || {
+            let inputs = inputs_shared(&d);
+            assert!(
+                d.inputs.try_lock().is_ok(),
+                "inputs lock held after the inputs copy"
+            );
+            assert_eq!(inputs.error.as_deref(), Some("no file"));
+        });
+        let reply = handle(&d, "inputs");
+        let parsed: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(parsed["hands"][0]["identity"], "left-device");
+        assert_eq!(parsed["error"], "no file");
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(status["input_calibration"]["configured"], false);
+        assert_eq!(status["input_calibration"]["error"], "no file");
+        assert!(status["camera_queue"].is_object());
+    }
+
+    /// The push takes the camera queue and releases it before `enqueue_frame` returns.
+    /// The serial, timestamp and frame are arguments, so they are built before the call
+    /// that locks. This test does not observe that build. It checks that the push blocks
+    /// while the queue is held, finishes once the lock is released, and leaves the queue free.
+    #[test]
+    fn a_camera_frame_push_releases_the_queue() {
+        let queue = Mutex::new(FrameQueue::<u32>::default());
+        queue.lock().unwrap().register(["cam".into()]);
+        enqueue_frame(&queue, "cam".into(), 7, 11);
+        assert!(
+            queue.try_lock().is_ok(),
+            "camera queue locked after the frame is pushed"
+        );
+        assert_eq!(queue.lock().unwrap().pop_frame(), Some(11));
+        copy_waits_only_while_held(&queue, || {
+            enqueue_frame(&queue, "cam".into(), 8, 12);
+        });
+        assert_eq!(queue.lock().unwrap().pop_frame(), Some(12));
     }
 
     /// Each engine open is marked in a recording before the new engine's identity notices,

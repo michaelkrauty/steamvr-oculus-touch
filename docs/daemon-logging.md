@@ -6,8 +6,8 @@ The tracking daemon's Rust output originally used `log` in `src/bin/cv1touchd.rs
 
 | Rust caller | Thread | Frequency | Locks that may be held |
 | --- | --- | --- | --- |
-| `BiasMemory::seed` | radio | A controller model arrives | `RadioLink::bodies` |
-| `save_biases` | engine | Changed biases every 30 s; engine close | `RadioLink::biases` in the engine-loop `if let`; the session-close caller releases it first |
+| `BiasMemory::seed` | radio | A controller model arrives | No shared Rust guard at the call: `RadioLink::bodies` is drained before the body is installed or seeded |
+| `save_biases` | engine | Changed biases every 30 s; engine close | No: both the engine loop and session close take the file out of `RadioLink::biases` before the write |
 | `LandmarkWatch::load` | engine initialization | Start/reopen | No shared Rust guard at the call |
 | `LandmarkWatch::frame` | radio | Changed landmark windows every 60 s; missing for three windows | `landmark_shifts` |
 | `Daemon::report` battery notices | native update/engine | Battery value changes | May hold the native device lock; no shared Rust guard in the callback |
@@ -15,10 +15,10 @@ The tracking daemon's Rust output originally used `log` in `src/bin/cv1touchd.rs
 | `engine_main`, `engine_session` | engine | Open/reopen/error/retry (1 s wait), worker startup | No shared Rust guard at these calls (bias saving listed separately) |
 | `start_engine_run` | engine | Each reopen, once initialization is done: `engine reopened after N s` | No shared Rust guard at the call |
 | `Reposing::start`, `release`, `apply_changes` (with the line `moved` returns), `tick` | radio | Solver startup, pose changes, timeouts, errors; monitor windows, including a waiting movement verdict dropped by a retraction (an invalidation or overflow) | No shared Rust guard at these calls; the pipeline is exclusively borrowed. Lifecycle delivery to the monitor runs under the mailbox lock and logs nothing: a verdict it drops is returned as a change and logged by `apply_changes` after that lock is released |
-| `apply_reposed`, `write_reposed`, `thin_own_backups` | engine | A replacement pose is applied/saved | Yes: `RadioLink::reposed` while applying changes, the setup file lock, and `own_backups` while thinning |
-| `engine_loop` | engine | Mode changes, I/O failure, sensor updates, each inspection or placement search it asks the engine for | Mode guard during formatting; `RadioLink::reposed` while it hands the radio thread's pose changes to the engine; native device lock in native calls |
+| `apply_reposed`, `write_reposed`, `thin_own_backups` | engine | A replacement pose is applied/saved | The setup file lock, and `own_backups` while thinning. Not `RadioLink::reposed`: that queue is released before the engine is asked and before these writes |
+| `engine_loop` | engine | Mode changes, I/O failure, sensor updates, each inspection or placement search it asks the engine for | Mode guard during formatting; native device lock in native calls. Queued pose changes and bias files are taken out of their locks before an inspection, a calibration write or a bias write |
 | `BodyFinder::find` | engine | New controller model without cached IMU | No shared Rust guard at its diagnostic |
-| `radio_main` | radio | Start/priority result, read failure, each new body | `RadioLink::bodies` while reporting bodies/biases |
+| `radio_main` | radio | Start/priority result, read failure, each new body | No shared Rust guard while a new body is installed or reported. `RadioLink::bodies` is held only to drain the queue |
 | `publish_hand_state` with `gap_notice` | radio, or engine fallback | A gap begins/ends/expires (named by what began it: radio silence, an engine reopen or a stalled thread); position lost/regained; wrong-lock loss | No: the hand's state lives in the daemon's `Mutex<HandPublisher>`, and its notices are emitted after publishing and releasing that lock |
 | `refresh_radio_hands` | radio | A hand given to the radio thread before its first sample of it: its gap begins once nothing has published it for 100 ms, or expires | No: emitted after the hand's lock is released |
 | `publish_unavailable` | heartbeat every 200 ms; engine at close and failed opens | A gap begins/expires while the engine is closed or opening, or when no worker has published a hand for over 100 ms | No: both hands are published and their locks released before any notice. It reads `hand_workers` without a lock and takes a hand's lock only when no worker has that hand |
