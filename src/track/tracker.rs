@@ -547,18 +547,16 @@ impl Tracker {
             .or(self.saved_bias.map(|f| (f.x.bg, f.x.ba)))
             .unwrap_or_default();
         let from = s.t.saturating_sub(p.still_window_ns);
-        let win: Vec<&ImuSample> = self
-            .imu
-            .iter()
-            .filter(|x| x.t >= from)
-            .chain(std::iter::once(s))
-            .collect();
-        let n = win.len() as f64;
-        let gm = win.iter().map(|x| x.gyro).sum::<Vector3<f64>>() / n;
-        let am = win.iter().map(|x| x.accel).sum::<Vector3<f64>>() / n;
+        let start = self.imu.partition_point(|x| x.t < from);
+        let n = (self.imu.len() - start + 1) as f64;
+        let mut win = self.imu.range(start..).chain(std::iter::once(s));
+        let gm = win.clone().map(|x| x.gyro).sum::<Vector3<f64>>() / n;
+        let am = win.clone().map(|x| x.accel).sum::<Vector3<f64>>() / n;
+        #[cfg(test)]
+        stillness_tests::observe_means(gm, am);
         (gm - bg).norm() < p.still_gyro
             && ((am - ba).norm() - p.gravity).abs() < p.still_accel_g
-            && win.iter().all(|x| {
+            && win.all(|x| {
                 (x.gyro - gm).norm() < p.still_gyro_spread
                     && (x.accel - am).norm() < p.still_accel_spread
             })
@@ -3332,3 +3330,6 @@ mod tests {
         assert_eq!(tr.stats.frames, 0);
     }
 }
+
+#[cfg(test)]
+mod stillness_tests;
