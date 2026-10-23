@@ -16012,11 +16012,45 @@ mod tests {
         }
     }
 
-    /// Both a blocked write and a blocked sync leave status/haptics/daemon stop responsive, and
-    /// neither a premature success reply nor a replacement writer may escape while finishing.
+    /// Real requests on the other endpoint complete before the caller releases storage.
+    /// The synchronous test below independently checks unfinished stop outcomes: notification
+    /// order here alone cannot locate a response before a delayed client notification.
     #[test]
     fn blocked_recording_storage_does_not_block_control_commands() {
+        #[derive(Debug)]
+        enum Event {
+            Controls(io::Result<[String; 4]>, bool),
+            StorageFinished,
+            Stop(io::Result<String>),
+        }
+
+        struct ObservedSink(BlockedSink, std::sync::mpsc::Sender<Event>);
+        impl Write for ObservedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        impl recorder::RecordingSink for ObservedSink {
+            fn sync_all(&mut self) -> io::Result<()> {
+                self.0.sync_all()
+            }
+            fn disk_space(&self) -> io::Result<recorder::DiskSpace> {
+                self.0.disk_space()
+            }
+        }
+        impl Drop for ObservedSink {
+            fn drop(&mut self) {
+                // The synthetic sink has no close work. The writer drops it after write/sync
+                // return and before publishing `finished`, which allows the stop reply.
+                let _ = self.1.send(Event::StorageFinished);
+            }
+        }
+
         for (sync, scoped) in [(false, false), (true, false), (false, true), (true, true)] {
+            let case = format!("sync={sync}, scoped={scoped}");
             let d = Arc::new(status_daemon());
             let fixture = socket_dir::SocketDir::new();
             let dir = fixture.path();
@@ -16025,18 +16059,22 @@ mod tests {
             let driver_endpoint = dir.join("driver.sock");
             let (entered_tx, entered) = std::sync::mpsc::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
+            let (events_tx, events) = std::sync::mpsc::channel();
             d.rec
                 .start_with_sink(
                     &path,
                     1,
                     false,
-                    Box::new(BlockedSink {
-                        entered: Some(entered_tx),
-                        release: release_rx,
-                        sync,
-                        header_written: false,
-                        block_header: false,
-                    }),
+                    Box::new(ObservedSink(
+                        BlockedSink {
+                            entered: Some(entered_tx),
+                            release: release_rx,
+                            sync,
+                            header_written: false,
+                            block_header: false,
+                        },
+                        events_tx.clone(),
+                    )),
                 )
                 .unwrap();
             d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
@@ -16056,51 +16094,73 @@ mod tests {
             } else {
                 "record stop".into()
             };
-            let (answered_tx, answered) = std::sync::mpsc::channel();
+            let start = control::record_start_line(&dir.join("replacement.rec"), false).unwrap();
+            let stopped_tx = events_tx.clone();
             let stop = thread::spawn(move || {
-                // Old callers only checked `ok`, with a five-second request timeout.
+                // Bounds this client's I/O, not the whole test or arbitrary internal deadlocks.
                 let result =
-                    control::request(&stop_endpoint, &stop_command, Duration::from_secs(5));
-                answered_tx.send(result).unwrap();
+                    control::request(&stop_endpoint, &stop_command, Duration::from_secs(35));
+                let _ = stopped_tx.send(Event::Stop(result));
             });
-            if sync {
-                entered.recv_timeout(Duration::from_secs(2)).unwrap();
-            }
+            let sync_entered = sync.then(|| entered.recv_timeout(Duration::from_secs(2)));
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while d.rec.active() && std::time::Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
             }
-            assert!(!d.rec.active(), "stop did not reach the recorder");
-            let request = |line: &str| {
-                control::request(&driver_endpoint, line, Duration::from_millis(200)).unwrap()
+            let inactive = !d.rec.active();
+            let control_daemon = Arc::clone(&d);
+            let controls = thread::spawn(move || {
+                // Prove completion before storage is released, rather than beating a short
+                // stopwatch. One deadline bounds the whole phase if dispatch waits on storage.
+                let until = std::time::Instant::now() + Duration::from_secs(10);
+                let request = |line: &str| control::request_until(&driver_endpoint, line, until);
+                let replies = (|| {
+                    Ok([
+                        request("status")?,
+                        request("haptic left 0.1 80 0.5")?,
+                        request("stop")?,
+                        request(&start)?,
+                    ])
+                })();
+                let _ = events_tx.send(Event::Controls(replies, control_daemon.rec.has_session()));
+            });
+            let first = events.recv_timeout(Duration::from_secs(12));
+            // Release even on timeout or an early stop reply, then join both request threads
+            // before asserting. A blocking regression must not strand the synthetic writer.
+            let _ = release.send(());
+            let second = events.recv_timeout(Duration::from_secs(12));
+            let third = events.recv_timeout(Duration::from_secs(12));
+            let controls_joined = controls.join();
+            let stop_joined = stop.join();
+            controls_joined.unwrap();
+            stop_joined.unwrap();
+            if let Some(entered) = sync_entered {
+                entered.expect(&case);
+            }
+            assert!(inactive, "{case}: stop did not reach the recorder");
+            let (replies, pending) = match first.expect("control phase did not finish") {
+                Event::Controls(replies, pending) => (replies.expect(&case), pending),
+                other => panic!("{case}: before the control responses: {other:?}"),
             };
-            let reply = request("status");
+            assert!(
+                matches!(second, Ok(Event::StorageFinished)),
+                "{case}: unexpected storage/notification order: {second:?}"
+            );
+            let reply = match third.expect("record stop did not finish after releasing storage") {
+                Event::Stop(reply) => reply.unwrap(),
+                other => panic!("{case}: expected the final stop reply: {other:?}"),
+            };
+            let [status, haptic, stopping, replacement] = replies;
             let value: serde_json::Value =
-                serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+                serde_json::from_str(status.strip_prefix("ok ").unwrap()).unwrap();
             assert_eq!(value["recording_status"]["state"], "finishing");
             assert_eq!(value["recording_status"]["finished"], false);
-            assert_eq!(request("haptic left 0.1 80 0.5"), "ok");
+            assert_eq!(haptic, "ok");
             assert!(d.haptics.lock().unwrap()[HAND_LEFT].is_some());
-            assert_eq!(request("stop"), "ok stopping");
-            let start = control::record_start_line(&dir.join("replacement.rec"), false).unwrap();
-            assert!(request(&start).starts_with("err "));
+            assert_eq!(stopping, "ok stopping");
+            assert!(replacement.starts_with("err "));
             assert!(!dir.join("replacement.rec").exists());
-            let premature = answered.recv_timeout(Duration::from_millis(600));
-            let pending = d.rec.has_session();
-            let waited_for_storage = premature.is_err();
-            // Always release before asserting so a mutation cannot strand a test writer.
-            release.send(()).unwrap();
-            let reply = match premature {
-                Ok(reply) => reply,
-                Err(_) => answered.recv_timeout(Duration::from_secs(2)).unwrap(),
-            }
-            .unwrap();
-            stop.join().unwrap();
             assert!(pending);
-            assert!(
-                waited_for_storage,
-                "record stop answered before storage completed"
-            );
             assert!(
                 reply.starts_with(if scoped {
                     "ok stopped records="
@@ -16111,6 +16171,76 @@ mod tests {
             );
             assert!(d.rec.status().finished);
             assert!(!d.rec.has_session());
+        }
+    }
+
+    /// The caller alone owns the release gate across the complete recorder call and reply
+    /// mapping. Even if preempted, it cannot observe success after accidentally releasing storage.
+    #[test]
+    fn blocked_recording_storage_retains_unfinished_stop_outcome() {
+        for (sync, scoped) in [(false, false), (true, false), (false, true), (true, true)] {
+            let case = format!("sync={sync}, scoped={scoped}");
+            let d = status_daemon();
+            let fixture = socket_dir::SocketDir::new();
+            let path = fixture.path().join("capture.rec");
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            d.rec
+                .start_with_sink(
+                    &path,
+                    1,
+                    false,
+                    Box::new(BlockedSink {
+                        entered: Some(entered_tx),
+                        release: release_rx,
+                        sync,
+                        header_written: false,
+                        block_header: false,
+                    }),
+                )
+                .unwrap();
+            d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
+            let matching = scoped.then_some(path.as_path());
+            let requested = d.rec.request_stop(matching);
+            let storage_entered = entered.recv_timeout(Duration::from_secs(2));
+            // Exercise the same stop_wait used by both control commands without waiting for
+            // their 30-second storage budget. No other thread can release this storage gate.
+            let unfinished = d.rec.stop_timeout(matching, Duration::ZERO);
+            let pending = d.rec.has_session();
+            let reply = unfinished
+                .as_ref()
+                .map(|status| record_stop_reply(status, scoped));
+            let _ = release.send(());
+            let finished = d.rec.stop_timeout(matching, Duration::from_secs(2));
+            // Release and collect the final outcome before any semantic assertion, including
+            // mutation failures that falsely acknowledge the still-blocked session.
+            assert!(requested, "{case}: stop was not requested");
+            storage_entered.expect(&case);
+            let unfinished = unfinished.expect("blocked stop lost its session");
+            assert!(
+                !unfinished.finished,
+                "{case}: blocked storage reported finished"
+            );
+            assert_eq!(unfinished.state, recorder::State::Finishing, "{case}");
+            assert!(pending, "{case}: blocked stop acknowledged its session");
+            assert!(
+                reply.unwrap().starts_with("err "),
+                "{case}: unfinished stop succeeded"
+            );
+            let finished = finished.expect("completed stop lost its session");
+            assert!(finished.finished, "{case}: released storage did not finish");
+            assert!(
+                record_stop_reply(&finished, scoped).starts_with(if scoped {
+                    "ok stopped records="
+                } else {
+                    "ok records="
+                }),
+                "{case}: completed stop changed its reply shape"
+            );
+            assert!(
+                !d.rec.has_session(),
+                "{case}: completed session was not acknowledged"
+            );
         }
     }
 
