@@ -71,7 +71,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
          cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
          cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS] | prediction [PERCENT] | prediction position|rotation PERCENT | tilt [DEGREES]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
-         cv1touch fit-render [REC]\n  cv1touch steamvr install|check [--legacy-assets SO MANIFEST] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
+         cv1touch fit-render [REC]\n  cv1touch steamvr install [--legacy-assets SO MANIFEST] | steamvr check [--legacy-assets SO MANIFEST] [--install-script] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
          cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
          cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
          cv1touch register --follow BASE --reference SERIAL|hmd [--tracking-base LHB-SERIAL] [--write] | register --stations REC [--write | --out PATH]\n  \
@@ -364,13 +364,17 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
             vr::runtime_library().is_file(),
             "SteamVR native OpenVR client library".into(),
         ),
-        (
-            "input_profile",
-            runtime
-                .join("drivers/oculus/resources/input/touch_profile.json")
-                .is_file(),
-            "SteamVR Oculus Touch input profile".into(),
-        ),
+        match steamvr::check_input_profile(&steamvr::driver_dir(), &runtime) {
+            Ok(profile) => (
+                "input_profile",
+                true,
+                format!(
+                    "{}, made from SteamVR's Oculus Touch profile",
+                    profile.display()
+                ),
+            ),
+            Err(e) => ("input_profile", false, e),
+        },
         (
             "render_models",
             rendermodel::steamvr_body_obj(true).is_file()
@@ -1511,14 +1515,32 @@ fn vrserver_running() -> Result<bool, String> {
         .map_err(|e| format!("cannot check SteamVR processes: {e}"))
 }
 
-fn steamvr_check(legacy: Option<(&Path, &Path)>) -> i32 {
+/// Whether the registered driver package is cv1touch's own, unchanged.
+fn steamvr_owned(legacy: Option<(&Path, &Path)>) -> Result<(), String> {
     let assets = steamvr::driver_assets().ok();
     let legacy = legacy.or_else(|| {
         assets
             .as_ref()
             .map(|(so, manifest)| (so.as_path(), manifest.as_path()))
     });
-    match steamvr::check_driver(&steamvr::driver_dir(), legacy) {
+    steamvr::check_driver(&steamvr::driver_dir(), legacy)
+}
+
+fn derive_for_check(install_script: bool) -> Result<steamvr::DriverResources, String> {
+    #[cfg(not(windows))]
+    if install_script {
+        return steamvr::derive_resources_for_install_script(&steamvr::runtime_root());
+    }
+    #[cfg(windows)]
+    let _ = install_script;
+    steamvr::derive_resources(&steamvr::runtime_root())
+}
+
+/// What `steamvr install` needs before it changes anything: a package it may replace, and
+/// SteamVR's Oculus Touch profile to make the driver's own from. `install_script` is
+/// `scripts/install.py`'s preflight, which has not installed cv1touch yet.
+fn steamvr_check(legacy: Option<(&Path, &Path)>, install_script: bool) -> i32 {
+    match steamvr_owned(legacy).and_then(|()| derive_for_check(install_script).map(drop)) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("cv1touch: {e}");
@@ -1545,15 +1567,23 @@ fn steamvr_install(legacy: Option<(&Path, &Path)>) -> i32 {
         eprintln!("cv1touch: {e}");
         return 1;
     }
-    if !steamvr::vrpathreg().is_file() {
+    let runtime = steamvr::runtime_root();
+    if !steamvr::steamvr_present(&runtime) {
         eprintln!(
-            "cv1touch: vrpathreg missing at {}; set CV1TOUCH_STEAMVR",
-            steamvr::vrpathreg().display()
+            "cv1touch: {}",
+            steamvr::steamvr_not_found(&runtime, steamvr::REINSTALL)
         );
         return 1;
     }
     let (so, manifest) = match steamvr::driver_assets() {
         Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("cv1touch: {e}");
+            return 1;
+        }
+    };
+    let resources = match steamvr::derive_resources(&runtime) {
+        Ok(resources) => resources,
         Err(e) => {
             eprintln!("cv1touch: {e}");
             return 1;
@@ -1567,9 +1597,13 @@ fn steamvr_install(legacy: Option<(&Path, &Path)>) -> i32 {
             return 1;
         }
     };
-    if let Err(e) =
-        steamvr::assemble_with_legacy(&so, &manifest, &dir, legacy.or(Some((&so, &manifest))))
-    {
+    if let Err(e) = steamvr::assemble_with_legacy(
+        &so,
+        &manifest,
+        &resources,
+        &dir,
+        legacy.or(Some((&so, &manifest))),
+    ) {
         eprintln!("cv1touch: {e}");
         return 1;
     }
@@ -1611,7 +1645,8 @@ fn steamvr_install(legacy: Option<(&Path, &Path)>) -> i32 {
 }
 
 fn steamvr_uninstall() -> i32 {
-    if steamvr_check(None) != 0 {
+    if let Err(e) = steamvr_owned(None) {
+        eprintln!("cv1touch: {e}");
         return 1;
     }
     match Command::new(steamvr::vrpathreg())
@@ -2677,19 +2712,22 @@ fn input_steps(hand: usize) -> Vec<InputStep> {
             None,
         ),
     ];
-    if !right {
-        v.push(step(
-            "press the menu button (the one below Y)".into(),
-            Box::new(|s| s.buttons & h::BTN_SYSTEM != 0),
-            None,
-        ));
-    }
+    v.push(step(
+        if right {
+            "press the Oculus button (the small one with the Oculus logo)"
+        } else {
+            "press the menu button (the one below Y)"
+        }
+        .into(),
+        Box::new(|s| s.buttons & h::BTN_SYSTEM != 0),
+        None,
+    ));
     v
 }
 
 /// Walks through every input of both Touches and checks each in the daemon's published state and
-/// in SteamVR's exact supported legacy input. Menu/thumb-rest need a manual check, then a
-/// haptic pulse per hand.
+/// in SteamVR's exact supported legacy input. Menu/Oculus button/thumb-rest need a manual
+/// check, then a haptic pulse per hand.
 fn input_test() -> i32 {
     catch_interrupts();
     let reader = match ShmReader::open(shm::DEFAULT_NAME) {
@@ -2709,7 +2747,7 @@ fn input_test() -> i32 {
     let mut results: Vec<(String, bool, String)> = Vec::new();
     let (mut daemon_seen, mut daemon_total, mut steam_seen, mut steam_total) = (0, 0, 0, 0);
     let mut manual = Vec::new();
-    println!("Keep SteamVR input focus available; unsupported menu/thumb-rest delivery needs a manual check.");
+    println!("Keep SteamVR input focus available; unsupported menu/Oculus button/thumb-rest delivery needs a manual check.");
     for hand in [HAND_LEFT, HAND_RIGHT] {
         let name = ["left", "right"][hand];
         let vr_index = index_of(if hand == HAND_LEFT {
@@ -2733,7 +2771,7 @@ fn input_test() -> i32 {
                     seen = if st.steam.is_some() {
                         "required input observed".into()
                     } else {
-                        "unverified by legacy interface; check manually in SteamVR".into()
+                        manual_steamvr_note(&st.prompt)
                     };
                     break;
                 }
@@ -2750,7 +2788,7 @@ fn input_test() -> i32 {
                     seen = "required input not observed; check SteamVR input focus".into();
                 }
             } else {
-                seen = "unverified by legacy interface; check manually in SteamVR".into();
+                seen = manual_steamvr_note(&st.prompt);
                 manual.push(format!("{name}: {}", st.prompt));
             }
             if !ok {
@@ -2823,6 +2861,20 @@ fn input_test() -> i32 {
         0
     } else {
         1
+    }
+}
+
+/// What input-test says for a button Valve's legacy interface cannot see. The right Oculus
+/// button has nothing bound to it, so pressing it in a game shows nothing until it is bound. A
+/// game that uses OpenXR has its binding page only while it runs.
+fn manual_steamvr_note(prompt: &str) -> String {
+    if prompt.contains("Oculus button") {
+        format!(
+            "unverified by legacy interface; bind it first in SteamVR with the game running (Settings, Controllers, Manage Controller Bindings, the game, right hand, the button named {}), then check it in that game",
+            steamvr::HOME_NAME
+        )
+    } else {
+        "unverified by legacy interface; check manually in SteamVR".into()
     }
 }
 
@@ -6379,8 +6431,10 @@ fn main() {
         ["register", "--solve", file, "--force"] => register_solve_file(Path::new(file), true),
         ["steamvr", "install"] => steamvr_install(None),
         ["steamvr", "install", "--legacy-assets", so, manifest] => steamvr_install(Some((Path::new(so), Path::new(manifest)))),
-        ["steamvr", "check"] => steamvr_check(None),
-        ["steamvr", "check", "--legacy-assets", so, manifest] => steamvr_check(Some((Path::new(so), Path::new(manifest)))),
+        ["steamvr", "check"] => steamvr_check(None, false),
+        ["steamvr", "check", "--install-script"] => steamvr_check(None, true),
+        ["steamvr", "check", "--legacy-assets", so, manifest] => steamvr_check(Some((Path::new(so), Path::new(manifest))), false),
+        ["steamvr", "check", "--legacy-assets", so, manifest, "--install-script"] => steamvr_check(Some((Path::new(so), Path::new(manifest))), true),
         ["steamvr", "uninstall"] => steamvr_uninstall(),
         ["eval-capture"] => eval_capture(),
         ["input-test"] => input_test(),
@@ -6423,6 +6477,19 @@ fn main() {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn steamvr_usage_shows_install_script_only_on_check() {
+        let line = include_str!("cv1touch.rs")
+            .lines()
+            .find(|line| line.contains("steamvr uninstall"))
+            .unwrap();
+        assert!(
+            line.contains("steamvr install [--legacy-assets SO MANIFEST] | steamvr check [--legacy-assets SO MANIFEST] [--install-script] | steamvr uninstall"),
+            "{line}"
+        );
+        assert!(!line.contains("install|check"), "{line}");
+    }
+
     #[test]
     fn universe_reports_skipped_tracking_as_unknown_and_recovers() {
         use std::io::Write;
@@ -8129,6 +8196,34 @@ mod tests {
         assert!(diagnostic.contains("SteamVR 0.000..0.000"), "{diagnostic}");
         assert!(progress.daemon_seen);
         assert!(!progress.steam_seen);
+    }
+
+    #[test]
+    fn each_hand_ends_with_its_system_button_checked_by_hand() {
+        for (hand, prompt) in [(HAND_LEFT, "menu button"), (HAND_RIGHT, "Oculus button")] {
+            let steps = input_steps(hand);
+            let last = steps.last().unwrap();
+            assert!(last.prompt.contains(prompt), "{}", last.prompt);
+            assert!(last.steam.is_none());
+            let note = manual_steamvr_note(&last.prompt);
+            if hand == HAND_RIGHT {
+                assert!(
+                    note.contains("bind it first in SteamVR with the game running (Settings, Controllers, Manage Controller Bindings, the game, right hand, the button named Oculus Button), then check it in that game")
+                        && !note.contains("docs/"),
+                    "{note}"
+                );
+            } else {
+                assert!(
+                    note.contains("check manually in SteamVR") && !note.contains("bind it first"),
+                    "{note}"
+                );
+            }
+            let pressed = ControllerState {
+                buttons: cv1touch::hand::BTN_SYSTEM,
+                ..Default::default()
+            };
+            assert!((last.done)(&pressed) && !(last.done)(&ControllerState::default()));
+        }
     }
 
     #[test]

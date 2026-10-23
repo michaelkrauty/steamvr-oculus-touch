@@ -201,10 +201,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         .as_ref()
         .is_some_and(|v| matches!(v["mode"].as_str(), Some("calibrated" | "provisional")));
     let runtime = steamvr::runtime_root();
-    let runtime_ok = vr::runtime_library().is_file()
-        && runtime
-            .join("drivers/oculus/resources/input/touch_profile.json")
-            .is_file();
+    let runtime_ok = vr::runtime_library().is_file() && steamvr::touch_profile(&runtime).is_file();
     let loaded = second.as_ref().is_some_and(|v| {
         v["mode"] == "calibrated"
             && !sensors.is_empty()

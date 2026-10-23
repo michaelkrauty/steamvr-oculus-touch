@@ -89,7 +89,7 @@ fn injected(hand: usize, list: &str) -> Result<Injected, String> {
         match (name, left) {
             ("x", true) => (v.buttons, v.touches) = (v.buttons | BTN_X, v.touches | TOUCH_X),
             ("y", true) => (v.buttons, v.touches) = (v.buttons | BTN_Y, v.touches | TOUCH_Y),
-            ("system", true) => v.buttons |= BTN_SYSTEM,
+            ("system", _) => v.buttons |= BTN_SYSTEM,
             ("a", false) => (v.buttons, v.touches) = (v.buttons | BTN_A, v.touches | TOUCH_A),
             ("b", false) => (v.buttons, v.touches) = (v.buttons | BTN_B, v.touches | TOUCH_B),
             ("stick", _) => {
@@ -104,7 +104,7 @@ fn injected(hand: usize, list: &str) -> Result<Injected, String> {
                     if left {
                         "x y system stick trigger grip"
                     } else {
-                        "a b stick trigger grip"
+                        "a b system stick trigger grip"
                     }
                 ))
             }
@@ -839,10 +839,26 @@ mod tests {
                 ms: 5
             }
         );
-        // the right Touch has no x, y or system; a press is at most 2 s; a hand and a known input
+        // the right Oculus button is /input/home: system presses it, the same as the left Menu button
+        assert_eq!(
+            parse("inject right system 100").unwrap(),
+            Command::Inject {
+                hand: HAND_RIGHT,
+                inputs: Injected {
+                    buttons: BTN_SYSTEM,
+                    ..Default::default()
+                },
+                ms: 100
+            }
+        );
+        // the right Touch has no x or y; the left has no a or b; a press is at most 2 s
+        let right_x = parse("inject right x 100").unwrap_err();
+        assert!(
+            right_x.contains("a b system stick trigger grip"),
+            "{right_x}"
+        );
         for bad in [
             "inject right x 100",
-            "inject right system 100",
             "inject left a 100",
             "inject left x 2001",
             "inject left x 0",

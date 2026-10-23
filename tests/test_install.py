@@ -177,6 +177,7 @@ class InstallTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "modified registered driver"):
                 INSTALLER.install(args)
         self.assertEqual(run.call_args.args[0][1:3], ["steamvr", "check"])
+        self.assertEqual(run.call_args.args[0][-1], "--install-script")
         self.assertFalse((self.prefix / "bin/cv1touch").exists())
         self.assertFalse((self.prefix / "lib/cv1touch/install-manifest.json").exists())
 
@@ -190,6 +191,10 @@ class InstallTests(unittest.TestCase):
             observed.append(command)
             self.assertEqual(command[2], "check" if len(observed) == 1 else "install")
             self.assertEqual(command[3], "--legacy-assets")
+            if len(observed) == 1:
+                self.assertEqual(command[-1], "--install-script")
+            else:
+                self.assertNotIn("--install-script", command)
             self.assertEqual(Path(command[4]).read_bytes(), old_driver)
         with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(INSTALLER, "run", side_effect=capture):
             INSTALLER.install(args)

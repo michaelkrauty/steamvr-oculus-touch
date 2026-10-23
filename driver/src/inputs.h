@@ -19,8 +19,9 @@ struct InputValues {
 /* Left hand: a/b are the X/Y buttons. No data, not connected, or dead sample: everything released. */
 InputValues map_inputs(const cv1t_controller_state *st, int hand, uint64_t now_ns);
 
-/* The face-button and system component paths per hand (touch_profile.json). system_click is
- * nullptr for the right hand: its Oculus button belongs to the runtime. */
+/* The face-button and system component paths per hand (the input profile). The left Menu button
+ * is SteamVR's dashboard button, /input/system. The right Oculus button gets a source of its own,
+ * /input/home, which games can bind: SteamVR keeps /input/system to itself. */
 struct FaceNames {
 	const char *a_click, *a_touch, *b_click, *b_touch, *system_click;
 };

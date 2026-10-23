@@ -4,6 +4,7 @@
 #include "touch_device.h"
 
 
+#include "cv1touch_steamvr.h"
 #include "log.h"
 #include "pose.h"
 
@@ -19,8 +20,11 @@ vr::EVRInitError TouchDevice::Activate(uint32_t object_id)
 	props->SetStringProperty(container_, vr::Prop_SerialNumber_String, serial());
 	props->SetStringProperty(container_, vr::Prop_ManufacturerName_String, "Oculus");
 	props->SetStringProperty(container_, vr::Prop_RenderModelName_String, left ? "oculus_cv1_controller_left" : "oculus_cv1_controller_right");
-	props->SetStringProperty(container_, vr::Prop_ControllerType_String, "oculus_touch");
-	props->SetStringProperty(container_, vr::Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
+	// A controller type of their own: SteamVR keeps one profile per type, and for oculus_touch that
+	// is its own, which has no right Oculus button. Games' Oculus Touch bindings still apply.
+	props->SetStringProperty(container_, vr::Prop_ControllerType_String, CV1T_CONTROLLER_TYPE);
+	// SteamVR's Oculus Touch profile made over into that type's, with the button, at install time
+	props->SetStringProperty(container_, vr::Prop_InputProfilePath_String, "{cv1touch}/input/touch_profile.json");
 	props->SetStringProperty(container_, vr::Prop_RegisteredDeviceType_String, left ? "cv1touch/CV1T-LEFT" : "cv1touch/CV1T-RIGHT");
 	props->SetInt32Property(container_, vr::Prop_ControllerRoleHint_Int32, left ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
 	props->SetInt32Property(container_, vr::Prop_DeviceClass_Int32, vr::TrackedDeviceClass_Controller);
@@ -33,9 +37,7 @@ vr::EVRInitError TouchDevice::Activate(uint32_t object_id)
 	in->CreateBooleanComponent(container_, f.a_touch, &h_.a_touch);
 	in->CreateBooleanComponent(container_, f.b_click, &h_.b_click);
 	in->CreateBooleanComponent(container_, f.b_touch, &h_.b_touch);
-	h_.system_click = vr::k_ulInvalidInputComponentHandle;
-	if (f.system_click)
-		in->CreateBooleanComponent(container_, f.system_click, &h_.system_click);
+	in->CreateBooleanComponent(container_, f.system_click, &h_.system_click);
 	in->CreateBooleanComponent(container_, "/input/joystick/click", &h_.joy_click);
 	in->CreateBooleanComponent(container_, "/input/joystick/touch", &h_.joy_touch);
 	in->CreateScalarComponent(container_, "/input/joystick/x", &h_.joy_x, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
@@ -66,7 +68,7 @@ void TouchDevice::send_inputs(const InputValues &v, double time_offset)
 		return;
 	auto *in = vr::VRDriverInput();
 	const auto b = [&](vr::VRInputComponentHandle_t hnd, bool now, bool before) {
-		if (hnd != vr::k_ulInvalidInputComponentHandle && (!inputs_sent_ || now != before))
+		if (!inputs_sent_ || now != before)
 			in->UpdateBooleanComponent(hnd, now, time_offset);
 	};
 	const auto s = [&](vr::VRInputComponentHandle_t hnd, float now, float before) {

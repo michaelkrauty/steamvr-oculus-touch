@@ -153,7 +153,7 @@ begin
   Left := Step(Tool, 'sensors install', 'Giving the sensors their driver (Windows asks for permission once)...',
     'The sensors are not ready: plug in every sensor, and allow the permission prompt.');
   Left := Left + Step(Tool, 'steamvr install', 'Registering the SteamVR driver...',
-    'cv1touch is not registered with SteamVR: install SteamVR, and quit it while cv1touch is set up.');
+    'cv1touch is not registered with SteamVR: install SteamVR and start it once (or have Steam verify its files), and quit it while cv1touch is set up.');
   WizardForm.StatusLabel.Caption := 'Starting cv1touch...';
   Exec(ExpandConstant('{app}\bin\cv1touchd-quiet.exe'), '', '', SW_HIDE, ewNoWait, Code);
   if (Left <> '') and not WizardSilent then

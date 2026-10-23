@@ -251,7 +251,9 @@ def install(args):
                 legacy_args = ["--legacy-assets", *snapshots]
             check_env = dict(os.environ)
             check_env["LD_LIBRARY_PATH"] = str(bundle) + (":" + check_env["LD_LIBRARY_PATH"] if check_env.get("LD_LIBRARY_PATH") else "")
-            run([bundle / "cv1touch", "steamvr", "check", *legacy_args], env=check_env)
+            # --install-script: cv1touch is not installed yet, so a failure must say to run
+            # this installer again, not `cv1touch steamvr install`.
+            run([bundle / "cv1touch", "steamvr", "check", *legacy_args, "--install-script"], env=check_env)
         managed = {relative: digest(source) for relative, source in sources.items()}
         replacements = {owned_destination(prefix, relative): source for relative, source in sources.items()}
         if not args.no_service:

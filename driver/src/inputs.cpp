@@ -18,7 +18,7 @@ InputValues map_inputs(const cv1t_controller_state *st, int hand, uint64_t now_n
 	v.a_touch = st->touches & a_tch;
 	v.b_click = st->buttons & b_btn;
 	v.b_touch = st->touches & b_tch;
-	v.system_click = left && (st->buttons & CV1T_BTN_SYSTEM);
+	v.system_click = st->buttons & CV1T_BTN_SYSTEM;
 	v.joy_click = st->buttons & CV1T_BTN_STICK;
 	v.joy_touch = (st->touches & CV1T_TOUCH_STICK) || v.joy_click;
 	v.trigger_touch = st->touches & CV1T_TOUCH_TRIGGER;
@@ -35,7 +35,7 @@ FaceNames face_names(int hand)
 {
 	if (hand == CV1T_HAND_LEFT)
 		return {"/input/x/click", "/input/x/touch", "/input/y/click", "/input/y/touch", "/input/system/click"};
-	return {"/input/a/click", "/input/a/touch", "/input/b/click", "/input/b/touch", nullptr};
+	return {"/input/a/click", "/input/a/touch", "/input/b/click", "/input/b/touch", "/input/home/click"};
 }
 
 } // namespace cv1t
