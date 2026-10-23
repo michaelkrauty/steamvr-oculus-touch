@@ -1347,17 +1347,34 @@ mod tests {
         let r = Recorder::new(4096);
         r.start(&path, 1).unwrap();
         r.write(HAPTIC, 2, &[&[0; 16]]);
-        let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
-        let mut reader = Reader::open(&path).unwrap();
-        let count = reader.by_ref().count();
-        std::fs::remove_file(&path).unwrap();
+        // This offline fixture needs sync and close, not a bounded control response.
+        r.stop();
+        let status = r.status();
         assert!(
             status.finished && status.error.is_none(),
             "{}",
             status.message()
         );
-        assert_eq!(count, 1);
+        assert!(!status.pending && !r.has_session());
+        assert_eq!(status.state, State::Complete);
+        assert!(status.reason.is_none());
+        assert_eq!((status.stats.records, status.stats.bytes), (1, 64));
+        assert_eq!(status.stats.write_errors, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+        let mut reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.start_host_ns, 1);
+        assert_eq!(
+            reader.next(),
+            Some(Record {
+                rtype: HAPTIC,
+                host_ns: 2,
+                payload: vec![0; 16],
+            })
+        );
+        assert!(reader.next().is_none());
         assert!(reader.error().is_none());
+        drop(reader);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1397,12 +1414,12 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(r
-            .stop_timeout(None, Duration::from_secs(2))
-            .unwrap()
-            .error
-            .unwrap()
-            .contains("test original sync failed"));
+        r.stop();
+        let status = r.status();
+        assert!(status.finished && !status.pending && !r.has_session());
+        assert_eq!(status.state, State::Failed);
+        assert_eq!(status.stats.write_errors, 1);
+        assert!(status.error.unwrap().contains("test original sync failed"));
         // Completion must already be published when stop acknowledges and releases the slot.
         assert!(starting
             .final_status()
@@ -1428,11 +1445,11 @@ mod tests {
             .error
             .unwrap()
             .contains("test original sync failed"));
-        assert!(r
-            .stop_timeout(None, Duration::from_secs(2))
-            .unwrap()
-            .error
-            .is_none());
+        r.stop();
+        let status = r.status();
+        assert!(status.finished && !status.pending && !r.has_session());
+        assert_eq!(status.state, State::Complete);
+        assert!(status.error.is_none());
     }
 
     #[test]
@@ -1725,10 +1742,14 @@ mod tests {
         let available = Arc::new(std::sync::atomic::AtomicU64::new(1 << 30));
         let error = r
             .start_session(&path, 1, RECORDING_BYTES, || {
-                Ok(Box::new(SpaceSink {
-                    file: File::create(&path)?,
-                    available,
-                }))
+                // Five percent is below 2 GiB here, exercising the minimum reserve.
+                Ok(Box::new(CapacitySink(
+                    SpaceSink {
+                        file: File::create(&path)?,
+                        available,
+                    },
+                    10 << 30,
+                )))
             })
             .unwrap_err();
         assert!(
@@ -1783,9 +1804,19 @@ mod tests {
                 result.unwrap();
                 assert_eq!(r.status().byte_limit, 8 << 30);
                 state_record(&r, 1);
-                let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
+                // These offline policy cases reuse the file and recorder. A timed stop can
+                // retain the session and its open file, so wait for close and acknowledge it.
+                r.stop();
+                let status = r.status();
+                assert!(status.finished && !status.pending);
+                assert_eq!(status.state, State::Complete);
                 assert_eq!(status.stats.records, 1);
+                assert_eq!(status.stats.bytes, 312);
                 assert!(status.error.is_none() && status.reason.is_none());
+                let mut reader = Reader::open(&path).unwrap();
+                assert_eq!(reader.by_ref().count(), 1);
+                assert!(reader.error().is_none());
+                drop(reader);
             } else {
                 let error = result.unwrap_err();
                 assert!(
