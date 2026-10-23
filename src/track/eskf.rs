@@ -212,7 +212,7 @@ impl Filter {
         let mut e = ErrVec::zeros();
         let mut x = self.x;
         let mut cov = self.cov;
-        for _ in 0..p.iterations.max(1) {
+        for iteration in 0..p.iterations.max(1) {
             let obs = measure(&x);
             if obs.is_empty() {
                 return None;
@@ -235,11 +235,12 @@ impl Filter {
             }
             let chol = info.cholesky()?;
             let next = chol.solve(&b);
-            cov = chol.inverse();
             let step = (next - e).norm();
             e = next;
             x = self.x.plus(&e);
-            if step < 1e-7 {
+            if step < 1e-7 || iteration + 1 == p.iterations.max(1) {
+                // Only the final accepted factor contributes the returned covariance.
+                cov = chol.inverse();
                 break;
             }
         }
@@ -385,3 +386,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod equivalence;
