@@ -1431,8 +1431,121 @@ mod tests {
 
     #[test]
     fn lost_output_is_reported_even_after_the_child_that_wrote_it_ends() {
+        use std::io::{BufRead, BufReader};
+
         let d = dir("lost-after-exit");
-        std::fs::create_dir_all(log_path(&d, 0)).unwrap();
+        let current = log_path(&d, 0);
+        let done = d.join("quiet-done");
+        std::fs::create_dir_all(&current).unwrap();
+        // Isolate stderr so the writer's own loss notices can acknowledge consumed records.
+        let mut supervisor = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "supervise::tests::lost_output_fixture",
+            ])
+            .env("CV1TOUCH_TEST_LOST_OUTPUT", &d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = supervisor.stderr.take().unwrap();
+        let (sent, notices) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut captured = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                if let Some(count) = line
+                    .strip_prefix("cv1touchd supervisor: dropped ")
+                    .and_then(|s| s.split_once(" supervisor notice"))
+                    .and_then(|(count, _)| count.parse::<u64>().ok())
+                {
+                    let _ = sent.send(count);
+                }
+                captured.push_str(&line);
+                captured.push('\n');
+            }
+            captured
+        });
+        // These are watchdogs, not a required child lifetime or a scheduler guarantee.
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut consumed = 0;
+        while (consumed < 4 || !done.with_extension("ready").exists()) && Instant::now() < until {
+            match notices.recv_timeout(Duration::from_millis(100)) {
+                Ok(count) => consumed += count,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        // Both starts, the first end and the restart notice have failed to write. The quiet
+        // child cannot exit yet, so no queued supervisor notice can trigger the recovery.
+        let quiet = consumed == 4 && done.with_extension("ready").exists();
+        if quiet {
+            std::fs::remove_dir(&current).unwrap();
+        }
+        let expected =
+            "cv1touchd supervisor: dropped 1 daemon output line while logging fell behind";
+        let mut reported = false;
+        while quiet && Instant::now() < until {
+            reported = std::fs::read_to_string(&current).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    line.split_once(' ')
+                        .is_some_and(|(_, text)| text == expected)
+                })
+            });
+            if reported || supervisor.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Release even on failure, then bound shutdown separately. Never recover by draining
+        // the writer here: the report must already exist while the second child is alive.
+        std::fs::write(&done, b"").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut status = supervisor.try_wait().unwrap();
+        while status.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            status = supervisor.try_wait().unwrap();
+        }
+        let completed = status.is_some();
+        let status = status.unwrap_or_else(|| {
+            supervisor.kill().unwrap();
+            supervisor.wait().unwrap()
+        });
+        let stderr = reader.join().unwrap();
+        let lines = std::fs::read_to_string(&current).unwrap_or_default();
+        std::fs::remove_dir_all(d).unwrap();
+        assert!(
+            quiet,
+            "startup records did not drain: {consumed} notices; {stderr}"
+        );
+        assert!(
+            reported,
+            "idle recovery did not report the ended child's loss; {stderr}"
+        );
+        assert!(
+            completed,
+            "supervisor shutdown exceeded its watchdog; {stderr}"
+        );
+        assert!(
+            status.success(),
+            "supervisor fixture failed: {status}; {stderr}"
+        );
+        assert_eq!(
+            lines
+                .lines()
+                .filter(|line| line.ends_with(expected))
+                .count(),
+            1,
+            "{lines}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by lost_output_is_reported_even_after_the_child_that_wrote_it_ends"]
+    fn lost_output_fixture() {
+        let d = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_LOST_OUTPUT").unwrap());
         let mut log = Writer::open(&d);
         let lost = log.dropped.clone();
         let mut runs = 0;
@@ -1446,18 +1559,31 @@ mod tests {
                         "echo first; exit 1"
                     })
                 } else {
+                    assert_eq!(runs, 2);
                     let until = Instant::now() + Duration::from_secs(5);
                     while lost.load(Ordering::Relaxed) == 0 && Instant::now() < until {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     assert_eq!(lost.load(Ordering::Relaxed), 1);
-                    std::fs::remove_dir(log_path(&d, 0)).unwrap();
-                    // A quiet child leaves the writer to retry and report the previous child's loss.
-                    shell(if cfg!(windows) {
-                        "ping -n 3 127.0.0.1 >nul"
-                    } else {
-                        "sleep 2"
-                    })
+                    // Redirect only the test harness's chatter. The stand-in itself is quiet
+                    // and exits when the parent observes recovery and releases its file.
+                    #[cfg(windows)]
+                    let mut command = {
+                        use std::os::windows::process::CommandExt;
+                        let mut command = Command::new("cmd");
+                        command.args(["/D", "/S", "/C"]).raw_arg(
+                            "\"\"%CV1TOUCH_TEST_EXE%\" --exact supervise::tests::stand_in_daemon --ignored >nul 2>&1\"",
+                        );
+                        command
+                    };
+                    #[cfg(unix)]
+                    let mut command = shell(
+                        "exec \"$CV1TOUCH_TEST_EXE\" --exact supervise::tests::stand_in_daemon --ignored >/dev/null 2>&1",
+                    );
+                    command
+                        .env("CV1TOUCH_TEST_EXE", std::env::current_exe().unwrap())
+                        .env(STAND_IN, d.join("quiet-done"));
+                    command
                 }
             },
             &mut log,
@@ -1467,11 +1593,6 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(runs, 2);
         assert_eq!(log.dropped.load(Ordering::Relaxed), 0);
-        assert!(texts(log.path())
-            .iter()
-            .any(|l| l.contains("dropped 1 daemon output line")));
-        drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
