@@ -10864,6 +10864,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn battery_reports_keep_atomic_updates_and_change_logs_in_message_order() {
+        for radio_on in [false, true] {
+            let d = status_daemon();
+            d.radio_on.store(radio_on, Ordering::Release);
+            let lines = daemon_log::capture(|| {
+                let send = |messages: [(u8, u16); 2], expected| {
+                    let mut data = [0; 64];
+                    data[0] = 0x0c;
+                    for (i, (device, percent)) in messages.into_iter().enumerate() {
+                        let m = &mut data[3 + 28 * i..3 + 28 * (i + 1)];
+                        m[0] = 0x1c;
+                        m[2] = device;
+                        m[25] = 0x21;
+                        m[26..28].copy_from_slice(&percent.to_le_bytes());
+                    }
+                    d.report(1, 1, &data);
+                    assert_eq!(
+                        d.battery.each_ref().map(|b| b.load(Ordering::Relaxed)),
+                        expected
+                    );
+                    data[0] = 0x0b;
+                    d.report(1, 2, &data);
+                    d.report(1, 3, &data[..63]);
+                    data[0] = 0x0c;
+                    d.report(0, 4, &data);
+                };
+                send([(2, 87), (3, 50)], [87, 50]);
+                send([(2, 87), (3, 50)], [87, 50]);
+                send([(2, 86), (2, 85)], [85, 50]);
+                send([(3, 65535), (2, 0)], [0, 100]);
+                assert_eq!(
+                    d.battery.each_ref().map(|b| b.load(Ordering::Relaxed)),
+                    [0, 100]
+                );
+            });
+            assert_eq!(
+                lines,
+                [
+                    "left Touch battery 87%",
+                    "right Touch battery 50%",
+                    "left Touch battery 86% (was 87%)",
+                    "left Touch battery 85% (was 86%)",
+                    "right Touch battery 100% (was 50%)",
+                    "left Touch battery 0% (was 85%)",
+                ]
+            );
+        }
+    }
+
     /// The fallback engine read its radio report before the report's flight producer could
     /// register, so the daemon's copies take their own time, read after registering.
     #[test]

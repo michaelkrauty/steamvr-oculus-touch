@@ -35,22 +35,18 @@ pub const CAP_THUMBREST: usize = ffi::CV1T_CAP_THUMBREST as usize;
 
 /// Battery reports in a radio report from the headset (64 bytes, id 0x0c, two 28-byte messages):
 /// (hand, percent) for each Touch message whose multiplexed ADC channel is the battery (0x21).
-pub fn battery_from_radio(d: &[u8]) -> Vec<(usize, i32)> {
-    if d.len() != 64 || d[0] != 0x0c {
-        return Vec::new();
-    }
-    (0..2)
-        .filter_map(|i| {
-            let m = &d[3 + 28 * i..3 + 28 * (i + 1)];
-            let hand = match m[2] {
-                2 => HAND_LEFT,
-                3 => HAND_RIGHT,
-                _ => return None,
-            };
-            (u16::from_le_bytes([m[0], m[1]]) == 0x1c && m[25] == 0x21)
-                .then(|| (hand, u16::from_le_bytes([m[26], m[27]]).min(100) as i32))
-        })
-        .collect()
+pub fn battery_from_radio(d: &[u8]) -> impl Iterator<Item = (usize, i32)> + '_ {
+    let messages = if d.len() != 64 || d[0] != 0x0c { 0 } else { 2 };
+    (0..messages).filter_map(move |i| {
+        let m = &d[3 + 28 * i..3 + 28 * (i + 1)];
+        let hand = match m[2] {
+            2 => HAND_LEFT,
+            3 => HAND_RIGHT,
+            _ => return None,
+        };
+        (u16::from_le_bytes([m[0], m[1]]) == 0x1c && m[25] == 0x21)
+            .then(|| (hand, u16::from_le_bytes([m[26], m[27]]).min(100) as i32))
+    })
 }
 
 /// Whether a published state is of a controller whose samples are arriving: connected and not in
@@ -2930,14 +2926,17 @@ mod tests {
         d[31 + 2] = 3;
         d[31 + 25] = 0x08;
         d[31 + 26] = 50;
-        assert_eq!(battery_from_radio(&d), vec![(HAND_LEFT, 87)]);
+        assert_eq!(
+            battery_from_radio(&d).collect::<Vec<_>>(),
+            vec![(HAND_LEFT, 87)]
+        );
         d[31 + 25] = 0x21;
         assert_eq!(
-            battery_from_radio(&d),
+            battery_from_radio(&d).collect::<Vec<_>>(),
             vec![(HAND_LEFT, 87), (HAND_RIGHT, 50)]
         );
         d[0] = 0x0b;
-        assert!(battery_from_radio(&d).is_empty());
+        assert!(battery_from_radio(&d).next().is_none());
     }
 
     #[test]
