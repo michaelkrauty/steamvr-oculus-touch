@@ -10,17 +10,31 @@ namespace cv1t {
 
 static vr::HmdQuaternion_t quat(const float q[4]) { return {q[3], q[0], q[1], q[2]}; }
 
+struct AgePercentiles { uint64_t p50, p99, max; };
+
+static AgePercentiles age_percentiles(std::vector<uint64_t> &v)
+{
+	const auto select = [&](double q) {
+		const size_t index = static_cast<size_t>(q * (v.size() - 1));
+		std::nth_element(v.begin(), v.begin() + index, v.end());
+		return v[index];
+	};
+	const uint64_t p50 = select(0.5);
+	const uint64_t p99 = select(0.99);
+	return {p50, p99, *std::max_element(v.begin(), v.end())};
+}
+
 std::string age_report(const char *serial, std::vector<uint64_t> &ages, std::vector<uint64_t> &handoffs)
 {
-	std::sort(ages.begin(), ages.end());
-	std::sort(handoffs.begin(), handoffs.end());
-	const auto at = [](const std::vector<uint64_t> &v, double q) { return v[static_cast<size_t>(q * (v.size() - 1))] * 1e-6; };
+	const auto age = age_percentiles(ages);
 	char buf[320];
 	int n = snprintf(buf, sizeof buf, "cv1touch: %s pose age at submission over %zu poses: p50 %.2f ms p99 %.2f ms max %.2f ms", serial,
-			 ages.size(), at(ages, 0.5), at(ages, 0.99), at(ages, 1.0));
-	if (!handoffs.empty() && n > 0 && static_cast<size_t>(n) < sizeof buf)
-		snprintf(buf + n, sizeof buf - n, "; of it after the daemon published: p50 %.2f ms p99 %.2f ms max %.2f ms", at(handoffs, 0.5),
-			 at(handoffs, 0.99), at(handoffs, 1.0));
+			 ages.size(), age.p50 * 1e-6, age.p99 * 1e-6, age.max * 1e-6);
+	if (!handoffs.empty() && n > 0 && static_cast<size_t>(n) < sizeof buf) {
+		const auto handoff = age_percentiles(handoffs);
+		snprintf(buf + n, sizeof buf - n, "; of it after the daemon published: p50 %.2f ms p99 %.2f ms max %.2f ms", handoff.p50 * 1e-6,
+			 handoff.p99 * 1e-6, handoff.max * 1e-6);
+	}
 	return buf;
 }
 

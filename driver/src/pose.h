@@ -35,7 +35,7 @@ inline bool sample_dead(const cv1t_controller_state &st, uint64_t now_ns)
 
 /* The driver's statistics line on the poses it submitted in the last while: `ages` are their
  * sample-to-submission ages (ns, at least one) and `handoffs` the part of each that passed after
- * the daemon published it (ns); both are sorted in place. No hand-offs (an older daemon that
+ * the daemon published it (ns); both may be reordered. No hand-offs (an older daemon that
  * stamps no publish time) leaves that part out. */
 std::string age_report(const char *serial, std::vector<uint64_t> &ages, std::vector<uint64_t> &handoffs);
 

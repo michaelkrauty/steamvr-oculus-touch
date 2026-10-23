@@ -4,8 +4,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 #include "pose.h"
+#include "age_report_oracle.h"
 
 #include <string>
 #include <vector>
@@ -125,7 +127,7 @@ static void alignment_is_applied_per_hand()
 static void age_report_splits_the_hand_off()
 {
 	// ages 0.1..10 ms, of which 0.01..1 ms passed after the daemon published; pushed newest-first,
-	// so the percentiles come out right only once sorted
+	// so the percentiles must be independent of insertion order
 	std::vector<uint64_t> ages, handoffs;
 	for (uint64_t k = 100; k >= 1; k--) {
 		ages.push_back(k * 100'000);
@@ -136,6 +138,41 @@ static void age_report_splits_the_hand_off()
 	// an older daemon stamps no publish time: the split is left out
 	std::vector<uint64_t> one{2'000'000}, none;
 	assert(cv1t::age_report("CV1T-RIGHT", one, none) == "cv1touch: CV1T-RIGHT pose age at submission over 1 poses: p50 2.00 ms p99 2.00 ms max 2.00 ms");
+}
+
+// Compare the complete diagnostic, including rounding, counts and both truncation branches.
+static void age_report_matches_full_sort()
+{
+	const auto check = [](const std::vector<uint64_t> &ages, const std::vector<uint64_t> &handoffs,
+			      const std::string &serial) {
+		auto a = ages, h = handoffs, oracle_a = ages, oracle_h = handoffs;
+		const auto expected = age_report_test::age_report(serial.c_str(), oracle_a, oracle_h);
+		const auto actual = cv1t::age_report(serial.c_str(), a, h);
+		if (actual != expected) {
+			fprintf(stderr, "age report differs (ages=%zu handoffs=%zu serial=%zu)\nexpected: %s\nactual: %s\n",
+				ages.size(), handoffs.size(), serial.size(), expected.c_str(), actual.c_str());
+			std::abort();
+		}
+	};
+	// Adjacent odd/even sizes and p99's first index transitions, then larger windows.
+	for (size_t n : {1, 2, 3, 4, 5, 49, 50, 51, 99, 100, 101, 102, 199, 200, 201, 202, 1000, 10000}) {
+		for (int d = 0; d < 6; ++d) {
+			for (uint64_t seed = 0; seed < 5; ++seed) {
+				const auto a = age_report_test::samples(n, d, seed);
+				for (size_t hn : {size_t{0}, size_t{1}, n / 2 + 1, n}) {
+					const auto h = age_report_test::samples(hn, (d + 1) % 6, seed + 100);
+					check(a, h, "CV1T-TEST");
+				}
+			}
+		}
+	}
+	const std::vector<uint64_t> extremes{0, 4999, 5000, 5001, UINT64_MAX, UINT64_MAX - 1,
+		uint64_t{1} << 63, (uint64_t{1} << 53) + 1};
+	// Empty serial, partial handoff text, a full age line, and truncation before any handoff.
+	for (size_t length : {0, 150, 200, 250, 318, 319, 320, 400}) {
+		check(extremes, extremes, std::string(length, 'X'));
+		check(extremes, {}, std::string(length, 'X'));
+	}
 }
 
 /* A sample stamped slightly after "now" (clocks read on two threads) is not a future pose. */
@@ -195,6 +232,7 @@ int main()
 	coasting_then_out_of_range();
 	a_lost_position_is_not_extrapolated();
 	alignment_is_applied_per_hand();
+	age_report_matches_full_sort();
 	age_report_splits_the_hand_off();
 	never_a_positive_time_offset();
 	stale_sample_stops_then_disconnects();
