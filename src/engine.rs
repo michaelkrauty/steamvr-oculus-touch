@@ -17,6 +17,11 @@ use crate::ffi;
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
 use crate::status::sensor_identity;
 
+#[cfg(any(feature = "engine", test))]
+mod identity;
+#[cfg(feature = "engine")]
+pub use identity::ControllerIdentity;
+
 pub use ffi::ohmd_cv1touch_blob as Blob;
 pub use ffi::ohmd_cv1touch_controller as Controller;
 
@@ -542,12 +547,12 @@ impl Engine {
 
     /// Stable factory-calibration identity for this physical controller. Available after
     /// calibration is loaded; query on the engine thread and keep out of public logs.
-    pub fn controller_identity(&self, hand: usize) -> Option<String> {
+    pub fn controller_identity(&self, hand: usize) -> Option<ControllerIdentity> {
         let device = *self.hands.get(hand)?;
-        let mut buf = [0 as c_char; 33];
-        // SAFETY: buffer has the advertised size and this Engine owns the device.
-        (unsafe { ffi::ohmd_cv1touch_get_controller_identity(device, buf.as_mut_ptr(), 33) } == 0)
-            .then(|| cstr_field(&buf))
+        ControllerIdentity::query(|buf| {
+            // SAFETY: buffer has the advertised size and this Engine owns the device.
+            unsafe { ffi::ohmd_cv1touch_get_controller_identity(device, buf.as_mut_ptr(), 33) }
+        })
     }
 
     pub fn controller(&self, hand: usize) -> Option<Controller> {

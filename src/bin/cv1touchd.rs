@@ -46,6 +46,10 @@ mod daemon_log;
 mod callback_tests;
 
 #[cfg(test)]
+#[path = "cv1touchd/identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
 #[path = "cv1touchd/hotplug_explorer.rs"]
 mod hotplug_explorer;
 
@@ -112,11 +116,11 @@ struct InputRuntime {
 }
 
 impl InputRuntime {
-    fn set_identity(&mut self, hand: usize, identity: String) {
+    fn set_identity(&mut self, hand: usize, identity: &str) {
         if self.latest[hand].identity != identity {
             // Never associate the previous device's sample with the new device's identity.
             self.latest[hand] = RawInputs {
-                identity,
+                identity: identity.to_owned(),
                 ..Default::default()
             };
         }
@@ -3213,7 +3217,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
             let read_from = shm::now_ns();
             let Some(c) = e.controller(h) else { continue };
             if let Some(identity) = e.controller_identity(h) {
-                d.inputs.lock().unwrap().set_identity(h, identity);
+                d.inputs.lock().unwrap().set_identity(h, identity.as_str());
             }
             link.engine_view.lock().unwrap()[h] = Some(c);
             if !engine_publishes_hand_persistent(d, &link.hands, h, &c, shm::now_ns) {
@@ -17823,7 +17827,7 @@ mod tests {
     #[test]
     fn raw_buttons_preserve_physical_bits_before_injection() {
         let mut runtime = InputRuntime::default();
-        runtime.set_identity(0, "a".repeat(32));
+        runtime.set_identity(0, &"a".repeat(32));
         let physical = cv1touch::hand::BTN_X | cv1touch::hand::BTN_STICK | (1 << 31);
         let mut state = ControllerState {
             flags: ffi::CV1T_FLAG_CONNECTED,
@@ -17859,7 +17863,7 @@ mod tests {
         let d = status_daemon();
         {
             let mut runtime = d.inputs.lock().unwrap();
-            runtime.set_identity(0, "a".repeat(32));
+            runtime.set_identity(0, &"a".repeat(32));
             let mut state = ControllerState {
                 flags: ffi::CV1T_FLAG_CONNECTED,
                 buttons: cv1touch::hand::BTN_X,
@@ -17867,7 +17871,7 @@ mod tests {
                 ..Default::default()
             };
             runtime.apply(0, &mut state);
-            runtime.set_identity(0, "b".repeat(32));
+            runtime.set_identity(0, &"b".repeat(32));
             let json = serde_json::to_value(&runtime.latest).unwrap();
             assert_eq!(json[0]["buttons"], 0);
             assert_eq!(json[0]["received_host_ns"], 0);
@@ -17911,7 +17915,7 @@ mod tests {
             calibration: Some(input_config()),
             ..Default::default()
         };
-        runtime.set_identity(0, "a".repeat(32));
+        runtime.set_identity(0, &"a".repeat(32));
         let mut state = ControllerState {
             flags: ffi::CV1T_FLAG_CONNECTED,
             trigger: 0.9,
@@ -17942,10 +17946,10 @@ mod tests {
             calibration: Some(input_config()),
             ..Default::default()
         };
-        runtime.set_identity(0, "a".repeat(32));
+        runtime.set_identity(0, &"a".repeat(32));
         runtime.latest[0].connected = true;
         runtime.latest[0].received_host_ns = 42;
-        runtime.set_identity(0, "c".repeat(32));
+        runtime.set_identity(0, &"c".repeat(32));
         assert!(!runtime.latest[0].connected);
         assert_eq!(runtime.latest[0].received_host_ns, 0);
         assert!(!runtime.calibration_applies(0));
