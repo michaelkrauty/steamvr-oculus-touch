@@ -230,6 +230,16 @@ struct RegisteredCamera {
     camera: Camera,
 }
 
+// Frame dispatch visits hand 0 then hand 1. The last consumer can own the
+// original allocation; the first still needs an independent, mutable buffer.
+fn frame_blobs_for_hand(blobs: &mut Vec<Blob>, hand: usize) -> Vec<Blob> {
+    if hand == 1 {
+        std::mem::take(blobs)
+    } else {
+        blobs.clone()
+    }
+}
+
 pub struct Pipeline {
     pub opts: Options,
     hmd_clock: LinearClock,
@@ -916,7 +926,7 @@ impl Pipeline {
         }
         let camera = registered.id;
         let cam = registered.camera;
-        let list: Vec<Blob> = blobs
+        let mut list: Vec<Blob> = blobs
             .iter()
             .map(|b| Blob {
                 xy: Vector2::new(b.x as f64, b.y as f64),
@@ -980,7 +990,7 @@ impl Pipeline {
                 self.probing[hand].push(PendingProbe {
                     t_e,
                     camera,
-                    blobs: list.clone(),
+                    blobs: frame_blobs_for_hand(&mut list, hand),
                     identity_epoch,
                 });
                 continue;
@@ -1008,7 +1018,7 @@ impl Pipeline {
                     frame_start_host_ns: info.frame_start_host_ns,
                     camera,
                     cam,
-                    blobs: list.clone(),
+                    blobs: frame_blobs_for_hand(&mut list, hand),
                     engine,
                     identity_epoch,
                 },
@@ -3185,5 +3195,39 @@ mod tests {
         assert_eq!(p.identity_evidence("SENSOR0")[HAND_LEFT], still);
         p.probe("SENSOR0", false);
         assert_eq!(p.identity_evidence("SENSOR0"), none);
+    }
+}
+
+#[cfg(test)]
+mod frame_allocation_tests {
+    use super::*;
+    use crate::track::tracker::stillness_tests::counted;
+
+    #[test]
+    fn last_hand_owns_frame_buffer_without_copying() {
+        for n in [0, 1, 24, 100] {
+            for left_consumes in [false, true] {
+                let mut blobs: Vec<_> = (0..n)
+                    .map(|i| Blob {
+                        xy: Vector2::new(i as f64, -(i as f64)),
+                        led_id: i,
+                    })
+                    .collect();
+                let original = blobs.clone();
+                let ptr = blobs.as_ptr();
+                let left = left_consumes.then(|| frame_blobs_for_hand(&mut blobs, 0));
+                assert_eq!(blobs, original);
+                let (right, counts) = counted(|| frame_blobs_for_hand(&mut blobs, 1));
+                assert_eq!(right, original);
+                assert_eq!(right.as_ptr(), ptr);
+                assert!(blobs.is_empty());
+                assert_eq!(counts.0, 0);
+                if let Some(mut left) = left {
+                    assert_eq!(left, original);
+                    left.clear();
+                    assert_eq!(right, original);
+                }
+            }
+        }
     }
 }
