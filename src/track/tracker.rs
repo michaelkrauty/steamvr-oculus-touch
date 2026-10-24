@@ -1390,9 +1390,9 @@ impl Tracker {
         if !comparable || pairs.len() < 4 {
             return;
         }
-        let res = vision::residuals(cam, &self.body, blobs, pairs, &prior.x);
-        let mean = res.iter().map(|o| o.r).sum::<Vector2<f64>>() / res.len() as f64;
-        let mut r: Vec<f64> = res.iter().map(|o| o.r.norm()).collect();
+        let res = vision::pixel_residuals(cam, &self.body, blobs, pairs, &prior.x);
+        let mean = res.iter().copied().sum::<Vector2<f64>>() / res.len() as f64;
+        let mut r: Vec<f64> = res.iter().map(|o| o.norm()).collect();
         r.sort_by(|a, b| a.total_cmp(b));
         let median = r[r.len() / 2];
         let a = &mut self.agreement[camera];

@@ -259,3 +259,71 @@ fn shifted_scratch_matches_baseline_and_reduces_allocations() {
         }
     }
 }
+
+#[test]
+#[ignore = "offline release benchmark"]
+fn benchmark_followup_shifted() {
+    use std::{hint::black_box, time::Instant};
+    let (cam, b, x) = (camera(), body(), state());
+    let f = filter(x, 0.01, 0.03);
+    let list: Vec<_> = blobs(&cam, &b, &x).into_iter().map(|(_, b)| b).collect();
+    let p = AssocParams::default();
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..12 {
+        for which in [round % 2, 1 - round % 2] {
+            let start = Instant::now();
+            for _ in 0..2000 {
+                let fun = if which == 0 {
+                    baseline_shifted
+                } else {
+                    associate_shifted
+                };
+                black_box(fun(black_box(&cam), &b, &f, &list, 0.5, &p, 1.5, 4, 2));
+            }
+            times[which].push(start.elapsed().as_secs_f64() * 1e6 / 2000.0);
+        }
+    }
+    for (name, t) in ["baseline", "scratch + selection"]
+        .into_iter()
+        .zip(&mut times)
+    {
+        t.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name} shifted us/call min/median/max: {:.3}/{:.3}/{:.3}",
+            t[0], t[6], t[11]
+        );
+    }
+}
+
+#[test]
+fn diagnostic_residuals_match_full_projection_bits() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, mut x) = (camera(), body(), state());
+    let list: Vec<_> = (0..b.leds.len())
+        .map(|i| Blob {
+            xy: Vector2::new(i as f64 * 40.0, 300.0),
+            led_id: -1,
+        })
+        .collect();
+    let pairs: Vec<_> = (0..b.leds.len()).rev().map(|i| (i, i)).collect();
+    for z in [0.0, 1.0, 2.0, 4.0, f64::NAN] {
+        x.p.z = z;
+        let (actual, nc) = counted(|| pixel_residuals(&cam, &b, &list, &pairs, &x));
+        let (full, oc) = counted(|| residuals(&cam, &b, &list, &pairs, &x));
+        let expected: Vec<_> = pairs
+            .iter()
+            .filter_map(|&(led, blob)| {
+                original_project(&cam, &b, &x, led).map(|p| list[blob].xy - p.uv)
+            })
+            .collect();
+        let bits = |v: Vec<Vector2<f64>>| {
+            v.into_iter()
+                .map(|v| [v.x.to_bits(), v.y.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(actual), bits(expected));
+        if !full.is_empty() {
+            assert!(nc.2 < oc.2, "smaller diagnostic storage: {nc:?} vs {oc:?}");
+        }
+    }
+}

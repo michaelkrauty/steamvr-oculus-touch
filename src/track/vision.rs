@@ -387,6 +387,21 @@ pub fn residuals(
         .collect()
 }
 
+/// Diagnostic residuals need pixels, not the filter update's Jacobians.
+pub(super) fn pixel_residuals(
+    cam: &Camera,
+    body: &Body,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    x: &Nominal,
+) -> Vec<Vector2<f64>> {
+    let projector = Projector::new(cam, body, x);
+    pairs
+        .iter()
+        .filter_map(|&(led, b)| projector.pixel(led).map(|(uv, _)| blobs[b].xy - uv))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitParams {
     pub update: UpdateParams,
