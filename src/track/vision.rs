@@ -298,6 +298,9 @@ fn associate_visible(
             }
         }
     }
+    if cand.is_empty() {
+        return Vec::new();
+    }
     cand.sort_by(|a, b| a.0.total_cmp(&b.0));
     let lone = |k: usize| {
         visible
