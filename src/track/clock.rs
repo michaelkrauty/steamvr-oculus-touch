@@ -166,8 +166,10 @@ mod tests {
         for n in [4, 5, 19, 20, 64] {
             for split in 0..n {
                 for constant_x in [false, true] {
-                    let mut c = LinearClock::default();
-                    c.bins = VecDeque::with_capacity(n);
+                    let mut c = LinearClock {
+                        bins: VecDeque::with_capacity(n),
+                        ..LinearClock::default()
+                    };
                     for i in 0..n {
                         c.bins
                             .push_back((i as f64 * 1e9, (i as f64 * 0.71).sin() * 1e6));
