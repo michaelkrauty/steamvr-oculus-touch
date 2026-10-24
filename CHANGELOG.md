@@ -25,6 +25,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Remembered-orientation reacquisition counts visible LEDs without running an unused blob-association pass for each fitted candidate. Acceptance rules and search cadence are unchanged; this does not affect the normal successful-tracking path. See [verification](docs/reacquisition-visible-count-performance.md).
+
 - Clock fitting no longer copies its retained samples into a temporary allocation on each mature refit; the fit and timestamp mapping are unchanged. See [verification](docs/clock-refit-performance.md).
 
 - Shifted optical association scans for a unique nearby blob instead of allocating and sorting a temporary distance list for every LED and candidate shift. Matching behavior is unchanged. A local synthetic recovery benchmark took about 26% less time per association; this is not an end-to-end latency measurement. See [verification](docs/shift-association-performance.md).
