@@ -59,6 +59,10 @@ impl LinearClock {
                     return;
                 }
                 self.current = Some((bin, x, y));
+                // The warm fit uses only closed bins. Save the open minimum for rollover.
+                if self.bins.len() >= 4 {
+                    return;
+                }
             }
             Some((b, cx, cy)) if bin > b => {
                 self.bins.push_back((cx, cy));
@@ -230,5 +234,60 @@ mod tests {
         let b = u.extend(5);
         assert_eq!(b - a, 16_000);
         assert_eq!(u.relative(u32::MAX - 2), Some(a + 8_000));
+    }
+}
+
+#[cfg(test)]
+impl LinearClock {
+    fn original_observe(&mut self, device_ns: u64, host_ns: u64) {
+        let offset = host_ns as i64 - device_ns as i64;
+        let (d0, y0) = *self.reference.get_or_insert((device_ns, offset));
+        let (x, y) = (device_ns as f64 - d0 as f64, (offset - y0) as f64);
+        if (y - self.a - self.b * x).abs() > self.reset_ns {
+            *self = LinearClock::new(self.bin_ns, self.window);
+            return self.original_observe(device_ns, host_ns);
+        }
+        let bin = device_ns / self.bin_ns;
+        match self.current {
+            Some((b, _, cy)) if b == bin => {
+                if y >= cy {
+                    return;
+                }
+                self.current = Some((bin, x, y));
+            }
+            Some((b, cx, cy)) if bin > b => {
+                self.bins.push_back((cx, cy));
+                while self.bins.len() >= self.window {
+                    self.bins.pop_front();
+                }
+                self.current = Some((bin, x, y));
+            }
+            Some(_) => return, // stamps going backwards: ignore
+            None => self.current = Some((bin, x, y)),
+        }
+        self.refit();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn skipped_refits_match_original_for_every_observation() {
+    for window in [1, 4, 5, 20] {
+        let mut a = LinearClock::new(100_000_000, window);
+        let mut b = a.clone();
+        for k in 0..5000u64 {
+            let d = k * 1_000_000;
+            let delay = 1_000_000 - (k % 100) * 1000;
+            let h = 5_000_000_000 + d + delay + if k % 1703 == 0 { 100_000_000 } else { 0 };
+            a.original_observe(d, h);
+            b.observe(d, h);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            assert_eq!(
+                (a.a.to_bits(), a.b.to_bits()),
+                (b.a.to_bits(), b.b.to_bits())
+            );
+            assert_eq!(a.to_host(d), b.to_host(d));
+            assert_eq!(a.to_device(h), b.to_device(h));
+        }
     }
 }

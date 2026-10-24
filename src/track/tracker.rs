@@ -694,7 +694,8 @@ impl Tracker {
         }
         let (tk, mut f) = self.history[k - 1];
         if t > tk {
-            let s = self.imu.iter().find(|s| s.t > tk)?;
+            let next = self.imu.partition_point(|s| s.t <= tk);
+            let s = self.imu.get(next)?;
             f.propagate(
                 &s.gyro,
                 &s.accel,
@@ -728,26 +729,21 @@ impl Tracker {
         let (mut t, mut f) = (first.t, posterior);
         self.history.push_back((t, f));
         self.applied.push_back(first);
-        let imu: Vec<(ImuSample, bool)> = self
+        let from = t;
+        let mut imu = self
             .imu
             .iter()
             .zip(&self.still)
-            .filter(|(s, _)| s.t > t)
-            .map(|(s, st)| (*s, *st))
-            .collect();
-        let (mut i, mut m) = (0, 0);
+            .filter(|(s, _)| s.t > from)
+            .peekable();
+        let mut m = 0;
         loop {
             let next_m = later.get(m).map(|a| a.t);
-            let next_s = imu.get(i).map(|s| s.0.t);
+            let next_s = imu.peek().map(|(s, _)| s.t);
             match (next_m, next_s) {
                 (Some(tm), Some(ts)) if tm <= ts => {
-                    f.propagate(
-                        &imu[i].0.gyro,
-                        &imu[i].0.accel,
-                        (tm - t) as f64 * 1e-9,
-                        &g,
-                        &n,
-                    );
+                    let (s, _) = *imu.peek().unwrap();
+                    f.propagate(&s.gyro, &s.accel, (tm - t) as f64 * 1e-9, &g, &n);
                     t = tm;
                     let a = &later[m];
                     match vision::fit_pairs(
@@ -771,17 +767,11 @@ impl Tracker {
                     m += 1;
                 }
                 (_, Some(ts)) => {
-                    f.propagate(
-                        &imu[i].0.gyro,
-                        &imu[i].0.accel,
-                        (ts - t) as f64 * 1e-9,
-                        &g,
-                        &n,
-                    );
-                    self.zupt(&mut f, t, ts, imu[i].1);
+                    let (s, still) = imu.next().unwrap();
+                    f.propagate(&s.gyro, &s.accel, (ts - t) as f64 * 1e-9, &g, &n);
+                    self.zupt(&mut f, t, ts, *still);
                     t = ts;
                     self.history.push_back((t, f));
-                    i += 1;
                 }
                 // a measurement can't be newer than the newest IMU sample (frames wait for it)
                 (Some(_), None) | (None, None) => break,
@@ -1307,24 +1297,20 @@ impl Tracker {
         fit_params: &FitParams,
     ) -> Option<(Filter, vision::Fit)> {
         let all: Vec<usize> = (0..blobs.len()).collect();
-        let costed: Vec<(f64, (Filter, vision::Fit))> =
-            search::search_position(cam, &self.body, &kept.x.q, blobs, &all, &self.params.search)
-                .into_iter()
-                .filter_map(|c| {
-                    self.attempt(
-                        cam,
-                        blobs,
-                        &c.world_from_model,
-                        c.pairs,
-                        carried,
-                        fit_params,
-                    )
-                })
-                .filter(|(_, fit)| self.explains_frame(cam, blobs, fit))
-                .map(|h| (self.acquisition_cost(cam, blobs, &h.1), h))
-                .collect();
-        costed
+        search::search_position(cam, &self.body, &kept.x.q, blobs, &all, &self.params.search)
             .into_iter()
+            .filter_map(|c| {
+                self.attempt(
+                    cam,
+                    blobs,
+                    &c.world_from_model,
+                    c.pairs,
+                    carried,
+                    fit_params,
+                )
+            })
+            .filter(|(_, fit)| self.explains_frame(cam, blobs, fit))
+            .map(|h| (self.acquisition_cost(cam, blobs, &h.1), h))
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, h)| h)
     }
@@ -1416,7 +1402,8 @@ impl Tracker {
                 && updates
                     .iter()
                     .rev()
-                    .any(|&t| t <= t_e && t_e - t <= CROSS_CHECK_NS)
+                    .find(|&&t| t <= t_e)
+                    .is_some_and(|&t| t_e - t <= CROSS_CHECK_NS)
         })
     }
 
@@ -1449,11 +1436,10 @@ impl Tracker {
         if k == 0 || self.imu.front().is_none_or(|s| s.t > from) {
             return None;
         }
-        let win: Vec<&ImuSample> = self.imu.iter().take(k).filter(|s| s.t >= from).collect();
-        let mean = win.iter().map(|s| s.accel).sum::<Vector3<f64>>() / win.len() as f64;
-        let steady = win
-            .iter()
-            .all(|s| (s.accel - mean).norm() < self.params.steady_accel)
+        let start = self.imu.partition_point(|s| s.t < from);
+        let mut win = self.imu.range(start..k);
+        let mean = win.clone().map(|s| s.accel).sum::<Vector3<f64>>() / win.len() as f64;
+        let steady = win.all(|s| (s.accel - mean).norm() < self.params.steady_accel)
             && ((mean - ba).norm() - self.params.gravity).abs() < self.params.steady_accel;
         steady.then(|| (mean - ba).normalize())
     }
@@ -1465,15 +1451,8 @@ impl Tracker {
             .iter()
             .map(|r| (r.r.norm() / self.params.alias_sigma_px).powi(2))
             .sum();
-        let (visible, near, _) = vision::association_report(
-            cam,
-            &self.body,
-            f,
-            blobs,
-            self.params.fit.update.sigma_px,
-            &self.params.fit.assoc,
-            3.0,
-        );
+        let (visible, near) =
+            vision::visibility_counts(cam, &self.body, &f.x, blobs, &self.params.fit.assoc, 3.0);
         chi + self.params.alias_miss_cost * (visible.saturating_sub(near) + fit.unexplained) as f64
     }
 
@@ -1510,6 +1489,7 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+    mod hot_paths;
     use super::*;
     use crate::calib::synth::{self, Motion, Rng};
     use nalgebra::{Point3, Translation3, UnitQuaternion, Vector2};
@@ -3450,4 +3430,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod stillness_tests;
+pub(crate) mod stillness_tests;

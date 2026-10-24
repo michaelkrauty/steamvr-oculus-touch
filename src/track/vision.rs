@@ -177,8 +177,33 @@ pub fn association_report(
     (
         visible.len(),
         near,
-        associate(cam, body, f, blobs, sigma_px, p).len(),
+        associate_visible(&visible, f, blobs, sigma_px, p).len(),
     )
+}
+
+/// Visible LEDs and those with a nearby blob, without computing a matching.
+pub fn visibility_counts(
+    cam: &Camera,
+    body: &Body,
+    x: &Nominal,
+    blobs: &[Blob],
+    p: &AssocParams,
+    near_px: f64,
+) -> (usize, usize) {
+    let (w, h) = (cam.model.width as f64, cam.model.height as f64);
+    (0..body.leds.len())
+        .filter_map(|i| project(cam, body, x, i))
+        .filter(|pr| {
+            pr.facing > p.min_facing
+                && pr.uv.x >= 0.0
+                && pr.uv.y >= 0.0
+                && pr.uv.x < w
+                && pr.uv.y < h
+        })
+        .fold((0, 0), |(visible, near), pr| {
+            let nearby = blobs.iter().any(|b| (b.xy - pr.uv).norm() <= near_px);
+            (visible + 1, near + usize::from(nearby))
+        })
 }
 
 /// Matches blobs to the LEDs the prior predicts, one to one: (LED, blob index) pairs.
@@ -201,6 +226,16 @@ pub fn associate(
                 && pr.uv.y < h
         })
         .collect();
+    associate_visible(&visible, f, blobs, sigma_px, p)
+}
+
+fn associate_visible(
+    visible: &[Projection],
+    f: &Filter,
+    blobs: &[Blob],
+    sigma_px: f64,
+    p: &AssocParams,
+) -> Vec<(usize, usize)> {
     let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
     let var = Matrix2::identity() * (sigma_px * sigma_px);
     // (d2, visible index, blob)
@@ -377,17 +412,16 @@ pub fn unexplained_blobs(
     min_facing: f64,
     margin: f64,
 ) -> usize {
-    let uv: Vec<Vector2<f64>> = (0..body.leds.len())
+    let mut uv = (0..body.leds.len())
         .filter_map(|i| project(cam, body, x, i))
         .filter(|pr| pr.facing > min_facing)
-        .map(|pr| pr.uv)
-        .collect();
-    if uv.is_empty() {
+        .map(|pr| pr.uv);
+    let Some(first) = uv.next() else {
         return 0;
-    }
-    let (lo, hi) = uv
-        .iter()
-        .fold((uv[0], uv[0]), |(lo, hi), p| (lo.inf(p), hi.sup(p)));
+    };
+    let (lo, hi) = std::iter::once(first)
+        .chain(uv)
+        .fold((first, first), |(lo, hi), p| (lo.inf(&p), hi.sup(&p)));
     blobs
         .iter()
         .enumerate()
@@ -551,16 +585,14 @@ pub fn fit_pairs(
     let pair_residual = |x: &Nominal, &(led, b): &(usize, usize)| {
         project(cam, body, x, led).map_or(f64::INFINITY, |pr| (blobs[b].xy - pr.uv).norm())
     };
-    let keep: Vec<(usize, usize)> = pairs
-        .iter()
-        .filter(|pr| pair_residual(&updated.filter.x, pr) <= p.inlier_px)
-        .copied()
-        .collect();
-    if keep.len() < p.min_leds || (keep.len() as f64) < p.min_inlier_fraction * pairs.len() as f64 {
+    let original_len = pairs.len();
+    pairs.retain(|pr| pair_residual(&updated.filter.x, pr) <= p.inlier_px);
+    if pairs.len() < p.min_leds
+        || (pairs.len() as f64) < p.min_inlier_fraction * original_len as f64
+    {
         return Err(Miss::Rejected);
     }
-    if keep.len() < pairs.len() {
-        pairs = keep;
+    if pairs.len() < original_len {
         updated = prior
             .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
             .ok_or(Miss::Rejected)?;
@@ -686,7 +718,8 @@ pub fn ring_aliases(leds: &[Led]) -> Vec<Alias> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) mod hot_paths;
     mod shift;
 
     use super::*;
