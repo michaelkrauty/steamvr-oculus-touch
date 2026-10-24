@@ -292,6 +292,7 @@ fn benchmark_sweep_association() {
     use std::{hint::black_box, time::Instant};
     let (visible, f, list) = association_fixture();
     let p = AssocParams::default();
+    let f = filter(f.x, 0.001, 0.001);
     for (label, list) in [
         ("near", list.clone()),
         (
@@ -342,4 +343,17 @@ fn sweep_no_candidates_avoids_masks() {
     assert_eq!(new, old);
     assert_eq!(nc.0, 0);
     assert_eq!(oc.0, 2);
+}
+
+#[test]
+fn sweep_empty_blobs_skip_projection_allocation() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    let f = filter(x, 0.1, 0.1);
+    let p = AssocParams::default();
+    let (new, nc) = counted(|| associate(&cam, &b, &f, &[], 0.5, &p));
+    let (old, oc) = counted(|| super::hot_paths::original_associate(&cam, &b, &f, &[], 0.5, &p));
+    assert_eq!(new, old);
+    assert_eq!(nc.0, 0);
+    assert!(oc.0 > 0);
 }

@@ -257,6 +257,9 @@ pub fn associate(
     sigma_px: f64,
     p: &AssocParams,
 ) -> Vec<(usize, usize)> {
+    if blobs.is_empty() {
+        return Vec::new();
+    }
     let projector = Projector::new(cam, body, &f.x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     let visible: Vec<Projection> = (0..body.leds.len())
