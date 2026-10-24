@@ -214,7 +214,7 @@ fn search(
             .then(x.sq_px.total_cmp(&y.sq_px))
     });
     let mut out: Vec<Candidate> = Vec::new();
-    for s in &scored {
+    for s in scored {
         if out.len() == p.max_candidates {
             break;
         }
@@ -232,7 +232,7 @@ fn search(
         if let Some(t) = on_rays.and_then(|r| closest_to_rays(&centre, &r)) {
             out.push(Candidate {
                 world_from_model: Isometry3::from_parts(Translation3::from(t), *q),
-                pairs: s.pairs.clone(),
+                pairs: s.pairs,
             });
         }
     }

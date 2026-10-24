@@ -25,6 +25,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Tracking avoids redundant clock refits, temporary IMU/geometry/candidate buffers, and unused association work during acquisition scoring. Historical lookups and stale-camera checks skip unnecessary scans. Algorithms and acceptance rules are unchanged; some owned vectors retain their existing spare capacity. These are local CPU/allocation improvements, not an end-to-end latency claim. See [verification](docs/tracking-hot-path-performance.md).
+
 - Remembered-orientation reacquisition counts visible LEDs without running an unused blob-association pass for each fitted candidate. Acceptance rules and search cadence are unchanged; this does not affect the normal successful-tracking path. See [verification](docs/reacquisition-visible-count-performance.md).
 
 - Clock fitting no longer copies its retained samples into a temporary allocation on each mature refit; the fit and timestamp mapping are unchanged. See [verification](docs/clock-refit-performance.md).

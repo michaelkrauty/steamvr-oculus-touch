@@ -59,7 +59,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-fn counted<T>(f: impl FnOnce() -> T) -> (T, (usize, usize, usize)) {
+pub(crate) fn counted<T>(f: impl FnOnce() -> T) -> (T, (usize, usize, usize)) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -369,7 +369,7 @@ fn stillness_means_and_decisions_match_for_wrapping_growth_and_thresholds() {
     equivalent(&tr, &sample(3));
 }
 
-fn filter_bits(f: &Filter) -> Vec<u64> {
+pub(crate) fn filter_bits(f: &Filter) -> Vec<u64> {
     f.x.q
         .coords
         .iter()
@@ -408,7 +408,7 @@ fn legacy_imu_copies_the_current_handler_except_for_detector_selection() {
     );
 }
 
-fn assert_state(a: &Tracker, b: &Tracker) {
+pub(super) fn assert_state(a: &Tracker, b: &Tracker) {
     assert_eq!(a.still, b.still);
     assert_eq!(a.imu, b.imu);
     assert_eq!(a.stats, b.stats);
