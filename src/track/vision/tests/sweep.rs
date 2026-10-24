@@ -430,3 +430,62 @@ fn sweep_predicted_capacity_preserves_pixels_and_avoids_growth() {
         }
     }
 }
+
+fn sweep_baseline_gate_pairs(
+    cam: &Camera,
+    body: &Body,
+    f: &Filter,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    sigma_px: f64,
+    p: &AssocParams,
+) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
+    let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
+    let var = Matrix2::identity() * (sigma_px * sigma_px);
+    pairs
+        .iter()
+        .copied()
+        .filter(|&(led, b)| {
+            let Some(pr) = projector.project(led) else {
+                return false;
+            };
+            let d = blobs[b].xy - pr.uv;
+            let within = pr.facing > p.min_facing && d.norm() <= p.max_px;
+            if !within {
+                return false;
+            }
+            let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
+                return false;
+            };
+            (d.transpose() * s_inv * d)[0] < p.gate
+        })
+        .collect()
+}
+
+#[test]
+fn sweep_hint_capacity_preserves_matches_and_avoids_growth() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    let seen = blobs(&cam, &b, &x);
+    let list: Vec<_> = seen.iter().map(|s| s.1).collect();
+    let pairs: Vec<_> = seen.iter().enumerate().map(|(i, s)| (s.0, i)).collect();
+    let f = filter(x, 0.1, 0.1);
+    for n in 0..=pairs.len() {
+        for min_facing in [-1.0, 0.2, 1.0, f64::NAN] {
+            let p = AssocParams {
+                min_facing,
+                ..AssocParams::default()
+            };
+            let (new, nc) = counted(|| gate_pairs(&cam, &b, &f, &list, &pairs[..n], 0.5, &p));
+            let (old, oc) =
+                counted(|| sweep_baseline_gate_pairs(&cam, &b, &f, &list, &pairs[..n], 0.5, &p));
+            assert_eq!(new, old);
+            assert_eq!(nc.0, usize::from(!new.is_empty()));
+            assert!(nc.0 <= oc.0);
+            if n > 4 && min_facing == -1.0 {
+                assert!(nc.0 < oc.0);
+            }
+        }
+    }
+}

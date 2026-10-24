@@ -350,24 +350,27 @@ pub fn gate_pairs(
     let projector = Projector::new(cam, body, &f.x);
     let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
     let var = Matrix2::identity() * (sigma_px * sigma_px);
-    pairs
-        .iter()
-        .copied()
-        .filter(|&(led, b)| {
-            let Some(pr) = projector.project(led) else {
-                return false;
-            };
-            let d = blobs[b].xy - pr.uv;
-            let within = pr.facing > p.min_facing && d.norm() <= p.max_px;
-            if !within {
-                return false;
-            }
-            let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
-                return false;
-            };
-            (d.transpose() * s_inv * d)[0] < p.gate
-        })
-        .collect()
+    let mut accepted = pairs.iter().copied().filter(|&(led, b)| {
+        let Some(pr) = projector.project(led) else {
+            return false;
+        };
+        let d = blobs[b].xy - pr.uv;
+        let within = pr.facing > p.min_facing && d.norm() <= p.max_px;
+        if !within {
+            return false;
+        }
+        let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
+            return false;
+        };
+        (d.transpose() * s_inv * d)[0] < p.gate
+    });
+    let Some(first) = accepted.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    out.push(first);
+    out.extend(accepted);
+    out
 }
 
 /// `ours` plus every hint whose LED and blob `ours` leaves free.
