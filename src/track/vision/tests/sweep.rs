@@ -489,3 +489,35 @@ fn sweep_hint_capacity_preserves_matches_and_avoids_growth() {
         }
     }
 }
+
+#[test]
+fn sweep_visible_projection_capacity_avoids_growth() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    let projector = Projector::new(&cam, &b, &x);
+    for min_facing in [-1.0, 0.2, 1.0, f64::NAN] {
+        let p = AssocParams {
+            min_facing,
+            ..AssocParams::default()
+        };
+        let (new, nc) = counted(|| visible_projections(&projector, &p));
+        let (old, oc) = counted(|| {
+            (0..b.leds.len())
+                .filter_map(|i| projector.project(i))
+                .filter(|pr| {
+                    pr.facing > p.min_facing
+                        && pr.uv.x >= 0.0
+                        && pr.uv.y >= 0.0
+                        && pr.uv.x < cam.model.width as f64
+                        && pr.uv.y < cam.model.height as f64
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(new, old);
+        assert_eq!(nc.0, usize::from(!new.is_empty()));
+        assert!(nc.0 <= oc.0);
+        if min_facing == -1.0 {
+            assert!(nc.0 < oc.0);
+        }
+    }
+}

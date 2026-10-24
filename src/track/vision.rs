@@ -210,17 +210,7 @@ pub fn association_report(
     near_px: f64,
 ) -> (usize, usize, usize) {
     let projector = Projector::new(cam, body, &f.x);
-    let (w, h) = (cam.model.width as f64, cam.model.height as f64);
-    let visible: Vec<Projection> = (0..body.leds.len())
-        .filter_map(|i| projector.project(i))
-        .filter(|pr| {
-            pr.facing > p.min_facing
-                && pr.uv.x >= 0.0
-                && pr.uv.y >= 0.0
-                && pr.uv.x < w
-                && pr.uv.y < h
-        })
-        .collect();
+    let visible = visible_projections(&projector, p);
     let near = visible
         .iter()
         .filter(|pr| blobs.iter().any(|b| (b.xy - pr.uv).norm() <= near_px))
@@ -267,8 +257,15 @@ pub fn associate(
         return Vec::new();
     }
     let projector = Projector::new(cam, body, &f.x);
+    let visible = visible_projections(&projector, p);
+    associate_visible(&visible, f, blobs, sigma_px, p)
+}
+
+fn visible_projections(projector: &Projector<'_>, p: &AssocParams) -> Vec<Projection> {
+    let cam = projector.cam;
+    let body = projector.body;
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
-    let visible: Vec<Projection> = (0..body.leds.len())
+    let mut projected = (0..body.leds.len())
         .filter_map(|i| projector.project(i))
         .filter(|pr| {
             pr.facing > p.min_facing
@@ -276,9 +273,14 @@ pub fn associate(
                 && pr.uv.y >= 0.0
                 && pr.uv.x < w
                 && pr.uv.y < h
-        })
-        .collect();
-    associate_visible(&visible, f, blobs, sigma_px, p)
+        });
+    let Some(first) = projected.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(body.leds.len());
+    out.push(first);
+    out.extend(projected);
+    out
 }
 
 fn associate_visible(
