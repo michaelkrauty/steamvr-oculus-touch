@@ -304,11 +304,12 @@ fn score(
         return None;
     }
     near.sort_by(|x, y| x.0.total_cmp(&y.0));
-    let (mut leds, mut used) = (HashSet::new(), HashSet::new());
     let mut pairs = Vec::new();
     let mut sq_px = 0.0;
     for (d2, k, b) in near {
-        if leds.insert(k) && used.insert(b) {
+        // Each LED contributes at most one entry to near. Only blobs can repeat;
+        // scan the short output instead of allocating and hashing two sets.
+        if !pairs.iter().any(|&(_, used)| used == b) {
             pairs.push((k, b));
             sq_px += d2;
         }
@@ -552,3 +553,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod perf_tests;
