@@ -127,7 +127,7 @@ impl<'a> Projector<'a> {
         let mut dpc = SMatrix::<f64, 3, 6>::zeros();
         dpc.fixed_view_mut::<3, 3>(0, 0)
             .copy_from(&(rcw * (-r * skew(&arm))));
-        dpc.fixed_view_mut::<3, 3>(0, 3).copy_from(&rcw);
+        dpc.fixed_view_mut::<3, 3>(0, 3).copy_from(rcw);
         let facing = (rcw * (r * led.dir)).dot(&(-pc)) / pc.norm();
         Some(Projection {
             led: i,
@@ -562,7 +562,7 @@ pub fn associate_shifted(
             }
         }
     };
-    let mut scratch = Vec::with_capacity(visible.len());
+    let mut scratch = Vec::new();
     let mut scored: Vec<(usize, Vector2<f64>)> = Vec::new();
     for pr in &visible {
         for b in blobs {

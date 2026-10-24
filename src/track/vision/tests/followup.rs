@@ -442,3 +442,131 @@ fn residual_capacity_removes_growth_without_changing_bits() {
         }
     }
 }
+
+#[test]
+fn shifted_search_with_no_hypotheses_does_not_allocate_scratch() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    let f = filter(x, 0.01, 0.03);
+    let list: Vec<_> = blobs(&cam, &b, &x).into_iter().map(|(_, b)| b).collect();
+    let p = AssocParams {
+        max_px: -1.0,
+        ..Default::default()
+    };
+    let (new, nc) = counted(|| associate_shifted(&cam, &b, &f, &list, 0.5, &p, 1.5, 0, 0));
+    let (old, oc) = counted(|| baseline_shifted(&cam, &b, &f, &list, 0.5, &p, 1.5, 0, 0));
+    assert_eq!(new, old);
+    assert!(new.is_empty());
+    assert_eq!(nc, oc);
+}
+
+#[test]
+#[ignore = "offline release benchmark"]
+fn benchmark_followup_residuals_and_gates() {
+    use std::{hint::black_box, time::Instant};
+    let (cam, b, x) = (camera(), body(), state());
+    let f = filter(x, 0.01, 0.03);
+    let list: Vec<_> = (0..b.leds.len())
+        .map(|i| Blob {
+            xy: original_project(&cam, &b, &x, i).unwrap().uv,
+            led_id: -1,
+        })
+        .collect();
+    let pairs: Vec<_> = (0..b.leds.len()).map(|i| (i, i)).collect();
+    for scenario in 0..4 {
+        let p = AssocParams {
+            min_facing: if scenario == 3 { 2.0 } else { -2.0 },
+            ..Default::default()
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..12 {
+            for which in [round % 2, 1 - round % 2] {
+                let start = Instant::now();
+                for _ in 0..5000 {
+                    let cam = black_box(&cam);
+                    match (scenario, which) {
+                        (0, 0) | (1, 0) => {
+                            black_box(baseline_residuals(cam, &b, &list, &pairs, &x));
+                        }
+                        (0, _) => {
+                            black_box(residuals(cam, &b, &list, &pairs, &x));
+                        }
+                        (1, _) => {
+                            black_box(pixel_residuals(cam, &b, &list, &pairs, &x));
+                        }
+                        (_, 0) => {
+                            black_box(baseline_gate_pairs(cam, &b, &f, &list, &pairs, 0.5, &p));
+                        }
+                        (_, _) => {
+                            black_box(gate_pairs(cam, &b, &f, &list, &pairs, 0.5, &p));
+                        }
+                    }
+                }
+                times[which].push(start.elapsed().as_secs_f64() * 1e6 / 5000.0);
+            }
+        }
+        for (name, t) in ["baseline", "optimized"].into_iter().zip(&mut times) {
+            t.sort_by(f64::total_cmp);
+            eprintln!(
+                "{} {name} us/call min/median/max: {:.3}/{:.3}/{:.3}",
+                [
+                    "residual capacity",
+                    "diagnostic residuals",
+                    "accepted gates",
+                    "rejected gates"
+                ][scenario],
+                t[0],
+                t[6],
+                t[11]
+            );
+        }
+    }
+}
+
+// A complete pixel-only caller: LLVM can eliminate unused Jacobian fields in the
+// baseline too. Do not infer its speedup from a benchmark consuming full Jacobians.
+fn baseline_predicted_pixels(
+    cam: &Camera,
+    body: &Body,
+    x: &Nominal,
+    min_facing: f64,
+) -> Vec<Vector2<f64>> {
+    (0..body.leds.len())
+        .filter_map(|i| original_project(cam, body, x, i))
+        .filter(|pr| pr.facing > min_facing)
+        .map(|pr| pr.uv)
+        .collect()
+}
+
+#[test]
+#[ignore = "offline release benchmark"]
+fn benchmark_followup_predicted_pixels() {
+    use std::{hint::black_box, time::Instant};
+    let (cam, b, x) = (camera(), body(), state());
+    assert_eq!(
+        predicted_pixels(&cam, &b, &x, 0.2),
+        baseline_predicted_pixels(&cam, &b, &x, 0.2)
+    );
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..12 {
+        for which in [round % 2, 1 - round % 2] {
+            let start = Instant::now();
+            for _ in 0..10000 {
+                let f = if which == 0 {
+                    baseline_predicted_pixels
+                } else {
+                    predicted_pixels
+                };
+                black_box(f(black_box(&cam), &b, &x, 0.2));
+            }
+            times[which].push(start.elapsed().as_secs_f64() * 1e6 / 10000.0);
+        }
+    }
+    for (name, t) in ["baseline", "pixel-only"].into_iter().zip(&mut times) {
+        t.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name} predicted_pixels us/call min/median/max: {:.3}/{:.3}/{:.3}",
+            t[0], t[6], t[11]
+        );
+    }
+}

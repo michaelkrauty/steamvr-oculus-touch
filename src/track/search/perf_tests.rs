@@ -62,6 +62,7 @@ fn baseline_score(
     )
 }
 
+#[allow(clippy::type_complexity)]
 fn fixture() -> (
     Camera,
     Vec<Vector3<f64>>,
