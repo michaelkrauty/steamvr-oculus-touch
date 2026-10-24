@@ -96,6 +96,22 @@ impl<'a> Projector<'a> {
                 .into_inner(),
         }
     }
+    /// Pixel-only callers do not need six extra fisheye projections or a Jacobian.
+    /// Preserve the finite-difference routine's camera-plane rejection, including
+    /// NaNs/infinities: CameraModel::project rejects only z <= 1e-6.
+    fn pixel(&self, i: usize) -> Option<(Vector2<f64>, f64)> {
+        let led = &self.body.leds[i];
+        let arm = led.pos - self.body.imu_pos;
+        let pc = self.rcw * (self.x.p + self.r * arm - self.cam.world_from_cam.translation.vector);
+        let uv = self.cam.model.project(&pc)?;
+        let h = 1e-6 * pc.norm().max(1e-3);
+        if pc.z + h <= 1e-6 || pc.z - h <= 1e-6 {
+            return None;
+        }
+        let facing = (self.rcw * (self.r * led.dir)).dot(&(-pc)) / pc.norm();
+        Some((uv, facing))
+    }
+
     fn project(&self, i: usize) -> Option<Projection> {
         let Self {
             cam,
@@ -158,9 +174,9 @@ pub fn predicted_pixels(
 ) -> Vec<Vector2<f64>> {
     let projector = Projector::new(cam, body, x);
     (0..body.leds.len())
-        .filter_map(|i| projector.project(i))
-        .filter(|pr| pr.facing > min_facing)
-        .map(|pr| pr.uv)
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(_, facing)| *facing > min_facing)
+        .map(|(uv, _)| uv)
         .collect()
 }
 
@@ -169,13 +185,9 @@ pub fn visible_leds(cam: &Camera, body: &Body, x: &Nominal, p: &AssocParams) -> 
     let projector = Projector::new(cam, body, x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     (0..body.leds.len())
-        .filter_map(|i| projector.project(i))
-        .filter(|pr| {
-            pr.facing > p.min_facing
-                && pr.uv.x >= 0.0
-                && pr.uv.y >= 0.0
-                && pr.uv.x < w
-                && pr.uv.y < h
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(uv, facing)| {
+            *facing > p.min_facing && uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h
         })
         .count()
 }
@@ -226,16 +238,12 @@ pub fn visibility_counts(
     let projector = Projector::new(cam, body, x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     (0..body.leds.len())
-        .filter_map(|i| projector.project(i))
-        .filter(|pr| {
-            pr.facing > p.min_facing
-                && pr.uv.x >= 0.0
-                && pr.uv.y >= 0.0
-                && pr.uv.x < w
-                && pr.uv.y < h
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(uv, facing)| {
+            *facing > p.min_facing && uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h
         })
-        .fold((0, 0), |(visible, near), pr| {
-            let nearby = blobs.iter().any(|b| (b.xy - pr.uv).norm() <= near_px);
+        .fold((0, 0), |(visible, near), (uv, _)| {
+            let nearby = blobs.iter().any(|b| (b.xy - uv).norm() <= near_px);
             (visible + 1, near + usize::from(nearby))
         })
 }
@@ -451,9 +459,9 @@ pub fn unexplained_blobs(
 ) -> usize {
     let projector = Projector::new(cam, body, x);
     let mut uv = (0..body.leds.len())
-        .filter_map(|i| projector.project(i))
-        .filter(|pr| pr.facing > min_facing)
-        .map(|pr| pr.uv);
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(_, facing)| *facing > min_facing)
+        .map(|(uv, _)| uv);
     let Some(first) = uv.next() else {
         return 0;
     };
