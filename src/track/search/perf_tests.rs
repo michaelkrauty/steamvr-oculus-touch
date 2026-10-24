@@ -163,3 +163,40 @@ fn benchmark_followup_search_score() {
         );
     }
 }
+
+#[test]
+fn streamed_ray_fit_matches_collecting_baseline() {
+    let centre = Vector3::new(0.1, -0.5, 0.3);
+    let (_, offsets, _, _, _, rays) = fixture();
+    let baseline = |pairs: Vec<Option<(Vector3<f64>, Vector3<f64>)>>| {
+        let pairs: Option<Vec<_>> = pairs.into_iter().collect();
+        pairs.and_then(|pairs| {
+            let mut a = nalgebra::Matrix3::zeros();
+            let mut rhs = Vector3::zeros();
+            for (o, d) in &pairs {
+                let across = nalgebra::Matrix3::identity() - d * d.transpose();
+                a += across;
+                rhs += across * (centre - o);
+            }
+            a.try_inverse().map(|inv| inv * rhs)
+        })
+    };
+    for n in 0..=offsets.len() {
+        let mut pairs: Vec<_> = offsets
+            .iter()
+            .zip(&rays)
+            .take(n)
+            .map(|(&o, &(_, d))| Some((o, d)))
+            .collect();
+        for missing in 0..=n {
+            if missing > 0 {
+                pairs[missing - 1] = None;
+            }
+            let (actual, counts) = counted(|| closest_to_rays(&centre, pairs.iter().copied()));
+            let expected = baseline(pairs.clone());
+            let bits = |v: Option<Vector3<f64>>| v.map(|v| v.map(f64::to_bits));
+            assert_eq!(bits(actual), bits(expected));
+            assert_eq!(counts.0, 0);
+        }
+    }
+}
