@@ -445,18 +445,16 @@ pub fn associate_shifted(
         let mut out = Vec::new();
         for pr in &visible {
             let at = pr.uv + d;
-            let mut near: Vec<(f64, usize)> = blobs
+            // Only a unique blob strictly inside snap_px is usable. A second
+            // match proves ambiguity; sorting a wider neighbourhood adds nothing.
+            let mut near = blobs
                 .iter()
                 .enumerate()
-                .map(|(b, x)| ((x.xy - at).norm(), b))
-                .filter(|x| x.0 < 2.0 * snap_px)
-                .collect();
-            near.sort_by(|a, b| a.0.total_cmp(&b.0));
-            if near.first().is_some_and(|x| x.0 < snap_px)
-                && near.get(1).is_none_or(|x| x.0 >= snap_px)
-                && !out.iter().any(|o: &(usize, usize)| o.1 == near[0].1)
-            {
-                out.push((pr.led, near[0].1));
+                .filter(|(_, x)| (x.xy - at).norm() < snap_px);
+            if let Some((b, _)) = near.next() {
+                if near.next().is_none() && !out.iter().any(|o: &(usize, usize)| o.1 == b) {
+                    out.push((pr.led, b));
+                }
             }
         }
         out
@@ -689,6 +687,8 @@ pub fn ring_aliases(leds: &[Led]) -> Vec<Alias> {
 
 #[cfg(test)]
 mod tests {
+    mod shift;
+
     use super::*;
     use crate::calib::synth;
     use crate::track::eskf::{Cov, Nominal};
