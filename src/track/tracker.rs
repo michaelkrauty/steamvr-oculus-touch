@@ -728,22 +728,23 @@ impl Tracker {
         let (mut t, mut f) = (first.t, posterior);
         self.history.push_back((t, f));
         self.applied.push_back(first);
-        let imu: Vec<(ImuSample, bool)> = self
+        let from = t;
+        let mut imu = self
             .imu
             .iter()
             .zip(&self.still)
-            .filter(|(s, _)| s.t > t)
-            .map(|(s, st)| (*s, *st))
-            .collect();
-        let (mut i, mut m) = (0, 0);
+            .filter(|(s, _)| s.t > from)
+            .peekable();
+        let mut m = 0;
         loop {
             let next_m = later.get(m).map(|a| a.t);
-            let next_s = imu.get(i).map(|s| s.0.t);
+            let next_s = imu.peek().map(|(s, _)| s.t);
             match (next_m, next_s) {
                 (Some(tm), Some(ts)) if tm <= ts => {
+                    let (s, _) = *imu.peek().unwrap();
                     f.propagate(
-                        &imu[i].0.gyro,
-                        &imu[i].0.accel,
+                        &s.gyro,
+                        &s.accel,
                         (tm - t) as f64 * 1e-9,
                         &g,
                         &n,
@@ -771,17 +772,17 @@ impl Tracker {
                     m += 1;
                 }
                 (_, Some(ts)) => {
+                    let (s, still) = imu.next().unwrap();
                     f.propagate(
-                        &imu[i].0.gyro,
-                        &imu[i].0.accel,
+                        &s.gyro,
+                        &s.accel,
                         (ts - t) as f64 * 1e-9,
                         &g,
                         &n,
                     );
-                    self.zupt(&mut f, t, ts, imu[i].1);
+                    self.zupt(&mut f, t, ts, *still);
                     t = ts;
                     self.history.push_back((t, f));
-                    i += 1;
                 }
                 // a measurement can't be newer than the newest IMU sample (frames wait for it)
                 (Some(_), None) | (None, None) => break,
