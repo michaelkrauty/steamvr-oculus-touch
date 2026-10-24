@@ -550,14 +550,16 @@ pub fn associate_shifted(
             }
         }
     }
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let Some(&(best, d)) = scored.first() else {
+    // min_by_key returns the first tie, just like the old stable descending sort.
+    let Some(&(best, d)) = scored.iter().min_by_key(|s| std::cmp::Reverse(s.0)) else {
         return Vec::new();
     };
     let rival = scored
         .iter()
-        .find(|s| (s.1 - d).norm() > 2.0 * snap_px)
-        .map_or(0, |s| s.0);
+        .filter(|s| (s.1 - d).norm() > 2.0 * snap_px)
+        .map(|s| s.0)
+        .max()
+        .unwrap_or(0);
     if best < min_leds || best < rival + margin {
         return Vec::new();
     }
