@@ -25,6 +25,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Clock fitting no longer copies its retained samples into a temporary allocation on each mature refit; the fit and timestamp mapping are unchanged. See [verification](docs/clock-refit-performance.md).
+
 - Optical tracking skips intermediate covariance inversions within each iterative update, keeping the same final state and covariance. A release benchmark of three- and four-iteration optical fits took about 28% less time, and one 30-second offline replay about 9% less; single-iteration updates do the same matrix work. This does not measure display latency.
 - The driver computes the exact pose-age percentiles without sorting every sample. Synthetic 1,000- and 10,000-sample reports with random ages and handoffs ran about 2.9 and 4.2 times faster in a local optimized benchmark. Diagnostic text and the ten-second reporting interval stay the same; this does not establish an end-to-end tracking latency improvement.
 
