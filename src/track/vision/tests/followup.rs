@@ -327,3 +327,64 @@ fn diagnostic_residuals_match_full_projection_bits() {
         }
     }
 }
+
+fn baseline_gate_pairs(
+    cam: &Camera,
+    body: &Body,
+    f: &Filter,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    sigma_px: f64,
+    p: &AssocParams,
+) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
+    let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
+    let var = Matrix2::identity() * (sigma_px * sigma_px);
+    pairs
+        .iter()
+        .copied()
+        .filter(|&(led, b)| {
+            let Some(pr) = projector.project(led) else {
+                return false;
+            };
+            let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
+                return false;
+            };
+            let d = blobs[b].xy - pr.uv;
+            pr.facing > p.min_facing
+                && d.norm() <= p.max_px
+                && (d.transpose() * s_inv * d)[0] < p.gate
+        })
+        .collect()
+}
+
+#[test]
+fn cheap_pair_gates_preserve_matches() {
+    let (cam, b, x) = (camera(), body(), state());
+    let list: Vec<_> = (0..b.leds.len())
+        .map(|i| Blob {
+            xy: original_project(&cam, &b, &x, i).unwrap().uv,
+            led_id: -1,
+        })
+        .collect();
+    let pairs: Vec<_> = (0..b.leds.len()).map(|i| (i, i)).collect();
+    for facing in [-1.0, 0.2, 1.0, f64::NAN] {
+        for cap in [-1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
+            for covariance in [0.0, 1e-4, f64::NAN] {
+                let mut f = filter(x, 0.01, 0.03);
+                f.cov.fill(covariance);
+                let p = AssocParams {
+                    min_facing: facing,
+                    max_px: cap,
+                    ..Default::default()
+                };
+                for sigma in [0.0, 0.5, f64::NAN] {
+                    assert_eq!(
+                        gate_pairs(&cam, &b, &f, &list, &pairs, sigma, &p),
+                        baseline_gate_pairs(&cam, &b, &f, &list, &pairs, sigma, &p)
+                    );
+                }
+            }
+        }
+    }
+}

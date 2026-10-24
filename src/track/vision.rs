@@ -345,13 +345,15 @@ pub fn gate_pairs(
             let Some(pr) = projector.project(led) else {
                 return false;
             };
+            let d = blobs[b].xy - pr.uv;
+            let within = pr.facing > p.min_facing && d.norm() <= p.max_px;
+            if !within {
+                return false;
+            }
             let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
                 return false;
             };
-            let d = blobs[b].xy - pr.uv;
-            pr.facing > p.min_facing
-                && d.norm() <= p.max_px
-                && (d.transpose() * s_inv * d)[0] < p.gate
+            (d.transpose() * s_inv * d)[0] < p.gate
         })
         .collect()
 }
