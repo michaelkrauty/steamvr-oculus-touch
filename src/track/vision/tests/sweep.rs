@@ -400,3 +400,33 @@ fn sweep_diagnostic_capacity_preserves_bits_and_avoids_growth() {
     assert!(new.is_empty());
     assert_eq!(nc.0, 0);
 }
+
+fn sweep_baseline_predicted_pixels(
+    cam: &Camera,
+    body: &Body,
+    x: &Nominal,
+    min_facing: f64,
+) -> Vec<Vector2<f64>> {
+    let projector = Projector::new(cam, body, x);
+    (0..body.leds.len())
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(_, facing)| *facing > min_facing)
+        .map(|(uv, _)| uv)
+        .collect()
+}
+
+#[test]
+fn sweep_predicted_capacity_preserves_pixels_and_avoids_growth() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    for min_facing in [-1.0, 0.0, 0.2, 1.0, f64::NAN] {
+        let (new, nc) = counted(|| predicted_pixels(&cam, &b, &x, min_facing));
+        let (old, oc) = counted(|| sweep_baseline_predicted_pixels(&cam, &b, &x, min_facing));
+        assert_eq!(new, old);
+        assert_eq!(nc.0, usize::from(!new.is_empty()));
+        assert!(nc.0 <= oc.0);
+        if min_facing == -1.0 {
+            assert!(nc.0 < oc.0);
+        }
+    }
+}

@@ -173,11 +173,17 @@ pub fn predicted_pixels(
     min_facing: f64,
 ) -> Vec<Vector2<f64>> {
     let projector = Projector::new(cam, body, x);
-    (0..body.leds.len())
+    let mut pixels = (0..body.leds.len())
         .filter_map(|i| projector.pixel(i))
         .filter(|(_, facing)| *facing > min_facing)
-        .map(|(uv, _)| uv)
-        .collect()
+        .map(|(uv, _)| uv);
+    let Some(first) = pixels.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(body.leds.len());
+    out.push(first);
+    out.extend(pixels);
+    out
 }
 
 /// How many LEDs the state predicts in the image, facing the camera.
