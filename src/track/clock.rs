@@ -86,7 +86,7 @@ impl LinearClock {
             self.b = 0.0;
             return;
         }
-        let points: Vec<(f64, f64)> = self.bins.iter().copied().collect();
+        let points = &self.bins;
         let n = points.len() as f64;
         let (mx, my) = (
             points.iter().map(|p| p.0).sum::<f64>() / n,
@@ -159,6 +159,44 @@ mod tests {
                 (device, host + delay)
             })
             .collect()
+    }
+
+    #[test]
+    fn refit_matches_vec_oracle_for_every_deque_split() {
+        for n in [4, 5, 19, 20, 64] {
+            for split in 0..n {
+                for constant_x in [false, true] {
+                    let mut c = LinearClock {
+                        bins: VecDeque::with_capacity(n),
+                        ..LinearClock::default()
+                    };
+                    for i in 0..n {
+                        c.bins
+                            .push_back((i as f64 * 1e9, (i as f64 * 0.71).sin() * 1e6));
+                    }
+                    for _ in 0..split {
+                        let p = c.bins.pop_front().unwrap();
+                        c.bins.push_back(p);
+                    }
+                    if constant_x {
+                        for p in &mut c.bins {
+                            p.0 = 1.0;
+                        }
+                    }
+                    // Original contiguous-copy algorithm, retaining reduction order.
+                    let points: Vec<(f64, f64)> = c.bins.iter().copied().collect();
+                    let count = points.len() as f64;
+                    let mx = points.iter().map(|p| p.0).sum::<f64>() / count;
+                    let my = points.iter().map(|p| p.1).sum::<f64>() / count;
+                    let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
+                    let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+                    let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+                    let a = my - b * mx;
+                    c.refit();
+                    assert_eq!((c.a.to_bits(), c.b.to_bits()), (a.to_bits(), b.to_bits()));
+                }
+            }
+        }
     }
 
     #[test]
