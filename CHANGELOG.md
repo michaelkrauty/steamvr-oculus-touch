@@ -25,6 +25,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Tracking uses pixel-only outlier checks, skips empty-frame association work, avoids repeated growth of small vision/acquisition vectors, and transfers frame buffers to the final hand instead of copying them. Tracking decisions and interfaces are unchanged; see [verification and memory tradeoffs](docs/tracking-allocation-performance.md).
+
 - Tracking batches invariant LED rotations, skips unused Jacobians in visibility and camera-agreement queries, reuses shifted-matching scratch storage, and removes temporary acquisition buffers and redundant hash sets. Match ordering and acceptance rules are unchanged. Focused equivalence tests and offline measurements are documented in the [follow-up verification](docs/tracking-followup-performance.md); these are not end-to-end latency claims.
 
 - Tracking avoids redundant clock refits, temporary IMU/geometry/candidate buffers, and unused association work during acquisition scoring. Historical lookups and stale-camera checks skip unnecessary scans. Algorithms and acceptance rules are unchanged; some owned vectors retain their existing spare capacity. These are local CPU/allocation improvements, not an end-to-end latency claim. See [verification](docs/tracking-hot-path-performance.md).
