@@ -304,7 +304,7 @@ fn score(
         return None;
     }
     near.sort_by(|x, y| x.0.total_cmp(&y.0));
-    let mut pairs = Vec::new();
+    let mut pairs = Vec::with_capacity(near.len());
     let mut sq_px = 0.0;
     for (d2, k, b) in near {
         // Each LED contributes at most one entry to near. Only blobs can repeat;

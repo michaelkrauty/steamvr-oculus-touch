@@ -201,3 +201,81 @@ fn streamed_ray_fit_matches_collecting_baseline() {
         }
     }
 }
+
+fn sweep_baseline_score(
+    cam: &Camera,
+    offsets: &[Vector3<f64>],
+    normals: &[Vector3<f64>],
+    t: &Vector3<f64>,
+    blobs: &[Blob],
+    rays: &[(usize, Vector3<f64>)],
+    p: &SearchParams,
+) -> Option<Scored> {
+    let centre = cam.world_from_cam.translation.vector;
+    let cam_from_world = cam.world_from_cam.rotation.inverse();
+    let mut near: Vec<(f64, usize, usize)> = Vec::new();
+    let mut shown = 0;
+    for (k, (o, n)) in offsets.iter().zip(normals).enumerate() {
+        let w = t + o;
+        let to_cam = centre - w;
+        if n.dot(&to_cam) <= p.min_facing * to_cam.norm() {
+            continue;
+        }
+        let Some(uv) = cam.model.project(&(cam_from_world * -to_cam)) else {
+            continue;
+        };
+        if uv.x < 0.0
+            || uv.y < 0.0
+            || uv.x >= cam.model.width as f64
+            || uv.y >= cam.model.height as f64
+        {
+            continue;
+        }
+        shown += 1;
+        let nearest = rays
+            .iter()
+            .map(|&(b, _)| ((blobs[b].xy - uv).norm_squared(), b))
+            .min_by(|x, y| x.0.total_cmp(&y.0));
+        if let Some((d2, b)) = nearest.filter(|(d2, _)| *d2 <= p.inlier_px * p.inlier_px) {
+            near.push((d2, k, b));
+        }
+    }
+    if near.len() < p.min_leds {
+        return None;
+    }
+    near.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut pairs = Vec::new();
+    let mut sq_px = 0.0;
+    for (d2, k, b) in near {
+        // Each LED contributes at most one entry to near. Only blobs can repeat;
+        // scan the short output instead of allocating and hashing two sets.
+        if !pairs.iter().any(|&(_, used)| used == b) {
+            pairs.push((k, b));
+            sq_px += d2;
+        }
+    }
+    (pairs.len() >= p.min_leds && pairs.len() as f64 >= p.min_share * shown as f64).then_some(
+        Scored {
+            pairs,
+            shown,
+            sq_px,
+        },
+    )
+}
+
+#[test]
+fn sweep_score_capacity_eliminates_growth() {
+    let (cam, offsets, normals, t, blobs, rays) = fixture();
+    let p = SearchParams::default();
+    let bits = |s: Option<Scored>| s.map(|s| (s.pairs, s.shown, s.sq_px.to_bits()));
+    for n in 0..=rays.len() {
+        let (new, nc) = counted(|| score(&cam, &offsets, &normals, &t, &blobs, &rays[..n], &p));
+        let (old, oc) =
+            counted(|| sweep_baseline_score(&cam, &offsets, &normals, &t, &blobs, &rays[..n], &p));
+        assert_eq!(bits(new), bits(old));
+        assert!(nc.0 <= oc.0);
+        if n == rays.len() {
+            assert!(nc.0 < oc.0, "{nc:?} vs {oc:?}");
+        }
+    }
+}
