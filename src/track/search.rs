@@ -297,6 +297,10 @@ fn score(
             .map(|&(b, _)| ((blobs[b].xy - uv).norm_squared(), b))
             .min_by(|x, y| x.0.total_cmp(&y.0));
         if let Some((d2, b)) = nearest.filter(|(d2, _)| *d2 <= p.inlier_px * p.inlier_px) {
+            if near.is_empty() {
+                // Each LED contributes at most one nearest-blob candidate.
+                near.reserve(offsets.len().min(normals.len()));
+            }
             near.push((d2, k, b));
         }
     }

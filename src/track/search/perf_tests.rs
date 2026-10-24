@@ -276,6 +276,7 @@ fn sweep_score_capacity_eliminates_growth() {
         assert!(nc.0 <= oc.0);
         if n == rays.len() {
             assert!(nc.0 < oc.0, "{nc:?} vs {oc:?}");
+            assert_eq!(nc.0, 2, "one candidate buffer and one match buffer");
         }
     }
 }
