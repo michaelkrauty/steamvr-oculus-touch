@@ -655,11 +655,14 @@ pub fn fit_pairs(
         .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
         .ok_or(Miss::Rejected)?;
     // per pair (a pair that no longer projects counts as an outlier, keeping pairs and residuals aligned)
-    let pair_residual = |x: &Nominal, &(led, b): &(usize, usize)| {
-        project(cam, body, x, led).map_or(f64::INFINITY, |pr| (blobs[b].xy - pr.uv).norm())
+    let pair_residual = |projector: &Projector<'_>, &(led, b): &(usize, usize)| {
+        projector
+            .pixel(led)
+            .map_or(f64::INFINITY, |(uv, _)| (blobs[b].xy - uv).norm())
     };
     let original_len = pairs.len();
-    pairs.retain(|pr| pair_residual(&updated.filter.x, pr) <= p.inlier_px);
+    let projector = Projector::new(cam, body, &updated.filter.x);
+    pairs.retain(|pr| pair_residual(&projector, pr) <= p.inlier_px);
     if pairs.len() < p.min_leds
         || (pairs.len() as f64) < p.min_inlier_fraction * original_len as f64
     {
@@ -669,9 +672,10 @@ pub fn fit_pairs(
         updated = prior
             .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
             .ok_or(Miss::Rejected)?;
+        let projector = Projector::new(cam, body, &updated.filter.x);
         if pairs
             .iter()
-            .any(|pr| pair_residual(&updated.filter.x, pr) > p.inlier_px)
+            .any(|pr| pair_residual(&projector, pr) > p.inlier_px)
         {
             return Err(Miss::Rejected);
         }
@@ -795,6 +799,7 @@ pub(crate) mod tests {
     mod followup;
     pub(crate) mod hot_paths;
     mod shift;
+    mod sweep;
 
     use super::*;
     use crate::calib::synth;
