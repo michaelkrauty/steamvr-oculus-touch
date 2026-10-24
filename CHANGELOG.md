@@ -25,6 +25,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Tracking batches invariant LED rotations, skips unused Jacobians in visibility and camera-agreement queries, reuses shifted-matching scratch storage, and removes temporary acquisition buffers and redundant hash sets. Match ordering and acceptance rules are unchanged. Focused equivalence tests and offline measurements are documented in the [follow-up verification](docs/tracking-followup-performance.md); these are not end-to-end latency claims.
+
 - Tracking avoids redundant clock refits, temporary IMU/geometry/candidate buffers, and unused association work during acquisition scoring. Historical lookups and stale-camera checks skip unnecessary scans. Algorithms and acceptance rules are unchanged; some owned vectors retain their existing spare capacity. These are local CPU/allocation improvements, not an end-to-end latency claim. See [verification](docs/tracking-hot-path-performance.md).
 
 - Remembered-orientation reacquisition counts visible LEDs without running an unused blob-association pass for each fitted candidate. Acceptance rules and search cadence are unchanged; this does not affect the normal successful-tracking path. See [verification](docs/reacquisition-visible-count-performance.md).

@@ -68,28 +68,74 @@ pub fn project_with_jacobian(
 
 /// LED `i` in the image, with its Jacobian. None at or behind the camera plane.
 pub fn project(cam: &Camera, body: &Body, x: &Nominal, i: usize) -> Option<Projection> {
-    let led = &body.leds[i];
-    let arm = led.pos - body.imu_pos;
-    let r = x.q.to_rotation_matrix().into_inner();
-    let rcw = cam
-        .world_from_cam
-        .rotation
-        .inverse()
-        .to_rotation_matrix()
-        .into_inner();
-    let pc = rcw * (x.p + r * arm - cam.world_from_cam.translation.vector);
-    let (uv, duv) = project_with_jacobian(&cam.model, &pc)?;
-    let mut dpc = SMatrix::<f64, 3, 6>::zeros();
-    dpc.fixed_view_mut::<3, 3>(0, 0)
-        .copy_from(&(rcw * (-r * skew(&arm))));
-    dpc.fixed_view_mut::<3, 3>(0, 3).copy_from(&rcw);
-    let facing = (rcw * (r * led.dir)).dot(&(-pc)) / pc.norm();
-    Some(Projection {
-        led: i,
-        uv,
-        j: duv * dpc,
-        facing,
-    })
+    Projector::new(cam, body, x).project(i)
+}
+
+/// Invariant rotations for one state evaluation. Preserve per-LED multiplication
+/// order rather than pre-multiplying the rotations and changing rounding.
+struct Projector<'a> {
+    cam: &'a Camera,
+    body: &'a Body,
+    x: &'a Nominal,
+    r: Matrix3<f64>,
+    rcw: Matrix3<f64>,
+}
+
+impl<'a> Projector<'a> {
+    fn new(cam: &'a Camera, body: &'a Body, x: &'a Nominal) -> Self {
+        Self {
+            cam,
+            body,
+            x,
+            r: x.q.to_rotation_matrix().into_inner(),
+            rcw: cam
+                .world_from_cam
+                .rotation
+                .inverse()
+                .to_rotation_matrix()
+                .into_inner(),
+        }
+    }
+    /// Pixel-only callers do not need six extra fisheye projections or a Jacobian.
+    /// Preserve the finite-difference routine's camera-plane rejection, including
+    /// NaNs/infinities: CameraModel::project rejects only z <= 1e-6.
+    fn pixel(&self, i: usize) -> Option<(Vector2<f64>, f64)> {
+        let led = &self.body.leds[i];
+        let arm = led.pos - self.body.imu_pos;
+        let pc = self.rcw * (self.x.p + self.r * arm - self.cam.world_from_cam.translation.vector);
+        let uv = self.cam.model.project(&pc)?;
+        let h = 1e-6 * pc.norm().max(1e-3);
+        if pc.z + h <= 1e-6 || pc.z - h <= 1e-6 {
+            return None;
+        }
+        let facing = (self.rcw * (self.r * led.dir)).dot(&(-pc)) / pc.norm();
+        Some((uv, facing))
+    }
+
+    fn project(&self, i: usize) -> Option<Projection> {
+        let Self {
+            cam,
+            body,
+            x,
+            r,
+            rcw,
+        } = self;
+        let led = &body.leds[i];
+        let arm = led.pos - body.imu_pos;
+        let pc = rcw * (x.p + r * arm - cam.world_from_cam.translation.vector);
+        let (uv, duv) = project_with_jacobian(&cam.model, &pc)?;
+        let mut dpc = SMatrix::<f64, 3, 6>::zeros();
+        dpc.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(rcw * (-r * skew(&arm))));
+        dpc.fixed_view_mut::<3, 3>(0, 3).copy_from(rcw);
+        let facing = (rcw * (r * led.dir)).dot(&(-pc)) / pc.norm();
+        Some(Projection {
+            led: i,
+            uv,
+            j: duv * dpc,
+            facing,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -126,24 +172,22 @@ pub fn predicted_pixels(
     x: &Nominal,
     min_facing: f64,
 ) -> Vec<Vector2<f64>> {
+    let projector = Projector::new(cam, body, x);
     (0..body.leds.len())
-        .filter_map(|i| project(cam, body, x, i))
-        .filter(|pr| pr.facing > min_facing)
-        .map(|pr| pr.uv)
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(_, facing)| *facing > min_facing)
+        .map(|(uv, _)| uv)
         .collect()
 }
 
 /// How many LEDs the state predicts in the image, facing the camera.
 pub fn visible_leds(cam: &Camera, body: &Body, x: &Nominal, p: &AssocParams) -> usize {
+    let projector = Projector::new(cam, body, x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     (0..body.leds.len())
-        .filter_map(|i| project(cam, body, x, i))
-        .filter(|pr| {
-            pr.facing > p.min_facing
-                && pr.uv.x >= 0.0
-                && pr.uv.y >= 0.0
-                && pr.uv.x < w
-                && pr.uv.y < h
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(uv, facing)| {
+            *facing > p.min_facing && uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h
         })
         .count()
 }
@@ -159,9 +203,10 @@ pub fn association_report(
     p: &AssocParams,
     near_px: f64,
 ) -> (usize, usize, usize) {
+    let projector = Projector::new(cam, body, &f.x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     let visible: Vec<Projection> = (0..body.leds.len())
-        .filter_map(|i| project(cam, body, &f.x, i))
+        .filter_map(|i| projector.project(i))
         .filter(|pr| {
             pr.facing > p.min_facing
                 && pr.uv.x >= 0.0
@@ -190,18 +235,15 @@ pub fn visibility_counts(
     p: &AssocParams,
     near_px: f64,
 ) -> (usize, usize) {
+    let projector = Projector::new(cam, body, x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     (0..body.leds.len())
-        .filter_map(|i| project(cam, body, x, i))
-        .filter(|pr| {
-            pr.facing > p.min_facing
-                && pr.uv.x >= 0.0
-                && pr.uv.y >= 0.0
-                && pr.uv.x < w
-                && pr.uv.y < h
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(uv, facing)| {
+            *facing > p.min_facing && uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h
         })
-        .fold((0, 0), |(visible, near), pr| {
-            let nearby = blobs.iter().any(|b| (b.xy - pr.uv).norm() <= near_px);
+        .fold((0, 0), |(visible, near), (uv, _)| {
+            let nearby = blobs.iter().any(|b| (b.xy - uv).norm() <= near_px);
             (visible + 1, near + usize::from(nearby))
         })
 }
@@ -215,9 +257,10 @@ pub fn associate(
     sigma_px: f64,
     p: &AssocParams,
 ) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     let visible: Vec<Projection> = (0..body.leds.len())
-        .filter_map(|i| project(cam, body, &f.x, i))
+        .filter_map(|i| projector.project(i))
         .filter(|pr| {
             pr.facing > p.min_facing
                 && pr.uv.x >= 0.0
@@ -292,22 +335,25 @@ pub fn gate_pairs(
     sigma_px: f64,
     p: &AssocParams,
 ) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
     let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
     let var = Matrix2::identity() * (sigma_px * sigma_px);
     pairs
         .iter()
         .copied()
         .filter(|&(led, b)| {
-            let Some(pr) = project(cam, body, &f.x, led) else {
-                return false;
-            };
-            let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
+            let Some(pr) = projector.project(led) else {
                 return false;
             };
             let d = blobs[b].xy - pr.uv;
-            pr.facing > p.min_facing
-                && d.norm() <= p.max_px
-                && (d.transpose() * s_inv * d)[0] < p.gate
+            let within = pr.facing > p.min_facing && d.norm() <= p.max_px;
+            if !within {
+                return false;
+            }
+            let Some(s_inv) = (pr.j * p6 * pr.j.transpose() + var).try_inverse() else {
+                return false;
+            };
+            (d.transpose() * s_inv * d)[0] < p.gate
         })
         .collect()
 }
@@ -331,14 +377,36 @@ pub fn residuals(
     pairs: &[(usize, usize)],
     x: &Nominal,
 ) -> Vec<PixelResidual> {
+    let projector = Projector::new(cam, body, x);
+    let mut projected = pairs.iter().filter_map(|&(led, b)| {
+        projector.project(led).map(|pr| PixelResidual {
+            r: blobs[b].xy - pr.uv,
+            j: pr.j,
+        })
+    });
+    // Allocate only after a surviving projection, and at most once. The fit's
+    // matched-pair count bounds every iteration's output.
+    let Some(first) = projected.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    out.push(first);
+    out.extend(projected);
+    out
+}
+
+/// Diagnostic residuals need pixels, not the filter update's Jacobians.
+pub(super) fn pixel_residuals(
+    cam: &Camera,
+    body: &Body,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    x: &Nominal,
+) -> Vec<Vector2<f64>> {
+    let projector = Projector::new(cam, body, x);
     pairs
         .iter()
-        .filter_map(|&(led, b)| {
-            project(cam, body, x, led).map(|pr| PixelResidual {
-                r: blobs[b].xy - pr.uv,
-                j: pr.j,
-            })
-        })
+        .filter_map(|&(led, b)| projector.pixel(led).map(|(uv, _)| blobs[b].xy - uv))
         .collect()
 }
 
@@ -412,10 +480,11 @@ pub fn unexplained_blobs(
     min_facing: f64,
     margin: f64,
 ) -> usize {
+    let projector = Projector::new(cam, body, x);
     let mut uv = (0..body.leds.len())
-        .filter_map(|i| project(cam, body, x, i))
-        .filter(|pr| pr.facing > min_facing)
-        .map(|pr| pr.uv);
+        .filter_map(|i| projector.pixel(i))
+        .filter(|(_, facing)| *facing > min_facing)
+        .map(|(uv, _)| uv);
     let Some(first) = uv.next() else {
         return 0;
     };
@@ -453,9 +522,10 @@ pub fn associate_shifted(
     min_leds: usize,
     margin: usize,
 ) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
     let (w, h) = (cam.model.width as f64, cam.model.height as f64);
     let visible: Vec<Projection> = (0..body.leds.len())
-        .filter_map(|i| project(cam, body, &f.x, i))
+        .filter_map(|i| projector.project(i))
         .filter(|pr| {
             pr.facing > p.min_facing
                 && pr.uv.x >= -50.0
@@ -475,8 +545,8 @@ pub fn associate_shifted(
         .fold(0.0, f64::max)
         * 3.0
         + 3.0 * sigma_px;
-    let place = |d: &Vector2<f64>| -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
+    let place = |d: &Vector2<f64>, out: &mut Vec<(usize, usize)>| {
+        out.clear();
         for pr in &visible {
             let at = pr.uv + d;
             // Only a unique blob strictly inside snap_px is usable. A second
@@ -491,31 +561,34 @@ pub fn associate_shifted(
                 }
             }
         }
-        out
     };
+    let mut scratch = Vec::new();
     let mut scored: Vec<(usize, Vector2<f64>)> = Vec::new();
     for pr in &visible {
         for b in blobs {
             let d = b.xy - pr.uv;
             if d.norm() <= reach.min(p.max_px * 3.0) {
-                scored.push((place(&d).len(), d));
+                place(&d, &mut scratch);
+                scored.push((scratch.len(), d));
             }
         }
     }
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let Some(&(best, d)) = scored.first() else {
+    // min_by_key returns the first tie, just like the old stable descending sort.
+    let Some(&(best, d)) = scored.iter().min_by_key(|s| std::cmp::Reverse(s.0)) else {
         return Vec::new();
     };
     let rival = scored
         .iter()
-        .find(|s| (s.1 - d).norm() > 2.0 * snap_px)
-        .map_or(0, |s| s.0);
+        .filter(|s| (s.1 - d).norm() > 2.0 * snap_px)
+        .map(|s| s.0)
+        .max()
+        .unwrap_or(0);
     if best < min_leds || best < rival + margin {
         return Vec::new();
     }
-    let mut pairs = place(&d);
-    pairs.sort();
-    pairs
+    place(&d, &mut scratch);
+    scratch.sort();
+    scratch
 }
 
 /// Associates, updates, re-associates under the tightened posterior, and updates again from the
@@ -719,6 +792,7 @@ pub fn ring_aliases(leds: &[Led]) -> Vec<Alias> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod followup;
     pub(crate) mod hot_paths;
     mod shift;
 

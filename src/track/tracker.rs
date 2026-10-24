@@ -14,6 +14,16 @@ use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
 use super::search::{self, SearchParams};
 use super::vision::{self, Blob, Body, Camera, FitParams};
 
+/// The two cheapest costs in total_cmp order, including signed zero and NaNs.
+fn retain_two_costs(costs: &mut [Option<f64>; 2], cost: f64) {
+    if costs[0].is_none_or(|first| cost.total_cmp(&first).is_lt()) {
+        costs[1] = costs[0];
+        costs[0] = Some(cost);
+    } else if costs[1].is_none_or(|second| cost.total_cmp(&second).is_lt()) {
+        costs[1] = Some(cost);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImuSample {
     /// Controller clock, ns.
@@ -1131,7 +1141,8 @@ impl Tracker {
                 // well, so its turns are tried on this frame too
                 let mut turned = false;
                 if memory.is_none() && !self.aliases.is_empty() {
-                    let mut costs = vec![self.acquisition_cost(cam, blobs, &chosen.1)];
+                    let original_cost = self.acquisition_cost(cam, blobs, &chosen.1);
+                    let mut costs = [Some(original_cost), None];
                     let mut best: Option<(f64, (Filter, vision::Fit))> = None;
                     for a in &self.aliases {
                         let pairs: Vec<(usize, usize)> = labelled
@@ -1147,14 +1158,15 @@ impl Tracker {
                             &fit_params,
                         ) {
                             let c = self.acquisition_cost(cam, blobs, &h.1);
-                            if c < costs[0] && best.as_ref().is_none_or(|b| c < b.0) {
+                            if c < original_cost && best.as_ref().is_none_or(|b| c < b.0) {
                                 best = Some((c, h));
                             }
-                            costs.push(c);
+                            retain_two_costs(&mut costs, c);
                         }
                     }
-                    costs.sort_by(f64::total_cmp);
-                    if costs.len() > 1 && costs[1] - costs[0] < self.params.alias_margin {
+                    if costs[1]
+                        .is_some_and(|second| second - costs[0].unwrap() < self.params.alias_margin)
+                    {
                         if self.ambiguous_since == 0 {
                             self.ambiguous_since = t_e;
                         }
@@ -1378,9 +1390,9 @@ impl Tracker {
         if !comparable || pairs.len() < 4 {
             return;
         }
-        let res = vision::residuals(cam, &self.body, blobs, pairs, &prior.x);
-        let mean = res.iter().map(|o| o.r).sum::<Vector2<f64>>() / res.len() as f64;
-        let mut r: Vec<f64> = res.iter().map(|o| o.r.norm()).collect();
+        let res = vision::pixel_residuals(cam, &self.body, blobs, pairs, &prior.x);
+        let mean = res.iter().copied().sum::<Vector2<f64>>() / res.len() as f64;
+        let mut r: Vec<f64> = res.iter().map(|o| o.norm()).collect();
         r.sort_by(|a, b| a.total_cmp(b));
         let median = r[r.len() / 2];
         let a = &mut self.agreement[camera];
@@ -3431,3 +3443,7 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod stillness_tests;
+
+#[cfg(test)]
+#[path = "tracker/perf_tests.rs"]
+mod perf_tests;

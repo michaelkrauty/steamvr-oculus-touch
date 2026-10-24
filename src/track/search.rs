@@ -224,12 +224,11 @@ fn search(
         {
             continue;
         }
-        let on_rays: Option<Vec<(Vector3<f64>, Vector3<f64>)>> = s
+        let on_rays = s
             .pairs
             .iter()
-            .map(|&(k, b)| Some((offsets[k], rays.iter().find(|r| r.0 == b)?.1)))
-            .collect();
-        if let Some(t) = on_rays.and_then(|r| closest_to_rays(&centre, &r)) {
+            .map(|&(k, b)| Some((offsets[k], rays.iter().find(|r| r.0 == b)?.1)));
+        if let Some(t) = closest_to_rays(&centre, on_rays) {
             out.push(Candidate {
                 world_from_model: Isometry3::from_parts(Translation3::from(t), *q),
                 pairs: s.pairs,
@@ -248,11 +247,12 @@ fn shared(a: &[(usize, usize)], b: &[(usize, usize)]) -> usize {
 /// frame) on its ray from `centre` along the unit `d`: sum (I - d d') (t + o - centre) = 0.
 fn closest_to_rays(
     centre: &Vector3<f64>,
-    rays: &[(Vector3<f64>, Vector3<f64>)],
+    rays: impl Iterator<Item = Option<(Vector3<f64>, Vector3<f64>)>>,
 ) -> Option<Vector3<f64>> {
     let mut a = nalgebra::Matrix3::zeros();
     let mut rhs = Vector3::zeros();
-    for (o, d) in rays {
+    for pair in rays {
+        let (o, d) = pair?;
         let across = nalgebra::Matrix3::identity() - d * d.transpose();
         a += across;
         rhs += across * (centre - o);
@@ -304,11 +304,12 @@ fn score(
         return None;
     }
     near.sort_by(|x, y| x.0.total_cmp(&y.0));
-    let (mut leds, mut used) = (HashSet::new(), HashSet::new());
     let mut pairs = Vec::new();
     let mut sq_px = 0.0;
     for (d2, k, b) in near {
-        if leds.insert(k) && used.insert(b) {
+        // Each LED contributes at most one entry to near. Only blobs can repeat;
+        // scan the short output instead of allocating and hashing two sets.
+        if !pairs.iter().any(|&(_, used)| used == b) {
             pairs.push((k, b));
             sq_px += d2;
         }
@@ -552,3 +553,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod perf_tests;
