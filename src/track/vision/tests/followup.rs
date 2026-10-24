@@ -106,6 +106,49 @@ fn benchmark_followup_projection() {
     }
 }
 
+// Rust does not guarantee the sign or payload of NaNs produced by arithmetic.
+// Preserve exact comparisons for every other value, including signed zero and infinities.
+fn comparable_pixel_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+#[test]
+fn pixel_comparison_ignores_only_nan_representation() {
+    // The opposite-sign quiet NaNs reported by Windows stable CI in PR #84.
+    let positive = f64::from_bits(9221120237041090560);
+    let negative = f64::from_bits(18444492273895866368);
+    assert_eq!(
+        comparable_pixel_bits(positive),
+        comparable_pixel_bits(negative)
+    );
+    for bits in [0x7ff8_0000_0000_0001, 0xfff8_0000_0000_1234] {
+        assert_eq!(
+            comparable_pixel_bits(f64::from_bits(bits)),
+            comparable_pixel_bits(positive)
+        );
+    }
+    for value in [0.0, -0.0, 1.0, -1.0, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(comparable_pixel_bits(value), value.to_bits());
+        assert_ne!(
+            comparable_pixel_bits(value),
+            comparable_pixel_bits(positive)
+        );
+    }
+    assert_ne!(comparable_pixel_bits(0.0), comparable_pixel_bits(-0.0));
+    assert_ne!(
+        comparable_pixel_bits(f64::INFINITY),
+        comparable_pixel_bits(f64::NEG_INFINITY)
+    );
+    assert_ne!(
+        comparable_pixel_bits(1.0),
+        comparable_pixel_bits(f64::from_bits(1.0f64.to_bits() + 1))
+    );
+}
+
 #[test]
 fn pixel_only_matches_baseline_including_camera_plane_and_nonfinite() {
     let mut cam = camera();
@@ -134,7 +177,7 @@ fn pixel_only_matches_baseline_including_camera_plane_and_nonfinite() {
             let actual = Projector::new(&cam, &b, &x).pixel(0);
             let expected = original_project(&cam, &b, &x, 0).map(|p| (p.uv, p.facing));
             let bits = |p: Option<(Vector2<f64>, f64)>| {
-                p.map(|(uv, f)| [uv.x.to_bits(), uv.y.to_bits(), f.to_bits()])
+                p.map(|(uv, f)| [uv.x, uv.y, f].map(comparable_pixel_bits))
             };
             assert_eq!(bits(actual), bits(expected), "a={a}, z={z}");
         }

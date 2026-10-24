@@ -44,6 +44,13 @@ boundaries, NaNs/infinities, varied orientations, empty and rejected outputs,
 duplicate blobs, hypothesis ties, covariance failures, missing rays, singular
 fits, and exact ordered match lists. Thread-local allocation assertions verify
 reductions and absence of scratch allocations when no hypothesis can be tried.
+The pixel-only non-finite oracle compares NaN classification rather than NaN sign
+or payload: Rust arithmetic does not guarantee those bits, and Windows stable CI
+for PR #84 produced opposite-sign NaNs from the two equivalent paths. Every non-NaN
+component still compares bitwise, including signed zero and infinities; `Some`/`None`
+projection results must also match. A regression includes both exact CI bit patterns,
+alternate payloads, and checks that non-NaN differences remain distinguishable.
+
 The existing 2,000-case shifted-association differential test and synthetic
 tracking/acquisition/camera-agreement tests run against the combined code too.
 
