@@ -357,3 +357,46 @@ fn sweep_empty_blobs_skip_projection_allocation() {
     assert_eq!(nc.0, 0);
     assert!(oc.0 > 0);
 }
+
+fn baseline_pixel_residuals(
+    cam: &Camera,
+    body: &Body,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    x: &Nominal,
+) -> Vec<Vector2<f64>> {
+    let projector = Projector::new(cam, body, x);
+    pairs
+        .iter()
+        .filter_map(|&(led, b)| projector.pixel(led).map(|(uv, _)| blobs[b].xy - uv))
+        .collect()
+}
+
+#[test]
+fn sweep_diagnostic_capacity_preserves_bits_and_avoids_growth() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, mut x) = (camera(), body(), state());
+    let seen = blobs(&cam, &b, &x);
+    let list: Vec<_> = seen.iter().map(|s| s.1).collect();
+    let pairs: Vec<_> = seen.iter().enumerate().map(|(i, s)| (s.0, i)).collect();
+    let bits = |v: Vec<Vector2<f64>>| {
+        v.into_iter()
+            .map(|p| [p.x.to_bits(), p.y.to_bits()])
+            .collect::<Vec<_>>()
+    };
+    for n in 0..=pairs.len() {
+        let (new, nc) = counted(|| pixel_residuals(&cam, &b, &list, &pairs[..n], &x));
+        let (old, oc) = counted(|| baseline_pixel_residuals(&cam, &b, &list, &pairs[..n], &x));
+        assert_eq!(bits(new), bits(old));
+        assert_eq!(nc.0, usize::from(n > 0));
+        assert!(nc.0 <= oc.0);
+        if n > 4 {
+            assert!(nc.0 < oc.0);
+        }
+    }
+    x.p = cam.world_from_cam.translation.vector
+        + cam.world_from_cam.rotation * Vector3::new(0.0, 0.0, -10.0);
+    let (new, nc) = counted(|| pixel_residuals(&cam, &b, &list, &pairs, &x));
+    assert!(new.is_empty());
+    assert_eq!(nc.0, 0);
+}

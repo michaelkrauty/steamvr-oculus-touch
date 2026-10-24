@@ -410,10 +410,16 @@ pub(super) fn pixel_residuals(
     x: &Nominal,
 ) -> Vec<Vector2<f64>> {
     let projector = Projector::new(cam, body, x);
-    pairs
+    let mut projected = pairs
         .iter()
-        .filter_map(|&(led, b)| projector.pixel(led).map(|(uv, _)| blobs[b].xy - uv))
-        .collect()
+        .filter_map(|&(led, b)| projector.pixel(led).map(|(uv, _)| blobs[b].xy - uv));
+    let Some(first) = projected.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    out.push(first);
+    out.extend(projected);
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
