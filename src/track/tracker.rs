@@ -1335,6 +1335,28 @@ impl Tracker {
     /// frame.
     fn explains_frame(&self, cam: &Camera, blobs: &[Blob], fit: &vision::Fit) -> bool {
         let p = &self.params.search;
+        let visible = vision::visible_leds(
+            cam,
+            &self.body,
+            &fit.updated.filter.x,
+            &self.params.fit.assoc,
+        );
+        let n = fit.pairs.len();
+        let residuals =
+            vision::residuals(cam, &self.body, blobs, &fit.pairs, &fit.updated.filter.x);
+        let rms = (residuals.iter().map(|o| o.r.norm_squared()).sum::<f64>()
+            / residuals.len().max(1) as f64)
+            .sqrt();
+        n >= p.min_fit_leds
+            && n as f64 >= p.min_fit_share * visible as f64
+            && fit.unexplained <= p.max_unexplained
+            && rms <= p.max_fit_rms_px
+    }
+
+    // Original predicate retained as an independent differential/benchmark oracle.
+    #[cfg(test)]
+    fn explains_frame_baseline(&self, cam: &Camera, blobs: &[Blob], fit: &vision::Fit) -> bool {
+        let p = &self.params.search;
         let (visible, _, _) = vision::association_report(
             cam,
             &self.body,
@@ -1917,9 +1939,11 @@ mod tests {
             .attempt(cam, &blobs, &pose, labels, None, &fit_params)
             .unwrap();
         assert!(fit.pairs.len() >= 8 && tr.explains_frame(cam, &blobs, &fit));
+        assert!(tr.explains_frame_baseline(cam, &blobs, &fit));
         let mut strays = fit.clone();
         strays.unexplained = 2;
         assert!(!tr.explains_frame(cam, &blobs, &strays));
+        assert!(!tr.explains_frame_baseline(cam, &blobs, &strays));
         let mut part = fit.clone();
         part.pairs.truncate(fit.pairs.len() * 3 / 4);
         assert!(
@@ -1938,6 +1962,100 @@ mod tests {
             })
             .collect();
         assert!(!tr.explains_frame(cam, &loose, &fit), "a pixel off");
+        assert!(!tr.explains_frame_baseline(cam, &loose, &fit));
+        assert!(!tr.explains_frame_baseline(cam, &blobs, &part));
+    }
+
+    #[test]
+    fn visible_count_matches_association_report() {
+        let mut checked = 0;
+        for seed in 1..=8 {
+            let w = touch_world(seed);
+            let tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+            let mut rng = Rng::new(seed);
+            for step in 0..100 {
+                let t = step as f64 * 0.073;
+                let f = tr.acquisition_prior(&w.motion.pose(t), None);
+                for cam in &w.cams {
+                    let blobs = sight(&w, cam, t, &mut rng, 0.2);
+                    for facing in [-1.0, 0.0, 0.2, 0.9, 1.0] {
+                        let mut p = tr.params.fit.assoc;
+                        p.min_facing = facing;
+                        assert_eq!(
+                            vision::association_report(cam, &w.body, &f, &blobs, 1.0, &p, 3.0).0,
+                            vision::visible_leds(cam, &w.body, &f.x, &p),
+                            "seed={seed}, step={step}, facing={facing}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("equivalent cases: {checked}");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_explains_frame_visible_count() {
+        use std::{hint::black_box, time::Instant};
+        let w = touch_world(3);
+        let tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let mut rng = Rng::new(5);
+        let mut cases = Vec::new();
+        for step in 0..100 {
+            let t = step as f64 * 0.073;
+            for cam in &w.cams {
+                let blobs = sight(&w, cam, t, &mut rng, 0.2);
+                let labels = blobs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| ((b.led_id & 0xff) as usize, i))
+                    .collect();
+                if let Some((_, fit)) =
+                    tr.attempt(cam, &blobs, &w.motion.pose(t), labels, None, &tr.params.fit)
+                {
+                    cases.push((*cam, blobs, fit));
+                }
+            }
+        }
+        assert!(cases.len() > 20);
+        for (cam, blobs, fit) in &cases {
+            assert_eq!(
+                tr.explains_frame_baseline(cam, blobs, fit),
+                tr.explains_frame(cam, blobs, fit)
+            );
+            let mut rejected = fit.clone();
+            rejected.unexplained = usize::MAX;
+            assert_eq!(
+                tr.explains_frame_baseline(cam, blobs, &rejected),
+                tr.explains_frame(cam, blobs, &rejected)
+            );
+        }
+        println!("benchmark cases: {}", cases.len());
+        for round in 0..9 {
+            for new in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                for _ in 0..200 {
+                    for (cam, blobs, fit) in &cases {
+                        let (cam, blobs, fit) =
+                            (black_box(cam), black_box(blobs.as_slice()), black_box(fit));
+                        black_box(if new {
+                            tr.explains_frame(cam, blobs, fit)
+                        } else {
+                            tr.explains_frame_baseline(cam, blobs, fit)
+                        });
+                    }
+                }
+                println!(
+                    "round={round} new={new} ns/call={:.1}",
+                    start.elapsed().as_nanos() as f64 / (200 * cases.len()) as f64
+                );
+            }
+        }
     }
 
     /// An engine pose rated only good is taken, and published once a second sensor's frame
