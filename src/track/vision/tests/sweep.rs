@@ -269,7 +269,7 @@ fn sweep_association_matches_baseline() {
             for margin in [-1.0, 0.0, 6.0, f64::INFINITY, f64::NAN] {
                 for sigma in [0.0, 0.5, f64::NAN] {
                     for cov in [f.cov, Cov::zeros()] {
-                        let f = Filter { cov, ..f.clone() };
+                        let f = Filter { cov, ..f };
                         let p = AssocParams {
                             max_px,
                             margin,
@@ -352,7 +352,7 @@ fn sweep_empty_blobs_skip_projection_allocation() {
     let f = filter(x, 0.1, 0.1);
     let p = AssocParams::default();
     let (new, nc) = counted(|| associate(&cam, &b, &f, &[], 0.5, &p));
-    let (old, oc) = counted(|| super::hot_paths::original_associate(&cam, &b, &f, &[], 0.5, &p));
+    let (old, oc) = counted(|| sweep_baseline_associate(&cam, &b, &f, &[], 0.5, &p));
     assert_eq!(new, old);
     assert_eq!(nc.0, 0);
     assert!(oc.0 > 0);
@@ -520,4 +520,91 @@ fn sweep_visible_projection_capacity_avoids_growth() {
             assert!(nc.0 < oc.0);
         }
     }
+}
+
+#[test]
+#[ignore = "offline release benchmark"]
+fn benchmark_sweep_buffers() {
+    use crate::track::tracker::stillness_tests::counted;
+    use std::{hint::black_box, time::Instant};
+    let (cam, b, x) = (camera(), body(), state());
+    let seen = blobs(&cam, &b, &x);
+    let list: Vec<_> = seen.iter().map(|s| s.1).collect();
+    let pairs: Vec<_> = seen.iter().enumerate().map(|(i, s)| (s.0, i)).collect();
+    let f = filter(x, 0.1, 0.1);
+    let p = AssocParams::default();
+    for operation in 0..4 {
+        let run = |which| match operation {
+            0 => {
+                let fun = if which == 0 {
+                    baseline_pixel_residuals
+                } else {
+                    pixel_residuals
+                };
+                black_box(fun(black_box(&cam), &b, &list, &pairs, &x));
+            }
+            1 => {
+                let fun = if which == 0 {
+                    sweep_baseline_predicted_pixels
+                } else {
+                    predicted_pixels
+                };
+                black_box(fun(black_box(&cam), &b, &x, p.min_facing));
+            }
+            2 => {
+                let fun = if which == 0 {
+                    sweep_baseline_gate_pairs
+                } else {
+                    gate_pairs
+                };
+                black_box(fun(black_box(&cam), &b, &f, &list, &pairs, 0.5, &p));
+            }
+            _ => {
+                let fun = if which == 0 {
+                    sweep_baseline_associate
+                } else {
+                    associate
+                };
+                black_box(fun(black_box(&cam), &b, &f, &[], 0.5, &p));
+            }
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..12 {
+            for which in [round % 2, 1 - round % 2] {
+                let start = Instant::now();
+                for _ in 0..5000 {
+                    run(which);
+                }
+                times[which].push(start.elapsed().as_secs_f64() * 1e6 / 5000.0);
+            }
+        }
+        for (which, t) in times.iter_mut().enumerate() {
+            t.sort_by(f64::total_cmp);
+            let (_, counts) = counted(|| run(which));
+            eprintln!("buffer {operation} variant {which}: {:.3}/{:.3}/{:.3} us min/median/max, {counts:?} alloc/dealloc/bytes", t[0], t[6], t[11]);
+        }
+    }
+}
+
+fn sweep_baseline_associate(
+    cam: &Camera,
+    body: &Body,
+    f: &Filter,
+    blobs: &[Blob],
+    sigma_px: f64,
+    p: &AssocParams,
+) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
+    let (w, h) = (cam.model.width as f64, cam.model.height as f64);
+    let visible: Vec<Projection> = (0..body.leds.len())
+        .filter_map(|i| projector.project(i))
+        .filter(|pr| {
+            pr.facing > p.min_facing
+                && pr.uv.x >= 0.0
+                && pr.uv.y >= 0.0
+                && pr.uv.x < w
+                && pr.uv.y < h
+        })
+        .collect();
+    baseline_associate_visible(&visible, f, blobs, sigma_px, p)
 }

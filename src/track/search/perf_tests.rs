@@ -280,3 +280,46 @@ fn sweep_score_capacity_eliminates_growth() {
         }
     }
 }
+
+#[test]
+#[ignore = "offline release benchmark"]
+fn benchmark_sweep_score_buffers() {
+    use std::{hint::black_box, time::Instant};
+    let (cam, offsets, normals, t, blobs, rays) = fixture();
+    let p = SearchParams::default();
+    for n in [0, 1, rays.len()] {
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..12 {
+            for which in [round % 2, 1 - round % 2] {
+                let f = if which == 0 {
+                    sweep_baseline_score
+                } else {
+                    score
+                };
+                let start = Instant::now();
+                for _ in 0..5000 {
+                    black_box(f(
+                        black_box(&cam),
+                        &offsets,
+                        &normals,
+                        &t,
+                        &blobs,
+                        &rays[..n],
+                        &p,
+                    ));
+                }
+                times[which].push(start.elapsed().as_secs_f64() * 1e6 / 5000.0);
+            }
+        }
+        for (which, tms) in times.iter_mut().enumerate() {
+            let f = if which == 0 {
+                sweep_baseline_score
+            } else {
+                score
+            };
+            let (_, counts) = counted(|| f(&cam, &offsets, &normals, &t, &blobs, &rays[..n], &p));
+            tms.sort_by(f64::total_cmp);
+            eprintln!("score {n} rays variant {which}: {:.3}/{:.3}/{:.3} us min/median/max, {counts:?} alloc/dealloc/bytes", tms[0], tms[6], tms[11]);
+        }
+    }
+}
