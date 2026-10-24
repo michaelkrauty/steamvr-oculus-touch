@@ -388,3 +388,57 @@ fn cheap_pair_gates_preserve_matches() {
         }
     }
 }
+
+fn baseline_residuals(
+    cam: &Camera,
+    body: &Body,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    x: &Nominal,
+) -> Vec<PixelResidual> {
+    let projector = Projector::new(cam, body, x);
+    pairs
+        .iter()
+        .filter_map(|&(led, b)| {
+            projector.project(led).map(|pr| PixelResidual {
+                r: blobs[b].xy - pr.uv,
+                j: pr.j,
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn residual_capacity_removes_growth_without_changing_bits() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, mut x) = (camera(), body(), state());
+    let list: Vec<_> = (0..b.leds.len())
+        .map(|i| Blob {
+            xy: Vector2::new(i as f64, 300.0),
+            led_id: -1,
+        })
+        .collect();
+    let pairs: Vec<_> = (0..b.leds.len()).map(|i| (i, i)).collect();
+    let bits = |v: Vec<PixelResidual>| {
+        v.into_iter()
+            .flat_map(|p| {
+                p.r.iter()
+                    .chain(p.j.iter())
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    for z in [0.0, 1.0, 2.0, 100.0, f64::NAN] {
+        x.p.z = z;
+        for n in 0..=pairs.len() {
+            let (new, nc) = counted(|| residuals(&cam, &b, &list, &pairs[..n], &x));
+            let (old, oc) = counted(|| baseline_residuals(&cam, &b, &list, &pairs[..n], &x));
+            assert_eq!(nc.0, usize::from(!new.is_empty()));
+            if old.len() > 4 {
+                assert!(nc.0 < oc.0, "{nc:?} vs {oc:?}");
+            }
+            assert_eq!(bits(new), bits(old));
+        }
+    }
+}

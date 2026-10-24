@@ -378,15 +378,21 @@ pub fn residuals(
     x: &Nominal,
 ) -> Vec<PixelResidual> {
     let projector = Projector::new(cam, body, x);
-    pairs
-        .iter()
-        .filter_map(|&(led, b)| {
-            projector.project(led).map(|pr| PixelResidual {
-                r: blobs[b].xy - pr.uv,
-                j: pr.j,
-            })
+    let mut projected = pairs.iter().filter_map(|&(led, b)| {
+        projector.project(led).map(|pr| PixelResidual {
+            r: blobs[b].xy - pr.uv,
+            j: pr.j,
         })
-        .collect()
+    });
+    // Allocate only after a surviving projection, and at most once. The fit's
+    // matched-pair count bounds every iteration's output.
+    let Some(first) = projected.next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    out.push(first);
+    out.extend(projected);
+    out
 }
 
 /// Diagnostic residuals need pixels, not the filter update's Jacobians.
