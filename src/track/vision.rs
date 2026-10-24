@@ -522,8 +522,8 @@ pub fn associate_shifted(
         .fold(0.0, f64::max)
         * 3.0
         + 3.0 * sigma_px;
-    let place = |d: &Vector2<f64>| -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
+    let place = |d: &Vector2<f64>, out: &mut Vec<(usize, usize)>| {
+        out.clear();
         for pr in &visible {
             let at = pr.uv + d;
             // Only a unique blob strictly inside snap_px is usable. A second
@@ -538,14 +538,15 @@ pub fn associate_shifted(
                 }
             }
         }
-        out
     };
+    let mut scratch = Vec::with_capacity(visible.len());
     let mut scored: Vec<(usize, Vector2<f64>)> = Vec::new();
     for pr in &visible {
         for b in blobs {
             let d = b.xy - pr.uv;
             if d.norm() <= reach.min(p.max_px * 3.0) {
-                scored.push((place(&d).len(), d));
+                place(&d, &mut scratch);
+                scored.push((scratch.len(), d));
             }
         }
     }
@@ -560,9 +561,9 @@ pub fn associate_shifted(
     if best < min_leds || best < rival + margin {
         return Vec::new();
     }
-    let mut pairs = place(&d);
-    pairs.sort();
-    pairs
+    place(&d, &mut scratch);
+    scratch.sort();
+    scratch
 }
 
 /// Associates, updates, re-associates under the tightened posterior, and updates again from the

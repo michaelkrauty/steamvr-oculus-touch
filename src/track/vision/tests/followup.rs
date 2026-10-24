@@ -153,3 +153,109 @@ fn pixel_only_matches_baseline_including_camera_plane_and_nonfinite() {
         }
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+fn baseline_shifted(
+    cam: &Camera,
+    body: &Body,
+    f: &Filter,
+    blobs: &[Blob],
+    sigma_px: f64,
+    p: &AssocParams,
+    snap_px: f64,
+    min_leds: usize,
+    margin: usize,
+) -> Vec<(usize, usize)> {
+    let projector = Projector::new(cam, body, &f.x);
+    let (w, h) = (cam.model.width as f64, cam.model.height as f64);
+    let visible: Vec<Projection> = (0..body.leds.len())
+        .filter_map(|i| projector.project(i))
+        .filter(|pr| {
+            pr.facing > p.min_facing
+                && pr.uv.x >= -50.0
+                && pr.uv.y >= -50.0
+                && pr.uv.x < w + 50.0
+                && pr.uv.y < h + 50.0
+        })
+        .collect();
+    if visible.len() < min_leds || blobs.len() < min_leds {
+        return Vec::new();
+    }
+    let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
+    // the pattern moves as a whole: the largest per-LED spread bounds the search
+    let reach = visible
+        .iter()
+        .map(|pr| (pr.j * p6 * pr.j.transpose()).trace().sqrt())
+        .fold(0.0, f64::max)
+        * 3.0
+        + 3.0 * sigma_px;
+    let place = |d: &Vector2<f64>| -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for pr in &visible {
+            let at = pr.uv + d;
+            // Only a unique blob strictly inside snap_px is usable. A second
+            // match proves ambiguity; sorting a wider neighbourhood adds nothing.
+            let mut near = blobs
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| (x.xy - at).norm() < snap_px);
+            if let Some((b, _)) = near.next() {
+                if near.next().is_none() && !out.iter().any(|o: &(usize, usize)| o.1 == b) {
+                    out.push((pr.led, b));
+                }
+            }
+        }
+        out
+    };
+    let mut scored: Vec<(usize, Vector2<f64>)> = Vec::new();
+    for pr in &visible {
+        for b in blobs {
+            let d = b.xy - pr.uv;
+            if d.norm() <= reach.min(p.max_px * 3.0) {
+                scored.push((place(&d).len(), d));
+            }
+        }
+    }
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let Some(&(best, d)) = scored.first() else {
+        return Vec::new();
+    };
+    let rival = scored
+        .iter()
+        .find(|s| (s.1 - d).norm() > 2.0 * snap_px)
+        .map_or(0, |s| s.0);
+    if best < min_leds || best < rival + margin {
+        return Vec::new();
+    }
+    let mut pairs = place(&d);
+    pairs.sort();
+    pairs
+}
+
+#[test]
+fn shifted_scratch_matches_baseline_and_reduces_allocations() {
+    use crate::track::tracker::stillness_tests::counted;
+    let (cam, b, x) = (camera(), body(), state());
+    let f = filter(x, 0.01, 0.03);
+    let base: Vec<_> = blobs(&cam, &b, &x).into_iter().map(|(_, b)| b).collect();
+    let p = AssocParams::default();
+    let (new, nc) = counted(|| associate_shifted(&cam, &b, &f, &base, 0.5, &p, 1.5, 4, 2));
+    let (old, oc) = counted(|| baseline_shifted(&cam, &b, &f, &base, 0.5, &p, 1.5, 4, 2));
+    assert!(!new.is_empty());
+    assert_eq!(new, old);
+    assert!(nc.0 < oc.0, "{nc:?} vs {oc:?}");
+    for n in 0..=base.len() {
+        let mut list = base[..n].to_vec();
+        if n % 2 == 0 {
+            list.extend_from_within(..);
+        }
+        for snap in [-1.0, 0.0, 0.5, 1.5, 20.0, f64::INFINITY, f64::NAN] {
+            for margin in [0, 1, 2, 100] {
+                assert_eq!(
+                    associate_shifted(&cam, &b, &f, &list, 0.5, &p, snap, 4, margin),
+                    baseline_shifted(&cam, &b, &f, &list, 0.5, &p, snap, 4, margin)
+                );
+            }
+        }
+    }
+}
