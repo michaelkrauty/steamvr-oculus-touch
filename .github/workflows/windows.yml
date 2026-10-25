@@ -30,7 +30,10 @@ jobs:
       - name: Install Rust toolchain for this job
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy
       - name: Release metadata
-        run: python -m unittest discover -s tests -p test_release.py
+        run: |
+          python -m unittest discover -s tests -p test_release.py
+          if ($LASTEXITCODE -ne 0) { throw 'Release metadata does not match' }
+          python -m unittest discover -s tests -p test_windows_bundle.py
       - name: Lint
         run: cargo clippy --locked --no-default-features --lib --tests -- -D warnings
       # the daemon and the tool need the engine to link, not to type-check
@@ -145,6 +148,8 @@ jobs:
           path: target/bundle
       - name: The bundle runs without the build's libraries
         run: |
+          python windows\check_bundle.py target\bundle --readobj "C:\Program Files\LLVM\bin\llvm-readobj.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'The bundle requires an unshipped DLL' }
           & target\bundle\bin\cv1touchd.exe --version
           if ($LASTEXITCODE -ne 0) { throw "cv1touchd exit $LASTEXITCODE" }
           & target\bundle\bin\cv1touch.exe --version

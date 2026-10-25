@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- Windows executables now include their C runtime instead of depending on an unbundled Visual C++ Redistributable. CI audits the executable and DLL imports, including transitive and delayed imports, so development runtimes installed on the runner cannot hide a missing dependency.
+
 ## [0.3.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0) - 2026-10-24
 
 ### Added
