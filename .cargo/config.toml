@@ -1,3 +1,8 @@
 # Prefer dependency versions compatible with the crate's declared minimum Rust version.
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# Windows users should not need the Visual C++ Redistributable. The native engine and
+# SteamVR driver already use /MT; Rust's executables must carry their runtime too.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
