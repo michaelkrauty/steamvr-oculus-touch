@@ -9,6 +9,10 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "windows/driver_tests.rs"]
+mod driver_tests;
+
 /// Opens a reparse point (a link) itself rather than its target.
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;

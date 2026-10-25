@@ -43,6 +43,13 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --no-default-features --lib
+      # Hosted, disposable runner only: a generated ROOT node, never a USB device. This
+      # validates SetupAPI's real inbox-driver binding path, not USB transfers or UAC UI.
+      - name: Inbox WinUSB driver binding without hardware
+        if: matrix.rust == 'stable'
+        env:
+          CV1TOUCH_TEST_ROOT_DEVICE: "1"
+        run: cargo test --locked --no-default-features --lib platform::windows::driver_tests::inbox_winusb_binds_to_a_synthetic_device -- --ignored --exact --nocapture
   driver:
     # The SteamVR driver DLL (clang-cl, static runtime) and its tests, then the driver against the
     # daemon's own shared-memory and control code.
