@@ -4,7 +4,7 @@ Use first-generation Oculus Rift CV1 Touch controllers in SteamVR on Linux and W
 
 SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
 
-**Status:** v0.3.0 is an early release, tested on one Linux installation with one left/right controller pair and up to five CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. Windows builds and installer checks pass, but gameplay on Windows has not yet been validated. This project is independent of Meta, Oculus, and Valve.
+**Status:** v0.3.1 is an early release. Physical testing so far covers one Linux installation with one left/right controller pair and up to five CV1 sensors. The tracking stack has been used in VR games; broader hardware, distribution, headset, and application compatibility still needs testing. Windows builds, synthetic driver binding and standard-user installer checks pass, but physical Windows USB streaming, calibration and gameplay remain unvalidated. See the [first Windows test checklist](docs/windows-first-test.md). This project is independent of Meta, Oculus, and Valve.
 
 ## Hardware and software
 
@@ -18,19 +18,19 @@ This repository supplies controllers, not a CV1 display/headset driver. Sandboxe
 
 ## Quick start
 
-**Windows:** download `cv1touch-setup-0.3.0.exe` from the [v0.3.0 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0), then follow [cv1touch on Windows](docs/windows.md). The installer is unsigned; sensor-driver setup asks for elevation separately.
+**Windows:** download `cv1touch-setup-0.3.1.exe` from the [v0.3.1 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.1), then follow [cv1touch on Windows](docs/windows.md). The installer is unsigned; sensor-driver setup asks for elevation separately.
 
 **Linux:**
 
 Quit SteamVR before installing. Install the build dependencies from [setup](docs/setup.md#build-dependencies), then:
 
 ```sh
-git clone --branch v0.3.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
+git clone --branch v0.3.1 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
 cd steamvr-oculus-touch
 python3 scripts/install.py
 ```
 
-Linux v0.3.0 is distributed as source, including [tagged source archives](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0). Native dependencies are dynamically linked; build locally on the distribution where you will run it. For development on `main`, see [Contributing](CONTRIBUTING.md).
+Linux v0.3.1 is distributed as source, including [tagged source archives](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.1). Native dependencies are dynamically linked; build locally on the distribution where you will run it. For development on `main`, see [Contributing](CONTRIBUTING.md).
 
 The installer builds with the locked dependency graph, installs into `~/.local`, registers the SteamVR driver, backs up SteamVR settings before enabling multiple drivers, and starts a user service. It never runs sudo. Put `~/.local/bin` on your PATH.
 

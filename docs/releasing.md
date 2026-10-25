@@ -25,7 +25,7 @@ captures, calibration, or an installed workstation directory.
 
 ## Package and publish
 
-For example, with `version=0.3.0` and `tag=v$version`, create an annotated tag on
+For example, with `version=0.3.1` and `tag=v$version`, create an annotated tag on
 the validated commit, then push that tag. The Windows tag workflow rebuilds and
 tests the installer. Its release job waits for the library, standalone driver,
 and installer checks and uploads `cv1touch-setup-$version.exe` to a **draft** release
@@ -34,7 +34,7 @@ if no release exists. Wait for the entire tag workflow, not just the upload.
 Prepare the source asset from the tag, not from the working directory:
 
 ```sh
-version=0.3.0
+version=0.3.1
 tag=v$version
 mkdir -p target/dist
 git archive --format=tar --prefix="steamvr-oculus-touch-$version/" "$tag" \
