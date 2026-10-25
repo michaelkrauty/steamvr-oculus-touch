@@ -50,7 +50,8 @@ impl<F> FrameQueue<F> {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.frames.entry(serial.clone())
             {
-                entry.insert(VecDeque::new());
+                // Allocate before callbacks start, and never temporarily exceed this bound.
+                entry.insert(VecDeque::with_capacity(FRAMES_PER_SENSOR));
                 self.roster.push(serial);
             }
         }
@@ -88,17 +89,21 @@ impl<F> FrameQueue<F> {
         };
         // Fast and long analysis workers can finish out of order. Keep the newest
         // exposures, not the newest callback arrivals, and consume them in order.
-        let at = queue.partition_point(|(time, _)| *time < timestamp_ns);
+        let mut at = queue.partition_point(|(time, _)| *time < timestamp_ns);
         if queue.get(at).is_some_and(|(time, _)| *time == timestamp_ns) {
             queue[at] = (timestamp_ns, frame);
             self.stats.dropped_frames = self.stats.dropped_frames.saturating_add(1);
             return;
         }
-        queue.insert(at, (timestamp_ns, frame));
-        if queue.len() > FRAMES_PER_SENSOR {
-            queue.pop_front();
+        if queue.len() == FRAMES_PER_SENSOR {
             self.stats.dropped_frames = self.stats.dropped_frames.saturating_add(1);
+            if at == 0 {
+                return; // older than both retained exposures
+            }
+            queue.pop_front();
+            at -= 1;
         }
+        queue.insert(at, (timestamp_ns, frame));
     }
 
     pub fn push_clock(&mut self, host_ns: u64, device_us: u32) {
@@ -110,7 +115,16 @@ impl<F> FrameQueue<F> {
     }
 
     pub fn take_clocks(&mut self) -> Vec<(u64, u32)> {
-        self.clocks.drain(..).collect()
+        let mut clocks = Vec::new();
+        self.take_clocks_into(&mut clocks);
+        clocks
+    }
+
+    /// Replace the consumer's batch while keeping both buffers' allocations for the next pass.
+    /// The caller can release the ingress lock before fitting clocks from this batch.
+    pub fn take_clocks_into(&mut self, clocks: &mut Vec<(u64, u32)>) {
+        clocks.clear();
+        clocks.extend(self.clocks.drain(..));
     }
 
     /// Takes the admitted sensor's queued frames that `take` selects, oldest exposure first;
@@ -119,10 +133,16 @@ impl<F> FrameQueue<F> {
         let Some(queue) = self.frames.get_mut(serial) else {
             return Vec::new();
         };
-        let (taken, kept): (VecDeque<_>, VecDeque<_>) =
-            queue.drain(..).partition(|(_, frame)| take(frame));
-        *queue = kept;
-        taken.into_iter().map(|(_, frame)| frame).collect()
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            if take(&queue[i].1) {
+                taken.push(queue.remove(i).unwrap().1);
+            } else {
+                i += 1;
+            }
+        }
+        taken
     }
 
     pub fn pop_frame(&mut self) -> Option<F> {
@@ -148,6 +168,10 @@ impl<F> FrameQueue<F> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "frame_queue/perf_tests.rs"]
+mod perf_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3506,6 +3506,7 @@ fn radio_main(
     let mut search_skip = SearchSkip::default();
     let mut next_stats = 0u64;
     let mut buf = [0u8; 64];
+    let mut clocks = Vec::new();
     let mut radio_failed = false;
     let mut rest = Rest::new();
     while !link.stop.load(Ordering::Acquire) && !radio_failed {
@@ -3587,11 +3588,12 @@ fn radio_main(
         }
         // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
         // consumer's queue. Release the ingress lock before any tracking work.
-        let (clocks, frame) = {
+        let frame = {
             let mut ingress = d.track_in.lock().unwrap();
-            (ingress.take_clocks(), ingress.pop_frame())
+            ingress.take_clocks_into(&mut clocks);
+            ingress.pop_frame()
         };
-        for (host, us) in clocks {
+        for &(host, us) in &clocks {
             pipe.hmd_clock_sample(host, us);
         }
         let search = d.track_searches.lock().unwrap().pop_frame();

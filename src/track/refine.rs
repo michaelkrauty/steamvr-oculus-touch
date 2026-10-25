@@ -49,15 +49,21 @@ fn matches(
     let mut out = Vec::new();
     for (i, u) in uv.iter().enumerate() {
         let Some(u) = u else { continue };
-        let mut d: Vec<(f64, usize)> = s
-            .blobs
-            .iter()
-            .enumerate()
-            .map(|(b, x)| ((x - u).norm(), b))
-            .collect();
-        d.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let Some(&(d1, b)) = d.first() else { continue };
-        if d1 > gate || d.get(1).is_some_and(|x| x.0 < d1 + margin) {
+        // Only the nearest and runner-up matter. Strict total ordering preserves the stable
+        // sort's first-blob tie rule, including its non-finite distance ordering.
+        let mut nearest: Option<(f64, usize)> = None;
+        let mut second: Option<f64> = None;
+        for (b, x) in s.blobs.iter().enumerate() {
+            let d = (x - u).norm();
+            if nearest.is_none_or(|n| d.total_cmp(&n.0).is_lt()) {
+                second = nearest.map(|n| n.0);
+                nearest = Some((d, b));
+            } else if second.is_none_or(|s| d.total_cmp(&s).is_lt()) {
+                second = Some(d);
+            }
+        }
+        let Some((d1, b)) = nearest else { continue };
+        if d1 > gate || second.is_some_and(|d| d < d1 + margin) {
             continue;
         }
         let rival = uv
@@ -83,8 +89,8 @@ fn median(mut v: Vec<f64>) -> f64 {
     if v.is_empty() {
         return f64::NAN;
     }
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
+    let mid = v.len() / 2;
+    *v.select_nth_unstable_by(mid, f64::total_cmp).1
 }
 
 /// Gauss-Newton with Huber weights on cam_from_world, perturbed on the left in the camera frame.
@@ -390,6 +396,10 @@ pub fn recording_models(path: &std::path::Path) -> Result<RecordingModels, Strin
     }
     Ok((cams, leds))
 }
+
+#[cfg(test)]
+#[path = "refine/perf_tests.rs"]
+mod perf_tests;
 
 #[cfg(test)]
 mod tests {
