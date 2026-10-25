@@ -4,6 +4,7 @@
 # Build and run hardware-independent Rust and native regressions.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+python3 -m unittest discover -s tests -p test_release.py
 python3 -m unittest discover -s tests -p test_install.py
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 cargo fmt --all --check

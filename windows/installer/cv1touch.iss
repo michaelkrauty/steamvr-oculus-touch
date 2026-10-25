@@ -10,12 +10,12 @@
 ; force if it will not end), unregisters the driver and takes the sensors' driver off again;
 ; settings and calibration under %LOCALAPPDATA%\cv1touch stay, so that installing again finds them.
 ;
-; Build: ISCC /DVersion=0.2.0 /DBundle=..\..\target\bundle cv1touch.iss, with a bundle from
+; Build: ISCC /DVersion=0.3.0 /DBundle=..\..\target\bundle cv1touch.iss, with a bundle from
 ; windows\bundle.ps1; the installer lands in target\installer (CI does both:
 ; .github\workflows\windows.yml).
 
 #ifndef Version
-  #error Pass the version: ISCC /DVersion=0.2.0 ...
+  #error Pass the version: ISCC /DVersion=0.3.0 ...
 #endif
 #ifndef Bundle
   #define Bundle "..\..\target\bundle"

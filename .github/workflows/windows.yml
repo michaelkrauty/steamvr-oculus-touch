@@ -29,6 +29,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain for this job
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy
+      - name: Release metadata
+        run: python -m unittest discover -s tests -p test_release.py
       - name: Lint
         run: cargo clippy --locked --no-default-features --lib --tests -- -D warnings
       # the daemon and the tool need the engine to link, not to type-check
@@ -184,7 +186,7 @@ jobs:
     # A tag v* attaches the installer to its release (a draft, if none exists yet). The only job
     # that may write to the repository, and it runs nothing it built.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: installer
+    needs: [library, driver, installer]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -200,5 +202,5 @@ jobs:
           path: setup
       - name: Attach to the release
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes "See CHANGELOG.md."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes "See CHANGELOG.md."
           gh release upload "$TAG" setup/cv1touch-setup-*.exe --clobber

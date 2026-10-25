@@ -1,12 +1,12 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite this repository."
 type: software
-title: "SteamVR Oculus Touch: Rift CV1 controllers for Linux SteamVR"
+title: "SteamVR Oculus Touch: Rift CV1 controllers for SteamVR"
 authors:
   - name: "michaelkrauty"
-version: "0.2.0"
-date-released: "2026-10-11"
-url: "https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.2.0"
+version: "0.3.0"
+date-released: "2026-10-24"
+url: "https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0"
 repository-code: "https://github.com/michaelkrauty/steamvr-oculus-touch"
 license: Apache-2.0
 keywords:
@@ -15,3 +15,4 @@ keywords:
   - sensor fusion
   - SteamVR
   - Linux
+  - Windows

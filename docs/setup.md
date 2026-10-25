@@ -33,7 +33,7 @@ Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or r
 
 ## Install
 
-Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.2.0` tag or an extracted [v0.2.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.2.0) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
+Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.3.0` tag or an extracted [v0.3.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
 
 | Location | Purpose |
 | --- | --- |
@@ -154,11 +154,20 @@ The live status board lists every sensor. `camera_queue.dropped_frames` counts e
 
 ## Upgrade
 
-Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.2.0` with the desired published tag:
+**From v0.2.0 to v0.3.0:** update both the daemon and the SteamVR driver with the
+installer, then restart the daemon and SteamVR. The shared-memory ABI changed
+from v3 to v4; mixing the two releases disconnects the controllers rather than
+reading incompatible poses. Calibration and settings are kept. Run
+`cv1touch doctor` and `cv1touch setup --check` after upgrading. The controllers
+now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch
+bindings, but custom bindings for the old controller type may need to be selected
+or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
+
+Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.3.0` with the desired published tag:
 
 ```sh
 git fetch origin --tags
-git checkout --detach v0.2.0
+git checkout --detach v0.3.0
 python3 scripts/install.py
 systemctl --user restart cv1touchd
 ```

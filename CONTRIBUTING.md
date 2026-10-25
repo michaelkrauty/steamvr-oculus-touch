@@ -39,4 +39,6 @@ Preserve upstream copyright and license notices. Update third-party provenance w
 
 Document user-visible changes in `CHANGELOG.md`. ABI/recording-format changes require coordinated reader/writer compatibility tests. Performance claims need a baseline, exact method, hardware context, and uncertainty. Keep the default setup portable; optional optimizations must fail visibly or fall back safely.
 
+Maintainers: follow the [release checklist](docs/releasing.md) for version metadata, validation, source archives, and the Windows installer.
+
 By submitting a contribution, you agree to license your original changes under the repository's Apache License 2.0. Third-party code must retain its applicable license.
