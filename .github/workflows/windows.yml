@@ -11,6 +11,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  installer-script:
+    # Catch installer script errors without waiting for the native build queue. These
+    # placeholder payloads are never executed or uploaded; the installer job tests real files.
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile the installer with placeholder payloads
+        run: |
+          $bundle = "$PWD\target\installer-script-test"
+          New-Item -ItemType Directory -Force "$bundle\bin", "$bundle\lib\cv1touch", "$bundle\third_party" | Out-Null
+          Set-Content "$bundle\bin\placeholder.txt" 'not executable'
+          Set-Content "$bundle\lib\cv1touch\placeholder.txt" 'not executable'
+          Set-Content "$bundle\third_party\placeholder.txt" 'test fixture'
+          Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md $bundle
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.0.0 "/DBundle=$bundle" windows\installer\cv1touch.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer script did not compile' }
   library:
     # The library without the native engine on GitHub's isolated Windows runners: the platform
     # layer and the tracking, calibration and protocol code, on the oldest supported Rust too.

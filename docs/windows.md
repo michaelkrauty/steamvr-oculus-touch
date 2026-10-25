@@ -41,4 +41,4 @@ The command line is there too, in `%LOCALAPPDATA%\Programs\cv1touch\bin`: `cv1to
 
 ## Uninstall
 
-Uninstall cv1touch from Windows' installed apps. It stops the daemon, unregisters it from SteamVR and takes the sensors' driver off again (Windows asks once more). Your settings and calibration stay in `%LOCALAPPDATA%\cv1touch`, in case you install it again; delete that folder to remove them.
+Quit SteamVR and keep all sensors plugged in, then uninstall cv1touch from Windows' installed apps. It stops the daemon, unregisters it from SteamVR and takes the connected sensors' driver off again (Windows asks once more). Approve that prompt; if cleanup cannot finish, read the message before closing the window. A disconnected sensor cannot be restored by this step: if you already uninstalled with it disconnected, reinstall cv1touch with that sensor connected, then uninstall again. Your settings and calibration stay in `%LOCALAPPDATA%\cv1touch`, in case you install it again; delete that folder to remove them.
