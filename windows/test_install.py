@@ -10,6 +10,7 @@ not calibration, real SteamVR, UAC interaction, or USB streaming.
 
 import argparse
 import ctypes
+import faulthandler
 import hashlib
 import json
 import os
@@ -27,6 +28,14 @@ def run(args, expected=0, timeout=90, **kwargs):
     if result.returncode != expected:
         raise AssertionError(f"{args}: exit {result.returncode}, expected {expected}\n{result.stdout}\n{result.stderr}")
     return result.stdout
+
+
+def run_installer(args, expected=0):
+    # Inno's bootstrap and its children can keep inherited capture pipes open after
+    # setup exits. Its /LOG file is the diagnostic channel; wait only for the process.
+    result = subprocess.run([str(a) for a in args], timeout=180,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert result.returncode == expected, (args, result.returncode, expected)
 
 
 def until(predicate, explanation, timeout=30):
@@ -128,7 +137,8 @@ def main(installer, work):
         quiet = app / "bin/cv1touchd-quiet.exe"
         uninstall = app / "unins000.exe"
         install_args = [installer, *flags, f"/DIR={app}", f"/LOG={work / f'install-{cycle}.log'}"]
-        run(install_args, timeout=180)
+        run_installer(install_args)
+        print("Installed; checking daemon and shortcuts", flush=True)
         try:
             assert "cv1touch " in run([tool, "--version"])
             assert run_entry() == f'"{quiet}"'
@@ -209,7 +219,7 @@ def main(installer, work):
 
             # Upgrade with the previous daemon running, preserving the same user settings.
             generation = status(tool)["generation"]
-            run(install_args, timeout=180)
+            run_installer(install_args)
             until(lambda: (s := status(tool)) is not None and s["generation"] != generation,
                   "upgrade left the old daemon running")
             assert settings.read_bytes() == saved
@@ -230,7 +240,7 @@ def main(installer, work):
                     time.sleep(0.5)
                     before = hashlib.sha256(tool.read_bytes()).digest()
                     run([tool, "finish-setup"], expected=1)
-                    run(install_args, expected=7, timeout=120)
+                    run_installer(install_args, expected=7)
                     assert hashlib.sha256(tool.read_bytes()).digest() == before
                     assert status(tool) is not None, "blocked upgrade stopped tracking"
                     # Cancellation must leave the install in place, including the Run entry.
@@ -241,7 +251,7 @@ def main(installer, work):
                     process.wait(timeout=10)
         finally:
             if uninstall.exists():
-                run([uninstall, *flags, f"/LOG={work / f'uninstall-{cycle}.log'}"], timeout=120)
+                run_installer([uninstall, *flags, f"/LOG={work / f'uninstall-{cycle}.log'}"])
                 until(lambda: not app.exists(), "uninstaller left application files behind")
         assert run_entry() is None
         assert settings.read_bytes() == saved, "uninstaller removed personal settings"
@@ -270,4 +280,5 @@ if __name__ == "__main__":
     # CI retains this folder on failure for diagnosing installer/shortcut errors.
     work = Path("target/windows-install-test").resolve()
     work.mkdir(parents=True, exist_ok=True)
+    faulthandler.dump_traceback_later(300, repeat=True)
     main(args.installer.resolve(), work)

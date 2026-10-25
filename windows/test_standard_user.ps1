@@ -39,6 +39,13 @@ try {
     if (Test-Path "$work\target\windows-install-test") {
         Copy-Item "$work\target\windows-install-test\*" $destination -Recurse -Force
     }
+    if ($user) {
+        $profile = Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $user.SID.Value }
+        if ($profile) {
+            $logs = Join-Path $profile.LocalPath 'AppData\Local\cv1touch\state\logs'
+            if (Test-Path $logs) { Copy-Item $logs (Join-Path $destination 'runtime-logs') -Recurse -Force }
+        }
+    }
     foreach ($log in 'stdout.log', 'stderr.log') {
         if (Test-Path "$work\$log") { Copy-Item "$work\$log" $destination -Force }
     }
