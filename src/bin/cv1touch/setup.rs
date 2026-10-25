@@ -157,12 +157,12 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
     thread::sleep(Duration::from_millis(300));
     let second = daemon_status(Duration::from_millis(750), DaemonPurpose::Check);
     let daemon_detail = second.as_ref().err().map_or_else(
-        || "Start cv1touchd with access to the CV1 USB devices.".to_string(),
+        || daemon_start_advice().to_string(),
         |error| {
             if error.kind() == io::ErrorKind::InvalidInput {
                 error.to_string()
             } else {
-                format!("Start cv1touchd with access to the CV1 USB devices. ({error})")
+                format!("{} ({error})", daemon_start_advice())
             }
         },
     );
@@ -278,6 +278,14 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             .map(|s| status::sensor_identity(&shm::serial_str(s)))
             .collect(),
         engine_ready: second.as_ref().and_then(|v| v["engine_ready"].as_bool()),
+    }
+}
+
+fn daemon_start_advice() -> &'static str {
+    if cfg!(windows) {
+        "Choose Start cv1touch in the Start menu. If it still fails, choose Send a cv1touch report."
+    } else {
+        "Start cv1touchd with access to the CV1 USB devices."
     }
 }
 
