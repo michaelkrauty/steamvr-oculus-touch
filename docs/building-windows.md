@@ -46,6 +46,8 @@ The first `vcpkg install` compiles OpenCV, which takes a long time. `build.rs` b
 
 The repository's Cargo configuration statically links the MSVC runtime into the Rust executables, just as the native libraries do. Do not override it with a dynamic CRT build: the installer does not require or ship the Visual C++ Redistributable. `python windows/check_bundle.py target/bundle` uses `llvm-readobj` to reject unshipped DLL dependencies, including dependencies a CI runner happens to have installed.
 
+On a disposable hosted runner, `python windows/test_install.py target/installer/cv1touch-setup-0.3.0.exe --disposable-runner` exercises the actual installer, upgrade, repair, Start-menu command quoting, daemon stop/start, report creation and uninstall. It repeats with spaces, Unicode and an ampersand in the installation path, preserves a settings fixture, and checks that a synthetic process named `vrserver.exe` prevents replacement/removal. Do not run it on a configured user account: it uses that account's real installation and Start menu. These tests cover missing prerequisites, not actual SteamVR or physical calibration.
+
 The hosted Windows library job also creates a uniquely named synthetic ROOT device, selects the inbox WinUSB driver through the production SetupAPI path, checks the binding, and removes the node. This opt-in test requires an elevated disposable runner; it never rebinds physical devices. A synthetic device cannot stream USB data, so it does not validate sensor transfers, real-device recovery, or the UAC interaction.
 
 ## Bundle and installer

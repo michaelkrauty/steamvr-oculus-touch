@@ -167,27 +167,16 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw "tag $env:GITHUB_REF_NAME, but Cargo.toml says $version" }
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$version" "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC exit $LASTEXITCODE" }
-      - name: Install and uninstall silently
+      - name: Install, repair, upgrade and uninstall without hardware
         run: |
           $setup = (Get-Item target\installer\cv1touch-setup-*.exe).FullName
-          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=setup.log' -PassThru
-          $p.WaitForExit()
-          if ($p.ExitCode -ne 0) { Get-Content setup.log; throw "setup exit $($p.ExitCode)" }
-          $app = "$env:LOCALAPPDATA\Programs\cv1touch"
-          & "$app\bin\cv1touch.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "installed cv1touch exit $LASTEXITCODE" }
-          if (-not (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').cv1touch) { throw 'no Run entry' }
-          Start-Sleep 5
-          if (-not (Get-Process cv1touchd -ErrorAction SilentlyContinue)) { Get-Content "$env:LOCALAPPDATA\cv1touch\state\logs\cv1touchd.log"; throw 'the daemon is not running' }
-          $p = Start-Process -FilePath "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=unins.log' -PassThru
-          $p.WaitForExit()
-          if ($p.ExitCode -ne 0) { Get-Content unins.log; throw "uninstall exit $($p.ExitCode)" }
-          # the uninstaller's exit code comes before its copy removes the last files
-          $waited = 0
-          while ((Test-Path $app) -and $waited -lt 20) { Start-Sleep 1; $waited++ }
-          if (Test-Path $app) { throw 'files left behind' }
-          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').cv1touch) { throw 'Run entry left behind' }
-          if (Get-Process cv1touchd -ErrorAction SilentlyContinue) { throw 'the daemon is still running' }
+          python windows\test_install.py $setup --disposable-runner
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: windows-install-test-logs
+          path: target/windows-install-test
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cv1touch-setup

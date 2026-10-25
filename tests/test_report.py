@@ -56,6 +56,8 @@ class ReportTests(unittest.TestCase):
             (self.state / f"dropout-{t}-right.rec").write_bytes(b"CV1TREC\0" + bytes([t % 256]) * 100)
         (self.state / "logs/cv1touchd.log").write_text("2026-10-14T17:05:03.123Z cv1touchd: started\n")
         (self.state / "logs/cv1touchd.1.log").write_text("an earlier run\n")
+        for name in ("installer.log", "uninstaller.log", "finish-setup.log", "finish-setup.previous.log"):
+            (self.state / "logs" / name).write_text(f"{name}: test diagnostics\n")
         (self.root / "steam/logs/vrserver.txt").write_text("driver_cv1touch: connected\n")
         out = self.root / "report.zip"
         printed = self.report(out).stdout
@@ -64,6 +66,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(out.stat().st_mode & 0o777, 0o600)
         with zipfile.ZipFile(out) as archive:
             self.assertIsNone(archive.testzip())
+            for name in ("installer.log", "uninstaller.log", "finish-setup.log", "finish-setup.previous.log"):
+                self.assertEqual(archive.read(f"logs/{name}"), f"{name}: test diagnostics\n".encode())
             names = set(archive.namelist())
             for name in ("report.txt", "config/settings.json", "state/imu-biases.json",
                          "logs/cv1touchd.log", "logs/cv1touchd.1.log", "steamvr/vrserver.txt"):

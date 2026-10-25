@@ -278,6 +278,14 @@ fn collect() -> Report {
         let name = format!("cv1touchd.{age}.log");
         report.log(&format!("logs/{name}"), &logs.join(&name), false);
     }
+    for name in [
+        "installer.log",
+        "uninstaller.log",
+        "finish-setup.log",
+        "finish-setup.previous.log",
+    ] {
+        report.log(&format!("logs/{name}"), &logs.join(name), false);
+    }
     journal(&mut report);
     let steamvr = steamvr::log_dir();
     report.log("steamvr/vrserver.txt", &steamvr.join("vrserver.txt"), false);

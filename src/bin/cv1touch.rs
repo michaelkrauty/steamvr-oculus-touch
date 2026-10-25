@@ -28,6 +28,8 @@ use cv1touch::status;
 use cv1touch::summary::{self, Window};
 use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 
+#[path = "cv1touch/finish_setup.rs"]
+mod finish_setup;
 #[path = "cv1touch/setup.rs"]
 mod guided_setup;
 #[path = "cv1touch/report.rs"]
@@ -1513,6 +1515,21 @@ fn vr_pulse(index: &str, ms: &str) -> i32 {
 fn vrserver_running() -> Result<bool, String> {
     platform::process::running("vrserver")
         .map_err(|e| format!("cannot check SteamVR processes: {e}"))
+}
+
+/// A read-only installer preflight, also used before changing driver registration.
+fn steamvr_stopped() -> i32 {
+    match vrserver_running() {
+        Ok(false) => 0,
+        Ok(true) => {
+            eprintln!("cv1touch: quit SteamVR first, then try again. No drivers were changed.");
+            1
+        }
+        Err(e) => {
+            eprintln!("cv1touch: {e}");
+            1
+        }
+    }
 }
 
 /// Whether the registered driver package is cv1touch's own, unchanged.
@@ -6314,6 +6331,8 @@ fn main() {
         ["sensors"] => sensors::status(),
         ["sensors", "install"] => sensors::install(),
         ["sensors", "remove"] => sensors::remove(),
+        ["finish-setup"] => finish_setup::run(),
+        ["steamvr", "check-stopped"] => steamvr_stopped(),
         ["report", "--out", path] => report::run(Some(PathBuf::from(path))),
         ["calibration", "capture"] => send("calibration capture"),
         ["calibration", "provisional"] => send("calibration provisional"),

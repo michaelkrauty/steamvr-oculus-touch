@@ -30,6 +30,11 @@ fn supervisor(launcher: &Path, args: &[String]) -> Command {
     let mut command = Command::new(daemon);
     command.arg("--supervise").args(args);
     process::without_window(&mut command);
+    #[cfg(windows)]
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     command
 }
 
