@@ -170,7 +170,7 @@ jobs:
       - name: Install, repair, upgrade and uninstall without hardware
         run: |
           $setup = (Get-Item target\installer\cv1touch-setup-*.exe).FullName
-          python windows\test_install.py $setup --disposable-runner
+          & windows\test_standard_user.ps1 -Installer $setup
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:

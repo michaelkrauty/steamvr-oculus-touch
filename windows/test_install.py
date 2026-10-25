@@ -9,11 +9,13 @@ not calibration, real SteamVR, UAC interaction, or USB streaming.
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 import winreg
 import zipfile
@@ -60,6 +62,32 @@ def start(quiet):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def cancel_uninstall(uninstall):
+    """Click No on the actual uninstall confirmation; opening it must not stop tracking."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.FindWindowW.restype = ctypes.c_void_p
+    user32.GetDlgItem.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.GetDlgItem.restype = ctypes.c_void_p
+    user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    process = subprocess.Popen([str(uninstall)])
+    button = None
+    def confirmation():
+        nonlocal button
+        window = user32.FindWindowW(None, "cv1touch Uninstall")
+        button = user32.GetDlgItem(window, 7) if window else None  # IDNO
+        return button is not None
+    try:
+        until(confirmation, "uninstall confirmation was not shown")
+        user32.SendMessageW(button, 0x00F5, 0, 0)  # BM_CLICK
+        process.wait(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+
+
 def shortcut(folder, name):
     path = folder / (name + ".lnk")
     assert path.is_file(), path
@@ -81,6 +109,7 @@ def run_shortcut(link, expected=0):
 
 
 def main(installer, work):
+    assert not ctypes.windll.shell32.IsUserAnAdmin(), "run this check as a standard user, not an administrator"
     local = Path(os.environ["LOCALAPPDATA"])
     data = local / "cv1touch"
     assert not data.exists(), "refusing to change existing user data; use a fresh disposable runner"
@@ -162,6 +191,13 @@ def main(installer, work):
             run([tool, "steamvr", "install"], env=env)
             package = data / "data/steamvr/cv1touch"
             assert (package / "bin/win64/driver_cv1touch.dll").read_bytes() == (app / "lib/cv1touch/driver_cv1touch.dll").read_bytes()
+            # Load the actual packaged DLL in a child, so Windows unloads it before removal.
+            run([sys.executable, "-c", "import ctypes,sys; "
+                 "d=ctypes.CDLL(sys.argv[1]); f=d.HmdDriverFactory; "
+                 "f.argtypes=[ctypes.c_char_p,ctypes.POINTER(ctypes.c_int)]; f.restype=ctypes.c_void_p; "
+                 "e=ctypes.c_int(0); assert f(b'IServerTrackedDeviceProvider_004',ctypes.byref(e)); "
+                 "assert not f(b'not-an-openvr-interface',ctypes.byref(e)); assert e.value != 0",
+                 package / "bin/win64/driver_cv1touch.dll"])
             made = json.loads((package / "resources/input/touch_profile.json").read_text())
             assert made["controller_type"] == "cv1touch_touch"
             assert made["compatibility_mode_controller_type"] == "oculus_touch"
@@ -177,6 +213,11 @@ def main(installer, work):
             until(lambda: (s := status(tool)) is not None and s["generation"] != generation,
                   "upgrade left the old daemon running")
             assert settings.read_bytes() == saved
+
+            generation = status(tool)["generation"]
+            cancel_uninstall(uninstall)
+            assert status(tool)["generation"] == generation, "canceling uninstall stopped tracking"
+            assert tool.exists() and run_entry()
 
             # A fake vrserver exercises the real process preflight. It is a test-only .NET
             # sleeper, not SteamVR and not evidence that the real runtime loads our driver.
@@ -216,6 +257,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("Windows only")
+    # CreateProcessWithLogonW loads the new user's profile, but a parent shell may pass
+    # its own environment. Resolve these from the actual token, never the runner account.
+    for name, folder in (("USERPROFILE", 0x28), ("LOCALAPPDATA", 0x1C), ("APPDATA", 0x1A)):
+        path = ctypes.create_unicode_buffer(32768)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, folder, None, 0, path)
+        assert result == 0 and path.value, (name, result)
+        os.environ[name] = path.value
+    temporary = Path(os.environ["LOCALAPPDATA"]) / "Temp"
+    temporary.mkdir(exist_ok=True)
+    os.environ["TEMP"] = os.environ["TMP"] = str(temporary)
     # CI retains this folder on failure for diagnosing installer/shortcut errors.
     work = Path("target/windows-install-test").resolve()
     work.mkdir(parents=True, exist_ok=True)

@@ -144,10 +144,19 @@ end;
 function InitializeUninstall: Boolean;
 begin
   Result := SteamVRStopped;
-  if Result then
-    Result := StopDaemon;
   if not Result then
-    SuppressibleMsgBox('Quit SteamVR and stop cv1touch before uninstalling. If they will not stop, restart Windows and try again.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox('Quit SteamVR before uninstalling, then try again.', mbError, MB_OK, IDOK);
+end;
+
+// This event is after the user's confirmation and before files are removed. An exception
+// here aborts removal; InitializeUninstall must remain read-only so Cancel keeps tracking.
+procedure InitializeUninstallProgressForm;
+begin
+  if not SteamVRStopped or not StopDaemon then
+  begin
+    SuppressibleMsgBox('cv1touch could not stop safely. Restart Windows, then uninstall again.', mbError, MB_OK, IDOK);
+    Abort;
+  end;
 end;
 
 // Before files are removed: the daemon, the SteamVR registration, the sensors' driver (which asks
