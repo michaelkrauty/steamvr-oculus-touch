@@ -15878,22 +15878,28 @@ mod tests {
         }
 
         drop(client);
+        drop(second_client);
+        // Use fresh, acknowledged clients: the earlier connections may have reached their
+        // idle deadline while the capacity/flood cases ran on a busy CI machine.
         let mut client = connect();
+        let mut second_client = connect_on(&second_endpoint);
+        for client in [&mut client, &mut second_client] {
+            client.write_all(b"status\n").unwrap();
+            assert!(answered(reply(client)), "client admitted before stopping");
+        }
         let _stopped = control.stop();
-        client
-            .set_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        client.write_all(b"status\n").unwrap();
-        assert_eq!(reply(&mut client), Reply::Silent, "no answer once stopped");
-        second_client
-            .set_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        second_client.write_all(b"status\n").unwrap();
-        assert_eq!(
-            reply(&mut second_client),
-            Reply::Silent,
-            "both listeners stop"
-        );
+        for client in [&mut client, &mut second_client] {
+            client
+                .set_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            // Expiring or closing a connection is also no answer. The contract is that no
+            // response line is handled, not that the transport stays open during shutdown.
+            let _ = client.write_all(b"status\n");
+            assert!(
+                matches!(reply(client), Reply::Silent | Reply::Closed),
+                "no answer once stopped"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
