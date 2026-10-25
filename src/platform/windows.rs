@@ -1816,6 +1816,31 @@ fn sensor_interface(id: &str, whole_device: bool) -> bool {
     })
 }
 
+fn sensor_grouped_function(devinst: u32, id: &str) -> bool {
+    use windows_sys::Win32::Devices::{
+        DeviceAndDriverInstallation::{CM_Get_DevNode_PropertyW, CR_SUCCESS},
+        Properties::{DEVPKEY_Device_CompatibleIds, DEVPROP_TYPE_STRING_LIST},
+    };
+    let mut ids = [0u16; 512];
+    let (mut kind, mut size) = (0, std::mem::size_of_val(&ids) as u32);
+    // SAFETY: a live node's read-only string-list property and a buffer of the stated size.
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_CompatibleIds,
+            &mut kind,
+            ids.as_mut_ptr().cast(),
+            &mut size,
+            0,
+        )
+    };
+    result == CR_SUCCESS
+        && kind == DEVPROP_TYPE_STRING_LIST
+        && size % 2 == 0
+        && (size as usize) <= std::mem::size_of_val(&ids)
+        && crate::platform::usb::cv1_grouped_function(id, &ids[..size as usize / 2])
+}
+
 pub fn usb_sensors() -> io::Result<Vec<crate::platform::usb::Sensor>> {
     use crate::platform::usb::WindowsSensorNode;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::DN_STARTED;
@@ -1835,6 +1860,7 @@ pub fn usb_sensors() -> io::Result<Vec<crate::platform::usb::Sensor>> {
             arrival: root.then(|| sensor_arrival(devinst)).flatten(),
             started: status.map(|s| s & DN_STARTED != 0),
             interface: winusb && sensor_interface(&node.id, root),
+            grouped: !root && sensor_grouped_function(devinst, &node.id),
             node,
         });
     })?;

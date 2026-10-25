@@ -928,6 +928,22 @@ pub mod usb {
         pub arrival: Option<u64>,
         pub started: Option<bool>,
         pub interface: bool,
+        /// Usbccgp grouped the CV1 control/video interfaces into one IAD function node.
+        pub grouped: bool,
+    }
+
+    /// CV1's IAD groups interfaces 0 and 1 with function class FF/03/00. Windows derives
+    /// the function node's compatible IDs from the IAD, not the individual FF/01/00
+    /// control interface. A lone MI_00 without that evidence is still incomplete.
+    #[cfg(any(windows, test))]
+    pub(crate) fn cv1_grouped_function(id: &str, compatible: &[u16]) -> bool {
+        id.to_ascii_uppercase()
+            .starts_with(r"USB\VID_2833&PID_0211&MI_00\")
+            && compatible.ends_with(&[0, 0])
+            && compatible.split(|c| *c == 0).any(|id| {
+                String::from_utf16(id)
+                    .is_ok_and(|id| id.eq_ignore_ascii_case(r"USB\Class_FF&SubClass_03&Prot_00"))
+            })
     }
 
     #[cfg(any(windows, test))]
@@ -969,12 +985,14 @@ pub mod usb {
                         winusb(n)
                     } else {
                         let mut count = 0;
+                        let mut grouped = false;
                         let mut ready = true;
                         for interface in interfaces {
                             count += 1;
+                            grouped |= interface.grouped;
                             ready &= winusb(interface);
                         }
-                        count >= 2 && ready
+                        (count >= 2 || grouped) && ready
                     };
                 Some(Sensor {
                     serial: serial.to_string(),
@@ -1067,6 +1085,7 @@ pub mod usb {
                 arrival: Some(1),
                 started: Some(true),
                 interface: true,
+                grouped: false,
                 node: Node {
                     id: id.into(),
                     product: 0x0211,
@@ -1176,6 +1195,62 @@ pub mod usb {
                 arrival: Some(1),
                 started: Some(true),
                 interface: true,
+                grouped: false,
+            }
+        }
+
+        #[test]
+        fn hotplug_windows_accepts_the_cv1_iad_as_one_function_not_two_nodes() {
+            let mut parent = whole_sensor();
+            parent.node.driver = Some("usbccgp".into());
+            let mut function = whole_sensor();
+            function.node.id = r"USB\VID_2833&PID_0211&MI_00\FUNCTION".into();
+            function.node.parent = Some(parent.node.id.clone());
+            let compatible: Vec<_> =
+                "USB\\Class_FF&SubClass_03&Prot_00\0USB\\Class_FF&SubClass_03\0USB\\Class_FF\0\0"
+                    .encode_utf16()
+                    .collect();
+            function.grouped = cv1_grouped_function(&function.node.id, &compatible);
+            assert!(function.grouped);
+            let mut nodes = vec![parent, function];
+            assert!(sensors_on_windows(&nodes)[0].ready);
+            nodes[1].grouped = false;
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes[1].grouped = true;
+            nodes[1].interface = false;
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes[1].interface = true;
+            nodes[1].node.problem = Some(10);
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+            nodes[1].node.problem = None;
+            nodes[1].started = Some(false);
+            assert!(!sensors_on_windows(&nodes)[0].ready);
+        }
+
+        #[test]
+        fn hotplug_windows_iad_identity_is_specific_and_case_insensitive() {
+            let id = r"usb\vid_2833&pid_0211&mi_00\function";
+            let compatible: Vec<_> = "usb\\class_ff&subclass_03&prot_00\0\0"
+                .encode_utf16()
+                .collect();
+            assert!(cv1_grouped_function(id, &compatible));
+            for other in [
+                id.replace("mi_00", "mi_01"),
+                id.replace("2833", "1234"),
+                id.replace("0211", "0001"),
+            ] {
+                assert!(!cv1_grouped_function(&other, &compatible));
+            }
+            for other in [
+                "",
+                "USB\\Class_FF&SubClass_01&Prot_00\0\0",
+                "USB\\Class_FF&SubClass_03\0\0",
+                "USB\\Class_FF&SubClass_03&Prot_00",
+            ] {
+                assert!(!cv1_grouped_function(
+                    id,
+                    &other.encode_utf16().collect::<Vec<_>>()
+                ));
             }
         }
 

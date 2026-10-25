@@ -7,6 +7,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 ### Fixed
 
 - Windows executables now include their C runtime instead of depending on an unbundled Visual C++ Redistributable. CI audits the executable and DLL imports, including transitive and delayed imports, so development runtimes installed on the runner cannot hide a missing dependency.
+- Windows sensor hotplug recognizes the CV1 camera's control/video interfaces grouped into one USB function. It no longer waits forever for a second device node that Windows does not create. Separate-interface layouts still wait for both drivers, and readiness still requires an active WinUSB interface and a healthy started device.
 
 ## [0.3.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.0) - 2026-10-24
 
