@@ -213,7 +213,11 @@ def main(installer, work):
             run([tool, "steamvr", "install"], env=env)  # replace an existing managed directory
             run([tool, "steamvr", "uninstall"], env=env)
             assert not package.exists()
-            assert registration_log.read_text(encoding="utf-8").splitlines() == [f"adddriver|{package}", f"adddriver|{package}", f"removedriver|{package}"]
+            registrations = [
+                (action, Path(path))
+                for action, path in (line.split("|", 1) for line in registration_log.read_text(encoding="utf-8").splitlines())
+            ]
+            assert registrations == [(action, package) for action in ("adddriver", "adddriver", "removedriver")], registrations
 
             # Upgrade with the previous daemon running, preserving the same user settings.
             generation = status(tool)["generation"]
