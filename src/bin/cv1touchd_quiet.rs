@@ -17,6 +17,10 @@ use std::time::Duration;
 
 use cv1touch::platform::process;
 
+#[cfg(windows)]
+#[path = "cv1touchd_quiet/windows.rs"]
+mod windows;
+
 const DAEMON: &str = "cv1touchd";
 
 /// How long an early failure of the supervisor is waited for: refusing its arguments, or its log
@@ -30,12 +34,21 @@ fn supervisor(launcher: &Path, args: &[String]) -> Command {
     let mut command = Command::new(daemon);
     command.arg("--supervise").args(args);
     process::without_window(&mut command);
-    #[cfg(windows)]
     command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command
+}
+
+#[cfg(not(windows))]
+fn launch(command: &mut Command) -> std::io::Result<Option<u32>> {
+    let mut child = command.spawn()?;
+    std::thread::sleep(EARLY);
+    Ok(child
+        .try_wait()?
+        .map(|status| status.code().unwrap_or(1) as u32))
+}
+
+#[cfg(windows)]
+fn launch(command: &mut Command) -> std::io::Result<Option<u32>> {
+    windows::launch(command, EARLY)
 }
 
 fn main() -> ExitCode {
@@ -45,20 +58,14 @@ fn main() -> ExitCode {
         Err(e) => return fail(format!("cannot tell where it is installed: {e}")),
     };
     let mut command = supervisor(&launcher, &args);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return fail(format!(
-                "cannot start {}: {e}",
-                command.get_program().to_string_lossy()
-            ))
-        }
-    };
     // a supervisor that ends at once had a reason: another one running (fine), or a failure
-    std::thread::sleep(EARLY);
-    match child.try_wait() {
-        Ok(Some(status)) if !status.success() => fail(format!(
-            "the supervisor ended at once ({status}); Check cv1touch in the Start menu says what \
+    match launch(&mut command) {
+        Err(e) => fail(format!(
+            "cannot start {}: {e}",
+            command.get_program().to_string_lossy()
+        )),
+        Ok(Some(code)) if code != 0 => fail(format!(
+            "the supervisor ended at once (exit {code}); Check cv1touch in the Start menu says what \
              is missing"
         )),
         _ => ExitCode::SUCCESS,

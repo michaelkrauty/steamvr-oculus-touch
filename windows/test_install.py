@@ -65,10 +65,8 @@ def status(tool):
 
 
 def start(quiet):
-    # A quiet launcher detaches a long-lived supervisor; never give it capture pipes
-    # whose EOF would then depend on stopping that supervisor.
-    subprocess.run([str(quiet)], check=True, timeout=15,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Regression: the detached supervisor must not retain these capture pipes.
+    run([quiet], timeout=15)
 
 
 def cancel_uninstall(uninstall):
