@@ -57,7 +57,7 @@ From a release build with the engine, `windows\bundle.ps1` collects what a Windo
 ```powershell
 cargo build --locked --release --bins
 powershell -ExecutionPolicy Bypass -File windows\bundle.ps1
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.3.0 "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.3.1 "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
 ```
 
 CI does both on every push and pull request (`.github\workflows\windows.yml`), installs and uninstalls the result silently on a clean runner, and attaches it to the release of a tag `v*`.
