@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.3.2](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.2) - 2026-10-30
+
 ### Fixed
 
 - Controllers could remain fixed in mid-air while rotation continued after a sleep or timing discontinuity. Clock re-synchronization now discards camera work timestamped through the old mapping and requires a fresh optical fix instead of keeping future-dated frames that reject every new observation. Sensor calibration and headset alignment are unchanged.
