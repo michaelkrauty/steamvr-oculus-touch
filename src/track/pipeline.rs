@@ -556,7 +556,22 @@ impl Pipeline {
 
     /// The headset clock (microseconds) of a report received at `host_ns`.
     pub fn hmd_clock_sample(&mut self, host_ns: u64, us: u32) {
-        self.hmd_clock.observe(self.hmd_stamps.extend(us), host_ns);
+        if self.hmd_clock.observe(self.hmd_stamps.extend(us), host_ns) {
+            for hand in [HAND_LEFT, HAND_RIGHT] {
+                self.clear_exposure_work(hand);
+            }
+        }
+    }
+
+    /// Discard work whose exposure was mapped through a clock fit that no longer exists.
+    /// Keeping future-dated frames would make the bounded queue evict every fresh frame.
+    fn clear_exposure_work(&mut self, hand: usize) {
+        self.pending[hand].clear();
+        self.probing[hand].clear();
+        self.inspection_starts[hand].clear();
+        if let Some(tr) = self.trackers[hand].as_mut() {
+            tr.clear_inspection_priors();
+        }
     }
 
     /// One factory-calibrated IMU sample of a controller (repeats are ignored). Returns the
@@ -573,18 +588,26 @@ impl Pipeline {
         if device_ns == 0 || tr.newest_imu().is_some_and(|n| device_ns <= n) {
             return None;
         }
-        self.clocks[hand].observe(device_ns, received_host_ns);
+        let host_gap = tr
+            .newest_imu()
+            .and_then(|t| self.clocks[hand].to_host(t))
+            .is_some_and(|t| received_host_ns.saturating_sub(t) > self.opts.params.max_imu_gap_ns);
         let gaps = tr.stats.imu_gaps;
+        // Short buffered bursts can re-lock the fit without breaking IMU continuity:
+        // keep their delayed optical evidence. A long host gap hidden by the native
+        // device clock, however, must not preserve future frames or re-stamp an old fix.
+        if self.clocks[hand].observe(device_ns, received_host_ns) && host_gap {
+            tr.reset_clock();
+            self.latest[hand] = None;
+        }
         tr.imu(ImuSample {
             t: device_ns,
             gyro,
             accel,
         });
         if tr.stats.imu_gaps != gaps {
-            // the controller slept or dropped out: frames queued for its old clock are stale
-            self.pending[hand].clear();
-            self.probing[hand].clear();
-            self.inspection_starts[hand].clear();
+            // A sleep/dropout or clock re-lock invalidates the old exposure mappings.
+            self.clear_exposure_work(hand);
         }
         self.inspection_starts[hand].retain(|s| s.until > device_ns);
         self.drain(hand);
@@ -2370,6 +2393,7 @@ mod tests {
         let probes: Vec<_> = p.probes.iter().filter(|q| q.camera == 2).collect();
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].identity_epoch, 1);
+        assert_eq!(p.stats(HAND_RIGHT).imu_gaps, 0);
     }
 
     #[test]
@@ -2834,6 +2858,252 @@ mod tests {
             "max error after re-acquisition {}",
             after.iter().copied().fold(0.0, f64::max)
         );
+    }
+
+    #[test]
+    fn a_controller_clock_relock_retires_frames_from_before_compressed_sleep() {
+        let mut p = Pipeline::new(Options {
+            exposure_offset_ns: 0,
+            ..Options::default()
+        });
+        for camera in 0..3 {
+            p.sensor(
+                &format!("SENSOR{camera}"),
+                synth::camera_model(),
+                Isometry3::identity(),
+            );
+        }
+        for device in [DEVICE_LEFT, DEVICE_RIGHT] {
+            p.body(device, synth::touch_leds(), Vector3::zeros());
+        }
+        p.hmd_clock_sample(H0, hmd_us(H0));
+        for hand in [HAND_LEFT, HAND_RIGHT] {
+            p.imu(hand, H0 - C0, H0, Vector3::zeros(), Vector3::y() * 9.8);
+        }
+        // The native clock's u32 microseconds-to-nanoseconds product compresses this
+        // long sleep to 2 ms: too little to trigger the tracker's 100 ms IMU-gap reset.
+        let sleep_us = (1u32 << 29) + 2_000;
+        let sleep_ns = u64::from(sleep_us) * 1_000;
+        let device_gap = u64::from(sleep_us.wrapping_mul(1_000));
+        assert_eq!(device_gap, 2_000_000);
+        for ago in [40_000_000, 20_000_000] {
+            let host = H0 + sleep_ns - ago;
+            p.hmd_clock_sample(host, hmd_us(host));
+            p.imu(
+                HAND_LEFT,
+                host - C0,
+                host,
+                Vector3::zeros(),
+                Vector3::y() * 9.8,
+            );
+            for camera in 0..3 {
+                p.frame(
+                    &FrameInfo {
+                        serial: serial(camera),
+                        exposure_valid: 1,
+                        exposure_hmd_ts: hmd_us(host),
+                        ..Default::default()
+                    },
+                    &[],
+                );
+            }
+        }
+        assert_eq!(p.pending[HAND_RIGHT].len(), 6);
+        assert!(p.pending[HAND_LEFT].is_empty());
+        let left_imu = p.tracker(HAND_LEFT).unwrap().newest_imu();
+        let left_gaps = p.stats(HAND_LEFT).imu_gaps;
+        let before = p.stats(HAND_RIGHT).frames;
+        // New frames now map *before* both old queued frames for each camera. Without
+        // invalidation, the bounded queue discards every fresh frame as its oldest one.
+        for elapsed in [0, 20_000_000, 40_000_000] {
+            let host = H0 + sleep_ns + elapsed;
+            p.hmd_clock_sample(host, hmd_us(host));
+            p.imu(
+                HAND_RIGHT,
+                H0 - C0 + device_gap + elapsed,
+                host,
+                Vector3::zeros(),
+                Vector3::y() * 9.8,
+            );
+            for camera in 0..3 {
+                p.frame(
+                    &FrameInfo {
+                        serial: serial(camera),
+                        exposure_valid: 1,
+                        exposure_hmd_ts: hmd_us(host),
+                        ..Default::default()
+                    },
+                    &[],
+                );
+            }
+        }
+        assert!(
+            p.stats(HAND_RIGHT).frames > before,
+            "fresh optical frames stayed blocked"
+        );
+        assert!(p.pending[HAND_RIGHT].is_empty());
+        assert_eq!(p.tracker(HAND_LEFT).unwrap().newest_imu(), left_imu);
+        assert_eq!(p.stats(HAND_LEFT).imu_gaps, left_gaps);
+    }
+
+    #[test]
+    fn a_controller_clock_relock_cannot_restamp_an_old_fix() {
+        for host_gap in [120_000_000, 536_872_912_000] {
+            let (_, _, mut p, _) =
+                run_with_sensors(2.0, None, IMU_DELAY, 3, None, MATCH_GOOD | MATCH_STRONG);
+            let old = p.latest(HAND_RIGHT).unwrap().output;
+            assert!(old.tracking);
+            let device = p.tracker(HAND_RIGHT).unwrap().newest_imu().unwrap();
+            let received = p.clocks[HAND_RIGHT].to_host(device).unwrap();
+            let gaps = p.stats(HAND_RIGHT).imu_gaps;
+            p.imu(
+                HAND_RIGHT,
+                device + 2_000_000,
+                received + host_gap,
+                Vector3::zeros(),
+                Vector3::y() * 9.8,
+            );
+            assert!(
+                p.latest(HAND_RIGHT).is_none(),
+                "pre-sleep pose was re-stamped as current"
+            );
+            assert_eq!(p.tracker(HAND_RIGHT).unwrap().last_fix(), 0);
+            assert_eq!(p.stats(HAND_RIGHT).imu_gaps, gaps + 1);
+            // The reset must recover position, not merely exchange one permanent hold for
+            // another. Supply fresh optical observations of a controller moved while asleep.
+            let mut pose = old.world_from_model;
+            pose.translation.vector.x += 0.1;
+            let leds = synth::touch_leds();
+            for tick in 1..31 {
+                let elapsed = tick * 2_000_000;
+                let at = received + host_gap + elapsed - IMU_DELAY;
+                p.hmd_clock_sample(at + HMD_DELAY, hmd_us(at));
+                p.imu(
+                    HAND_RIGHT,
+                    device + 2_000_000 + elapsed,
+                    at + IMU_DELAY,
+                    Vector3::zeros(),
+                    pose.rotation.inverse() * (Vector3::y() * 9.80665),
+                );
+                for camera in 0..3 {
+                    let cam = p.cams[&format!("SENSOR{camera}")].camera;
+                    let relative = cam.world_from_cam.inverse() * pose;
+                    let blobs: Vec<EngineBlob> = leds
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, led)| {
+                            let point = relative * Point3::from(led.pos);
+                            if (relative.rotation * led.dir).dot(&-point.coords)
+                                / point.coords.norm()
+                                < 0.3
+                            {
+                                return None;
+                            }
+                            let uv = cam.model.project(&point.coords)?;
+                            Some(EngineBlob {
+                                x: uv.x as f32,
+                                y: uv.y as f32,
+                                led_id: (DEVICE_RIGHT << 8) | i as i32,
+                                ..Default::default()
+                            })
+                        })
+                        .collect();
+                    let mut info = FrameInfo {
+                        serial: serial(camera),
+                        exposure_valid: 1,
+                        exposure_hmd_ts: hmd_us(at),
+                        n_devices: 1,
+                        ..Default::default()
+                    };
+                    let (orient, pos) = crate::calib::iso_to_xyzw(&relative);
+                    info.devices[0].device_id = DEVICE_RIGHT;
+                    info.devices[0].match_flags = MATCH_GOOD | MATCH_STRONG;
+                    info.devices[0].pose_valid = 1;
+                    info.devices[0].cam_orient = orient;
+                    info.devices[0].cam_pos = pos;
+                    p.frame(&info, &blobs);
+                }
+            }
+            let recovered = p
+                .latest(HAND_RIGHT)
+                .expect("fresh position was not reacquired");
+            assert!(recovered.output.tracking);
+            assert!(
+                (recovered.output.world_from_model.translation.vector - pose.translation.vector)
+                    .norm()
+                    < 0.005
+            );
+        }
+    }
+
+    #[test]
+    fn a_headset_clock_relock_clears_exposure_work_not_controller_history() {
+        let (_, _, mut p, _) =
+            run_with_sensors(2.0, None, IMU_DELAY, 3, None, MATCH_GOOD | MATCH_STRONG);
+        let tracked = p.latest(HAND_RIGHT).unwrap();
+        assert!(tracked.output.tracking);
+        let device = p.tracker(HAND_RIGHT).unwrap().newest_imu().unwrap();
+        let host = p.clocks[HAND_RIGHT].to_host(device).unwrap();
+        p.body(DEVICE_LEFT, synth::touch_leds(), Vector3::zeros());
+        p.imu(
+            HAND_LEFT,
+            device,
+            host,
+            Vector3::zeros(),
+            Vector3::y() * 9.8,
+        );
+        let tr = p.trackers[HAND_RIGHT].as_mut().unwrap();
+        let camera = (0..3)
+            .find(|&camera| {
+                tr.hold_inspection(camera, device, 1_000_000_000);
+                tr.take_inspection_prior(camera, device).is_some()
+            })
+            .expect("the tracked hand has a peer-confirmed inspection prior");
+        tr.hold_inspection(camera, device, 1_000_000_000);
+        let cam = p.cams[&format!("SENSOR{camera}")].camera;
+        for hand in [HAND_LEFT, HAND_RIGHT] {
+            p.pending[hand].push(Pending {
+                t_e: device + 100_000_000,
+                exposure_host_ns: host + 100_000_000,
+                frame_start_host_ns: host + 100_000_000,
+                camera,
+                cam,
+                blobs: Vec::new(),
+                engine: None,
+                identity_epoch: Some(0),
+            });
+            p.probing[hand].push(PendingProbe {
+                t_e: device + 100_000_000,
+                camera,
+                blobs: Vec::new(),
+                identity_epoch: 0,
+            });
+            p.inspection_starts[hand].push(InspectionExposure {
+                camera,
+                frame_start_host_ns: host,
+                t_e: device,
+                until: device + 1_000_000_000,
+                held: hand == HAND_RIGHT,
+            });
+        }
+        let gaps = [HAND_LEFT, HAND_RIGHT].map(|hand| p.stats(hand).imu_gaps);
+        p.hmd_clock_sample(host + 1_000_000_000, hmd_us(host));
+        for hand in [HAND_LEFT, HAND_RIGHT] {
+            assert!(p.pending[hand].is_empty());
+            assert!(p.probing[hand].is_empty());
+            assert!(p.inspection_starts[hand].is_empty());
+            assert_eq!(p.tracker(hand).unwrap().newest_imu(), Some(device));
+            assert_eq!(p.stats(hand).imu_gaps, gaps[hand]);
+        }
+        assert!(p.trackers[HAND_RIGHT]
+            .as_mut()
+            .unwrap()
+            .take_inspection_prior(camera, device)
+            .is_none());
+        let after = p.latest(HAND_RIGHT).unwrap();
+        assert!(after.output.tracking);
+        assert_eq!(after.host_ns, tracked.host_ns);
+        assert_eq!(after.last_fix_host_ns, tracked.last_fix_host_ns);
     }
     /// A sensor is probed when the options name it, or from the moment `probe` says so, and
     /// tracked with again when it says not; its frames queued the other way are dropped.

@@ -44,24 +44,27 @@ impl LinearClock {
         }
     }
 
-    pub fn observe(&mut self, device_ns: u64, host_ns: u64) {
+    /// Returns true when an existing mapping was discarded and re-locked. This can be
+    /// a clock discontinuity or a temporary transport delay, not first initialization.
+    pub fn observe(&mut self, device_ns: u64, host_ns: u64) -> bool {
         let offset = host_ns as i64 - device_ns as i64;
         let (d0, y0) = *self.reference.get_or_insert((device_ns, offset));
         let (x, y) = (device_ns as f64 - d0 as f64, (offset - y0) as f64);
         if (y - self.a - self.b * x).abs() > self.reset_ns {
             *self = LinearClock::new(self.bin_ns, self.window);
-            return self.observe(device_ns, host_ns);
+            self.observe(device_ns, host_ns);
+            return true;
         }
         let bin = device_ns / self.bin_ns;
         match self.current {
             Some((b, _, cy)) if b == bin => {
                 if y >= cy {
-                    return;
+                    return false;
                 }
                 self.current = Some((bin, x, y));
                 // The warm fit uses only closed bins. Save the open minimum for rollover.
                 if self.bins.len() >= 4 {
-                    return;
+                    return false;
                 }
             }
             Some((b, cx, cy)) if bin > b => {
@@ -71,10 +74,11 @@ impl LinearClock {
                 }
                 self.current = Some((bin, x, y));
             }
-            Some(_) => return, // stamps going backwards: ignore
+            Some(_) => return false, // stamps going backwards: ignore
             None => self.current = Some((bin, x, y)),
         }
         self.refit();
+        false
     }
 
     fn refit(&mut self) {
@@ -221,10 +225,11 @@ mod tests {
     fn a_clock_restart_relocks() {
         let mut c = LinearClock::default();
         for k in 0..5000u64 {
-            c.observe(k * 2_000_000, 9_000_000_000 + k * 2_000_000);
+            assert!(!c.observe(k * 2_000_000, 9_000_000_000 + k * 2_000_000));
         }
-        c.observe(1_000, 9_000_000_000 + 5000 * 2_000_000);
+        assert!(c.observe(1_000, 9_000_000_000 + 5000 * 2_000_000));
         assert_eq!(c.to_host(1_000), Some(9_000_000_000 + 5000 * 2_000_000));
+        assert!(!c.observe(2_001_000, 9_000_000_000 + 5001 * 2_000_000));
     }
 
     #[test]

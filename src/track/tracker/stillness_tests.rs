@@ -135,23 +135,7 @@ impl Tracker {
             .back()
             .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
         {
-            self.stats.imu_gaps += 1;
-            self.camera_updates.iter_mut().for_each(VecDeque::clear);
-            self.inspection_frames.clear();
-            self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
-            self.history.clear();
-            self.imu.clear();
-            self.still.clear();
-            self.applied.clear();
-            self.last_fix = 0;
-            self.last_track = 0;
-            self.last_confirmed = 0;
-            self.track_camera = None;
-            self.track_confirmed = false;
-            self.refusing_since = 0;
-            self.ambiguous_since = 0;
-            self.provisional = None;
-            self.held = None;
+            self.reset_imu_history();
         }
         if let Some((t, q, until)) = self.wrong_lock {
             let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);

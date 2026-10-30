@@ -472,23 +472,7 @@ impl Tracker {
             .back()
             .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
         {
-            self.stats.imu_gaps += 1;
-            self.camera_updates.iter_mut().for_each(VecDeque::clear);
-            self.inspection_frames.clear();
-            self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
-            self.history.clear();
-            self.imu.clear();
-            self.still.clear();
-            self.applied.clear();
-            self.last_fix = 0;
-            self.last_track = 0;
-            self.last_confirmed = 0;
-            self.track_camera = None;
-            self.track_confirmed = false;
-            self.refusing_since = 0;
-            self.ambiguous_since = 0;
-            self.provisional = None;
-            self.held = None;
+            self.reset_imu_history();
         }
         if let Some((t, q, until)) = self.wrong_lock {
             let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
@@ -539,6 +523,38 @@ impl Tracker {
             self.applied.pop_front();
         }
         self.note_held();
+    }
+
+    fn reset_imu_history(&mut self) {
+        self.stats.imu_gaps += 1;
+        self.camera_updates.iter_mut().for_each(VecDeque::clear);
+        self.inspection_frames.clear();
+        self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
+        self.history.clear();
+        self.imu.clear();
+        self.still.clear();
+        self.applied.clear();
+        self.last_fix = 0;
+        self.last_track = 0;
+        self.last_confirmed = 0;
+        self.track_camera = None;
+        self.track_confirmed = false;
+        self.refusing_since = 0;
+        self.ambiguous_since = 0;
+        self.provisional = None;
+        self.held = None;
+    }
+
+    /// Host time exposed a discontinuity that the controller's elapsed time concealed.
+    /// Keep calibration and bias estimates, but no pose or deadline from the old clock fit.
+    pub(super) fn reset_clock(&mut self) {
+        self.reset_imu_history();
+        self.wrong_lock = None;
+        self.searched_at.fill(0);
+    }
+
+    pub(super) fn clear_inspection_priors(&mut self) {
+        self.inspection_frames.clear();
     }
 
     /// Whether the controller is still at sample `s`, from it and the samples before it.
