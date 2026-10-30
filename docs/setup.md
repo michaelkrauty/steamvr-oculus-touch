@@ -33,7 +33,7 @@ Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or r
 
 ## Install
 
-Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.3.1` tag or an extracted [v0.3.1 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.1) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
+Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.3.2` tag or an extracted [v0.3.2 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.2) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
 
 | Location | Purpose |
 | --- | --- |
@@ -163,11 +163,11 @@ now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch
 bindings, but custom bindings for the old controller type may need to be selected
 or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
 
-Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.3.1` with the desired published tag:
+Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.3.2` with the desired published tag:
 
 ```sh
 git fetch origin --tags
-git checkout --detach v0.3.1
+git checkout --detach v0.3.2
 python3 scripts/install.py
 systemctl --user restart cv1touchd
 ```
