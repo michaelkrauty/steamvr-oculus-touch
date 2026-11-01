@@ -239,8 +239,6 @@ struct Daemon {
     /// newest (see `publish_alignment`).
     alignment_publish: Mutex<()>,
     settings_path: PathBuf,
-    /// The current recording keeps the sensors' pixels (RAW_FRAME records).
-    record_frames: AtomicBool,
     /// Extra stamp shift of published poses, ns (`latency` command); saved in `settings_path`
     /// on every change and read from it at start.
     extra_latency_ns: std::sync::atomic::AtomicI64,
@@ -638,12 +636,8 @@ impl EngineSink for Daemon {
         stride: usize,
         pixels: &[u8],
     ) {
-        if self.record_frames.load(Ordering::Acquire) && self.rec.active() {
-            let payload =
-                recorder::encode_frame(info, width, height, stride, pixels, RAW_FRAME_FLOOR);
-            self.rec
-                .write(recorder::RAW_FRAME, info.frame_start_host_ns, &[&payload]);
-        }
+        self.rec
+            .write_frame(info, width, height, stride, pixels, RAW_FRAME_FLOOR);
     }
 
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
@@ -5044,12 +5038,11 @@ fn status_json(d: &Daemon) -> String {
     )
 }
 
-/// The reply to `record start`. A recording that opened also keeps the sensors' pixels when it
-/// asked for them, and gets its own session info (sensor intrinsics, LED models) written.
-fn recording_started(d: &Daemon, frames: bool, started: Result<(), String>) -> String {
+/// The reply to `record start`. A recording that opened gets its own session info
+/// (sensor intrinsics, LED models) written.
+fn recording_started(d: &Daemon, started: Result<(), String>) -> String {
     match started {
         Ok(()) => {
-            d.record_frames.store(frames, Ordering::Release);
             d.session.lock().unwrap().reset();
             "ok".into()
         }
@@ -5083,24 +5076,16 @@ fn handle(d: &Daemon, line: &str) -> String {
         }
         // Control requests start recordings in `handle_control_recording`, which reserves the
         // session under the dispatch turn; this is the same start in one step.
-        Ok(Command::RecordStart(path, frames)) => recording_started(
-            d,
-            frames,
-            d.rec.start_with_frames(&path, shm::now_ns(), frames),
-        ),
+        Ok(Command::RecordStart(path, frames)) => {
+            recording_started(d, d.rec.start_with_frames(&path, shm::now_ns(), frames))
+        }
         Ok(Command::RecordStop) => match d.rec.stop_timeout(None, RECORD_STOP_WAIT) {
-            Some(status) => {
-                d.record_frames.store(false, Ordering::Release);
-                record_stop_reply(&status, false)
-            }
+            Some(status) => record_stop_reply(&status, false),
             None => "err not recording".into(),
         },
         Ok(Command::RecordStopIf(path)) => {
             match d.rec.stop_timeout(Some(&path), RECORD_STOP_WAIT) {
-                Some(status) => {
-                    d.record_frames.store(false, Ordering::Release);
-                    record_stop_reply(&status, true)
-                }
+                Some(status) => record_stop_reply(&status, true),
                 None => "ok not-matching".into(),
             }
         }
@@ -5687,7 +5672,7 @@ fn handle_control_recording<'a>(
                 Err(error) => return format!("err {error}"),
             };
             drop(turn);
-            return recording_started(d, frames, start(reserved));
+            return recording_started(d, start(reserved));
         }
         drop(turn);
         handle(d, line)
@@ -6214,7 +6199,6 @@ fn main() {
         rotation_prediction: AtomicU32::new(start_prediction(&settings).1),
         alignment_publish: Mutex::new(()),
         settings_path,
-        record_frames: AtomicBool::new(false),
         extra_latency_ns: std::sync::atomic::AtomicI64::new(start_latency_ns(&settings)),
         tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
         fitted_render_orient: Mutex::new(fitted_render_orient),
@@ -7952,7 +7936,6 @@ mod tests {
                     name.trim_start_matches('/')
                 ))
                 .join("settings.json"),
-            record_frames: AtomicBool::new(false),
             extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
             tilt_mdeg: std::sync::atomic::AtomicI32::new(0),
             fitted_render_orient: Mutex::new([[0.0, 0.0, 0.0, 1.0]; 2]),
@@ -17481,10 +17464,10 @@ mod tests {
             "ok not-matching"
         );
         assert!(d.rec.active());
-        assert!(d.record_frames.load(Ordering::Acquire));
+        assert!(d.rec.frames_enabled());
         assert!(handle(&d, &stop).starts_with("ok stopped records="));
         assert!(!d.rec.has_session());
-        assert!(!d.record_frames.load(Ordering::Acquire));
+        assert!(!d.rec.frames_enabled());
         assert_eq!(handle(&d, &stop), "ok not-matching");
         fs::remove_file(path).unwrap();
     }
@@ -17510,13 +17493,13 @@ mod tests {
             (true, vec![7])
         );
         assert!(d.session.lock().unwrap().complete(1));
-        assert!(!d.record_frames.load(Ordering::Acquire));
+        assert!(!d.rec.frames_enabled());
 
         let reply = request(&control::record_start_line(&path, true).unwrap()).unwrap();
 
         assert_eq!(reply, "ok");
         assert!(d.rec.active());
-        assert!(d.record_frames.load(Ordering::Acquire));
+        assert!(d.rec.frames_enabled());
         assert_eq!(d.rec.status().byte_limit, 16 << 30);
         assert_eq!(
             d.session.lock().unwrap().plan(true, &[(7, true)]),
@@ -17528,7 +17511,7 @@ mod tests {
         d.shm.retire();
         assert!(stopped.starts_with("ok stopped records="), "{stopped}");
         assert!(written.unwrap() > 0, "the recording file has its header");
-        assert!(!d.record_frames.load(Ordering::Acquire));
+        assert!(!d.rec.frames_enabled());
     }
 
     #[test]

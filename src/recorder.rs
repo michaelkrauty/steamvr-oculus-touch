@@ -24,7 +24,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -289,6 +289,8 @@ struct Ring {
     stop: bool,
     opening: bool,
     session: bool,
+    // Even generation plus the low-bit frame permission. Never reset, including failed starts.
+    admission: u64,
     finished: bool,
     path: Option<PathBuf>,
     accepted_bytes: u64,
@@ -382,7 +384,8 @@ impl Ring {
 struct Shared {
     ring: Mutex<Ring>,
     cond: Condvar,
-    active: AtomicBool,
+    // Zero revokes admission; otherwise generation and permission are one atomic snapshot.
+    active: AtomicU64,
     diagnostic: fn(&str),
 }
 
@@ -459,7 +462,10 @@ fn write_header(
     let mut ring = shared.ring.lock().unwrap();
     ring.stats.bytes = FILE_HEADER_LEN as u64;
     ring.opening = false;
-    shared.active.store(!ring.stop, Ordering::Release);
+    shared.active.store(
+        if ring.stop { 0 } else { ring.admission },
+        Ordering::Release,
+    );
     Ok(())
 }
 
@@ -522,12 +528,12 @@ fn writer_main(shared: &Shared, file: &mut dyn RecordingSink) {
                 ring.queued_records = 0;
                 ring.stop = true;
                 ring.reason = Some(space_reason(allowance.available, allowance.reserve));
-                shared.active.store(false, Ordering::Release);
+                shared.active.store(0, Ordering::Release);
                 break;
             }
             Err(error) => {
                 ring.fail(format!("cannot check free disk space: {error}"));
-                shared.active.store(false, Ordering::Release);
+                shared.active.store(0, Ordering::Release);
                 ring.used = 0;
                 ring.queued_records = 0;
                 break;
@@ -545,7 +551,7 @@ fn writer_main(shared: &Shared, file: &mut dyn RecordingSink) {
             Err(error) => {
                 ring.fail(format!("cannot write the recording: {error}"));
                 // A partial write can end inside a record. Never append after it.
-                shared.active.store(false, Ordering::Release);
+                shared.active.store(0, Ordering::Release);
                 ring.used = 0;
                 ring.queued_records = 0;
                 break;
@@ -579,6 +585,7 @@ impl Recorder {
                     stop: false,
                     opening: false,
                     session: false,
+                    admission: 0,
                     finished: true,
                     path: None,
                     accepted_bytes: 0,
@@ -590,7 +597,7 @@ impl Recorder {
                     stats: Stats::default(),
                 }),
                 cond: Condvar::new(),
-                active: AtomicBool::new(false),
+                active: AtomicU64::new(0),
                 diagnostic,
             }),
         }
@@ -624,6 +631,7 @@ impl Recorder {
             } else {
                 RECORDING_BYTES
             },
+            frames,
         )?;
         Ok(ReservedRecording {
             recorder: self,
@@ -648,6 +656,7 @@ impl Recorder {
             } else {
                 RECORDING_BYTES
             },
+            frames,
             || Ok(sink),
         )
     }
@@ -657,9 +666,10 @@ impl Recorder {
         path: &Path,
         start_host_ns: u64,
         byte_limit: u64,
+        frames: bool,
         open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>>,
     ) -> Result<(), String> {
-        self.reserve_session(path, byte_limit)?;
+        self.reserve_session(path, byte_limit, frames)?;
         self.start_reserved_session(path, start_host_ns, open)
     }
 
@@ -709,7 +719,7 @@ impl Recorder {
         start_host_ns: u64,
         open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>> + Send + 'static,
     ) -> Result<Starting, String> {
-        self.reserve_session(path, RECORDING_BYTES)?;
+        self.reserve_session(path, RECORDING_BYTES, false)?;
         let (ready, result) = mpsc::channel();
         let finished = Arc::new(Mutex::new(None));
         if let Err(error) = self.spawn_writer(
@@ -728,7 +738,7 @@ impl Recorder {
         })
     }
 
-    fn reserve_session(&self, path: &Path, byte_limit: u64) -> Result<(), String> {
+    fn reserve_session(&self, path: &Path, byte_limit: u64, frames: bool) -> Result<(), String> {
         {
             let mut ring = self.shared.ring.lock().unwrap();
             if ring.session {
@@ -741,6 +751,11 @@ impl Recorder {
                 };
                 return Err(message.into());
             }
+            // Refuse exhaustion rather than ever reusing an old producer's token.
+            ring.admission = (ring.admission & !1)
+                .checked_add(2)
+                .ok_or("recording session generation exhausted")?
+                | u64::from(frames);
             ring.head = 0;
             ring.used = 0;
             ring.queued_records = 0;
@@ -761,7 +776,7 @@ impl Recorder {
     }
 
     fn cancel_start(&self) {
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
         let mut ring = self.shared.ring.lock().unwrap();
         ring.stop = true;
         ring.opening = false;
@@ -773,7 +788,7 @@ impl Recorder {
     }
 
     fn start_failed(&self, error: &str) {
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
         let mut ring = self.shared.ring.lock().unwrap();
         ring.fail(error.into());
         ring.session = false;
@@ -812,7 +827,7 @@ impl Recorder {
                     Err(_) => Some("recording writer stopped unexpectedly".into()),
                 };
                 if let Some(error) = error {
-                    shared.active.store(false, Ordering::Release);
+                    shared.active.store(0, Ordering::Release);
                     shared.ring.lock().unwrap().fail(error);
                 }
                 let failure = shared.ring.lock().unwrap().error.clone();
@@ -826,7 +841,7 @@ impl Recorder {
                 }
                 // Closing also happens before `finished`, without a ring or control lock.
                 drop(file);
-                shared.active.store(false, Ordering::Release);
+                shared.active.store(0, Ordering::Release);
                 let note = {
                     let ring = shared.ring.lock().unwrap();
                     (ring.error.is_none() && ring.reason.is_some()).then(|| {
@@ -854,18 +869,56 @@ impl Recorder {
         self.shared.ring.lock().unwrap().session
     }
     pub fn active(&self) -> bool {
-        self.shared.active.load(Ordering::Acquire)
+        self.shared.active.load(Ordering::Acquire) != 0
     }
+    /// Status snapshot only; `write_frame` captures permission together with session identity.
+    pub fn frames_enabled(&self) -> bool {
+        self.admit(RAW_FRAME).is_some()
+    }
+
+    fn admit(&self, rtype: u16) -> Option<u64> {
+        let token = self.shared.active.load(Ordering::Acquire);
+        (token != 0 && (rtype != RAW_FRAME || token & 1 != 0)).then_some(token)
+    }
+
+    /// Capture this session's frame permission before encoding, without holding the ring lock.
+    /// A completed stop does not wait for encoders; their revoked tokens cannot enter a new file.
+    pub fn write_frame(
+        &self,
+        info: &FrameInfo,
+        width: usize,
+        height: usize,
+        stride: usize,
+        pixels: &[u8],
+        floor: u8,
+    ) {
+        let Some(token) = self.admit(RAW_FRAME) else {
+            return;
+        };
+        #[cfg(test)]
+        admission_tests::before_encode();
+        let payload = encode_frame(info, width, height, stride, pixels, floor);
+        self.write_admitted(token, RAW_FRAME, info.frame_start_host_ns, &[&payload]);
+    }
+
     pub fn status(&self) -> Status {
         self.shared.ring.lock().unwrap().status()
     }
 
-    /// Thread-safe and I/O-free. The byte ceiling includes the header, queued records and any
-    /// batch the writer has taken, so even a stalled writer cannot overshoot it.
+    /// Thread-safe and I/O-free. Admission belongs to the session active at entry, not a
+    /// replacement that starts during preparation. RAW_FRAME also requires its frame permission.
+    /// The byte ceiling includes the header, queued records and any batch the writer has taken,
+    /// so even a stalled writer cannot overshoot it.
     pub fn write(&self, rtype: u16, host_ns: u64, parts: &[&[u8]]) {
-        if !self.active() {
+        let Some(token) = self.admit(rtype) else {
             return;
-        }
+        };
+        self.write_admitted(token, rtype, host_ns, parts);
+    }
+
+    fn write_admitted(&self, token: u64, rtype: u16, host_ns: u64, parts: &[&[u8]]) {
+        #[cfg(test)]
+        admission_tests::before_write_lock();
         let payload_len: usize = parts.iter().map(|p| p.len()).sum();
         let len = RECORD_HEADER_LEN + payload_len;
         let mut header = [0u8; RECORD_HEADER_LEN];
@@ -873,7 +926,7 @@ impl Recorder {
         header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
         header[8..16].copy_from_slice(&host_ns.to_le_bytes());
         let mut ring = self.shared.ring.lock().unwrap();
-        if !self.active() {
+        if self.shared.active.load(Ordering::Acquire) != token {
             return;
         }
         if ring.accepted_bytes.saturating_add(len as u64) > ring.byte_limit {
@@ -905,7 +958,7 @@ impl Recorder {
         };
         ring.reason = Some(format!("{limit} recording size limit reached"));
         ring.stop = true;
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
     }
 
     pub fn stats(&self) -> Stats {
@@ -928,7 +981,7 @@ impl Recorder {
         if !ring.session || path.is_some_and(|p| ring.path.as_deref() != Some(p)) {
             return false;
         }
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
         ring.stop = true;
         self.shared.cond.notify_all();
         true
@@ -945,7 +998,7 @@ impl Recorder {
         if !ring.session || path.is_some_and(|p| ring.path.as_deref() != Some(p)) {
             return None;
         }
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
         ring.stop = true;
         self.shared.cond.notify_all();
         ring = if let Some(timeout) = timeout {
@@ -968,7 +1021,7 @@ impl Drop for Recorder {
     fn drop(&mut self) {
         // A blocked filesystem cannot be interrupted safely. Its one writer owns Shared until it
         // finishes; dropping the recorder must not join it or delay daemon shutdown.
-        self.shared.active.store(false, Ordering::Release);
+        self.shared.active.store(0, Ordering::Release);
         self.shared.ring.lock().unwrap().stop = true;
         self.shared.cond.notify_all();
     }
@@ -1246,6 +1299,10 @@ mod frame_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "recorder/admission_tests.rs"]
+mod admission_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1632,7 +1689,7 @@ mod tests {
             let path = tmp(&format!("capped-{limit}"));
             let r = Recorder::new(4096);
             let available = Arc::new(std::sync::atomic::AtomicU64::new(100 << 30));
-            r.start_session(&path, 1, limit, || {
+            r.start_session(&path, 1, limit, false, || {
                 Ok(Box::new(SpaceSink {
                     file: File::create(&path)?,
                     available,
@@ -1709,7 +1766,7 @@ mod tests {
         let path = tmp("disk-reserve");
         let r = Recorder::new(4096);
         let available = Arc::new(std::sync::atomic::AtomicU64::new((2 << 30) + 591));
-        r.start_session(&path, 1, RECORDING_BYTES, || {
+        r.start_session(&path, 1, RECORDING_BYTES, false, || {
             Ok(Box::new(SpaceSink {
                 file: File::create(&path)?,
                 available: Arc::clone(&available),
@@ -1741,7 +1798,7 @@ mod tests {
         let r = Recorder::new(4096);
         let available = Arc::new(std::sync::atomic::AtomicU64::new(1 << 30));
         let error = r
-            .start_session(&path, 1, RECORDING_BYTES, || {
+            .start_session(&path, 1, RECORDING_BYTES, false, || {
                 // Five percent is below 2 GiB here, exercising the minimum reserve.
                 Ok(Box::new(CapacitySink(
                     SpaceSink {
@@ -1924,7 +1981,7 @@ mod tests {
         assert!(r.stop_if(&path).is_none());
         r.start(&other, 222).unwrap();
         // Model the writer-error state: active is false but its session still needs reaping.
-        r.shared.active.store(false, Ordering::Release);
+        r.shared.active.store(0, Ordering::Release);
         r.shared.ring.lock().unwrap().stats.write_errors = 1;
         assert!(r.stop_if(&path).is_none());
         assert!(r.has_session());
