@@ -81,6 +81,10 @@ struct ukf_measurement {
   matrix2d *sigmas; /* Sigma point measurement vectors for Z during predict (N x num_sigmas) */
   matrix2d *Pz_tmp1; /* N x N workspace */
   matrix2d *Pz_tmp2; /* N x N workspace */
+  /* Owned for the measurement lifetime; fully overwritten on each correction.
+   * Keep separate from Pxz, which retains the last cross-variance. Allocation
+   * follows the same matrix2d_alloc policy as the other init matrices. */
+  matrix2d *KPz_tmp; /* u->N_cov x N workspace for K * Pz */
 };
 
 /* Initialise the UKF process. Takes ownership of the process noise Q if supplied.

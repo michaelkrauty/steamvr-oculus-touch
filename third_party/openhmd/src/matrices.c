@@ -539,19 +539,31 @@ matrix_result matrix2d_invert (matrix2d *dest, matrix2d *src)
 matrix_result matrix2d_multiplyXYXt (matrix2d *dest, const matrix2d *X, const matrix2d *Y)
 {
   matrix_result ret;
-  matrix2d *tmp; /* FIXME: Avoid allocation - pass a tmp space? */
-  int i, j, k;
+  matrix2d *tmp;
 
-  /* Dest and X must be square matrices, with dimensions that match correspondingly
-   * to Y */
+  /* Dest and Y must be square; X may be rectangular. */
   MATRIX_CHECK(Y->cols == Y->rows && dest->rows == dest->cols &&
        dest->cols == X->rows && X->cols == Y->rows, MATRIX_RESULT_INVALID);
 
   tmp = matrix2d_alloc(X->rows, X->cols);
+  ret = matrix2d_multiplyXYXt_workspace(dest, X, Y, tmp);
+  matrix2d_free(tmp);
+  return ret;
+}
+
+matrix_result matrix2d_multiplyXYXt_workspace(matrix2d *dest, const matrix2d *X,
+    const matrix2d *Y, matrix2d *tmp)
+{
+  matrix_result ret;
+  int i, j, k;
+
+  MATRIX_CHECK(Y->cols == Y->rows && dest->rows == dest->cols &&
+       dest->cols == X->rows && X->cols == Y->rows &&
+       tmp->rows == X->rows && tmp->cols == X->cols, MATRIX_RESULT_INVALID);
 
   ret = matrix2d_multiply(tmp, X, Y);
   if (ret != MATRIX_RESULT_OK)
-    goto out;
+    return ret;
 
   /* Multiply tmp by the transpose of X */
   for (j = 0; j < dest->cols; j++) {
@@ -563,8 +575,6 @@ matrix_result matrix2d_multiplyXYXt (matrix2d *dest, const matrix2d *X, const ma
     }
   }
 
-out:
-  matrix2d_free(tmp);
   return ret;
 }
 

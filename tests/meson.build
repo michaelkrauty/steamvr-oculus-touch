@@ -82,6 +82,9 @@ if windows
   subdir_done()
 endif
 
+# Scoped source build keeps GNU allocator wrapping inside the native test executable.
+test('ukf_workspace', assert_python, args: [files('check_ukf_workspace.py')], timeout: 600)
+
 # The real native owner + UKF must retire discontinuous epochs and old camera slots.
 test_native_clock_gap = executable('test_native_clock_gap', 'test_native_clock_gap.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),

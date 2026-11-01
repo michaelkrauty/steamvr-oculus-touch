@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Changed
+
+- Native IMU and optical filter corrections reuse owned matrix workspace instead of allocating a temporary matrix on every update, preserving state, covariance and cross-variance results.
+
 ### Fixed
 
 - Upgrades retain ownership of files omitted from newer bundles, allowing later rollback and removal while preserving locally modified files.
