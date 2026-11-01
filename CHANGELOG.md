@@ -10,6 +10,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- Registration loading rejects zero or nonfinite station quaternions before they can produce an invalid alignment, while preserving finite scaled rotations and legacy files.
 - Late frames and reports cannot cross recording stop/start boundaries, and each session retains its own `--frames` setting.
 - Camera capture retries recoverable USB transfer errors and timeouts through bounded maintenance instead of permanently losing capture-queue slots.
 - Interrupted installer journal writes no longer block recovery and retries. Transaction journals are published atomically before any installed file is replaced.
