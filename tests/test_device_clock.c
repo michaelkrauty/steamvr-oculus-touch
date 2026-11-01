@@ -6,8 +6,32 @@
 #include <stdio.h>
 #include "rift-cv1touch-clock.h"
 
+static void elapsed_time_keeps_the_full_modular_delta(void)
+{
+	const uint64_t start = 9000000000ull;
+	const uint32_t previous[] = {1000000u, 0xfffff000u};
+	/* Last exact 32-bit ns product, first overflowing product, 5 s, and long gaps.
+	 * Subtraction must remain modular even when the microsecond counter wraps. */
+	const uint32_t gaps[] = {2000u, 4294967u, 4294968u, 5000000u, 3000000000u, UINT32_MAX};
+	for (unsigned i = 0; i < sizeof previous / sizeof previous[0]; i++) {
+		for (unsigned j = 0; j < sizeof gaps / sizeof gaps[0]; j++) {
+			uint32_t next = previous[i] + gaps[j];
+			assert(rift_device_time_next(start, previous[i], next) == start + (uint64_t)gaps[j] * 1000);
+		}
+	}
+}
+
+static void initial_epoch_keeps_upstream_truncation(void)
+{
+	uint64_t t = rift_device_time_next(0, 0, 5000000u);
+	assert(t == 705032704ull);
+	assert(rift_device_time_next(t, 5000000u, 5002000u) == t + 2000000ull);
+}
+
 int main(void)
 {
+	initial_epoch_keeps_upstream_truncation();
+	elapsed_time_keeps_the_full_modular_delta();
 	/* the first sample: its timestamp in ns (upstream's 32-bit product: 5 ms is exact) */
 	uint64_t t = rift_device_time_next(0, 0, 5000);
 	assert(t == 5000000);
