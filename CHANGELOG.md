@@ -11,6 +11,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - The Linux installer retains its cleanup tools and ownership record when a SteamVR registration attempt fails or its successful result cannot be saved. Uninstall refuses unresolved ownership and asks for an installer retry instead of silently leaving a registered driver behind or removing a standalone integration.
 - Native tracker teardown releases position-measurement storage instead of leaking it across repeated device lifecycles.
 - Recording sensor metadata rejects invalid boolean bytes before decoding, while preserving legacy padding compatibility.
+- Calibration recording loading rejects unknown controller hand IDs with a diagnostic instead of panicking or mixing their IMU samples into the left controller stream.
 
 ## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
 

@@ -124,6 +124,11 @@ pub fn from_records(records: impl IntoIterator<Item = Record>) -> Result<Capture
             }
             recorder::CONTROLLER_STATE => {
                 if let Some((hand, s)) = recorder::decode_state(&rec.payload) {
+                    if hand != HAND_LEFT && hand != HAND_RIGHT {
+                        return Err(format!(
+                            "recording has invalid controller hand {hand} (expected 0 or 1)"
+                        ));
+                    }
                     let series = imu.entry(hand_device_id(hand)).or_default();
                     if s.device_time_ns != 0
                         && series
