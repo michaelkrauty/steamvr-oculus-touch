@@ -521,7 +521,12 @@ static void haptics_write_done(rift_hmd_t *hmd, uint64_t ts, rift_touch_controll
 		hs->sent_amplitude = hs->inflight_amplitude;
 		hs->sent_low_freq = hs->inflight_low_freq;
 		hs->failures = 0;
-		if (hs->haptics_on && hs->inflight_amplitude != 0 && hs->end_time == (uint64_t)(-1))
+		/* Only a confirmation of the wanted state can start its duration. A newer
+		 * different pulse still waits for its own write; matching renewals and
+		 * A-B-A coalescing can use this confirmation without another write. */
+		if (hs->haptics_on && hs->inflight_amplitude != 0 &&
+		    hs->amplitude == hs->inflight_amplitude && hs->low_freq == hs->inflight_low_freq &&
+		    hs->end_time == (uint64_t)(-1))
 			hs->end_time = ts + roundf(hs->duration * ohmd_monotonic_per_sec(hmd->ctx));
 		return;
 	}

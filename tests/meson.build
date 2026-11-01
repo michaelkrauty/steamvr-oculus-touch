@@ -227,6 +227,7 @@ endif
 test_touch_calibration = executable('test_touch_calibration', 'test_touch_calibration.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [dependency('hidapi-hidraw')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('touch_haptics_confirmation', test_touch_calibration, args: ['haptics'])
 test('touch_calibration_parser', test_touch_calibration, args: ['parser'])
 test('touch_calibration_cache', test_touch_calibration, args: ['cache'])
 test('touch_calibration_radio', test_touch_calibration, args: ['radio'])
