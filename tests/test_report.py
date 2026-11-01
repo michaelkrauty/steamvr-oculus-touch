@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 michaelkrauty
 """`cv1touch report` with private directories, its zip read back by Python's own zipfile."""
+import json
 import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 from socket_dir import SocketDirectory
 import unittest
 from unittest import mock
@@ -142,6 +144,62 @@ class ReportTests(unittest.TestCase):
                 finally:
                     stub.write_bytes(contents)
                     stub.chmod(0o755)
+
+    def test_journal_streaming_preserves_tails_arguments_and_failed_exit(self):
+        limit = 4 << 20
+        source = self.root / "journal-input"
+        invocation = self.root / "journal-invocation"
+        finished = self.root / "journal-finished"
+        stub = self.mock_bin / "journalctl"
+        for index, (data, code) in enumerate([
+                (b"", 0),
+                (b"x" * (limit - 1) + b"\n", 0),
+                (b"prefix\n" + b"x" * (limit - 1) + b"\n", 0),
+                (b"abc\n" * (limit // 2) + b"end", 0),
+                (b"x" * (limit + 1), 0),
+                (b"x" * (limit + 1) + b"\n", 0),
+                (b"discarded\n" * (limit // 4), 7),
+        ]):
+            with self.subTest(size=len(data), code=code):
+                source.write_bytes(data)
+                finished.unlink(missing_ok=True)
+                stub.write_text(f"#!{sys.executable}\n" +
+                                "import json, os, sys\n" +
+                                "from pathlib import Path\n" +
+                                f"Path({str(invocation)!r}).write_text(json.dumps(\n" +
+                                "    dict(argv=sys.argv[1:], pid=os.getpid())))\n" +
+                                "assert sys.stdin.buffer.read() == b''\n" +
+                                "sys.stderr.buffer.write(b'ignored error' * 16384)\n" +
+                                f"with open({str(source)!r}, 'rb') as source:\n" +
+                                "    while chunk := source.read(16384):\n" +
+                                "        sys.stdout.buffer.write(chunk)\n" +
+                                "sys.stdout.buffer.flush()\n" +
+                                f"Path({str(finished)!r}).touch()\n" +
+                                f"sys.exit({code})\n")
+                out = self.root / f"journal-{index}.zip"
+                self.report(out)
+                called = json.loads(invocation.read_text())
+                self.assertEqual(called["argv"], ["--user", "-u", "cv1touchd", "-b",
+                                                 "--no-pager", "-o", "short-iso-precise"])
+                self.assertTrue(finished.exists(), "the entire producer must be drained")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(called["pid"], 0)
+                with zipfile.ZipFile(out) as archive:
+                    if code:
+                        self.assertNotIn("logs/journal.txt", archive.namelist())
+                        self.assertIn("the daemon's journal: journalctl exit status: 7",
+                                      archive.read("report.txt").decode())
+                        continue
+                    # Independent full-buffer reference, including the overlong-line fallback.
+                    start = max(0, len(data) - limit)
+                    if start and data[start - 1:start] != b"\n":
+                        newline = data.find(b"\n", start)
+                        if 0 <= newline < len(data) - 1:
+                            start = newline + 1
+                    expected = data[start:]
+                    if len(data) > limit:
+                        expected = f"[the first {start} bytes are left out]\n".encode() + expected
+                    self.assertEqual(archive.read("logs/journal.txt"), expected)
 
     def test_recording_summaries_read_old_and_skip_count_headers(self):
         path = self.root / "synthetic.rec"

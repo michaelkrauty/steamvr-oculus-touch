@@ -225,32 +225,75 @@ fn summary(created: SystemTime, report: &mut Report) -> String {
     text.join("\n") + "\n"
 }
 
+/// Drain the whole stream, retaining only the suffix and one byte of line-boundary context.
+/// Memory is bounded by `max`, even for a single unterminated line; I/O is not bounded.
+#[cfg(unix)]
+fn stream_tail(mut reader: impl Read, max: usize) -> io::Result<Vec<u8>> {
+    let mut ring = vec![0; max + 1];
+    let mut next = 0;
+    let mut total = 0u64;
+    loop {
+        match reader.read(&mut ring[next..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                next = (next + n) % ring.len();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let len = total.min(ring.len() as u64) as usize;
+    if total >= ring.len() as u64 {
+        ring.rotate_left(next);
+    }
+    Ok(line_tail(&ring[..len], max, total - len as u64))
+}
+
+#[cfg(unix)]
+fn journal_output(command: &mut Command) -> io::Result<(process::ExitStatus, Vec<u8>)> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let data = stream_tail(
+        child.stdout.take().expect("piped stdout"),
+        LOG_TAIL as usize,
+    );
+    // A failed read must not leave a producer blocked on its pipe, or an unreaped child.
+    if data.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok((status?, data?))
+}
+
 /// The daemon's journal for this boot (Linux, where systemd runs it).
 #[cfg(unix)]
 fn journal(report: &mut Report) {
-    let output = Command::new("journalctl")
-        .args([
-            "--user",
-            "-u",
-            "cv1touchd",
-            "-b",
-            "--no-pager",
-            "-o",
-            "short-iso-precise",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
+    let output = journal_output(Command::new("journalctl").args([
+        "--user",
+        "-u",
+        "cv1touchd",
+        "-b",
+        "--no-pager",
+        "-o",
+        "short-iso-precise",
+    ]));
     match output {
-        Ok(out) if out.status.success() => {
-            let data = line_tail(&out.stdout, LOG_TAIL as usize, 0);
+        Ok((status, data)) if status.success() => {
             report
                 .files
                 .push(("logs/journal.txt".into(), data, SystemTime::now()));
         }
-        Ok(out) => report
+        Ok((status, _)) => report
             .missing
-            .push(format!("the daemon's journal: journalctl {}", out.status)),
+            .push(format!("the daemon's journal: journalctl {status}")),
         Err(e) => report
             .missing
             .push(format!("the daemon's journal: journalctl: {e}")),
@@ -510,6 +553,112 @@ mod tests {
             line_tail(journal, 8, 0),
             b"[the first 8 bytes are left out]\nthree\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_tails_match_full_buffer_tails() {
+        struct Chunks<'a>(&'a [u8]);
+        impl Read for Chunks<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = out.len().min(7);
+                self.0.read(&mut out[..n])
+            }
+        }
+        for max in 0..64 {
+            for len in 0..256 {
+                for period in [0, 1, 7, 29, 100] {
+                    let data: Vec<u8> = (0..len)
+                        .map(|i| {
+                            if period != 0 && i % period == 0 {
+                                b'\n'
+                            } else {
+                                b'x'
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        stream_tail(Chunks(&data), max).unwrap(),
+                        line_tail(&data, max, 0)
+                    );
+                }
+            }
+        }
+        for data in [
+            b"abcd\nefgh\n".as_slice(),
+            b"abcdefghijkl",
+            b"abcdefghijkl\n",
+        ] {
+            assert_eq!(stream_tail(data, 5).unwrap(), line_tail(data, 5, 0));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_work_and_read_storage_are_bounded() {
+        struct Generated {
+            left: usize,
+            calls: usize,
+        }
+        impl Read for Generated {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert!(out.len() <= LOG_TAIL as usize + 1);
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let n = out.len().min(self.left);
+                out[..n].fill(b'x');
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        let size = 256 << 20;
+        let mut reader = Generated {
+            left: size,
+            calls: 0,
+        };
+        let kept = stream_tail(&mut reader, LOG_TAIL as usize).unwrap();
+        let prefix = format!(
+            "[the first {} bytes are left out]\n",
+            size - LOG_TAIL as usize
+        );
+        assert!(kept.starts_with(prefix.as_bytes()));
+        assert_eq!(kept.len(), prefix.len() + LOG_TAIL as usize);
+        assert!(kept[prefix.len()..].iter().all(|&b| b == b'x'));
+        assert_eq!(reader.left, 0);
+        assert!(reader.calls <= size / LOG_TAIL as usize + 4);
+
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("fixture read failure"))
+            }
+        }
+        assert_eq!(
+            stream_tail(Broken, 8).unwrap_err().to_string(),
+            "fixture read failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_children_are_drained_and_waited_for_even_on_failure() {
+        for code in [0, 7] {
+            let mut command = Command::new("/bin/sh");
+            // More than pipe capacity on both streams; stderr must remain discarded.
+            command.args([
+                "-c",
+                &format!(
+                    "i=0; while [ \"$i\" -lt 4096 ]; do printf 'journal line\\n'; \
+                 printf 'discarded error\\n' >&2; i=$((i+1)); done; exit {code}"
+                ),
+            ]);
+            let (status, data) = journal_output(&mut command).unwrap();
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(data, b"journal line\n".repeat(4096));
+        }
+        assert!(journal_output(&mut Command::new("/no/such/journalctl")).is_err());
     }
 
     #[test]

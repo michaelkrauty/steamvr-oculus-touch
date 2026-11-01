@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Changed
+
+- Support-report journal collection uses bounded memory while preserving the retained log tail and omitted-byte counts. It still drains the entire journal stream.
+
 ### Fixed
 
 - Camera capture retries recoverable USB transfer errors and timeouts through bounded maintenance instead of permanently losing capture-queue slots.
