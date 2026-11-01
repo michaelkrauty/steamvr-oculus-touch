@@ -803,6 +803,17 @@ pub fn load_registration(path: &Path) -> Result<Registration, String> {
     }
     r.lighthouse_from_world
         .validate(&path.display().to_string())?;
+    for station in &r.stations {
+        let q = &station.pose.orient_xyzw;
+        // Station rotations historically accept any scale; normalization promotes to f64.
+        if q.iter().any(|v| !v.is_finite()) || q.iter().all(|v| *v == 0.0) {
+            return Err(format!(
+                "{}: station {}: quaternion must be finite and nonzero",
+                path.display(),
+                station.serial
+            ));
+        }
+    }
     for m in &r.measured {
         m.world_from_station
             .validate(&format!("{}: {}", path.display(), m.serial))?;
@@ -1368,6 +1379,100 @@ mod tests {
         assert_eq!(a.render_orient[crate::shm::HAND_RIGHT], q);
         assert_eq!(a.render_pos[crate::shm::HAND_RIGHT], p);
         assert_eq!(alignment(None, None).valid, 0);
+    }
+
+    #[test]
+    fn station_quaternions_are_validated_without_requiring_unit_norm() {
+        let dir = std::env::temp_dir().join(format!("cv1t-station-quats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registration.json");
+        let mut value = serde_json::to_value(registration()).unwrap();
+        value["stations"] = serde_json::json!([{
+            "serial": "LHB-TEST",
+            "pose": {"orient_xyzw": [0, 0, 0, 1], "pos": [1, 2, 3]}
+        }]);
+        // Legacy files have neither measurements nor tracking-base/play-area metadata.
+        for field in ["measured", "tracking_base", "play_area"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        for scale in [
+            1.0,
+            2.0,
+            -2.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            f32::MAX,
+        ] {
+            value["stations"][0]["pose"]["orient_xyzw"] =
+                serde_json::json!([0.0, 0.0, scale, scale]);
+            std::fs::write(&path, value.to_string()).unwrap();
+            let loaded = load_registration(&path).unwrap();
+            assert!(loaded.measured.is_empty());
+            assert!(loaded.tracking_base.is_none());
+            assert!(loaded.play_area.is_none());
+            assert_eq!(
+                loaded.stations[0].pose.orient_xyzw,
+                [0.0, 0.0, scale, scale]
+            );
+            let rotation = loaded.fit_layout()[0].1.rotation;
+            let expected =
+                UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::FRAC_PI_2);
+            assert!(rotation.coords.iter().all(|v| v.is_finite()));
+            assert!(rotation.angle_to(&expected) < 1e-12, "scale {scale}");
+        }
+        value["measured"] = serde_json::json!([]);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(load_registration(&path).unwrap().measured.is_empty());
+        value["stations"] = serde_json::json!([]);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(load_registration(&path).unwrap().stations.is_empty());
+        value.as_object_mut().unwrap().remove("stations");
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(load_registration(&path).unwrap().stations.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zero_and_overflowing_station_quaternions_are_rejected() {
+        let dir =
+            std::env::temp_dir().join(format!("cv1t-bad-station-quats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registration.json");
+        let mut value = serde_json::to_value(registration()).unwrap();
+        // Check every station, not just the first one.
+        value["stations"] = serde_json::json!([
+            {"serial": "LHB-GOOD", "pose": {"orient_xyzw": [0, 0, 0, 1], "pos": [0, 0, 0]}},
+            {"serial": "LHB-BAD", "pose": {"orient_xyzw": [0, 0, 0, 1], "pos": [1, 2, 3]}}
+        ]);
+        let mut results = Vec::new();
+        for q in [
+            "[0,0,0,0]",
+            "[-0.0,0,-0.0,0]",
+            "[1e100,0,0,1]",
+            "[0,-1e100,0,1]",
+            "[0,0,1e100,1]",
+            "[0,0,0,-1e100]",
+        ] {
+            value["stations"][1]["pose"]["orient_xyzw"] = serde_json::from_str(q).unwrap();
+            std::fs::write(&path, value.to_string()).unwrap();
+            results.push((q, load_registration(&path)));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let accepted: Vec<_> = results
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(q, _)| q)
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "accepted invalid station quaternions: {accepted:?}"
+        );
+        for (_, result) in results {
+            let error = result.unwrap_err();
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(error.contains("LHB-BAD"), "{error}");
+            assert!(error.contains("quaternion"), "{error}");
+        }
     }
 
     #[test]
