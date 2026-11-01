@@ -8,6 +8,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - Native IMU and optical filter corrections reuse owned matrix workspace instead of allocating a temporary matrix on every update, preserving state, covariance and cross-variance results.
 - Calibration bundle adjustment uses fixed local storage for six-column pose Jacobians, reducing allocation requests without changing solver results.
+- Native pose projection uses per-call bounded storage for models of up to 64 points on OpenCV 5, reducing allocation traffic during correspondence searches. Larger models and other OpenCV major versions retain the existing projection path; pinhole and search-setup allocations remain.
 
 ### Fixed
 
