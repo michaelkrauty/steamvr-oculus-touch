@@ -132,7 +132,9 @@ fn legacy_fit_pairs(
     })
 }
 
-fn result_bits(r: &Result<Fit, Miss>) -> Result<(Vec<u64>, Vec<(usize, usize)>, usize), Miss> {
+type FitSnapshot = (Vec<u64>, Vec<(usize, usize)>, usize);
+
+fn result_bits(r: &Result<Fit, Miss>) -> Result<FitSnapshot, Miss> {
     r.as_ref()
         .map(|f| {
             let x = &f.updated.filter.x;

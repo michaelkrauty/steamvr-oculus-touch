@@ -6,6 +6,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- Vision fits evaluate final residual norms without computing unused Jacobians, preserving fitted state, covariance, matching, and acceptance results.
 - Support-report journal collection uses bounded memory while preserving the retained log tail and omitted-byte counts. It still drains the entire journal stream.
 
 ### Fixed
