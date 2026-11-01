@@ -1,5 +1,5 @@
 project('cv1touch', 'c', 'cpp',
-  version: '0.3.2',
+  version: '0.3.3',
   meson_version: '>= 1.3',
   subproject_dir: 'third_party',
   # b_vscrt (Windows): the driver carries its C/C++ runtime, as -static-libstdc++ does on Linux

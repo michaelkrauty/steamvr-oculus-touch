@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
+
 ### Changed
 
 - Vision fits evaluate final residual norms without computing unused Jacobians, preserving fitted state, covariance, matching, and acceptance results.
