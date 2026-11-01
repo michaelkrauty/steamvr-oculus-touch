@@ -195,6 +195,100 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(service.read_text(), "existing user service")
         self.assertFalse((self.prefix / "bin/cv1touch").exists())
 
+    def test_membership_changing_upgrade_retains_ownership(self):
+        relative = "lib/cv1touch/libopenhmd.so.0.1"
+        source = self.bundle / "libopenhmd.so.0.1"
+        source.write_bytes(b"old library")
+        self.assertEqual(self.invoke().returncode, 0)
+        manifest = self.prefix / "lib/cv1touch/install-manifest.json"
+        expected = json.loads(manifest.read_text())["files"][relative]
+        source.unlink()
+        newer = self.bundle / "libopenhmd.so.0.2"
+        newer.write_bytes(b"new library")
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(manifest.read_text())["files"].get(relative), expected)
+        self.assertEqual((self.prefix / relative).read_bytes(), b"old library")
+        # Rollback must recognize the retained library as managed.
+        newer.unlink()
+        source.write_bytes(b"old library")
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lib/cv1touch/libopenhmd.so.0.2", json.loads(manifest.read_text())["files"])
+        result = self.invoke("--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.prefix / relative).exists())
+        self.assertFalse((self.prefix / "lib/cv1touch/libopenhmd.so.0.2").exists())
+        self.assertFalse(manifest.exists())
+
+    def test_interrupted_membership_change_recovers_previous_ownership(self):
+        source = self.bundle / "libopenhmd.so.0.1"
+        source.write_bytes(b"old library")
+        self.assertEqual(self.invoke().returncode, 0)
+        manifest = self.prefix / "lib/cv1touch/install-manifest.json"
+        before = manifest.read_bytes()
+        source.unlink()
+        args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=True)
+        original = INSTALLER.atomic_copy
+
+        def interrupt(source, destination):
+            original(source, destination)
+            if destination == manifest:
+                raise KeyboardInterrupt()
+
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER, "atomic_copy", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                INSTALLER.install(args)
+        INSTALLER.recover_transaction(self.prefix)
+        self.assertEqual(manifest.read_bytes(), before)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke("--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.prefix / "lib/cv1touch/libopenhmd.so.0.1").exists())
+
+    def test_old_only_library_preserves_digest_and_modified_file_protection(self):
+        for state in ("modified", "missing", "symlink"):
+            with self.subTest(state=state):
+                self.prefix = self.root / state
+                source = self.bundle / "libopenhmd.so.0.1"
+                source.write_bytes(b"original library")
+                self.assertEqual(self.invoke().returncode, 0)
+                relative = "lib/cv1touch/libopenhmd.so.0.1"
+                installed = self.prefix / relative
+                manifest = self.prefix / "lib/cv1touch/install-manifest.json"
+                expected = json.loads(manifest.read_text())["files"][relative]
+                source.unlink()
+                installed.unlink()
+                target = self.root / "external-library"
+                target.write_bytes(b"user library")
+                if state == "modified":
+                    installed.write_bytes(b"user library")
+                elif state == "symlink":
+                    installed.symlink_to(target)
+                result = self.invoke()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(manifest.read_text())["files"].get(relative), expected)
+                source.write_bytes(b"original library")
+                result = self.invoke()
+                if state == "missing":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unmanaged or modified file", result.stderr)
+                result = self.invoke("--uninstall")
+                if state != "missing":
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Keeping modified file", result.stderr)
+                    self.assertEqual(installed.read_bytes(), b"user library")
+                    self.assertEqual(json.loads(manifest.read_text())["files"], {relative: expected})
+                    installed.unlink()
+                    self.assertEqual(self.invoke("--uninstall").returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(target.read_bytes(), b"user library")
+                self.assertFalse(manifest.exists())
+
     def test_remove_keeps_modified_files_and_manifest(self):
         self.assertEqual(self.invoke().returncode, 0)
         path = self.prefix / "bin/cv1touchd"

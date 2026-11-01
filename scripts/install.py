@@ -257,7 +257,10 @@ def install(args):
             # --install-script: cv1touch is not installed yet, so a failure must say to run
             # this installer again, not `cv1touch steamvr install`.
             run([bundle / "cv1touch", "steamvr", "check", *legacy_args, "--install-script"], env=check_env)
-        managed = {relative: digest(source) for relative, source in sources.items()}
+        # Keep old-only payloads owned for uninstall and later bundle rollback.
+        # Preserve their original digests rather than adopting local changes.
+        managed = dict(previous["files"])
+        managed.update({relative: digest(source) for relative, source in sources.items()})
         replacements = {owned_destination(prefix, relative): source for relative, source in sources.items()}
         if not args.no_service:
             source = Path(temporary) / "cv1touchd.service"
