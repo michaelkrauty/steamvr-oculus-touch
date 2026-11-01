@@ -331,7 +331,7 @@ static void process_scanline(uint8_t *frame, uint8_t *line, blobwatch *bw, int y
 			 * bottom of finished blobs. Store them into an array.
 			 */
 			while (le < le_end && le->end < center) {
-				extent_to_blobs(bw, ob, le, y, frame);
+				extent_to_blobs(bw, ob, le, y - 1, frame);
 				le++;
 			}
 
@@ -373,7 +373,7 @@ static void process_scanline(uint8_t *frame, uint8_t *line, blobwatch *bw, int y
 		 * extents in the previous line are finished blobs. Store them.
 		 */
 		while (le < le_end) {
-			extent_to_blobs(bw, ob, le, y, frame);
+			extent_to_blobs(bw, ob, le, y - 1, frame);
 			le++;
 		}
 	}
