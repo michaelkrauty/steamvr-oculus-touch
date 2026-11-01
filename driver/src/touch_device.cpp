@@ -51,9 +51,42 @@ vr::EVRInitError TouchDevice::Activate(uint32_t object_id)
 	in->CreateHapticComponent(container_, "/output/haptic", &haptic);
 	haptic_ = haptic;
 
-	object_id_.store(object_id, std::memory_order_release);
 	cv1t_log("cv1touch: %s activated as device %u", serial(), object_id);
+	{
+		std::lock_guard<std::mutex> lock(submission_mu_);
+		object_id_ = object_id;
+	}
 	return vr::VRInitError_None;
+}
+
+TouchDevice::Submission::Submission(TouchDevice &device) : device(device)
+{
+	std::lock_guard<std::mutex> lock(device.submission_mu_);
+	id = device.object_id_;
+	if (id != vr::k_unTrackedDeviceIndexInvalid)
+		++device.submissions_;
+}
+
+TouchDevice::Submission::~Submission()
+{
+	if (id == vr::k_unTrackedDeviceIndexInvalid)
+		return;
+	std::lock_guard<std::mutex> lock(device.submission_mu_);
+	if (--device.submissions_ == 0 && device.object_id_ == vr::k_unTrackedDeviceIndexInvalid)
+		device.submission_cv_.notify_all();
+}
+
+void TouchDevice::Deactivate()
+{
+	std::unique_lock<std::mutex> lock(submission_mu_);
+	object_id_ = vr::k_unTrackedDeviceIndexInvalid;
+	submission_cv_.notify_all();
+	// Valve requires all device runtime use to finish before this callback returns.
+	// wait releases the admission mutex: no driver mutex is held across OpenVR calls
+	// (including synchronous GetPose callbacks), nor while waiting for their completion.
+	// Lifecycle teardown must not be invoked recursively from an admitted call: that
+	// would require the call to wait for its own return.
+	submission_cv_.wait(lock, [this] { return submissions_ == 0; });
 }
 
 vr::DriverPose_t TouchDevice::GetPose()
@@ -116,7 +149,8 @@ void TouchDevice::update(const cv1t_controller_state *st, const cv1t_alignment *
 		std::lock_guard<std::mutex> g(pose_mu_);
 		last_pose_ = pose;
 	}
-	const uint32_t id = object_id_.load(std::memory_order_acquire);
+	const Submission submission(*this);
+	const uint32_t id = submission.id;
 	if (id == vr::k_unTrackedDeviceIndexInvalid)
 		return;
 	if (al && al->universe_id != 0 && al->universe_id != universe_) {
