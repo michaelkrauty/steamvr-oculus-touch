@@ -8,12 +8,14 @@
 #include <stdint.h>
 
 /* The device time of `device_ts`, after the newest sample at `device_time_ns` (0: none yet),
- * stamped `last_device_ts`. The arithmetic is upstream's, 32-bit products included. */
+ * stamped `last_device_ts`. Preserve upstream's truncated 32-bit initial epoch for
+ * compatibility, but widen the modular microsecond delta before converting to ns.
+ * Elapsed gaps of a full 32-bit counter cycle or more remain ambiguous. */
 static inline uint64_t rift_device_time_next(uint64_t device_time_ns, uint32_t last_device_ts, uint32_t device_ts)
 {
 	if (device_time_ns == 0)
 		return device_ts * 1000;
-	return device_time_ns + ((uint32_t)(device_ts - last_device_ts)) * 1000;
+	return device_time_ns + (uint64_t)(uint32_t)(device_ts - last_device_ts) * 1000;
 }
 
 #endif

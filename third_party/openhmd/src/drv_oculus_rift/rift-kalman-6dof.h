@@ -76,6 +76,8 @@ struct rift_kalman_6dof_filter {
 };
 
 void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int num_delay_slots);
+/* Retains allocations and noise; the owner must invalidate old optical/delay-slot work. */
+void rift_kalman_6dof_reset(rift_kalman_6dof_filter *state, const posef *init_pose);
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state);
 
 void rift_kalman_6dof_prepare_delay_slot(rift_kalman_6dof_filter *state, uint64_t time, int delay_slot);

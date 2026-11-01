@@ -74,6 +74,16 @@ if windows
   subdir_done()
 endif
 
+# The real native owner + UKF must retire discontinuous epochs and old camera slots.
+test_native_clock_gap = executable('test_native_clock_gap', 'test_native_clock_gap.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),
+    '-ffunction-sections', '-fdata-sections'],
+  dependencies: [threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
+test('native_clock_gap', test_native_clock_gap)
+foreach scenario : ['continuity', 'posterior-0', 'posterior-3']
+  test('native_clock_gap_' + scenario.underscorify(), test_native_clock_gap, args: [scenario])
+endforeach
+
 # Instrument the unity build itself so an ordinary native test run catches null member access.
 blobwatch_ubsan_args = ['-fsanitize=undefined', '-fno-sanitize-recover=undefined']
 test_blobwatch_ubsan = executable('test_blobwatch_ubsan', 'test_blobwatch_ubsan.c',

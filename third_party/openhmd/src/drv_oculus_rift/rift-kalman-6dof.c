@@ -639,14 +639,45 @@ static void rift_kalman_6dof_reinit(rift_kalman_6dof_filter *state)
 		MATRIX2D_XY(state->ukf.P_prior, i, i) = IMU_GYRO_BIAS_NOISE_INITIAL;
 }
 
+/* Start a new continuity epoch without reallocating matrices or changing noise/parameters. */
+void rift_kalman_6dof_reset(rift_kalman_6dof_filter *state, const posef *init_pose)
+{
+	matrix2d_fill(state->ukf.x_prior, 0.0);
+	matrix2d_fill_identity(state->ukf.P_prior);
+	/* Initialise the state with the init_pose */
+	for (int i = 0; i < 3; i++)
+		MATRIX2D_Y(state->ukf.x_prior, STATE_POSITION + i) = init_pose->pos.arr[i];
+	for (int i = 0; i < 4; i++)
+		MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION + i) = init_pose->orient.arr[i];
+
+	for (int i = 0; i < state->num_delay_slots; i++) {
+		int slot_index = BASE_STATE_SIZE + (DELAY_SLOT_STATE_SIZE * i);
+		MATRIX2D_Y(state->ukf.x_prior, slot_index + DELAY_SLOT_STATE_ORIENTATION + 3) = 1.0;
+		state->slot_inuse[i] = false;
+	}
+
+	/* Initialise the prior covariance / uncertainty - particularly around the biases,
+	 * where we assume they are close to 0 somewhere */
+	for (int i = COV_ACCEL_BIAS; i < COV_ACCEL_BIAS + 3; i++)
+		MATRIX2D_XY(state->ukf.P_prior, i, i) = IMU_ACCEL_BIAS_NOISE_INITIAL;
+
+	for (int i = COV_GYRO_BIAS; i < COV_GYRO_BIAS + 3; i++)
+		MATRIX2D_XY(state->ukf.P_prior, i, i) = IMU_GYRO_BIAS_NOISE_INITIAL;
+
+	state->first_update = true;
+	state->current_ts = 0;
+	state->saw_pose_update = false;
+	state->reset_slot = -1;
+	state->pose_slot = -1;
+	ovec3d_set(&state->ang_vel, 0.0, 0.0, 0.0);
+}
+
 void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int num_delay_slots)
 {
 	int i, d;
 
 	OHMD_ASSERT(num_delay_slots <= MAX_DELAY_SLOTS);
 
-	state->first_update = true;
-	state->saw_pose_update = false;
 	state->num_delay_slots = num_delay_slots;
 
 	const int STATE_SIZE = BASE_STATE_SIZE + (num_delay_slots * DELAY_SLOT_STATE_SIZE);
@@ -689,25 +720,7 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 	/* Takes ownership of Q_noise */
 	ukf_base_init(&state->ukf, STATE_SIZE, COV_SIZE, state->Q_noise, process_func, state_mean_func, state_residual_func, state_sum_func);
 
-	/* Initialise the state with the init_pose */
-	for (i = 0; i < 3; i++)
-		MATRIX2D_Y(state->ukf.x_prior, STATE_POSITION + i) = init_pose->pos.arr[i];
-	for (i = 0; i < 4; i++)
-		MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION + i) = init_pose->orient.arr[i];
-
-	for (i = 0; i < num_delay_slots; i++) {
-		int slot_index = BASE_STATE_SIZE + (DELAY_SLOT_STATE_SIZE * i);
-		MATRIX2D_Y(state->ukf.x_prior, slot_index + DELAY_SLOT_STATE_ORIENTATION + 3) = 1.0;
-		state->slot_inuse[i] = false;
-	}
-
-	/* Initialise the prior covariance / uncertainty - particularly around the biases,
-	 * where we assume they are close to 0 somewhere */
-	for (i = COV_ACCEL_BIAS; i < COV_ACCEL_BIAS + 3; i++)
-		MATRIX2D_XY(state->ukf.P_prior, i, i) = IMU_ACCEL_BIAS_NOISE_INITIAL;
-
-	for (i = COV_GYRO_BIAS; i < COV_GYRO_BIAS + 3; i++)
-		MATRIX2D_XY(state->ukf.P_prior, i, i) = IMU_GYRO_BIAS_NOISE_INITIAL;
+	rift_kalman_6dof_reset(state, init_pose);
 
 	/* m1 is for IMU measurement - accel */
 	ukf_measurement_init(&state->m1, 3, 3, &state->ukf, imu_measurement_func, NULL, NULL, NULL);
@@ -730,11 +743,6 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 	ukf_measurement_init(&state->m_position, 3, 3, &state->ukf, position_measurement_func, NULL, NULL, NULL);
 	for (int i = 0; i < 3; i++)
 		MATRIX2D_XY(state->m_position.R, i, i) = 0.01 * 0.01; /* 1cm error std dev */
-
-	state->reset_slot = -1;
-	state->pose_slot = -1;
-
-	ovec3d_set(&state->ang_vel, 0.0, 0.0, 0.0);
 }
 
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state)

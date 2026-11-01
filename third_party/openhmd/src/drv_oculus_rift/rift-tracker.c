@@ -55,6 +55,9 @@
  * tracking lost */
 #define POSE_LOST_THRESHOLD 500
 
+/* Continuity policy, matching the Rust tracker default, not a UKF stability bound. */
+#define MAX_IMU_GAP_NS 100000000ull
+
 /* Length of time (milliseconds) we can ignore orientation from cameras before
  * we force an update */
 #define POSE_LOST_ORIENT_THRESHOLD 100
@@ -709,6 +712,29 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 	free (tracker_ctx);
 }
 
+/* Called with only device_lock held. Camera copies carry slot index + timestamp,
+ * not references to UKF storage. Invalidate that identity before reusing slots so
+ * late get/update/claim/release callbacks cannot affect this new epoch. */
+static void rift_tracked_device_reset_continuity(rift_tracked_device_priv *dev)
+{
+	posef held_pose;
+	rift_kalman_6dof_get_pose_at(&dev->ukf_fusion, dev->device_time_ns, &held_pose,
+		NULL, NULL, NULL, NULL, NULL);
+	rift_kalman_6dof_reset(&dev->ukf_fusion, &held_pose);
+	for (int i = 0; i < dev->n_delay_slots; i++) {
+		dev->delay_slots[i].valid = false;
+		dev->delay_slots[i].use_count = 0;
+		dev->delay_slots[i].had_used_report = false;
+	}
+	dev->delay_slot_index = 0;
+	dev->last_no_free_delay_slot = 0;
+	dev->last_observed_pose_ts = dev->last_observed_orient_ts = 0;
+	dev->last_acquired_pose_lock_ts = dev->last_reported_pose = 0;
+	dev->pose_output_filter.pos_filter.have_prev_y = false;
+	dev->pose_output_filter.orient_filter.have_prev_y = false;
+	dev->reported_lin_vel = dev->reported_lin_accel = dev->reported_ang_vel = (vec3f){{0}};
+}
+
 void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field)
 {
 	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
@@ -717,7 +743,11 @@ void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t loca
 	ohmd_lock_mutex (dev->device_lock);
 
 	/* Handle device_ts wrap by extending to 64-bit and working in nanoseconds */
-	dev->device_time_ns = rift_device_time_next(dev->device_time_ns, dev->last_device_ts, device_ts);
+	uint64_t next_time_ns = rift_device_time_next(dev->device_time_ns, dev->last_device_ts, device_ts);
+	/* Use sample stamps, not dt: Touch deliberately stamps the previous report. */
+	if (dev->device_time_ns != 0 && next_time_ns - dev->device_time_ns > MAX_IMU_GAP_NS)
+		rift_tracked_device_reset_continuity(dev);
+	dev->device_time_ns = next_time_ns;
 	dev->last_device_ts = device_ts;
 
 	rift_kalman_6dof_imu_update (&dev->ukf_fusion, dev->device_time_ns, ang_vel, accel, mag_field);
@@ -760,7 +790,7 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		oposef_apply(&dev->device_from_fusion, &imu_global_pose, &device_pose);
 
 		dev->reported_pose.orient = device_pose.orient;
-		if (dev->device_time_ns - dev->last_observed_pose_ts >= (POSE_LOST_THRESHOLD * 1000000UL)) {
+		if (dev->last_observed_pose_ts == 0 || dev->device_time_ns - dev->last_observed_pose_ts >= (POSE_LOST_THRESHOLD * 1000000UL)) {
 			/* Don't let the device move unless there's a recent observation of actual position */
 			device_pose.pos = dev->reported_pose.pos;
 			imu_vel.x = imu_vel.y = imu_vel.z = 0.0;
@@ -1014,7 +1044,7 @@ void rift_tracked_device_get_model_pose_locked(rift_tracked_device_priv *dev, ui
 	}
 
 	dev->model_pose.orient = model_pose.orient;
-	if (dev->device_time_ns - dev->last_observed_pose_ts < (POSE_LOST_THRESHOLD * 1000000UL)) {
+	if (dev->last_observed_pose_ts != 0 && dev->device_time_ns - dev->last_observed_pose_ts < (POSE_LOST_THRESHOLD * 1000000UL)) {
 		/* Don't let the device move unless there's a recent observation of actual position */
 		dev->model_pose.pos = model_pose.pos;
 	}
@@ -1151,7 +1181,7 @@ rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, rift_tracked_
 		}
 	}
 
-	if (dev->device_time_ns - dev->last_observed_pose_ts < (POSE_LOST_THRESHOLD * 1000000UL))
+	if (dev->last_observed_pose_ts != 0 && dev->device_time_ns - dev->last_observed_pose_ts < (POSE_LOST_THRESHOLD * 1000000UL))
 		dev_info->had_pose_lock = true;
 	else {
 		dev_info->had_pose_lock = false;

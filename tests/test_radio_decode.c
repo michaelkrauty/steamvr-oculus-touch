@@ -167,8 +167,35 @@ static void activity_follows_decoding_on_each_reader(void)
 	}
 }
 
+static void decoded_report_gap_keeps_elapsed_time_and_sample_lag(void)
+{
+	rift_touch_controller_t decoder, engine;
+	calibrated(&decoder);
+	calibrated(&engine);
+	uint64_t filter_ns = 0;
+	uint32_t filter_ts = 0;
+	/* Two normal reports, 2499 missing nominal 2 ms reports, then normal again.
+	 * The previous-message stamp delays the 5 s sample gap until report 3. */
+	const uint32_t messages[] = {1000000, 1002000, 6002000, 6004000, 6006000};
+	const uint32_t samples[] = {998000, 1000000, 1002000, 6002000, 6004000};
+	for (unsigned i = 0; i < sizeof messages / sizeof messages[0]; i++) {
+		pkt_rift_radio_message m = touch_msg(messages[i], 0, 0, 0);
+		ohmd_cv1touch_controller out;
+		CHECK(touch_decode_sample(NULL, &decoder, &m, 10000000000ull + (uint64_t)messages[i] * 1000, &out));
+		cv1touch_sample_time t = touch_sample_time(&engine, &m);
+		CHECK(t.dt == (i == 2 ? 5000000 : 2000));
+		CHECK(t.device_ts == samples[i]);
+		/* Mirror rift_tracked_device_imu_update's clock state/arguments, not fusion. */
+		filter_ns = rift_device_time_next(filter_ns, filter_ts, t.device_ts);
+		filter_ts = t.device_ts;
+		CHECK(out.device_time_ns == t.device_ns && t.device_ns == filter_ns);
+		CHECK(out.device_time_ns == (uint64_t)samples[i] * 1000);
+	}
+}
+
 int main(void)
 {
+	decoded_report_gap_keeps_elapsed_time_and_sample_lag();
 	activity_follows_decoding_on_each_reader();
 	times_samples_like_the_engine();
 	an_empty_message_carries_only_the_buttons();
