@@ -432,7 +432,8 @@ static void note_device_gone(struct rift_sensor_uvc_stream *stream)
 		__atomic_store_n(stream->device_gone, 1, __ATOMIC_RELAXED);
 }
 
-/* Puts transfers parked after a failed submit back in flight, stopping at the first that fails again */
+/* Puts transfers parked after a failed completion or submit back in flight,
+ * stopping at the first that fails again. */
 static void resubmit_parked(struct rift_sensor_uvc_stream *stream)
 {
 	while (stream->n_parked > 0 && stream->video_running) {
@@ -460,6 +461,11 @@ static void iso_transfer_cb(struct libusb_transfer *transfer)
 			reject_frame(stream, UVC_DISCARD_TRANSFER);
 		if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
 			note_device_gone(stream);
+		else if (stream->video_running && transfer->status != LIBUSB_TRANSFER_CANCELLED) {
+			/* The completed operation is no longer active. Retain its transfer
+			 * for bounded maintenance retry, not an immediate callback loop. */
+			stream->parked[stream->n_parked++] = transfer;
+		}
 		if (transfer->status != LIBUSB_TRANSFER_CANCELLED)
 			LOGE("USB transfer error: %u", transfer->status);
 		stream->active_transfers--;

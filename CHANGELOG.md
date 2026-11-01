@@ -6,6 +6,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- Camera capture retries recoverable USB transfer errors and timeouts through bounded maintenance instead of permanently losing capture-queue slots.
 - Interrupted installer journal writes no longer block recovery and retries. Transaction journals are published atomically before any installed file is replaced.
 - Uninstall now refuses `--no-service` or `--no-steamvr` when the installation still owns that integration, preserving its files and cleanup metadata for a normal retry.
 

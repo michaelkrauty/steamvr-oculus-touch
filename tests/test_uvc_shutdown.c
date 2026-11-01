@@ -21,18 +21,25 @@ static bool alt_logging;
 static int submit_error = LIBUSB_ERROR_IO;
 static struct rift_sensor_uvc_stream stream;
 static struct libusb_transfer transfers[6];
+static struct libusb_transfer *tracked_transfers;
+static int successful_submits[6];
 /* A stream whose stop begins while a completion is resubmitting. */
 static struct rift_sensor_uvc_stream *stop_during_submit;
 
 int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *transfer)
 {
-	(void)transfer;
 	atomic_fetch_add(&submissions, 1);
 	if (stop_during_submit)
 		rift_sensor_uvc_stream_request_stop(stop_during_submit);
 	if (!submit_ok) {
 		errno = submit_errno;
 		return submit_error;
+	}
+	if (tracked_transfers) {
+		int i;
+		for (i = 0; i < 6 && transfer != &tracked_transfers[i]; i++) {}
+		CHECK(i < 6);
+		successful_submits[i]++;
 	}
 	return 0;
 }
@@ -259,6 +266,8 @@ static void device_gone_is_retained_only_for_no_device(void)
     t.status = LIBUSB_TRANSFER_ERROR;
     iso_transfer_cb(&t);
     CHECK(gone == 0 && s.active_transfers == 0);
+    /* Independent synthetic completions reuse t; discard its previous queue entry. */
+    s.n_parked = 0;
     s.active_transfers = 1;
     t.status = LIBUSB_TRANSFER_NO_DEVICE;
     iso_transfer_cb(&t);
@@ -340,9 +349,143 @@ static void expected_stop_failures_are_quiet(void)
 	submit_ok = true;
 }
 
-int main(void)
+/* A completed libusb transfer is no longer in flight. Recoverable completion
+ * errors must retain ownership in the maintenance queue, not just decrement
+ * active_transfers. Run each status separately so every fail-before is visible. */
+static void completion_error_recovery(enum libusb_transfer_status status)
+{
+	uint32_t gone = 0;
+	struct libusb_transfer t[6] = {0};
+	struct libusb_transfer *parked[6] = {0};
+	struct rift_sensor_uvc_stream s = {0};
+	s.video_running = true;
+	s.active_transfers = s.num_transfers = 6;
+	s.parked = parked;
+	s.device_gone = &gone;
+	submit_ok = true;
+	atomic_store(&submissions, 0);
+	tracked_transfers = t;
+	memset(successful_submits, 0, sizeof successful_submits);
+	bool retained = true;
+	for (int i = 0; i < 6; i++) {
+		t[i].user_data = &s;
+		t[i].status = status;
+		CHECK(pthread_mutex_lock(&waiters) == 0);
+		iso_transfer_cb(&t[i]);
+		CHECK(pthread_mutex_unlock(&waiters) == 0);
+		CHECK(s.active_transfers == 5 - i);
+		/* One ownership transition, no immediate resubmit or callback retry loop. */
+		retained = retained && s.n_parked == i + 1 && parked[i] == &t[i];
+		CHECK(atomic_load(&submissions) == 0);
+	}
+	printf("completion status=%d: running=%d active=%d parked=%d gone=%u submits=%d\n",
+		status, s.video_running, s.active_transfers, s.n_parked, gone,
+		atomic_load(&submissions));
+	/* Maintenance is intentionally invoked with zero in-flight transfers. */
+	rift_sensor_uvc_stream_retry(&s, 1);
+	rift_sensor_uvc_stream_retry(&s, 10000001);
+	printf("after maintenance: running=%d active=%d parked=%d gone=%u submits=%d\n",
+		s.video_running, s.active_transfers, s.n_parked, gone,
+		atomic_load(&submissions));
+	fflush(stdout);
+	CHECK(retained);
+	CHECK(s.video_running && !gone && s.active_transfers == 6 && !s.n_parked);
+	CHECK(atomic_load(&submissions) == 6);
+	for (int i = 0; i < 6; i++)
+		CHECK(successful_submits[i] == 1);
+
+	/* A persistent submit failure must remain bounded even if every completion
+	 * failed. No callback loop; one failed submit per maintenance interval. */
+	for (int i = 0; i < 6; i++) {
+		CHECK(pthread_mutex_lock(&waiters) == 0);
+		iso_transfer_cb(&t[i]);
+		CHECK(pthread_mutex_unlock(&waiters) == 0);
+	}
+	CHECK(s.active_transfers == 0 && s.n_parked == 6);
+	for (int i = 0; i < 6; i++)
+		CHECK(parked[i] == &t[i]);
+	submit_ok = false;
+	submit_error = LIBUSB_ERROR_IO;
+	for (int interval = 0; interval < 3; interval++) {
+		uint64_t now = 20000001 + interval * 10000000;
+		rift_sensor_uvc_stream_retry(&s, now);
+		CHECK(atomic_load(&submissions) == 7 + interval);
+		CHECK(s.n_parked == 6 && s.active_transfers == 0);
+		for (uint64_t offset = 1; offset < 10000000; offset += 1000000)
+			rift_sensor_uvc_stream_retry(&s, now + offset);
+		CHECK(atomic_load(&submissions) == 7 + interval);
+	}
+	submit_ok = true;
+	rift_sensor_uvc_stream_retry(&s, 50000001);
+	CHECK(s.active_transfers == 6 && s.n_parked == 0);
+	CHECK(atomic_load(&submissions) == 15);
+	for (int i = 0; i < 6; i++)
+		CHECK(successful_submits[i] == 2);
+
+	/* Successful retry followed by another error must park again, not spin.
+	 * Stop with all transfers parked: maintenance must not resurrect them. */
+	CHECK(pthread_mutex_lock(&waiters) == 0);
+	for (int i = 0; i < 6; i++)
+		iso_transfer_cb(&t[i]);
+	CHECK(pthread_mutex_unlock(&waiters) == 0);
+	CHECK(s.active_transfers == 0 && s.n_parked == 6);
+	rift_sensor_uvc_stream_retry(&s, 50000002);
+	CHECK(atomic_load(&submissions) == 15);
+	rift_sensor_uvc_stream_request_stop(&s);
+	CHECK(rift_sensor_uvc_stream_stop(&s) == 0);
+	rift_sensor_uvc_stream_retry(&s, 60000001);
+	CHECK(s.active_transfers == 0 && s.n_parked == 6);
+	CHECK(atomic_load(&submissions) == 15);
+	tracked_transfers = NULL;
+}
+
+static void terminal_completion_controls(void)
+{
+	for (int running = 0; running <= 1; running++) {
+		for (int status = LIBUSB_TRANSFER_COMPLETED; status <= LIBUSB_TRANSFER_OVERFLOW; status++) {
+			if (running && status != LIBUSB_TRANSFER_CANCELLED && status != LIBUSB_TRANSFER_NO_DEVICE)
+				continue;
+			uint32_t gone = 0;
+			struct libusb_transfer *parked[1] = {0};
+			struct rift_sensor_uvc_stream s = {0};
+			struct libusb_transfer t = {0};
+			s.video_running = running;
+			s.active_transfers = 1;
+			s.parked = parked;
+			s.device_gone = &gone;
+			t.user_data = &s;
+			t.status = status;
+			atomic_store(&submissions, 0);
+			CHECK(pthread_mutex_lock(&waiters) == 0);
+			iso_transfer_cb(&t);
+			CHECK(pthread_mutex_unlock(&waiters) == 0);
+			rift_sensor_uvc_stream_retry(&s, 1);
+			CHECK(!s.active_transfers && !s.n_parked && !atomic_load(&submissions));
+			CHECK(gone == (status == LIBUSB_TRANSFER_NO_DEVICE));
+		}
+	}
+	puts("terminal/stopped completion controls: ok");
+}
+
+int main(int argc, char **argv)
 {
 	alarm(5);
+	if (argc == 2) {
+		const char *names[] = {"completion-error", "completion-timeout", "completion-stall", "completion-overflow"};
+		const enum libusb_transfer_status statuses[] = {LIBUSB_TRANSFER_ERROR,
+			LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_OVERFLOW};
+		if (!strcmp(argv[1], "completion-controls")) {
+			terminal_completion_controls();
+			return 0;
+		}
+		for (int i = 0; i < 4; i++) {
+			if (!strcmp(argv[1], names[i])) {
+				completion_error_recovery(statuses[i]);
+				return 0;
+			}
+		}
+		CHECK(false);
+	}
 	struct libusb_transfer *parked[6];
 	stream.video_running = true;
 	stream.active_transfers = 6;

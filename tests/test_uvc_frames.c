@@ -676,6 +676,8 @@ static void same_fid_after_stall(void)
 static void gap_damage(void)
 {
     start();
+    struct libusb_transfer *parked[1] = {0};
+    stream.parked = parked;
     full(1, 1000);
     struct libusb_transfer *transfer = libusb_alloc_transfer(1);
     CHECK(transfer != NULL);
@@ -700,6 +702,10 @@ static void gap_damage(void)
     feed(0, 3000, 0, NULL, 0); /* A lone FID toggle in the gap */
     full(0, 4000);
     CHECK(callbacks == 4 && stream.n_discards == 0);
+    CHECK(stream.n_parked == 1 && parked[0] == transfer);
+    /* This synthetic transfer is freed here, rather than owned by setup/clear. */
+    stream.n_parked = 0;
+    stream.parked = NULL;
     libusb_free_transfer(transfer);
     finish();
 }
@@ -708,6 +714,8 @@ static void gap_damage(void)
 static void discard_summary(void)
 {
     start();
+    struct libusb_transfer *parked[1] = {0};
+    stream.parked = parked;
     stream.sensor_id = 3;
     capture_log();
     feed(1, 1000, 2, image, 100); /* incomplete */
@@ -727,6 +735,10 @@ static void discard_summary(void)
     transfer->user_data = &stream;
     transfer->status = LIBUSB_TRANSFER_ERROR;
     iso_transfer_cb(transfer);
+    CHECK(stream.n_parked == 1 && parked[0] == transfer);
+    /* This synthetic transfer is freed here, rather than owned by setup/clear. */
+    stream.n_parked = 0;
+    stream.parked = NULL;
     libusb_free_transfer(transfer);
     full(1, 8000);
     feed(1, 8000, 0, image, 1); /* taints the next image */
