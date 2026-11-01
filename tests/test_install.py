@@ -54,6 +54,126 @@ else:
 
 
 class InstallTests(unittest.TestCase):
+    def test_registration_publication_failure_retains_cleanup_and_retry(self):
+        args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True,
+                         no_service=True, no_steamvr=False)
+        registration = self.root / "registration"
+        driver = self.root / "independent-driver"
+        calls = []
+
+        def integration(command, **kwargs):
+            action = command[2]
+            calls.append(action)
+            if action == "install":
+                registration.write_text(str(driver))
+                driver.write_text("independent driver")
+            elif action == "uninstall":
+                registration.unlink()
+                driver.unlink()
+
+        original = INSTALLER.atomic_copy
+
+        def fail_publication(source, destination):
+            if destination == INSTALLER.manifest_path(self.prefix) and registration.exists():
+                raise OSError(errno.ENOSPC, "injected ownership publication failure")
+            return original(source, destination)
+
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(INSTALLER, "run", side_effect=integration), \
+                mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            with mock.patch.object(INSTALLER, "atomic_copy", side_effect=fail_publication):
+                with self.assertRaises(OSError) as raised:
+                    INSTALLER.install(args)
+            self.assertEqual(raised.exception.errno, errno.ENOSPC)
+            self.assertFalse(INSTALLER.read_manifest(self.prefix)["steamvr"])
+            self.assertFalse((self.prefix / ".cv1touch-transaction").exists())
+            INSTALLER.recover_transaction(self.prefix)
+            before = {p: p.read_bytes() for p in self.prefix.rglob("*") if p.is_file()}
+            for skip in (False, True):
+                args.no_steamvr = skip
+                with self.assertRaisesRegex(RuntimeError, "retry.*install"):
+                    INSTALLER.uninstall(args)
+                self.assertEqual(before, {p: p.read_bytes() for p in self.prefix.rglob("*") if p.is_file()})
+                self.assertTrue(registration.exists())
+                self.assertTrue(driver.exists())
+            args.no_steamvr = False
+            INSTALLER.install(args)
+            self.assertTrue(INSTALLER.read_manifest(self.prefix)["steamvr"])
+            self.assertNotIn("steamvr_pending", INSTALLER.read_manifest(self.prefix))
+            INSTALLER.uninstall(args)
+        self.assertEqual(calls, ["check", "install", "check", "install", "uninstall"])
+        self.assertFalse(registration.exists())
+        self.assertFalse(driver.exists())
+        self.assertFalse((self.prefix / "bin/cv1touch").exists())
+
+    def test_failed_registration_does_not_claim_or_remove_unrelated_integration(self):
+        # The CLI may fail before mutation, after partial registration, or while
+        # updating a standalone integration. None proves installer ownership.
+        for state in ("absent", "partial", "standalone"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                prefix = Path(temporary) / "prefix"
+                registration = Path(temporary) / "registration"
+                if state == "standalone":
+                    registration.write_text("standalone driver")
+                args = mock.Mock(prefix=prefix, artifacts=self.bundle, no_build=True,
+                                 no_service=True, no_steamvr=False)
+                calls = []
+
+                def integration(command, **kwargs):
+                    action = command[2]
+                    calls.append(action)
+                    if action == "install":
+                        if state == "partial":
+                            registration.write_text("partial driver")
+                        raise subprocess.CalledProcessError(1, command)
+
+                with mock.patch.dict(os.environ, self.env), \
+                        mock.patch.object(INSTALLER, "run", side_effect=integration), \
+                        mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        INSTALLER.install(args)
+                    record = INSTALLER.read_manifest(prefix)
+                    self.assertFalse(record["steamvr"])
+                    self.assertTrue(record["steamvr_pending"])
+                    # A file-only retry must not forget unresolved integration state.
+                    args.no_steamvr = True
+                    INSTALLER.install(args)
+                    self.assertTrue(INSTALLER.read_manifest(prefix)["steamvr_pending"])
+                    with self.assertRaisesRegex(RuntimeError, "retry.*install"):
+                        INSTALLER.uninstall(args)
+                self.assertEqual(calls, ["check", "install"])
+                self.assertTrue((prefix / "bin/cv1touch").exists())
+                self.assertEqual(registration.exists(), state != "absent")
+                if state == "standalone":
+                    self.assertEqual(registration.read_text(), "standalone driver")
+
+    def test_owned_registration_upgrade_failure_keeps_uninstall_available(self):
+        args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True,
+                         no_service=True, no_steamvr=False)
+        for failure in ("cli", "publication"):
+            with self.subTest(failure=failure), mock.patch.dict(os.environ, self.env), \
+                    mock.patch.object(INSTALLER, "run") as run, \
+                    mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)):
+                INSTALLER.install(args)
+                self.assertTrue(INSTALLER.read_manifest(self.prefix)["steamvr"])
+                if failure == "cli":
+                    def fail_install(command, **kwargs):
+                        if command[2] == "install":
+                            raise subprocess.CalledProcessError(1, command)
+                    run.side_effect = fail_install
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        INSTALLER.install(args)
+                    run.side_effect = None
+                else:
+                    with mock.patch.object(INSTALLER, "write_manifest", side_effect=OSError(errno.ENOSPC, "injected")):
+                        with self.assertRaises(OSError):
+                            INSTALLER.install(args)
+                record = INSTALLER.read_manifest(self.prefix)
+                self.assertTrue(record["steamvr"])
+                self.assertNotIn("steamvr_pending", record)
+                INSTALLER.uninstall(args)
+                self.assertEqual(run.call_args.args[0][1:], ["steamvr", "uninstall"])
+
     def test_installed_service_matches_the_checked_in_restart_policy(self):
         template = (INSTALLER.ROOT / "systemd/cv1touchd.service").read_text()
         binary = Path('/example path/cv1touchd')
