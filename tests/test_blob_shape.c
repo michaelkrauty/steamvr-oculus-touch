@@ -32,7 +32,7 @@ int main(void)
 	blobwatch_process(bw, frame, W, H, 0, NULL, 0, &ob);
 	CHECK(ob != NULL);
 	CHECK(ob->num_blobs == 2);
-	/* Identify by width: blobwatch records height one row larger than the pixel extent. */
+	/* Identify the two retained shapes by width. */
 	int round = 0, oblong = 0;
 	for (int i = 0; i < ob->num_blobs; i++) {
 		if (ob->blobs[i].width == 6)
