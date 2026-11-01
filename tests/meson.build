@@ -28,6 +28,10 @@ test_blob_shape = executable('test_blob_shape', 'test_blob_shape.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
   dependencies: [openhmd_dep])
 test('blob_shape', test_blob_shape)
+test_blob_brightness = executable('test_blob_brightness', 'test_blob_brightness.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
+  dependencies: [openhmd_dep])
+test('blob_brightness', test_blob_brightness)
 test_blob_skip = executable('test_blob_skip', 'test_blob_skip.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
   dependencies: [openhmd_dep])

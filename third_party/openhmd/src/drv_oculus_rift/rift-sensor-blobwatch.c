@@ -220,8 +220,8 @@ static void extent_to_blobs(blobwatch *bw, blobservation *ob, struct extent *e, 
 	if (e->max_pixel < BLOB_THRESHOLD_MIN)
 		return;
 
-	/* Don't store 1x1 blobs */
-	if (e->top == y && e->left == e->right)
+	/* Don't store 1x1 blobs, regardless of which row finalizes the extent. */
+	if (e->area == 1)
 		return;
 
 	/* Don't store blobs that are too big to be LEDs sensibly
@@ -305,7 +305,7 @@ static void process_scanline(uint8_t *frame, uint8_t *line, blobwatch *bw, int y
 	     x = skip_dark(line, x + 1, bw->width, bw->threshold)) {
 		int start, end;
 		bool is_new_extent = true;
-		uint8_t max_pixel = 0;
+		uint8_t max_pixel = line[x];
 
 		start = x++;
 
