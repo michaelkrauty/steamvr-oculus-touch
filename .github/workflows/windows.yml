@@ -94,6 +94,8 @@ jobs:
         run: meson test -C build-driver --print-errorlogs
       - name: Contract with the daemon
         run: cargo run --locked --no-default-features --example driver_contract -- build-driver\driver\test_daemon_contract.exe
+      - name: Native clock publication and pose contract
+        run: cargo run --locked --no-default-features --example native_clock_pose -- build-driver\driver\test_native_clock_pose.exe
   engine:
     # The native engine on the maintainer's persistent Windows runner, whose vcpkg binary cache
     # keeps OpenCV built between runs; Rust, LLVM, Python with meson and vcpkg are preinstalled.
