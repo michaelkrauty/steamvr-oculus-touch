@@ -747,6 +747,7 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state)
 {
+	ukf_measurement_clear(&state->m_position);
 	ukf_measurement_clear(&state->m2);
 	ukf_measurement_clear(&state->m1);
 	ukf_base_clear(&state->ukf);
