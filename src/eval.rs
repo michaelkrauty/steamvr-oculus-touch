@@ -216,6 +216,7 @@ pub fn offset_segments(
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ErrorStats {
+    /// Number of comparable poses; `errors` and `prediction` return NaN measurements when zero.
     pub n: usize,
     pub pos_median_mm: f64,
     pub pos_p90_mm: f64,
@@ -240,7 +241,7 @@ fn stats(pairs: impl Iterator<Item = (Isometry3<f64>, Isometry3<f64>)>) -> Error
         pe.push((a.translation.vector - b.translation.vector).norm() * 1e3);
         re.push(a.rotation.angle_to(&b.rotation).to_degrees());
     }
-    let rms = (pe.iter().map(|x| x * x).sum::<f64>() / pe.len().max(1) as f64).sqrt();
+    let rms = (pe.iter().map(|x| x * x).sum::<f64>() / pe.len() as f64).sqrt();
     ErrorStats {
         n: pe.len(),
         pos_median_mm: quantile(&mut pe, 0.5),
@@ -263,7 +264,8 @@ pub fn errors(published: &[Published], truth: &Truth, shift_ns: i64) -> ErrorSta
 }
 
 /// The lag (ms) that minimises the RMS position error of published(t) against truth(t - lag):
-/// 1 ms steps over `range_ms`, refined by a parabola through the best three. Returns (lag, rms mm).
+/// 1 ms steps over `range_ms`, refined through the best shift and its adjacent grid points.
+/// Returns (lag, rms mm), or (NaN, NaN) when no shift has comparable poses.
 pub fn lag_ms(published: &[Published], truth: &Truth, range_ms: (i64, i64)) -> (f64, f64) {
     let rms = |ms: i64| errors(published, truth, ms * 1_000_000).pos_rms_mm;
     let costs: Vec<(i64, f64)> = (range_ms.0..=range_ms.1)
@@ -273,7 +275,11 @@ pub fn lag_ms(published: &[Published], truth: &Truth, range_ms: (i64, i64)) -> (
     let Some(k) = (0..costs.len()).min_by(|&a, &b| costs[a].1.total_cmp(&costs[b].1)) else {
         return (f64::NAN, f64::NAN);
     };
-    if k == 0 || k + 1 == costs.len() {
+    if k == 0
+        || k + 1 == costs.len()
+        || costs[k - 1].0 != costs[k].0 - 1
+        || costs[k + 1].0 != costs[k].0 + 1
+    {
         return (costs[k].0 as f64, costs[k].1);
     }
     let (y0, y1, y2) = (costs[k - 1].1, costs[k].1, costs[k + 1].1);
@@ -644,6 +650,71 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_comparisons_have_no_rms_or_lag() {
+        let samples = truth(2.0);
+        let pubs = published(2.0, 0.0, 0.0, 0);
+        let no_segments = Truth {
+            samples: &samples,
+            world_from_lh: Isometry3::identity(),
+            segments: Vec::new(),
+        };
+        let late: Vec<_> = pubs
+            .iter()
+            .map(|p| Published {
+                t_ns: p.t_ns + ns(10.0),
+                ..*p
+            })
+            .collect();
+        for (p, tr) in [
+            (&[][..], identity_truth(&samples)),
+            (&pubs[..], identity_truth(&[])),
+            (&pubs[..], no_segments),
+            (&late[..], identity_truth(&samples)),
+        ] {
+            let e = errors(p, &tr, 0);
+            assert_eq!(e.n, 0);
+            assert!(e.pos_rms_mm.is_nan(), "{e:?}");
+            assert!(prediction(p, &tr, 20.0).pos_rms_mm.is_nan());
+            let (lag, rms) = lag_ms(p, &tr, (-50, 100));
+            assert!(lag.is_nan() && rms.is_nan(), "{lag}, {rms}");
+            assert_eq!(latency_advice(lag, Some(0.0)), None);
+        }
+    }
+
+    #[test]
+    fn lag_keeps_single_comparisons_but_does_not_refine_across_missing_shifts() {
+        let samples: Vec<_> = [(98, 0.002), (100, 0.001), (103, 0.003)]
+            .into_iter()
+            .map(|(ms, x)| TruthSample {
+                t_ns: ms * 1_000_000,
+                pose: Isometry3::translation(x, 0.0, 0.0),
+            })
+            .collect();
+        let tr = Truth {
+            samples: &samples,
+            world_from_lh: Isometry3::identity(),
+            segments: samples
+                .iter()
+                .map(|s| Segment {
+                    start_ns: s.t_ns,
+                    end_ns: s.t_ns,
+                    ref_from_touch: Isometry3::identity(),
+                })
+                .collect(),
+        };
+        let p = [Published {
+            t_ns: 100_000_000,
+            pose: Isometry3::identity(),
+            vel: Vector3::zeros(),
+            ang_vel_world: Vector3::zeros(),
+        }];
+        assert_eq!(errors(&p, &tr, 0).n, 1);
+        assert_eq!(lag_ms(&p, &tr, (-5, 5)), (0.0, 1.0));
+        // Even one overlapping shift is usable; empty shifts cannot win with zero RMS.
+        assert_eq!(lag_ms(&p, &tr, (1, 5)), (2.0, 2.0));
+    }
+
+    #[test]
     fn counts_hops_not_noise() {
         let t = truth(10.0);
         let p = published(10.0, 0.0, 0.0005, 100);
@@ -853,7 +924,10 @@ mod tests {
         );
         assert_eq!(latency_advice(0.4, Some(0.0)), None);
         assert_eq!(latency_advice(-0.4, None), None);
-        assert_eq!(latency_advice(f64::NAN, None), None);
+        for lag in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(latency_advice(lag, None), None);
+            assert_eq!(latency_advice(lag, Some(0.0)), None);
+        }
         assert_eq!(
             latency_advice(40.0, Some(0.0)).as_deref(),
             Some(

@@ -3439,6 +3439,13 @@ fn rig_pair(a: &RigDevice, b: &RigDevice) {
         segments: eval::offset_segments(&pubs, &truth, &id, 0, &params),
     };
     let (lag, _) = eval::lag_ms(&pubs, &tr0, (-50, 50));
+    if !lag.is_finite() {
+        println!(
+            "  {} vs {}: lag: unavailable (no comparable poses)",
+            b.name, a.name
+        );
+        return;
+    }
     let lag_ns = (lag * 1e6) as i64;
     let segs = eval::offset_segments(&pubs, &truth, &id, lag_ns, &params);
     let covered: u64 = segs.iter().map(|s| s.end_ns - s.start_ns).sum();
@@ -6176,15 +6183,21 @@ fn eval_report_with(
             segments: eval::offset_segments(pubs, &truth, x, 0, &params),
         };
         let (lag, _) = eval::lag_ms(&moving, &first, (-50, 150));
-        let segments = eval::offset_segments(pubs, &truth, x, (lag * 1e6) as i64, &params);
+        if !lag.is_finite() {
+            println!("== {label}");
+            println!("  lag: unavailable (no comparable moving poses)");
+            return lag;
+        }
+        let lag_ns = (lag * 1e6) as i64;
+        let segments = eval::offset_segments(pubs, &truth, x, lag_ns, &params);
         let tr = eval::Truth {
             samples: &truth,
             world_from_lh: x.inverse(),
             segments,
         };
         let e0 = eval::errors(&moving, &tr, 0);
-        let el = eval::errors(&moving, &tr, (lag * 1e6) as i64);
-        let (hops, n) = eval::hops(&moving, &tr, (lag * 1e6) as i64, 0.005);
+        let el = eval::errors(&moving, &tr, lag_ns);
+        let (hops, n) = eval::hops(&moving, &tr, lag_ns, 0.005);
         println!("== {label}");
         let t0 = pubs.first().map_or(0, |p| p.t_ns);
         let segs: Vec<String> = tr
@@ -6235,12 +6248,17 @@ fn eval_report_with(
         &installed,
         true,
     );
+    if !lag.is_finite() {
+        println!("(no best-fit registration: moving lag unavailable)");
+        return 0;
+    }
+    let lag_ns = (lag * 1e6) as i64;
     // best fit to this capture on its longest jig segment, the lag removed: tracking error alone
     let segs = eval::offset_segments(
         pubs,
         &truth,
         &installed,
-        (lag * 1e6) as i64,
+        lag_ns,
         &eval::SegmentParams::default(),
     );
     if let Some(longest) = segs.iter().max_by_key(|s| s.end_ns - s.start_ns) {
@@ -6249,7 +6267,7 @@ fn eval_report_with(
             .filter(|p| p.t_ns >= longest.start_ns && p.t_ns <= longest.end_ns)
             .filter_map(|p| {
                 Some((
-                    eval::interpolate(&truth, (p.t_ns as i64 - (lag * 1e6) as i64).max(0) as u64)?,
+                    eval::interpolate(&truth, (p.t_ns as i64 - lag_ns).max(0) as u64)?,
                     p.pose,
                 ))
             })

@@ -12,6 +12,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Native tracker teardown releases position-measurement storage instead of leaking it across repeated device lifecycles.
 - Recording sensor metadata rejects invalid boolean bytes before decoding, while preserving legacy padding compatibility.
 - Calibration recording loading rejects unknown controller hand IDs with a diagnostic instead of panicking or mixing their IMU samples into the left controller stream.
+- Accuracy and rig comparisons report unavailable lag when no reference poses can be compared, instead of zero RMS, fabricated latency or adjustment advice. Lag refinement no longer bridges missing comparison shifts.
 
 ## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
 
