@@ -1215,9 +1215,14 @@ pub fn decode_raw_frame(payload: &[u8]) -> Option<(FrameInfo, usize, usize, Vec<
 }
 
 pub fn decode_sensor_info(payload: &[u8]) -> Option<SensorInfo> {
-    (payload.len() == size_of::<SensorInfo>())
-        .then(|| read_pod(payload))
-        .flatten()
+    if payload.len() != size_of::<SensorInfo>()
+        || payload[std::mem::offset_of!(SensorInfo, have_camera_pose)] > 1
+    {
+        return None;
+    }
+    // Check the Rust bool before typed construction. usb_gone and historical
+    // padding remain arbitrary bytes, not additional boolean fields.
+    read_pod(payload)
 }
 
 pub fn decode_led_model(payload: &[u8]) -> Option<(i32, Vec<LedEntry>)> {
@@ -1229,6 +1234,66 @@ pub fn decode_led_model(payload: &[u8]) -> Option<(i32, Vec<LedEntry>)> {
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+
+    #[test]
+    fn sensor_info_boolean_validity_through_reader_and_calibration() {
+        assert_eq!(size_of::<SensorInfo>(), 120);
+        assert_eq!(std::mem::offset_of!(SensorInfo, have_camera_pose), 32);
+        assert_eq!(std::mem::offset_of!(SensorInfo, usb_gone), 33);
+        let path =
+            std::env::temp_dir().join(format!("cv1t-sensor-bool-{}.rec", std::process::id()));
+        let mut payload = vec![0u8; 120];
+        payload[..6].copy_from_slice(b"sensor");
+        let orient = std::mem::offset_of!(SensorInfo, camera_orient);
+        payload[orient + 12..orient + 16].copy_from_slice(&1f32.to_ne_bytes());
+        let frames = std::mem::offset_of!(SensorInfo, frames);
+        payload[frames..frames + 4].copy_from_slice(&17u32.to_ne_bytes());
+        for value in 0..=255u8 {
+            let legacy_values: Vec<u8> = if value <= 1 {
+                (0..=255).collect()
+            } else {
+                vec![255]
+            };
+            for legacy in legacy_values {
+                payload[32] = value;
+                payload[33..36].fill(legacy);
+                let mut bytes = MAGIC.to_vec();
+                bytes.extend_from_slice(&VERSION.to_le_bytes());
+                bytes.extend_from_slice(&32u32.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 16]);
+                bytes.extend_from_slice(&SENSOR_INFO.to_le_bytes());
+                bytes.extend_from_slice(&0u16.to_le_bytes());
+                bytes.extend_from_slice(&120u32.to_le_bytes());
+                bytes.extend_from_slice(&0u64.to_le_bytes());
+                bytes.extend_from_slice(&payload);
+                std::fs::write(&path, bytes).unwrap();
+                let mut reader = Reader::open(&path).unwrap();
+                let record = reader.next().unwrap();
+                assert!(reader.next().is_none());
+                assert!(reader.error().is_none());
+                assert_eq!(record.rtype, SENSOR_INFO);
+                assert_eq!(record.payload, payload);
+                let decoded = decode_sensor_info(&record.payload);
+                if value <= 1 {
+                    let sensor = decoded.unwrap();
+                    assert_eq!(sensor.have_camera_pose, value == 1);
+                    assert_eq!(sensor.usb_gone, legacy);
+                    assert_eq!(sensor.frames, 17);
+                } else {
+                    assert!(decoded.is_none(), "accepted bool byte {value}");
+                }
+                let poses = crate::calib::file::recording_sensor_poses(&path).unwrap();
+                assert_eq!(poses.len(), usize::from(value == 1));
+                if value == 1 {
+                    assert_eq!(poses[0].0, "sensor");
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+        for len in [0, 32, 119, 121] {
+            assert!(decode_sensor_info(&vec![0; len]).is_none());
+        }
+    }
 
     #[test]
     fn hotplug_legacy_sensor_padding_accepts_every_byte_without_a_rust_bool() {
