@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- Uninstall now refuses `--no-service` or `--no-steamvr` when the installation still owns that integration, preserving its files and cleanup metadata for a normal retry.
+
 ## [0.3.2](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.2) - 2026-10-30
 
 ### Fixed

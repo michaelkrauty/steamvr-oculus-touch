@@ -288,6 +288,13 @@ def uninstall(args):
     if not manifest.exists():
         raise RuntimeError(f"no managed installation at {prefix}")
     record = read_manifest(prefix)
+    skipped = []
+    if record.get("service") and args.no_service:
+        skipped.append("--no-service")
+    if record.get("steamvr") and args.no_steamvr:
+        skipped.append("--no-steamvr")
+    if skipped:
+        raise RuntimeError(f"managed integrations remain; installation unchanged; omit {' and '.join(skipped)} to uninstall")
     if record.get("steamvr") and not args.no_steamvr:
         run([prefix / "bin/cv1touch", "steamvr", "uninstall"])
         record["steamvr"] = False
