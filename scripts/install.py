@@ -267,6 +267,10 @@ def install(args):
             source.write_text(unit)
             replacements[unit_path] = source
         record = {"files": managed, "steamvr": previous.get("steamvr", False)}
+        # A failed/partial CLI attempt cannot establish ownership. Keep cleanup tools
+        # until a retry succeeds, including when publication after CLI success fails.
+        if previous.get("steamvr_pending") or (not args.no_steamvr and not record["steamvr"]):
+            record["steamvr_pending"] = True
         if not args.no_service:
             record.update(service=str(unit_path), service_sha256=hashlib.sha256(unit.encode()).hexdigest())
         elif previous.get("service"):
@@ -279,6 +283,7 @@ def install(args):
         if not args.no_steamvr:
             run([prefix / "bin/cv1touch", "steamvr", "install", *legacy_args])
             record["steamvr"] = True
+            record.pop("steamvr_pending", None)
             write_manifest(prefix, record)
     if not args.no_service:
         run(["systemctl", "--user", "daemon-reload"])
@@ -294,6 +299,9 @@ def uninstall(args):
     if not manifest.exists():
         raise RuntimeError(f"no managed installation at {prefix}")
     record = read_manifest(prefix)
+    if record.get("steamvr_pending"):
+        raise RuntimeError("SteamVR registration ownership is unresolved; installation unchanged; "
+                           "retry this installer without --no-steamvr before uninstalling")
     skipped = []
     if record.get("service") and args.no_service:
         skipped.append("--no-service")

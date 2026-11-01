@@ -8,6 +8,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - Upgrades retain ownership of files omitted from newer bundles, allowing later rollback and removal while preserving locally modified files.
 - Partial uninstall now updates its ownership manifest atomically, preserving a valid record and allowing retries if publishing the retained-file list fails.
+- The Linux installer retains its cleanup tools and ownership record when a SteamVR registration attempt fails or its successful result cannot be saved. Uninstall refuses unresolved ownership and asks for an installer retry instead of silently leaving a registered driver behind or removing a standalone integration.
 
 ## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
 
