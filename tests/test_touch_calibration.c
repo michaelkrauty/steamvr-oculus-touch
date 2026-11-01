@@ -227,11 +227,52 @@ static int transaction_response(unsigned char *data)
 	data_fetches++;
 	return FEATURE_BUFFER_SIZE;
 }
+/* Haptics-only protocol model: one live command, pending/clear/timeout status,
+ * and an unread result retained for the production drain. No device is opened. */
+static struct {
+	uint64_t sent, ready, ack, delay;
+	int hand, amplitude, low_freq, error;
+} pulses[128];
+static int pulse_model, pulse_count, pulse_active;
+static int pulse_send(const unsigned char *data, size_t length)
+{
+	if (data[0] == RIFT_CMD_RADIO_READ_DATA) {
+		CHECK(length == 31);
+		memcpy(staged_data, data, length);
+	} else {
+		CHECK(data[0] == RIFT_CMD_RADIO_CONTROL && length >= 6);
+		CHECK(data[3] == 2 && data[4] == 3);
+		CHECK(pulse_active == -1 && pulse_count < 128);
+		pulse_active = pulse_count++;
+		pulses[pulse_active].sent = fake_time;
+		pulses[pulse_active].ready = fake_time + pulses[pulse_active].delay;
+		pulses[pulse_active].hand = data[5];
+		pulses[pulse_active].amplitude = staged_data[7];
+		pulses[pulse_active].low_freq = staged_data[3] != 0;
+	}
+	return (int)length;
+}
+static int pulse_response(unsigned char *data, size_t length)
+{
+	if (data[0] == RIFT_CMD_RADIO_READ_DATA) return (int)length;
+	CHECK(data[0] == RIFT_CMD_RADIO_CONTROL && pulse_active >= 0);
+	if (fake_time < pulses[pulse_active].ready) data[3] = 0x80;
+	else if (pulses[pulse_active].error == -EIO) {
+		pulses[pulse_active].error = 0;
+		return 1; /* a short status does not consume completion */
+	} else {
+		if (pulses[pulse_active].error == -ETIMEDOUT) data[3] = 8;
+		pulses[pulse_active].ack = fake_time;
+		pulse_active = -1;
+	}
+	return (int)length;
+}
 int hid_send_feature_report(hid_device *handle, const unsigned char *data, size_t length)
 {
 	CHECK(handle != NULL && data != NULL);
 	fake_time += hid_delay_ns;
 	hid_sends++;
+	if (pulse_model) return pulse_send(data, length);
 	if (independent_radio) {
 		if (data[0] == RIFT_CMD_RADIO_READ_DATA) memcpy(staged_data, data, length);
 		else { CHECK(data[0] == RIFT_CMD_RADIO_CONTROL); queue_transaction(data); }
@@ -264,6 +305,7 @@ int hid_get_feature_report(hid_device *handle, unsigned char *data, size_t lengt
 	if (get_error && data[0] == RIFT_CMD_RADIO_READ_DATA) return -1;
 	/* Each fixture controls the controller identity independently of its JSON. */
 	memset(data + 1, 0, length - 1);
+	if (pulse_model) return pulse_response(data, length);
 	/* A status read that fails does not consume the command's completion. */
 	if (data[0] == RIFT_CMD_RADIO_CONTROL && fail_status_reads > 0) { fail_status_reads--; return 1; }
 	if (independent_radio) return transaction_response(data);
@@ -475,6 +517,7 @@ static void retry_fixture(rift_hmd_t *hmd, ohmd_context *ctx)
 	diagnostics[0] = 0;
 	fail_node_after = -1;
 	CHECK(live_nodes == 0);
+	pulse_model = 0;
 	independent_radio = transaction_count = 0;
 	fail_status_reads = set_config_error = hash_timeouts = status_reads = 0;
 	transaction_data = -1;
@@ -777,6 +820,176 @@ static void engine_frame(rift_hmd_t *hmd, uint64_t time)
 	hmd->sensor_config.keep_alive_interval = 60000;
 	update_hmd(hmd);
 }
+static void pulse_fixture(rift_hmd_t *hmd, ohmd_context *ctx)
+{
+	retry_fixture(hmd, ctx);
+	hmd->radio.device_in_progress = -1;
+	for (int hand = 0; hand < 2; hand++) {
+		hmd->touch_dev[hand].base.hmd = hmd;
+		hmd->touch_dev[hand].have_calibration = true;
+	}
+	pulse_model = 1;
+	pulse_count = 0;
+	pulse_active = -1;
+	memset(pulses, 0, sizeof pulses);
+}
+static void pulse_request(rift_hmd_t *hmd, int hand, float duration, float frequency, float amplitude)
+{
+	CHECK(set_touch_haptics((ohmd_device *)&hmd->touch_dev[hand], amplitude > 0,
+	                       duration, frequency, amplitude) == 0);
+}
+static void pulse_frame(rift_hmd_t *hmd, unsigned ms)
+{
+	engine_frame(hmd, (uint64_t)ms * 1000000);
+}
+
+/* Real setter -> update_hmd -> radio, not a copy of the haptics state machine.
+ * These synthetic delays test software timer ownership, not physical vibration. */
+static void a_replacement_waits_for_its_own_confirmation(int hand, unsigned latency, int variant)
+{
+	ohmd_context ctx = {0}; rift_hmd_t hmd;
+	pulse_fixture(&hmd, &ctx);
+	rift_haptic_state *hs = &hmd.touch_dev[hand].haptic_state;
+	pulses[0].delay = 4000000;
+	pulses[1].delay = latency * 1000000;
+	pulse_request(&hmd, hand, .1f, 160, .2f); pulse_frame(&hmd, 1000);
+	pulse_request(&hmd, hand, .01f, 320, variant == 1 ? .2f : .8f);
+	pulse_frame(&hmd, 1002);
+	CHECK(pulse_count == 1 && hs->end_time == UINT64_MAX);
+	if (variant == 2) pulse_request(&hmd, hand, .01f, 320, .6f);
+	pulse_frame(&hmd, 1004);
+	CHECK(pulse_count == 2 && pulses[0].ack == 1004000000);
+	CHECK(pulses[1].amplitude == (variant == 2 ? 153 : variant == 1 ? 51 : 204));
+	CHECK(!pulses[1].low_freq && pulses[1].hand == hmd.touch_dev[hand].device_num);
+	for (unsigned t = 1004; t <= 1040; t += 2) {
+		pulse_frame(&hmd, t);
+		if (!pulses[1].ack) {
+			CHECK(hs->haptics_on && hs->in_progress && hs->end_time == UINT64_MAX);
+			CHECK(pulse_count == 2);
+		} else {
+			CHECK(hs->end_time == pulses[1].ack + 10000000);
+			if ((uint64_t)t * 1000000 <= hs->end_time) CHECK(pulse_count == 2);
+		}
+	}
+	CHECK(pulse_count == 3 && pulses[2].amplitude == 0);
+	CHECK(pulses[2].sent > pulses[1].ack + 10000000);
+	clear_retry_fixture(&hmd);
+}
+static void haptic_confirmation_controls(int hand)
+{
+	ohmd_context ctx = {0}; rift_hmd_t hmd;
+	/* No replacement; matching renewal pending and confirmed; A-B-A coalescing. */
+	for (int mode = 0; mode < 4; mode++) {
+		pulse_fixture(&hmd, &ctx);
+		pulses[0].delay = 20000000;
+		pulse_request(&hmd, hand, .01f, 160, .2f); pulse_frame(&hmd, 1000);
+		if (mode == 1) pulse_request(&hmd, hand, .02f, 160, .2f);
+		if (mode == 3) {
+			pulse_request(&hmd, hand, .01f, 320, .8f); pulse_frame(&hmd, 1002);
+			pulse_request(&hmd, hand, .02f, 160, .2f);
+		}
+		for (unsigned t = 1004; t <= 1020; t += 2) pulse_frame(&hmd, t);
+		uint64_t end = mode == 1 || mode == 3 ? 1040000000 : 1030000000;
+		CHECK(pulse_count == 1 && hmd.touch_dev[hand].haptic_state.end_time == end);
+		if (mode == 2) {
+			pulse_request(&hmd, hand, .02f, 160, .2f); pulse_frame(&hmd, 1022);
+			end = 1042000000;
+			CHECK(pulse_count == 1 && hmd.touch_dev[hand].haptic_state.end_time == end);
+		}
+		pulse_frame(&hmd, end / 1000000); CHECK(pulse_count == 1);
+		pulse_frame(&hmd, end / 1000000 + 2);
+		CHECK(pulse_count == 2 && pulses[1].amplitude == 0);
+		clear_retry_fixture(&hmd);
+	}
+	/* Stop during on, then a new on during off: neither old ack starts that on. */
+	pulse_fixture(&hmd, &ctx);
+	pulses[0].delay = pulses[1].delay = pulses[2].delay = 4000000;
+	pulse_request(&hmd, hand, .1f, 160, .2f); pulse_frame(&hmd, 1000);
+	pulse_request(&hmd, hand, 0, 0, 0); pulse_frame(&hmd, 1002); pulse_frame(&hmd, 1004);
+	CHECK(pulse_count == 2 && pulses[1].amplitude == 0);
+	CHECK(!hmd.touch_dev[hand].haptic_state.haptics_on);
+	pulse_request(&hmd, hand, .01f, 320, .8f); pulse_frame(&hmd, 1006); pulse_frame(&hmd, 1008);
+	CHECK(pulse_count == 3 && hmd.touch_dev[hand].haptic_state.end_time == UINT64_MAX);
+	pulse_frame(&hmd, 1012);
+	CHECK(hmd.touch_dev[hand].haptic_state.end_time == 1022000000);
+	clear_retry_fixture(&hmd);
+	/* Another replacement while the replacement itself is pending. */
+	pulse_fixture(&hmd, &ctx);
+	pulses[0].delay = 4000000; pulses[1].delay = 12000000; pulses[2].delay = 20000000;
+	pulse_request(&hmd, hand, .1f, 160, .2f); pulse_frame(&hmd, 1000);
+	pulse_request(&hmd, hand, .01f, 320, .8f); pulse_frame(&hmd, 1004);
+	pulse_request(&hmd, hand, .01f, 160, .6f); pulse_frame(&hmd, 1006); pulse_frame(&hmd, 1016);
+	CHECK(pulse_count == 3 && hmd.touch_dev[hand].haptic_state.end_time == UINT64_MAX);
+	pulse_frame(&hmd, 1028); CHECK(hmd.touch_dev[hand].haptic_state.haptics_on);
+	pulse_frame(&hmd, 1036); CHECK(hmd.touch_dev[hand].haptic_state.end_time == 1046000000);
+	pulse_frame(&hmd, 1048); CHECK(pulse_count == 4 && pulses[3].amplitude == 0);
+	clear_retry_fixture(&hmd);
+	/* Old or replacement timeout, or old unread status: no premature success;
+	 * preserve retry delay and drain before the replacement/retry is sent. */
+	for (int mode = 0; mode < 3; mode++) {
+		pulse_fixture(&hmd, &ctx);
+		pulses[0].delay = pulses[1].delay = pulses[2].delay = 4000000;
+		pulses[mode == 2 ? 1 : 0].error = mode == 1 ? -EIO : -ETIMEDOUT;
+		pulse_request(&hmd, hand, .1f, 160, .2f); pulse_frame(&hmd, 1000);
+		pulse_request(&hmd, hand, .01f, 320, .8f); pulse_frame(&hmd, 1004);
+		if (mode == 2) pulse_frame(&hmd, 1008);
+		CHECK(hmd.touch_dev[hand].haptic_state.end_time == UINT64_MAX);
+		unsigned retry = mode == 2 ? 1018 : 1014;
+		pulse_frame(&hmd, retry - 2); CHECK(pulse_count == (mode == 2 ? 2 : 1));
+		pulse_frame(&hmd, retry);
+		CHECK(pulse_count == (mode == 2 ? 3 : 2) && !hmd.radio.discard_reply);
+		pulse_frame(&hmd, retry + 4);
+		CHECK(hmd.touch_dev[hand].haptic_state.end_time == (uint64_t)(retry + 14) * 1000000);
+		clear_retry_fixture(&hmd);
+	}
+}
+static void haptics_confirm_only_the_wanted_state(void)
+{
+	for (int hand = 0; hand < 2; hand++) {
+		for (unsigned latency = 0; latency <= 20; latency += 2)
+			a_replacement_waits_for_its_own_confirmation(hand, latency, 0);
+		a_replacement_waits_for_its_own_confirmation(hand, 12, 1);
+		a_replacement_waits_for_its_own_confirmation(hand, 12, 2);
+		haptic_confirmation_controls(hand);
+	}
+	/* Keep the existing on/off failure caps and 10 ms retry spacing. */
+	for (int off = 0; off < 2; off++) {
+		ohmd_context ctx = {0}; rift_hmd_t hmd;
+		pulse_fixture(&hmd, &ctx);
+		rift_haptic_state *hs = &hmd.touch_dev[0].haptic_state;
+		pulse_request(&hmd, 0, .1f, 160, .2f);
+		if (off) {
+			pulse_frame(&hmd, 1000);
+			pulse_request(&hmd, 0, 0, 0, 0);
+		}
+		int first = pulse_count, cap = off ? 50 : 20;
+		for (int i = first; i < first + cap; i++) pulses[i].error = -ETIMEDOUT;
+		for (int i = 0; i < cap; i++) {
+			pulse_frame(&hmd, 1002 + i * 10);
+			CHECK(pulse_count == first + i + 1 && hs->failures == (off && i == cap - 1 ? 0 : i + 1));
+			if (i + 1 < cap) {
+				pulse_frame(&hmd, 1010 + i * 10);
+				CHECK(pulse_count == first + i + 1);
+			}
+		}
+		CHECK(!hs->haptics_on);
+		pulse_frame(&hmd, 2000);
+		CHECK(pulse_count == first + cap && hs->sent_amplitude == 0);
+		clear_retry_fixture(&hmd);
+	}
+	/* Both hands share the same radio, but not the same confirmation timer. */
+	ohmd_context ctx = {0}; rift_hmd_t hmd;
+	pulse_fixture(&hmd, &ctx);
+	pulses[0].delay = 4000000; pulses[1].delay = 20000000;
+	pulse_request(&hmd, 0, .1f, 160, .2f); pulse_request(&hmd, 1, .01f, 320, .8f);
+	pulse_frame(&hmd, 1000); pulse_frame(&hmd, 1002); CHECK(pulse_count == 1);
+	pulse_frame(&hmd, 1004); CHECK(pulse_count == 2 && pulses[0].hand != pulses[1].hand);
+	CHECK(hmd.touch_dev[1].haptic_state.end_time == UINT64_MAX);
+	pulse_frame(&hmd, 1024); CHECK(hmd.touch_dev[1].haptic_state.end_time == 1034000000);
+	clear_retry_fixture(&hmd);
+	pulse_model = 0;
+}
+
 static void pending_reads_finish_or_expire_without_reports(int expire)
 {
 	ohmd_context ctx = {0};
@@ -1510,7 +1723,7 @@ int main(int argc, char **argv)
 		failure_diagnostics_name_the_hand_source_field_and_next_step();
 		a_failed_cache_save_keeps_the_calibration();
 	}
-	CHECK(argc == 1 || strcmp(argv[1], "leds") == 0 || strcmp(argv[1], "parser") == 0 ||
+	CHECK(argc == 1 || strcmp(argv[1], "haptics") == 0 || strcmp(argv[1], "leds") == 0 || strcmp(argv[1], "parser") == 0 ||
 	      strcmp(argv[1], "cache") == 0 || strcmp(argv[1], "radio") == 0 ||
 	      strcmp(argv[1], "fallback") == 0 || strcmp(argv[1], "retry") == 0 ||
 	      strcmp(argv[1], "slow") == 0 || strcmp(argv[1], "naps") == 0 ||
@@ -1531,6 +1744,7 @@ int main(int argc, char **argv)
 	      strcmp(argv[1], "diagnostics") == 0 ||
 	      strcmp(argv[1], "drain") == 0 || strcmp(argv[1], "drain_slow") == 0 || strcmp(argv[1], "drain_notice") == 0 ||
 	      strcmp(argv[1], "wake") == 0 || strcmp(argv[1], "wake_reason") == 0);
+	if (argc == 1 || strcmp(argv[1], "haptics") == 0) haptics_confirm_only_the_wanted_state();
 	puts("test_touch_calibration: ok");
 	return 0;
 }
