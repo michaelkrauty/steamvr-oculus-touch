@@ -168,10 +168,13 @@ def replace_transaction(prefix, sources):
                 os.fsync(saved.fileno())
             old = digest(destination)
         entries.append({"destination": str(destination), "backup": backup, "old_sha256": old, "new_sha256": digest(source)})
-    with (transaction / "journal.json").open("w") as journal:
+    # Recovery must never see a partially written journal as a recovery marker.
+    staged_journal = transaction / "journal.json.tmp"
+    with staged_journal.open("w") as journal:
         json.dump(entries, journal)
         journal.flush()
         os.fsync(journal.fileno())
+    os.replace(staged_journal, transaction / "journal.json")
     sync_directory(transaction)
     sync_directory(prefix)
     try:

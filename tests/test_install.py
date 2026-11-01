@@ -1,5 +1,7 @@
 """Exercise the real installer with isolated files and no desktop/device effects."""
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import importlib.util
 import json
@@ -238,6 +240,89 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(manifest.read_bytes(), before)
         self.assertEqual(self.invoke().returncode, 0)
 
+    def test_journal_prepublication_failures_leave_destinations_unchanged_and_allow_retry(self):
+        original_open = Path.open
+        original_replace = os.replace
+        for stage in ("write", "flush", "fsync", "rename"):
+            with self.subTest(stage=stage):
+                self.prefix = self.root / stage
+                result = self.invoke()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                before = {path: path.read_bytes() for path in self.prefix.rglob("*") if path.is_file()}
+                upgraded = f"upgraded-{stage}".encode()
+                (self.bundle / "cv1touch").write_bytes(upgraded)
+                transaction = self.prefix / ".cv1touch-transaction"
+                journal = transaction / "journal.json"
+                args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=True)
+                injected = []
+
+                def fail(*args, **kwargs):
+                    injected.append(stage)
+                    raise OSError(errno.ENOSPC, f"injected journal {stage} failure")
+
+                @contextmanager
+                def journal_open(path, *args, **kwargs):
+                    with original_open(path, *args, **kwargs) as stream:
+                        if stage == "write":
+                            write = stream.write
+
+                            def partial_write(text):
+                                write(text[:1])
+                                stream.flush()
+                                fail()
+
+                            with mock.patch.object(stream, "write", side_effect=partial_write):
+                                yield stream
+                        elif stage == "flush":
+                            with mock.patch.object(stream, "flush", side_effect=fail):
+                                yield stream
+                        elif stage == "fsync":
+                            with mock.patch.object(INSTALLER.os, "fsync", side_effect=fail):
+                                yield stream
+                        else:
+                            yield stream
+
+                def intercepted_open(path, *args, **kwargs):
+                    # Match the journal writer whether it uses the final or a staging name.
+                    if path.parent == transaction and args == ("w",):
+                        return journal_open(path, *args, **kwargs)
+                    return original_open(path, *args, **kwargs)
+
+                def interrupted_publish(source, destination):
+                    if Path(destination) == journal:
+                        injected.append(stage)
+                        raise KeyboardInterrupt()
+                    return original_replace(source, destination)
+
+                with mock.patch.dict(os.environ, self.env), mock.patch.object(Path, "open", intercepted_open):
+                    with mock.patch.object(INSTALLER.os, "replace", side_effect=interrupted_publish):
+                        with mock.patch.object(INSTALLER, "atomic_copy") as replacement:
+                            with self.assertRaises(KeyboardInterrupt if stage == "rename" else OSError) as failure:
+                                INSTALLER.install(args)
+                            if stage != "rename":
+                                self.assertEqual(failure.exception.errno, errno.ENOSPC)
+                            replacement.assert_not_called()
+                self.assertEqual(injected, [stage])
+                self.assertFalse(journal.exists())
+                if stage == "write":
+                    self.assertTrue(any(path.read_bytes() == b"[" for path in transaction.iterdir()))
+                for path, contents in before.items():
+                    self.assertEqual(path.read_bytes(), contents, str(path))
+                result = self.invoke()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(transaction.exists())
+                self.assertEqual((self.prefix / "bin/cv1touch").read_bytes(), upgraded)
+
+    def test_malformed_published_journal_is_retained(self):
+        transaction = self.prefix / ".cv1touch-transaction"
+        transaction.mkdir(parents=True, mode=0o700)
+        journal = transaction / "journal.json"
+        journal.write_bytes(b"[")
+        for _ in range(2):
+            with self.assertRaises(json.JSONDecodeError):
+                INSTALLER.recover_transaction(self.prefix)
+            self.assertEqual(journal.read_bytes(), b"[")
+
     def test_partial_remove_records_successful_unregister_before_removing_cli(self):
         self.assertEqual(self.invoke().returncode, 0)
         manifest = self.prefix / "lib/cv1touch/install-manifest.json"
@@ -256,6 +341,7 @@ class InstallTests(unittest.TestCase):
 
     def test_interrupted_upgrade_is_recovered_before_retry(self):
         self.assertEqual(self.invoke().returncode, 0)
+        before = {path: path.read_bytes() for path in self.prefix.rglob("*") if path.is_file()}
         (self.bundle / "cv1touch").write_bytes(b"upgraded-cli")
         (self.bundle / "cv1touchd").write_bytes(b"upgraded-daemon")
         args = mock.Mock(prefix=self.prefix, artifacts=self.bundle, no_build=True, no_service=True, no_steamvr=True)
@@ -269,7 +355,17 @@ class InstallTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER, "atomic_copy", side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 INSTALLER.install(args)
-        self.assertTrue((self.prefix / ".cv1touch-transaction/journal.json").exists())
+        journal = self.prefix / ".cv1touch-transaction/journal.json"
+        entries = json.loads(journal.read_text())
+        self.assertEqual({entry["destination"] for entry in entries}, {str(path) for path in before if path.name != ".cv1touch-install.lock"})
+        self.assertEqual((self.prefix / "bin/cv1touch").read_bytes(), b"upgraded-cli")
+        INSTALLER.recover_transaction(self.prefix)
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents, str(path))
+        # Repeat the interruption to also exercise recovery in a fresh installer.
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER, "atomic_copy", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                INSTALLER.install(args)
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.prefix / ".cv1touch-transaction").exists())
