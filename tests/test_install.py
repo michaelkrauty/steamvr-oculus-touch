@@ -1,9 +1,10 @@
 """Exercise the real installer with isolated files and no desktop/device effects."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -297,6 +298,51 @@ class InstallTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(path.read_text(), "locally changed")
         self.assertTrue((self.prefix / "lib/cv1touch/install-manifest.json").exists())
+
+    def test_partial_uninstall_manifest_publication_failure_allows_retry(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        manifest = INSTALLER.manifest_path(self.prefix)
+        record = json.loads(manifest.read_text())
+        record["extra"] = {"preserve": "unrelated metadata"}
+        manifest.write_text(json.dumps(record))
+        before = manifest.read_bytes()
+        modified = self.prefix / "bin/cv1touchd"
+        modified.write_text("locally changed")
+        original_replace = os.replace
+        injected = []
+
+        def fail_publication(source, destination):
+            if Path(destination) == manifest:
+                injected.append(True)
+                raise OSError(errno.ENOSPC, "synthetic manifest publication failure")
+            return original_replace(source, destination)
+
+        argv = [str(SCRIPT), "--prefix", str(self.prefix), "--uninstall",
+                "--no-service", "--no-steamvr"]
+        errors = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), redirect_stderr(errors), \
+                mock.patch.object(INSTALLER.os, "replace", side_effect=fail_publication), \
+                mock.patch.object(INSTALLER.subprocess, "run", side_effect=AssertionError("external command")):
+            self.assertEqual(INSTALLER.main(), 1)
+        self.assertTrue(injected, "partial uninstall must publish its manifest atomically")
+        self.assertIn("synthetic manifest publication failure", errors.getvalue())
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(modified.read_text(), "locally changed")
+        for relative in record["files"]:
+            if relative != "bin/cv1touchd":
+                self.assertFalse((self.prefix / relative).exists(), relative)
+        self.assertEqual(list(manifest.parent.glob(".cv1touch-*")), [])
+
+        retry = self.invoke("--uninstall")
+        self.assertEqual(retry.returncode, 1)
+        self.assertIn("modified files remain; installation manifest retained", retry.stderr)
+        expected = dict(record, files={"bin/cv1touchd": record["files"]["bin/cv1touchd"]})
+        self.assertEqual(json.loads(manifest.read_text()), expected)
+        self.assertEqual(modified.read_text(), "locally changed")
+        modified.unlink()
+        final = self.invoke("--uninstall")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertFalse(manifest.exists())
 
     def test_path_traversal_in_manifest_cannot_remove_external_file(self):
         self.assertEqual(self.invoke().returncode, 0)

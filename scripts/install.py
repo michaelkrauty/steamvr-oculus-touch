@@ -326,7 +326,7 @@ def uninstall(args):
             path.unlink(missing_ok=True)
     if kept:
         record["files"] = kept
-        manifest.write_text(json.dumps(record, indent=2) + "\n")
+        write_manifest(prefix, record)
         raise RuntimeError("modified files remain; installation manifest retained")
     manifest.unlink()
     print("Uninstalled managed files. Calibration, recordings, and SteamVR settings are retained.")
