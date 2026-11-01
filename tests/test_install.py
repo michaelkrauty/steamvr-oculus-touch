@@ -17,6 +17,39 @@ INSTALLER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INSTALLER)
 
 
+FAKE_INTEGRATION = r'''
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+root = Path(os.environ["FAKE_ROOT"])
+name, args = Path(sys.argv[0]).name, sys.argv[1:]
+with (root / "calls").open("a") as log:
+    log.write(json.dumps([name, *args]) + "\n")
+if name == "pgrep":
+    sys.exit(1)
+if name == "systemctl":
+    if "enable" in args:
+        (root / "enabled").write_text("enabled")
+    if "disable" in args:
+        (root / "enabled").unlink()
+    sys.exit(0)
+assert name == "cv1touch" and args[0] == "steamvr", sys.argv
+driver = root / "registered-driver"
+if args[1] == "install":
+    driver.mkdir()
+    (driver / "driver_cv1touch.so").write_bytes(b"independent driver copy")
+    (driver / ".cv1touch-owned.json").write_text("fake independent ownership record")
+    (root / "registration").write_text(str(driver))
+elif args[1] == "uninstall":
+    shutil.rmtree(driver)
+    (root / "registration").unlink()
+else:
+    assert args[1] == "check", sys.argv
+'''
+
+
 class InstallTests(unittest.TestCase):
     def test_installed_service_matches_the_checked_in_restart_policy(self):
         template = (INSTALLER.ROOT / "systemd/cv1touchd.service").read_text()
@@ -38,11 +71,83 @@ class InstallTests(unittest.TestCase):
         self.prefix = self.root / "prefix with spaces"
         self.env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"))
 
-    def invoke(self, *args, service=False):
-        command = [sys.executable, str(SCRIPT), "--prefix", str(self.prefix), "--artifacts", str(self.bundle), "--no-steamvr"]
+    def invoke(self, *args, service=False, steamvr=False):
+        command = [sys.executable, str(SCRIPT), "--prefix", str(self.prefix), "--artifacts", str(self.bundle)]
+        if not steamvr:
+            command.append("--no-steamvr")
         if not service:
             command.append("--no-service")
         return subprocess.run(command + list(args), env=self.env, capture_output=True, text=True)
+
+    def fake_integrations(self):
+        fakebin = self.root / "fakebin"
+        fakebin.mkdir()
+        for path in (self.bundle / "cv1touch", fakebin / "pgrep", fakebin / "systemctl"):
+            path.write_text(f"#!{sys.executable}\n" + FAKE_INTEGRATION)
+            path.chmod(0o755)
+        self.env.update(FAKE_ROOT=str(self.root), PATH=str(fakebin))
+
+    def assert_skip_refused(self, *flags):
+        self.fake_integrations()
+        installed = self.invoke(service=True, steamvr=True)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        manifest = self.prefix / "lib/cv1touch/install-manifest.json"
+        record = json.loads(manifest.read_text())
+        unit = Path(record["service"])
+        self.assertIn(str(self.prefix / "bin/cv1touchd"), unit.read_text())
+        self.assertTrue(record["steamvr"])
+        self.assertTrue((self.root / "enabled").exists())
+        self.assertTrue((self.root / "registration").exists())
+
+        def snapshot():
+            return {str(path.relative_to(self.root)): (path.read_bytes(), path.stat().st_mode)
+                    for path in self.root.rglob("*") if path.is_file()}
+
+        before = snapshot()
+        result = self.invoke("--uninstall", *flags, service=True, steamvr=True)
+        after = snapshot()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for flag in flags:
+            self.assertIn(flag, result.stderr)
+        self.assertIn("unchanged", result.stderr)
+        self.assertIn("omit", result.stderr)
+        # Includes payload, manifest bytes, unit, enablement, registration,
+        # independent fake driver ownership, and the integration command log.
+        self.assertEqual(after, before)
+
+        retry = self.invoke("--uninstall", service=True, steamvr=True)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(manifest.exists())
+        for relative in record["files"]:
+            self.assertFalse((self.prefix / relative).exists(), relative)
+        for path in (unit, self.root / "enabled", self.root / "registration", self.root / "registered-driver"):
+            self.assertFalse(path.exists(), str(path))
+
+    def test_uninstall_refuses_skipping_recorded_service(self):
+        self.assert_skip_refused("--no-service")
+
+    def test_uninstall_refuses_skipping_recorded_steamvr(self):
+        self.assert_skip_refused("--no-steamvr")
+
+    def test_uninstall_refuses_skipping_both_recorded_integrations(self):
+        self.assert_skip_refused("--no-service", "--no-steamvr")
+
+    def test_uninstall_allows_skip_flags_without_recorded_integrations(self):
+        self.fake_integrations()
+        for flags in (("--no-service",), ("--no-steamvr",), ("--no-service", "--no-steamvr")):
+            with self.subTest(flags=flags):
+                installed = self.invoke()
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                manifest = self.prefix / "lib/cv1touch/install-manifest.json"
+                record = json.loads(manifest.read_text())
+                self.assertFalse(record.get("service"))
+                self.assertFalse(record.get("steamvr"))
+                result = self.invoke("--uninstall", *flags, service=True, steamvr=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(manifest.exists())
+                for relative in record["files"]:
+                    self.assertFalse((self.prefix / relative).exists(), relative)
+                self.assertFalse((self.root / "calls").exists())
 
     def test_install_upgrade_and_remove_preserves_user_data(self):
         data = self.root / "config/cv1touch/calibration.json"
