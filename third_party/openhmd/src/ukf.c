@@ -216,7 +216,7 @@ ukf_base_update(ukf_base *u, ukf_measurement *m)
   }
 
   /* update P_prior = P_prior - K Py K^T */
-  if (matrix2d_multiplyXYXt(u->P_tmp, m->K, m->Pz) != MATRIX_RESULT_OK)
+  if (matrix2d_multiplyXYXt_workspace(u->P_tmp, m->K, m->Pz, m->KPz_tmp) != MATRIX_RESULT_OK)
     return false;
   if (matrix2d_subtract(u->P_prior, u->P, u->P_tmp) != MATRIX_RESULT_OK)
     return false;
@@ -258,6 +258,7 @@ void ukf_measurement_init(ukf_measurement *m, int N_measurement, int N_cov, cons
   m->Pxz = matrix2d_alloc(u->N_cov, N_cov);
   m->Pz_tmp1 = matrix2d_alloc(N_cov, N_cov);
   m->Pz_tmp2 = matrix2d_alloc(N_cov, N_cov);
+  m->KPz_tmp = matrix2d_alloc(u->N_cov, N_cov);
 }
 
 void ukf_measurement_clear(ukf_measurement *m)
@@ -274,6 +275,7 @@ void ukf_measurement_clear(ukf_measurement *m)
 
   matrix2d_free(m->Pz_tmp1);
   matrix2d_free(m->Pz_tmp2);
+  matrix2d_free(m->KPz_tmp);
   matrix2d_free(m->Z_est);
   matrix2d_free(m->sigmas);
 

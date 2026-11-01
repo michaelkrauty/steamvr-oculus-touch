@@ -62,6 +62,11 @@ matrix_result matrix2d_multiply (matrix2d *dest, const matrix2d *src1, const mat
 
 matrix_result matrix2d_multiplyXYXt (matrix2d *dest, const matrix2d *X, const matrix2d *Y);
 
+/* Allocation-free variant. tmp has X's shape and must not overlap dest, X or Y.
+ * As above, dest must not overlap X. All matrices may have column strides. */
+matrix_result matrix2d_multiplyXYXt_workspace(matrix2d *dest, const matrix2d *X,
+    const matrix2d *Y, matrix2d *tmp);
+
 matrix_result matrix2d_cholesky (matrix2d *dest, const matrix2d *src);
 matrix_result matrix2d_cholesky_in_place (matrix2d *mat);
 

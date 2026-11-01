@@ -191,10 +191,8 @@ static cv1touch_sample_time report(struct fixture *f, uint32_t delta_us, float g
 	unsigned before = allocations;
 	rift_tracked_device_imu_update(&f->dev->base, out.received_host_ns,
 		t.device_ts, t.dt * 1e-6f, &gyro, &accel, &mag);
-	/* The existing UKF measurement has one temporary matrix allocation. A reset
-	 * must add none; changing that pre-existing hot-path allocation is out of scope. */
-	CHECK(allocations <= before + 1);
-	if (!prediction_failures && !update_failures) CHECK(allocations == before + 1);
+	/* Prediction, correction and any continuity reset use owned workspace. */
+	CHECK(allocations == before);
 	CHECK(f->dev->device_time_ns == t.device_ns && f->dev->last_device_ts == t.device_ts);
 	CHECK(f->dev->ukf_fusion.current_ts == t.device_ns);
 	return t;
