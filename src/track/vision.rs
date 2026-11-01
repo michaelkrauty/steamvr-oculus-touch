@@ -433,6 +433,20 @@ pub(super) fn pixel_residuals(
     out
 }
 
+// Keep the filtered pair order, including nonfinite norms, without evaluating unused Jacobians.
+fn final_residual_norms(
+    cam: &Camera,
+    body: &Body,
+    blobs: &[Blob],
+    pairs: &[(usize, usize)],
+    x: &Nominal,
+) -> Vec<f64> {
+    pixel_residuals(cam, body, blobs, pairs, x)
+        .iter()
+        .map(|r| r.norm())
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitParams {
     pub update: UpdateParams,
@@ -650,7 +664,11 @@ pub fn fit_frame(
         return Err(Miss::TooFew);
     }
     let first = prior
-        .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
+        .update_with_final_residuals(
+            |x| residuals(cam, body, blobs, &pairs, x),
+            |x| final_residual_norms(cam, body, blobs, &pairs, x),
+            &p.update,
+        )
         .ok_or(Miss::Rejected)?;
     let again = merge_pairs(
         associate(cam, body, &first.filter, blobs, sigma, &p.assoc),
@@ -675,7 +693,11 @@ pub fn fit_pairs(
         return Err(Miss::TooFew);
     }
     let mut updated = prior
-        .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
+        .update_with_final_residuals(
+            |x| residuals(cam, body, blobs, &pairs, x),
+            |x| final_residual_norms(cam, body, blobs, &pairs, x),
+            &p.update,
+        )
         .ok_or(Miss::Rejected)?;
     // per pair (a pair that no longer projects counts as an outlier, keeping pairs and residuals aligned)
     let pair_residual = |projector: &Projector<'_>, &(led, b): &(usize, usize)| {
@@ -693,7 +715,11 @@ pub fn fit_pairs(
     }
     if pairs.len() < original_len {
         updated = prior
-            .update(|x| residuals(cam, body, blobs, &pairs, x), &p.update)
+            .update_with_final_residuals(
+                |x| residuals(cam, body, blobs, &pairs, x),
+                |x| final_residual_norms(cam, body, blobs, &pairs, x),
+                &p.update,
+            )
             .ok_or(Miss::Rejected)?;
         let projector = Projector::new(cam, body, &updated.filter.x);
         if pairs
@@ -819,6 +845,7 @@ pub fn ring_aliases(leds: &[Led]) -> Vec<Alias> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod final_residuals;
     mod followup;
     pub(crate) mod hot_paths;
     mod shift;

@@ -35,6 +35,10 @@ impl CameraModel {
     /// Pixel position of a point in camera coordinates (cv::fisheye::projectPoints). None at or
     /// behind the camera plane.
     pub fn project(&self, p: &Vector3<f64>) -> Option<Vector2<f64>> {
+        #[cfg(test)]
+        if option_env!("CV1TOUCH_NO_PROJECTION_COUNT").is_none() {
+            projection_count::PROJECTIONS.with(|n| n.set(n.get() + 1));
+        }
         if p.z <= 1e-6 {
             return None;
         }
@@ -72,6 +76,14 @@ impl CameraModel {
             d.y += step.y;
         }
         Some(d.normalize())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod projection_count {
+    // Count in ordinary tests; compile-time opt-out for the uninstrumented fit benchmark.
+    std::thread_local! {
+        pub static PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 }
 

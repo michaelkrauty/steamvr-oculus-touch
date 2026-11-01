@@ -207,6 +207,25 @@ impl Filter {
     where
         F: Fn(&Nominal) -> Vec<PixelResidual>,
     {
+        self.update_with_final_residuals(
+            &measure,
+            |x| measure(x).iter().map(|o| o.r.norm()).collect(),
+            p,
+        )
+    }
+
+    /// Same update, with a cheaper post-fit norm evaluation when Jacobians are unnecessary.
+    /// Called only after a successful solve; an empty final vector still returns Some(Updated).
+    pub(super) fn update_with_final_residuals<F, G>(
+        &self,
+        measure: F,
+        final_residuals: G,
+        p: &UpdateParams,
+    ) -> Option<Updated>
+    where
+        F: Fn(&Nominal) -> Vec<PixelResidual>,
+        G: Fn(&Nominal) -> Vec<f64>,
+    {
         let info0 = self.cov.cholesky()?.inverse();
         let var = p.sigma_px * p.sigma_px;
         let mut e = ErrVec::zeros();
@@ -244,7 +263,7 @@ impl Filter {
                 break;
             }
         }
-        let residuals_px = measure(&x).iter().map(|o| o.r.norm()).collect();
+        let residuals_px = final_residuals(&x);
         Some(Updated {
             filter: Filter {
                 x,
