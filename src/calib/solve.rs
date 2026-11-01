@@ -184,6 +184,16 @@ pub fn solve_samples(
             ));
         }
     }
+    ensure_connected(
+        &Problem {
+            cameras,
+            leds,
+            samples: &active,
+            reference: initial.reference,
+        },
+        &state,
+        serials,
+    )?;
     let mut gravity = motion::estimate(&active, &state.ref_from_obj, imu, &o.motion)?;
     let points: Vec<Vector3<f64>> = active
         .iter()
@@ -218,6 +228,70 @@ pub fn solve_samples(
             - active.iter().map(|s| s.views.len()).sum::<usize>(),
         iterations,
     })
+}
+
+/// Connectivity is about the final fit, not the engine poses used for initialization. A single
+/// surviving shared sample joins cameras, including indirectly; no new minimum link count applies.
+fn ensure_connected(p: &Problem, state: &State, serials: &[String]) -> Result<(), String> {
+    let mut neighbors = vec![Vec::new(); serials.len()];
+    for (i, sample) in p.samples.iter().enumerate() {
+        let (Some(pose), Some(model)) = (state.ref_from_obj[i], p.leds.get(&sample.device_id))
+        else {
+            continue;
+        };
+        let mut first: Option<usize> = None;
+        for view in &sample.views {
+            // Like the fit, ignore missing models/poses, unknown LEDs and unprojectable points.
+            let supported = view.obs.iter().any(|ob| {
+                model.get(ob.led).is_some_and(|led| {
+                    let point = pose * nalgebra::Point3::from(led.pos);
+                    p.cameras[view.camera]
+                        .project(
+                            &state.ref_from_cam[view.camera]
+                                .inverse_transform_point(&point)
+                                .coords,
+                        )
+                        .is_some()
+                })
+            });
+            if !supported {
+                continue;
+            }
+            if let Some(a) = first {
+                neighbors[a].push(view.camera);
+                neighbors[view.camera].push(a);
+            } else {
+                first = Some(view.camera);
+            }
+        }
+    }
+    let mut reached = vec![false; serials.len()];
+    let mut pending = vec![p.reference];
+    reached[p.reference] = true;
+    while let Some(c) = pending.pop() {
+        for &other in &neighbors[c] {
+            if !reached[other] {
+                reached[other] = true;
+                pending.push(other);
+            }
+        }
+    }
+    let missing: Vec<_> = serials
+        .iter()
+        .zip(reached)
+        .filter(|(_, reached)| !reached)
+        .map(|(serial, _)| serial.as_str())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sensor(s) {} disconnected after reprojection rejection from reference sensor {}: \
+             wave the controllers where those sensors' views overlap another sensor's",
+            missing.join(", "),
+            serials[p.reference]
+        ))
+    }
 }
 
 fn median_view_rms(p: &Problem, s: &State) -> f64 {
@@ -1085,3 +1159,7 @@ mod tests {
         assert_matches_truth(&tr, &sol, 2.5, 0.02, 2e-3);
     }
 }
+
+#[cfg(test)]
+#[path = "solve_connectivity.rs"]
+mod connectivity_tests;
