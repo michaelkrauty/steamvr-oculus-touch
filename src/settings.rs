@@ -7,12 +7,16 @@
 //! (`cv1touch tilt`). The daemon saves them on every change and reads them when it starts;
 //! without a usable file it goes on with the defaults.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 pub const FORMAT: &str = "cv1touch-settings";
+
+/// Raw settings input resource policy, not a bound implied by the JSON schema. Normal saved
+/// settings are a few hundred bytes; 1 MiB leaves generous room for future fields.
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -81,16 +85,31 @@ pub fn default_path() -> PathBuf {
 }
 
 /// The settings at `path`: the defaults when there is no file, and an error when it is
-/// unreadable, malformed, of another format or out of range (the caller goes on with the
-/// defaults).
+/// unreadable, not a regular file, over the 1 MiB resource limit, malformed, of another format
+/// or out of range (the caller goes on with the defaults). Symlinks to regular files are allowed.
 pub fn load(path: &Path) -> Result<Settings, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    // On Unix, O_NONBLOCK lets a FIFO reach the type check without waiting for a writer.
+    // This does not make regular-file or Windows I/O nonblocking.
+    let file = match crate::platform::fs::open_read_nonblocking(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let s: Settings =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: settings must be a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(size_error(path));
+    }
+    let bytes = read_bounded(file, path)?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let s: Settings = serde_json::from_str(text).map_err(|e| format!("{}: {e}", path.display()))?;
     if s.format != FORMAT {
         return Err(format!("{}: not a {FORMAT} file", path.display()));
     }
@@ -110,6 +129,25 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         ));
     }
     Ok(s)
+}
+
+fn size_error(path: &Path) -> String {
+    format!(
+        "{}: settings exceeds {MAX_FILE_BYTES} byte limit",
+        path.display()
+    )
+}
+
+fn read_bounded(file: std::fs::File, path: &Path) -> Result<Vec<u8>, String> {
+    // Metadata alone is insufficient: another writer may grow the opened file after the check.
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(size_error(path));
+    }
+    Ok(bytes)
 }
 
 /// Writes `s` to `path` through a temporary file, synced before and after the rename, so that
@@ -146,6 +184,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cv1t-settings-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("settings.json")
+    }
+
+    #[test]
+    fn bounded_read_rejects_growth_after_metadata_check() {
+        let path = temp("growth");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let file = crate::platform::fs::open_read_nonblocking(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert!(metadata.is_file());
+        assert!(metadata.len() <= MAX_FILE_BYTES);
+        // Deterministically reproduce growth between the loader's metadata check and read.
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.set_len(MAX_FILE_BYTES + 1).unwrap();
+        drop(writer);
+        let error = read_bounded(file, &path).unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
