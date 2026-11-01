@@ -14,11 +14,29 @@
 #include "ukf.h"
 
 static atomic_uint allocations;
+static size_t live_matrices;
 static void *counted_malloc(size_t n) { allocations++; return malloc(n); }
 static void *counted_calloc(size_t n, size_t size) { allocations++; return calloc(n, size); }
 static void *counted_realloc(void *p, size_t n) { allocations++; return realloc(p, n); }
-#define malloc counted_malloc
+static void *matrix_malloc(size_t n)
+{
+	void *p = counted_malloc(n);
+	CHECK(p);
+	live_matrices++;
+	return p;
+}
+static void matrix_free(void *p)
+{
+	if (p) {
+		CHECK(live_matrices > 0);
+		live_matrices--;
+	}
+	free(p);
+}
+#define malloc matrix_malloc
+#define free matrix_free
 #include "matrices.c"
+#undef free
 #undef malloc
 #include "omath.c"
 #include "exponential-filter.c"
@@ -128,8 +146,6 @@ static struct fixture *create_fixture(int slots, uint32_t first_message)
 
 static void destroy_fixture(struct fixture *f)
 {
-	/* Existing clear omits this measurement; fixing that is outside this change. */
-	ukf_measurement_clear(&f->dev->ukf_fusion.m_position);
 	rift_kalman_6dof_clear(&f->dev->ukf_fusion);
 	ohmd_destroy_mutex(f->dev->device_lock);
 	ohmd_destroy_mutex(f->ctx.tracker_lock);
@@ -286,7 +302,6 @@ static void reset_matches_fresh(struct fixture *f)
 		equal_matrix(u->ukf.x_prior, fresh.ukf.x_prior);
 		equal_matrix(u->ukf.P_prior, fresh.ukf.P_prior);
 	}
-	ukf_measurement_clear(&fresh.m_position);
 	rift_kalman_6dof_clear(&fresh);
 }
 
@@ -381,7 +396,6 @@ static void short_gaps_and_early_epoch(void)
 			CHECK(e.devices[0].had_pose_lock);
 			rift_tracked_device_frame_release(&d->base, &e);
 		}
-		ukf_measurement_clear(&control.m_position);
 		rift_kalman_6dof_clear(&control);
 		destroy_fixture(f);
 	}
@@ -515,8 +529,53 @@ static void posterior_regression(int slots)
 	destroy_fixture(f);
 }
 
+/* These resources are never created by the hardware-free lifecycle fixture. */
+void rift_sensor_request_stop(rift_sensor_ctx *s) { (void)s; abort(); }
+void rift_sensor_free(rift_sensor_ctx *s) { (void)s; abort(); }
+void led_search_model_free(led_search_model_t *s) { (void)s; abort(); }
+void ohmd_destroy_thread(ohmd_thread *t) { (void)t; abort(); }
+
+/* Exercise the production owner, including unused slots and construction cleanup.
+ * Sensor presence selects delay slots only; no sensor resources are created. */
+static int ownership_regression(void)
+{
+	rift_tracker_free(NULL);
+	rift_tracker_free(calloc(1, sizeof(rift_tracker_ctx)));
+	rift_tracker_ctx *partial = calloc(1, sizeof *partial);
+	partial->devices[0].ukf_fusion.m_position.z = matrix2d_alloc(3, 1);
+	rift_tracker_free(partial);
+	size_t retained = live_matrices;
+	printf("partial tracker retained_matrices=%zu\n", live_matrices);
+	for (int slots = 0; slots <= 3; slots += 3) {
+		for (int cycle = 0; cycle < 4; cycle++) {
+			rift_tracker_ctx *ctx = calloc(1, sizeof *ctx);
+			ctx->tracker_lock = ohmd_create_mutex(NULL);
+			ctx->n_sensors = slots ? 1 : 0;
+			ctx->sensors = slots ? calloc(1, sizeof *ctx->sensors) : NULL;
+			posef pose = {.orient = {.w = 1}};
+			rift_leds leds = {0};
+			rift_tracked_device_imu_calibration cal = {0};
+			/* Alternate one and two registrations, leaving unused slots. */
+			for (int i = 0; i < 1 + cycle % 2; i++) {
+				ctx->devices[i].device_lock = ohmd_create_mutex(NULL);
+				rift_tracked_device_priv *dev = (void *)rift_tracker_add_device(ctx,
+					i, &pose, &pose, &leds, &cal);
+				CHECK(dev->n_delay_slots == slots);
+			}
+			ctx->n_sensors = 0; /* No actual sensor ownership to drain. */
+			rift_tracker_free(ctx);
+			printf("ownership slots=%d cycle=%d retained_matrices=%zu\n",
+				slots, cycle + 1, live_matrices);
+			retained |= live_matrices;
+		}
+	}
+	return retained ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "ownership") == 0)
+		return ownership_regression();
 	if (argc == 2 && strcmp(argv[1], "continuity") == 0) {
 		short_gaps_and_early_epoch();
 		stale_camera_cannot_touch_reused_slots();
@@ -535,6 +594,7 @@ int main(int argc, char **argv)
 		}
 	}
 	CHECK(predictions && updates && !prediction_failures && !update_failures);
+	CHECK(live_matrices == 0);
 	puts("test_native_clock_gap: ok");
 	return 0;
 }
