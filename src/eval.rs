@@ -296,19 +296,22 @@ pub fn hops(
     shift_ns: i64,
     threshold_m: f64,
 ) -> (usize, usize) {
-    let errs: Vec<Vector3<f64>> = published
-        .iter()
-        .filter_map(|p| {
-            Some(p.pose.translation.vector - truth.at(p.t_ns as i64 - shift_ns)?.translation.vector)
-        })
-        .collect();
-    let n = errs.len().saturating_sub(1);
-    (
-        errs.windows(2)
-            .filter(|w| (w[1] - w[0]).norm() > threshold_m)
-            .count(),
-        n,
-    )
+    let mut previous: Option<Vector3<f64>> = None;
+    let (mut count, mut comparisons) = (0, 0);
+    for p in published {
+        let error = truth
+            .at(p.t_ns as i64 - shift_ns)
+            .map(|t| p.pose.translation.vector - t.translation.vector);
+        if let (Some(a), Some(b)) = (previous, error) {
+            comparisons += 1;
+            if (b - a).norm() > threshold_m {
+                count += 1;
+            }
+        }
+        // Missing truth breaks adjacency, rather than joining the errors on either side.
+        previous = error;
+    }
+    (count, comparisons)
 }
 
 /// What SteamVR's prediction gets: each published pose carried `horizon_ms` ahead by its
