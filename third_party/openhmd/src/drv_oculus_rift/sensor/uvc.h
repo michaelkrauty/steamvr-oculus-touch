@@ -83,7 +83,7 @@ struct rift_sensor_uvc_stream {
 	int num_transfers;
 	struct libusb_transfer **transfer;
 	int active_transfers;
-	/* Failed submissions, retried by the engine even if every transfer is parked */
+	/* Failed completions/submissions, retried by the engine even if all are parked */
 	struct libusb_transfer **parked;
 	int n_parked;
 	uint64_t retry_after_ns; /* engine thread only */

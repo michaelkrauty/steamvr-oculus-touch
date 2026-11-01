@@ -92,6 +92,10 @@ test_uvc_shutdown = executable('test_uvc_shutdown', 'test_uvc_shutdown.c',
   dependencies: [threads_dep, dependency('libusb-1.0')],
   link_args: ['-Wl,--gc-sections'])
 test('uvc_shutdown', test_uvc_shutdown, timeout: 10)
+foreach scenario : ['completion-error', 'completion-timeout', 'completion-stall',
+                    'completion-overflow', 'completion-controls']
+  test('uvc_' + scenario.underscorify(), test_uvc_shutdown, args: [scenario], timeout: 10)
+endforeach
 test_uvc_frames = executable('test_uvc_frames', 'test_uvc_frames.c',
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
