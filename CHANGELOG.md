@@ -13,6 +13,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Recording sensor metadata rejects invalid boolean bytes before decoding, while preserving legacy padding compatibility.
 - Calibration recording loading rejects unknown controller hand IDs with a diagnostic instead of panicking or mixing their IMU samples into the left controller stream.
 - Accuracy and rig comparisons report unavailable lag when no reference poses can be compared, instead of zero RMS, fabricated latency or adjustment advice. Lag refinement no longer bridges missing comparison shifts.
+- Moving accuracy reports count error hops only between consecutive published poses with available reference truth, avoiding false hops across tracking gaps.
 
 ## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
 
