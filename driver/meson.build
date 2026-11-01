@@ -30,6 +30,10 @@ foreach t : ['test_pose', 'test_inputs', 'test_haptics', 'test_shm_client', 'tes
     dependencies: [openvr_dep, threads_dep],
     cpp_args: ['-DCV1T_DRIVER_TEST']))
 endforeach
+test('test_touch_deactivate', executable('test_touch_deactivate',
+  'tests/test_touch_deactivate.cpp', 'src/touch_device.cpp', driver_common,
+  include_directories: driver_inc,
+  dependencies: [openvr_dep, threads_dep]))
 # Run by examples/driver_contract.rs against the daemon's own shared-memory and control code.
 contract_test = executable('test_daemon_contract', 'tests/test_daemon_contract.cpp', driver_common,
   include_directories: driver_inc,

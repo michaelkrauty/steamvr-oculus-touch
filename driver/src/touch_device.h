@@ -3,6 +3,7 @@
 
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -20,7 +21,7 @@ public:
 	const char *serial() const { return hand_ == CV1T_HAND_LEFT ? "CV1T-LEFT" : "CV1T-RIGHT"; }
 
 	vr::EVRInitError Activate(uint32_t object_id) override;
-	void Deactivate() override { object_id_ = vr::k_unTrackedDeviceIndexInvalid; }
+	void Deactivate() override;
 	void EnterStandby() override {}
 	void *GetComponent(const char *) override { return nullptr; }
 	void DebugRequest(const char *, char *buf, uint32_t size) override
@@ -35,6 +36,17 @@ public:
 	vr::VRInputComponentHandle_t haptic_component() const { return haptic_; }
 
 private:
+	friend struct TouchDeviceTestAccess;
+	// A pose-worker pass owns admission, not a mutex, across runtime calls. The provider
+	// remains the sole update caller; this does not serialize multiple update workers.
+	struct Submission {
+		explicit Submission(TouchDevice &device);
+		~Submission();
+		Submission(const Submission &) = delete;
+		Submission &operator=(const Submission &) = delete;
+		TouchDevice &device;
+		uint32_t id;
+	};
 	struct Handles {
 		vr::VRInputComponentHandle_t a_click, a_touch, b_click, b_touch, system_click, joy_click, joy_touch, joy_x, joy_y, trigger,
 			trigger_touch, grip, grip_touch, thumbrest_touch;
@@ -43,7 +55,10 @@ private:
 	void record_age(uint64_t age_ns, uint64_t handoff_ns, uint64_t now_ns);
 
 	int hand_;
-	std::atomic<uint32_t> object_id_{vr::k_unTrackedDeviceIndexInvalid};
+	std::mutex submission_mu_;
+	std::condition_variable submission_cv_;
+	uint32_t object_id_ = vr::k_unTrackedDeviceIndexInvalid;
+	unsigned submissions_ = 0;
 	vr::PropertyContainerHandle_t container_ = 0;
 	Handles h_{};
 	std::atomic<vr::VRInputComponentHandle_t> haptic_{vr::k_ulInvalidInputComponentHandle};

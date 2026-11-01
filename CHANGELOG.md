@@ -10,6 +10,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- SteamVR device deactivation closes submission admission and waits for in-flight pose, input, property, and logging calls to finish before returning.
 - Settings loading rejects non-regular files and files larger than 1 MiB before falling back to defaults. Unix FIFO paths no longer wait for a writer; symlinks to regular files remain supported.
 - Registration loading rejects zero or nonfinite station quaternions before they can produce an invalid alignment, while preserving finite scaled rotations and legacy files.
 - Late frames and reports cannot cross recording stop/start boundaries, and each session retains its own `--frames` setting.
