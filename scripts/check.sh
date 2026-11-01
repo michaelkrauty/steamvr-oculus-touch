@@ -11,6 +11,7 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 -m unittest discover -s tests -p test_eval_no_data.py
 messages=$(mktemp)
 socket_tests=
 trap 'rm -f -- "$messages"; rm -rf -- "${socket_tests:-}"' EXIT
