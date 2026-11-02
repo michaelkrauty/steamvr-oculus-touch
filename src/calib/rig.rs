@@ -237,6 +237,20 @@ pub fn solve(
     prior: Option<&Prior>,
 ) -> State {
     let n = s.params(p);
+    // A validation subset can omit a globally admitted Touch entirely. Its six
+    // columns are then identically zero, with no prior to constrain them. Pin
+    // only those increments, preserving the full parameter/Jacobian layout and
+    // the existing treatment of all other (possibly rank-deficient) directions.
+    let mut seen = vec![false; s.ref_from_touch.len()];
+    for o in obs {
+        seen[o.touch] = true;
+    }
+    let inactive: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(t, &seen)| (!seen).then_some(t))
+        .collect();
+    let touch_start = n - 6 * s.ref_from_touch.len();
     let mut cur = s.clone();
     let mut lambda = 1e-3;
     let cost = |st: &State| -> f64 {
@@ -307,6 +321,11 @@ pub fn solve(
                 }
             }
         }
+        for &t in &inactive {
+            for j in touch_start + 6 * t..touch_start + 6 * (t + 1) {
+                h[(j, j)] = 1.0;
+            }
+        }
         let mut improved = false;
         for _ in 0..8 {
             let mut hl = h.clone();
@@ -317,7 +336,10 @@ pub fn solve(
                 lambda *= 10.0;
                 continue;
             };
-            let next = cur.moved(p, step.as_slice());
+            let mut next = cur.moved(p, step.as_slice());
+            for &t in &inactive {
+                next.ref_from_touch[t] = s.ref_from_touch[t];
+            }
             let c1 = cost(&next);
             if c1 < c0 {
                 cur = next;
@@ -592,3 +614,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod inactive_tests;
