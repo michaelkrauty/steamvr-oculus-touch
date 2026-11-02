@@ -190,6 +190,18 @@ test_inspection_tracking = executable('test_inspection_tracking',
   dependencies: [openhmd_proj.get_variable('dep_opencv')], link_args: ['-lm'])
 test('inspection_tracking', test_inspection_tracking)
 
+# Real projection + complete cold-search allocation/equivalence regression. The
+# optional glibc heap-entry layer overlaps the portable Mat and C++ new layers.
+projection_args = ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'),
+  '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections']
+test_projection_search = executable('test_projection_search',
+  ['test_projection_search.c', 'test_projection_opencv.cpp', 'support/projection_alloc.cpp'],
+  c_args: projection_args + ['-Wno-sign-compare'],
+  cpp_args: projection_args,
+  dependencies: [openhmd_proj.get_variable('dep_opencv'), threads_dep],
+  link_args: ['-Wl,--gc-sections', '-lm'])
+test('projection_search', test_projection_search, timeout: 120)
+
 # An inspection's timeout cancels an active correspondence search; restoration is acknowledged
 # only after the search exits and the fast worker installs the pose.
 test_search_cancel = executable('test_search_cancel', 'test_search_cancel.c',

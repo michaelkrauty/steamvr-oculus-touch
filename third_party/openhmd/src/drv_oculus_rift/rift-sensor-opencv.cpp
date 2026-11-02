@@ -161,10 +161,56 @@ extern "C" bool estimate_initial_pose(struct blob *blobs, int num_blobs,
 	return true;
 }
 
+#if CV_VERSION_MAJOR == 5
+static void
+project_points_bounded(rift_led *leds, int count,
+    rift_sensor_camera_params *calib, posef *pose, vec3f *out)
+{
+	/* Per-call, naturally aligned storage; no shared scratch or vec3f aliasing. */
+	double translation[3], rotation[3], matrix[9];
+	cv::Point3f objects[64];
+	cv::Point2f pixels[64];
+	cv::Mat tvec(3, 1, CV_64F, translation), rvec(3, 1, CV_64F, rotation);
+	cv::Mat R(3, 3, CV_64F, matrix);
+	cv::Mat cameraK(3, 3, CV_64F, calib->camera_matrix.m);
+	cv::Mat distortion(calib->dist_fisheye ? 4 : 5, 1, CV_64F, calib->dist_coeffs);
+	cv::Mat input(count, 1, CV_32FC3, objects), output(count, 1, CV_32FC2, pixels);
+
+	for (int i = 0; i < 3; i++)
+		tvec.at<double>(i) = pose->pos.arr[i];
+	quatf_to_3x3(R, &pose->orient);
+	cv::Rodrigues(R, rvec);
+	for (int i = 0; i < count; i++)
+		objects[i] = cv::Point3f(leds[i].pos.x, leds[i].pos.y, leds[i].pos.z);
+
+	if (calib->dist_fisheye)
+		cv::fisheye::projectPoints(input, output, rvec, tvec, cameraK, distortion);
+	else
+		cv::projectPoints(input, rvec, tvec, cameraK, distortion, output);
+	/* Read the returned Mat: OutputArray may replace the offered storage or shape. */
+	CV_Assert(output.type() == CV_32FC2 && output.total() == (size_t)count);
+	for (int i = 0; i < count; i++) {
+		const cv::Point2f &p = output.at<cv::Point2f>(i / output.cols, i % output.cols);
+		out[i].x = p.x;
+		out[i].y = p.y;
+		out[i].z = 0;
+	}
+}
+#endif
+
 void rift_project_points(rift_led *leds, int num_led_pos,
     rift_sensor_camera_params *calib,
 		posef *pose, vec3f *out_points)
 {
+#if CV_VERSION_MAJOR == 5
+	/* Mat-input equivalence is verified on OpenCV 5. Retain the vector contract
+	 * on 3/4 and future majors, larger models, and nonpositive counts,
+	 * including legacy empty-input exceptions and negative-size errors. */
+	if (num_led_pos > 0 && num_led_pos <= 64) {
+		project_points_bounded(leds, num_led_pos, calib, pose, out_points);
+		return;
+	}
+#endif
 	cv::Mat cameraK = cv::Mat(3, 3, CV_64FC1, calib->camera_matrix.m);
 	cv::Mat distCoeffs;
 
