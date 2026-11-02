@@ -6307,6 +6307,77 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use cv1touch::track::tracker::Output;
+    mod clock_publication {
+        include!("../../tests/support/clock_publication.rs");
+    }
+
+    #[test]
+    fn rust_clock_pipeline_publications_reach_driver_unchanged() {
+        // The canonical runner supplies real Pipeline outputs. A regular cargo test still
+        // checks the real publication function with a deterministic nonzero-velocity stamp.
+        let fixture = std::env::var_os("CV1TOUCH_CLOCK_PUBLICATIONS");
+        let rows: Vec<(
+            u64,
+            u64,
+            clock_publication::Publication,
+            clock_publication::Publication,
+        )> = if let Some(path) = fixture {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        } else {
+            let s = tracked_sample();
+            vec![(60, s.host_ns + 60_000_000, s.into(), s.into())]
+        };
+        let mut bytes = Vec::new();
+        for (horizon, now, normal, stalled) in rows {
+            bytes.extend_from_slice(&now.to_ne_bytes());
+            let mut states = Vec::new();
+            for publication in [normal, stalled] {
+                let s = Stamped::from(publication);
+                let mut state = ControllerState {
+                    flags: ffi::CV1T_FLAG_CONNECTED,
+                    ..Default::default()
+                };
+                let mut shaper = VelocityShaper::new(ShapeParams::default());
+                apply_tracked(&mut state, &s, 0, &mut shaper, false);
+                assert_eq!(state.sample_host_ns, s.host_ns);
+                assert_eq!(state.last_position_fix_host_ns, s.last_fix_host_ns);
+                assert_eq!(
+                    state.lin_vel,
+                    <[f32; 3]>::from(s.output.vel.map(|v| v as f32))
+                );
+                assert!(state.flags & ffi::CV1T_FLAG_POSITION != 0);
+                // ControllerState is the production padding-free shared ABI.
+                bytes.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(
+                        &state as *const ControllerState as *const u8,
+                        std::mem::size_of::<ControllerState>(),
+                    )
+                });
+                states.push(state);
+            }
+            println!(
+                "daemon FIFO horizon_ms={horizon} sample={}/{} fix={}/{}",
+                states[0].sample_host_ns,
+                states[1].sample_host_ns,
+                states[0].last_position_fix_host_ns,
+                states[1].last_position_fix_host_ns
+            );
+        }
+        if let Some(driver) = std::env::var_os("CV1TOUCH_CLOCK_DRIVER") {
+            use std::io::Write;
+            let mut child = std::process::Command::new(driver)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&bytes).unwrap();
+            assert!(
+                child.wait().unwrap().success(),
+                "Rust clock driver contract"
+            );
+        }
+    }
+
     fn record_test_gap(d: &Daemon, h: usize, event: GapEvent) {
         let mut publisher = d.hands[h].lock().unwrap();
         super::record_gap(d, h, event, &mut publisher.memory);

@@ -84,6 +84,8 @@ meson test -C "$native" --no-rebuild --print-errorlogs
 cargo run --locked --release --example driver_contract -- "$native/driver/test_daemon_contract"
 # Native Hand timestamps through the shared ABI into the actual pose builder.
 cargo run --locked --release --example native_clock_pose -- "$native/driver/test_native_clock_pose"
+# Actual Rust Pipeline -> actual daemon apply_tracked -> actual driver pose builder.
+python3 scripts/check_rust_clock.py "$native/driver/test_rust_clock_pose"
 readelf -d "$daemon" | grep -F '$ORIGIN/../lib/cv1touch' >/dev/null
 CV1TOUCH_TEST_DAEMON="$daemon" CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_runtime_dir.py
 CV1TOUCH_TEST_BINARY="$(dirname "$daemon")/cv1touch" CV1TOUCH_TEST_LIBRARY_PATH="$native/third_party/openhmd" python3 -m unittest discover -s tests -p test_driver_package.py

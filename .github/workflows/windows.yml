@@ -144,6 +144,8 @@ jobs:
         run: cargo test --locked --lib --bins
       - name: Engine tests
         run: meson test -C (Get-Content target\debug\cv1touch-native-dir) --print-errorlogs
+      - name: Rust clock publication and pose contract
+        run: python scripts/check_rust_clock.py (Join-Path (Get-Content target\debug\cv1touch-native-dir) 'driver\test_rust_clock_pose.exe')
       # What a release ships: the bundle the installer job packs.
       - name: Release build
         if: matrix.rust == 'stable'

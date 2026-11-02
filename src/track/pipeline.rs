@@ -593,10 +593,15 @@ impl Pipeline {
             .and_then(|t| self.clocks[hand].to_host(t))
             .is_some_and(|t| received_host_ns.saturating_sub(t) > self.opts.params.max_imu_gap_ns);
         let gaps = tr.stats.imu_gaps;
-        // Short buffered bursts can re-lock the fit without breaking IMU continuity:
-        // keep their delayed optical evidence. A long host gap hidden by the native
-        // device clock, however, must not preserve future frames or re-stamp an old fix.
-        if self.clocks[hand].observe(device_ns, received_host_ns) && host_gap {
+        // A short FIFO stall is not evidence of a positive clock discontinuity. Outside
+        // the existing host continuity bound, retain immediate re-lock/reset so a sleep
+        // hidden by the native device clock cannot re-stamp old fixes or queued frames.
+        let relocked = if host_gap {
+            self.clocks[hand].observe(device_ns, received_host_ns)
+        } else {
+            self.clocks[hand].observe_continuous(device_ns, received_host_ns)
+        };
+        if relocked && host_gap {
             tr.reset_clock();
             self.latest[hand] = None;
         }
@@ -2944,6 +2949,174 @@ mod tests {
         assert!(p.pending[HAND_RIGHT].is_empty());
         assert_eq!(p.tracker(HAND_LEFT).unwrap().newest_imu(), left_imu);
         assert_eq!(p.stats(HAND_LEFT).imu_gaps, left_gaps);
+    }
+
+    mod clock_publication {
+        include!("../../tests/support/clock_publication.rs");
+    }
+
+    fn fifo_clock_seed() -> (Pipeline, Motion, Vector3<f64>) {
+        let (_, _, mut p, _) =
+            run_with_sensors(2.0, None, IMU_DELAY, 3, None, MATCH_GOOD | MATCH_STRONG);
+        let mut rng = Rng::new(5);
+        let motion = Motion::random(&mut rng, Vector3::new(0.0, 1.0, 0.0));
+        let lever = Vector3::new(0.015, -0.012, 0.008);
+        let dev = p.tracker(HAND_RIGHT).unwrap().newest_imu().unwrap() + 2_000_000;
+        let recv = p.clocks[HAND_RIGHT].to_host(dev).unwrap();
+        let t = (dev + C0 - H0) as f64 * 1e-9;
+        p.imu(
+            HAND_RIGHT,
+            dev,
+            recv,
+            motion.gyro(t),
+            motion.accel(t, &lever, &(Vector3::y() * 9.80665)),
+        );
+        assert!(p.pending[HAND_RIGHT].is_empty());
+        assert!(p.probing[HAND_RIGHT].is_empty());
+        let output = p.latest(HAND_RIGHT).unwrap().output;
+        assert!(output.tracking);
+        assert!(
+            output.vel.norm() > 0.1,
+            "FIFO fixture must exercise moving state"
+        );
+        (p, motion, lever)
+    }
+
+    #[test]
+    fn fifo_receive_stalls_preserve_physical_state_and_fix_age() {
+        let mut publications = Vec::new();
+        let mut failures = Vec::new();
+        for horizon in [20, 49, 51, 60, 80, 99, 100, 101] {
+            let (mut stalled, motion, lever) = fifo_clock_seed();
+            let (mut normal, _, _) = fifo_clock_seed();
+            let first = stalled.latest(HAND_RIGHT).unwrap();
+            let dev = stalled.tracker(HAND_RIGHT).unwrap().newest_imu().unwrap();
+            let recv0 = stalled.clocks[HAND_RIGHT].to_host(dev).unwrap();
+            let gaps = stalled.stats(HAND_RIGHT).imu_gaps;
+            let mut last_recv = recv0;
+            let mut max_shift = 0;
+            for tick in 1..=80 {
+                let elapsed = tick * 2_000_000;
+                // FIFO release after the previous receive, then drain at 50 us/report.
+                // The exact 100 ms control deliberately includes no first-report drain time.
+                let drain = if horizon == 100 {
+                    (tick - 1) * 50_000
+                } else {
+                    tick * 50_000
+                };
+                let recv = (recv0 + elapsed).max(recv0 + horizon * 1_000_000 + drain);
+                assert!(recv > last_recv);
+                last_recv = recv;
+                let t = (dev + elapsed + C0 - H0) as f64 * 1e-9;
+                let gyro = motion.gyro(t);
+                let accel = motion.accel(t, &lever, &(Vector3::y() * 9.80665));
+                normal.imu(HAND_RIGHT, dev + elapsed, recv0 + elapsed, gyro, accel);
+                stalled.imu(HAND_RIGHT, dev + elapsed, recv, gyro, accel);
+                let b = normal.latest(HAND_RIGHT).unwrap();
+                if horizon == 101 {
+                    assert_eq!(stalled.tracker(HAND_RIGHT).unwrap().last_fix(), 0);
+                    assert!(stalled.latest(HAND_RIGHT).is_none());
+                    continue;
+                }
+                let a = stalled.latest(HAND_RIGHT).unwrap();
+                assert_eq!(
+                    a.output, b.output,
+                    "physical output changed at {horizon} ms"
+                );
+                assert_eq!(a.output.last_fix, first.output.last_fix);
+                assert_eq!(
+                    stalled
+                        .tracker(HAND_RIGHT)
+                        .unwrap()
+                        .filter_at(dev + elapsed)
+                        .unwrap(),
+                    normal
+                        .tracker(HAND_RIGHT)
+                        .unwrap()
+                        .filter_at(dev + elapsed)
+                        .unwrap(),
+                    "nominal state or covariance changed at {horizon} ms"
+                );
+                max_shift = max_shift.max(a.host_ns.abs_diff(b.host_ns));
+                if a.host_ns != b.host_ns || a.last_fix_host_ns != b.last_fix_host_ns {
+                    failures.push((
+                        horizon,
+                        tick,
+                        a.host_ns,
+                        b.host_ns,
+                        a.last_fix_host_ns,
+                        b.last_fix_host_ns,
+                    ));
+                }
+                if tick == 1 {
+                    publications.push((
+                        horizon,
+                        recv + 1_000_000,
+                        clock_publication::Publication::from(b),
+                        clock_publication::Publication::from(a),
+                    ));
+                }
+            }
+            assert_eq!(
+                stalled.stats(HAND_RIGHT).imu_gaps - gaps,
+                u64::from(horizon == 101)
+            );
+            println!(
+                "FIFO horizon_ms={horizon} max_restamp_ns={max_shift} resets={}",
+                stalled.stats(HAND_RIGHT).imu_gaps - gaps
+            );
+        }
+        // Optional offline boundary runner consumes these actual Pipeline outputs, even on
+        // failure, so its daemon/driver oracle can independently expose the same regression.
+        if let Some(path) = std::env::var_os("CV1TOUCH_CLOCK_PUBLICATIONS") {
+            std::fs::write(path, serde_json::to_vec(&publications).unwrap()).unwrap();
+        }
+        assert!(failures.is_empty(), "FIFO host restamping: {failures:?}");
+    }
+
+    #[test]
+    fn sustained_positive_host_clock_step_recovers_without_changing_physical_state() {
+        let (mut shifted, motion, lever) = fifo_clock_seed();
+        let (mut normal, _, _) = fifo_clock_seed();
+        let dev = shifted.tracker(HAND_RIGHT).unwrap().newest_imu().unwrap();
+        let recv0 = shifted.clocks[HAND_RIGHT].to_host(dev).unwrap();
+        let gaps = shifted.stats(HAND_RIGHT).imu_gaps;
+        for tick in 1..=700 {
+            let elapsed = tick * 2_000_000;
+            let t = (dev + elapsed + C0 - H0) as f64 * 1e-9;
+            let gyro = motion.gyro(t);
+            let accel = motion.accel(t, &lever, &(Vector3::y() * 9.80665));
+            normal.imu(HAND_RIGHT, dev + elapsed, recv0 + elapsed, gyro, accel);
+            shifted.imu(
+                HAND_RIGHT,
+                dev + elapsed,
+                recv0 + elapsed + 60_000_000,
+                gyro,
+                accel,
+            );
+            assert_eq!(
+                shifted.latest(HAND_RIGHT).unwrap().output,
+                normal.latest(HAND_RIGHT).unwrap().output
+            );
+            assert_eq!(
+                shifted
+                    .tracker(HAND_RIGHT)
+                    .unwrap()
+                    .filter_at(dev + elapsed),
+                normal.tracker(HAND_RIGHT).unwrap().filter_at(dev + elapsed)
+            );
+        }
+        assert_eq!(shifted.stats(HAND_RIGHT).imu_gaps, gaps);
+        assert_eq!(
+            shifted.clocks[HAND_RIGHT].to_host(dev + 1_400_000_000),
+            Some(recv0 + 1_460_000_000)
+        );
+        let out = shifted.latest(HAND_RIGHT).unwrap();
+        assert!(!out.output.tracking);
+        assert_eq!(
+            out.last_fix_host_ns, 0,
+            "expired optical evidence was revived by clock recovery"
+        );
     }
 
     #[test]
