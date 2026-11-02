@@ -123,19 +123,16 @@ fn huber_cost(n: f64, delta: f64) -> f64 {
     }
 }
 
-/// Central-difference Jacobian columns of `f(param, step)` over `n` parameters.
+/// Central-difference columns for a six-parameter pose, in callback order.
 fn numeric<const R: usize>(
-    n: usize,
     mut f: impl FnMut(usize, f64) -> Option<[f64; R]>,
-) -> Option<Vec<[f64; R]>> {
-    (0..n)
-        .map(|a| {
-            let (plus, minus) = (f(a, H)?, f(a, -H)?);
-            Some(std::array::from_fn(|row| {
-                (plus[row] - minus[row]) / (2.0 * H)
-            }))
-        })
-        .collect()
+) -> Option<[[f64; R]; 6]> {
+    let mut columns = [[0.0; R]; 6];
+    for (a, column) in columns.iter_mut().enumerate() {
+        let (plus, minus) = (f(a, H)?, f(a, -H)?);
+        *column = std::array::from_fn(|row| (plus[row] - minus[row]) / (2.0 * H));
+    }
+    Some(columns)
 }
 
 fn dot<const R: usize>(a: &[f64; R], b: &[f64; R]) -> f64 {
@@ -192,6 +189,10 @@ impl Normal {
 }
 
 fn build(p: &Problem, s: &State, o: &Options, l: &Layout) -> Normal {
+    #[cfg(test)]
+    if storage_tests::LEGACY.get() {
+        return storage_tests::legacy_build(p, s, o, l);
+    }
     let mut n = Normal::new(p.samples.len(), l.globals);
     let delta = o.huber_px / o.sigma_px;
     for (i, sample) in p.samples.iter().enumerate() {
@@ -210,26 +211,26 @@ fn build(p: &Problem, s: &State, o: &Options, l: &Layout) -> Normal {
                 let Some(r) = residual(&t_cam, &w) else {
                     continue;
                 };
-                let Some(jw) = numeric(6, |a, h| residual(&t_cam, &retract(&w, &unit::<6>(a, h))))
+                let Some(jw) = numeric(|a, h| residual(&t_cam, &retract(&w, &unit::<6>(a, h))))
                 else {
                     continue;
                 };
-                let (jg, cols): (Vec<[f64; 2]>, Vec<usize>) = match l.cam[v.camera] {
+                let (jg, cols, len) = match l.cam[v.camera] {
                     Some(off) => {
-                        match numeric(6, |a, h| residual(&retract(&t_cam, &unit::<6>(a, h)), &w)) {
-                            Some(j) => (j, (off..off + 6).collect()),
+                        match numeric(|a, h| residual(&retract(&t_cam, &unit::<6>(a, h)), &w)) {
+                            Some(j) => (j, std::array::from_fn::<_, 6, _>(|i| off + i), 6),
                             None => continue,
                         }
                     }
-                    None => (Vec::new(), Vec::new()),
+                    None => ([[0.0; 2]; 6], [0; 6], 0),
                 };
                 let norm = (r[0] * r[0] + r[1] * r[1]).sqrt() / o.sigma_px;
                 n.add(
                     i,
                     &r,
                     &jw,
-                    &jg,
-                    &cols,
+                    &jg[..len],
+                    &cols[..len],
                     huber_weight(norm, delta) / (o.sigma_px * o.sigma_px),
                 );
             }
@@ -509,3 +510,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ba_storage_tests.rs"]
+mod storage_tests;
