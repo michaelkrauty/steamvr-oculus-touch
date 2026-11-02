@@ -24,6 +24,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Blob detection uses the last member row consistently for candidate dimensions and centroid integration, including at the image bottom. Eligible 3:1 spots no longer fail the shape filter solely because of their orientation or vertical position.
 - A replacement haptic pulse now starts its software duration only when its wanted amplitude and frequency mode are confirmed, rather than on an older, different write's acknowledgement.
 - Sensor calibration rejects fits whose surviving controller sightings no longer connect all sensors, naming the disconnected sensors instead of saving unconstrained relative poses. Indirect sensor chains and single-sensor captures remain supported.
+- Controller clock mapping on both native and Rust tracking paths no longer treats a short FIFO receive stall as a new clock offset, preserving optical-fix age and pose timing. Backward clock restarts and large negative corrections still recover immediately. Sustained positive offset changes recover through the native sliding minimum or, within a continuous Rust IMU epoch, after a full clock bin of persistent positive residuals. Explicit native engine reopen still recovers on the next sample; the existing strictly greater than 100 ms continuity reset is retained.
 
 ## [0.3.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.3) - 2026-11-01
 

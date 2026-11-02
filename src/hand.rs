@@ -902,6 +902,7 @@ pub struct Hand {
     hand: usize,
     cfg: HandConfig,
     clock: ClockMap,
+    clock_reopen: bool,
     last_device_ns: u64,
     last_advance_host_ns: u64,
     touches: u32,
@@ -931,6 +932,7 @@ impl Hand {
             hand,
             cfg,
             clock: ClockMap::default(),
+            clock_reopen: false,
             last_device_ns: 0,
             last_advance_host_ns: 0,
             touches: 0,
@@ -1200,6 +1202,9 @@ impl Hand {
     /// There is no sample to offer, for `cause` (a gap this starts keeps it). Keep the same gap
     /// and its deadline, even when the last sample was less than 100 ms ago.
     pub fn unavailable(&mut self, now_ns: u64, cause: GapCause) -> ControllerState {
+        // Keep held timestamps through the gap, but the next real engine sample starts a
+        // fresh clock map even if its initial truncated device epoch happens to be larger.
+        self.clock_reopen |= cause == GapCause::Reopen;
         let mut latest = self.event.take();
         self.unavailable_events(now_ns, cause, |event| latest = Some(event));
         self.event = latest;
@@ -1233,6 +1238,10 @@ impl Hand {
         {
             self.last_device_ns = c.device_time_ns;
             self.last_advance_host_ns = c.received_host_ns;
+            if missing.is_none() && self.clock_reopen {
+                self.clock = ClockMap::default();
+                self.clock_reopen = false;
+            }
             self.clock.observe(c.device_time_ns, c.received_host_ns);
         }
         let silent_ns = now_ns.saturating_sub(self.last_advance_host_ns);
@@ -3076,5 +3085,104 @@ mod tests {
             back.touches,
             TOUCH_A | TOUCH_B | TOUCH_TRIGGER | TOUCH_STICK | TOUCH_THUMBREST
         );
+    }
+}
+
+#[cfg(test)]
+mod native_clock_tests {
+    use super::*;
+
+    fn snapshot() -> ffi::ohmd_cv1touch_controller {
+        ffi::ohmd_cv1touch_controller {
+            calibrated: true,
+            device_time_ns: 1_000_000_000,
+            received_host_ns: 11_000_000_000,
+            last_pose_fix_device_ns: 800_000_000,
+            view_orient: [0., 0., 0., 1.],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delayed_final_report_preserves_historical_fix_and_sample_age() {
+        for delay in [40_000_000, 60_000_000] {
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut c = snapshot();
+            let before = hand.update(&c, c.received_host_ns);
+            c.device_time_ns += 2_000_000;
+            c.received_host_ns += 2_000_000 + delay;
+            let delayed = hand.update(&c, c.received_host_ns);
+            assert_eq!(delayed.sample_host_ns, 11_002_000_000);
+            assert_eq!(
+                delayed.last_position_fix_host_ns,
+                before.last_position_fix_host_ns
+            );
+            assert_ne!(delayed.flags & FLAG_POSITION, 0);
+            // Same report reread cannot confirm a clock change either.
+            let reread = hand.update(&c, c.received_host_ns + 1_000_000);
+            assert_eq!(reread.sample_host_ns, delayed.sample_host_ns);
+            c.device_time_ns = 1_064_000_000;
+            c.received_host_ns = 11_064_000_000;
+            let normal = hand.update(&c, c.received_host_ns);
+            assert_eq!(normal.sample_host_ns, c.received_host_ns);
+            assert_eq!(
+                normal.last_position_fix_host_ns,
+                before.last_position_fix_host_ns
+            );
+        }
+    }
+
+    #[test]
+    fn positive_epoch_shift_without_reopen_adapts_but_never_invents_a_fix() {
+        let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+        let mut c = snapshot();
+        hand.update(&c, c.received_host_ns);
+        // Native has no explicit epoch ID in this ABI. A forward 200 ms gap clears optical
+        // evidence natively; a +62 ms residual alone remains indistinguishable from delay.
+        c.last_pose_fix_device_ns = 0;
+        for i in 0..=1000u64 {
+            c.device_time_ns = 1_200_000_000 + i * 2_000_000;
+            c.received_host_ns = 11_262_000_000 + i * 2_000_000;
+            let out = hand.update(&c, c.received_host_ns);
+            assert_eq!(out.last_position_fix_host_ns, 0);
+            assert_eq!(out.flags & FLAG_POSITION, 0);
+            if i == 1000 {
+                assert_eq!(out.sample_host_ns, c.received_host_ns);
+            }
+        }
+    }
+
+    #[test]
+    fn native_epoch_recovery_keeps_zero_fix_sentinel() {
+        // A new native engine can start either side of the old extended time (the initial
+        // epoch is a truncated 32-bit ns product). Explicit reopen must not wait on minima.
+        for device in [2_000_000, 2_000_000_000] {
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut c = snapshot();
+            let before = hand.update(&c, c.received_host_ns);
+            let held = hand.update(&ffi::ohmd_cv1touch_controller::default(), 12_000_000_000);
+            assert_eq!(held.sample_host_ns, before.sample_host_ns);
+            c.device_time_ns = device;
+            c.received_host_ns = 20_000_000_000;
+            c.last_pose_fix_device_ns = 0;
+            let reopened = hand.update(&c, c.received_host_ns);
+            assert_eq!(reopened.sample_host_ns, c.received_host_ns);
+            assert_eq!(reopened.last_position_fix_host_ns, 0);
+            assert_eq!(reopened.flags & FLAG_POSITION, 0);
+        }
+        for device in [2_000_000, 4_294_969_296_000] {
+            let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
+            let mut c = snapshot();
+            hand.update(&c, c.received_host_ns);
+            // The latter is a counter restart extended FORWARD by native modular arithmetic:
+            // 1 s + uint32_t(2000 - 1000000) us. Native clears the fix on the >100 ms gap.
+            c.device_time_ns = device;
+            c.received_host_ns = 11_002_000_000;
+            c.last_pose_fix_device_ns = 0;
+            let restarted = hand.update(&c, c.received_host_ns);
+            assert_eq!(restarted.sample_host_ns, c.received_host_ns);
+            assert_eq!(restarted.last_position_fix_host_ns, 0);
+            assert_eq!(restarted.flags & FLAG_POSITION, 0);
+        }
     }
 }

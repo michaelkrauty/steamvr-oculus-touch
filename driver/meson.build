@@ -40,6 +40,12 @@ contract_test = executable('test_daemon_contract', 'tests/test_daemon_contract.c
   dependencies: [openvr_dep, threads_dep],
   cpp_args: ['-DCV1T_DRIVER_TEST'])
 test('test_daemon_contract_timing', contract_test, args: ['--timing'])
+# CPU-only publication/pose contract, fed by examples/native_clock_pose.rs.
+executable('test_native_clock_pose', 'tests/test_native_clock_pose.cpp', 'src/pose.cpp',
+  include_directories: driver_inc, dependencies: [openvr_dep])
+# CPU-only Rust Pipeline/daemon publication contract; scripts/check_rust_clock.py.
+executable('test_rust_clock_pose', 'tests/test_rust_clock_pose.cpp', 'src/pose.cpp',
+  include_directories: driver_inc, dependencies: [openvr_dep])
 if windows
   test('driver_exports', import('python').find_installation(), args: [files('tests/check_exports.py'), driver_lib])
   subdir_done()

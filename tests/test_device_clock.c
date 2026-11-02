@@ -39,6 +39,8 @@ int main(void)
 	assert(rift_device_time_next(t, 5000, 7500) == 7500000);
 	/* the 32-bit microsecond counter wraps (every ~71.6 min): time still runs forward */
 	assert(rift_device_time_next(9000000000ull, 0xfffff000u, 0x00000800u) == 9000000000ull + 0x1800ull * 1000);
+	/* A counter restart is also a modular forward delta, not a backward extended epoch. */
+	assert(rift_device_time_next(1000000000ull, 1000000u, 2000u) == 4294969296000ull);
 	/* the same state and timestamp give the same time: the poll's stamp is the filter's */
 	uint64_t a = rift_device_time_next(123456789000ull, 4000000u, 4002500u);
 	uint64_t b = rift_device_time_next(123456789000ull, 4000000u, 4002500u);
