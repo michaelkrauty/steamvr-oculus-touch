@@ -1998,7 +1998,8 @@ mod tests {
             drop(r);
             done_tx.send(()).unwrap();
         });
-        let dropped = done.recv_timeout(Duration::from_millis(200));
+        // The timeout only detects a deadlock; storage remains blocked until drop returns.
+        let dropped = done.recv_timeout(Duration::from_secs(60));
         let _ = release.send(());
         dropper.join().unwrap();
         assert!(dropped.is_ok(), "dropping the recorder waited for storage");

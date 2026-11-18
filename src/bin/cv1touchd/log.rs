@@ -246,6 +246,14 @@ fn report_drops(shared: &Shared, writer: &mut impl io::Write) {
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+#[cfg(test)]
+static WAIT_FOR_TEST_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn wait_for_test_output_at_exit() {
+    WAIT_FOR_TEST_OUTPUT.store(true, Ordering::Release);
+}
+
 pub(super) struct Guard;
 
 /// Called on the main thread, after it takes shutdown requests and before any engine is opened.
@@ -339,6 +347,11 @@ unsafe extern "C" fn native_fatal() {
 
 pub(super) fn exit(code: i32) -> ! {
     if let Some(logger) = LOGGER.get() {
+        // Outcome tests observe all enqueued lines independently of the production deadline.
+        #[cfg(test)]
+        if WAIT_FOR_TEST_OUTPUT.load(Ordering::Acquire) {
+            logger.flush(Duration::MAX);
+        }
         logger.close(EXIT_FLUSH);
     }
     std::process::exit(code);

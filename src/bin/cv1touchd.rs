@@ -16985,6 +16985,7 @@ mod tests {
         const CHILD: &str = "CV1TOUCH_TEST_RECORD_CLEANUP";
         if let Some(kind) = std::env::var_os(CHILD) {
             let _logging = recording_test_logger();
+            daemon_log::wait_for_test_output_at_exit();
             let dir = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_RECORD_CLEANUP_DIR").unwrap());
             let d = Arc::new(status_daemon());
             fs::write(dir.join("shm-name"), d.shm.name()).unwrap();
