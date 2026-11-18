@@ -13,6 +13,7 @@ Like the Linux build, the Windows build uses no Oculus software. The Rift headse
 - [vcpkg](https://github.com/microsoft/vcpkg), for the engine's dependencies
 
 Build with `clang-cl`. The shared-memory helpers and the engine use GNU C builtins and C11 atomics that `cl.exe` lacks.
+Use an LLVM version supported by the installed MSVC standard library; for example, MSVC 14.52 requires Clang 22 or newer.
 
 ## SteamVR driver only
 

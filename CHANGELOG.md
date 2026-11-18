@@ -6,6 +6,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- The Windows source build instructions now note the LLVM version required by newer MSVC standard libraries.
 - Building from source with Rust 1.100 works again on Linux and Windows, including tests and release bundles. Rust 1.85 remains supported.
 
 ## [0.3.4](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.4) - 2026-11-02
