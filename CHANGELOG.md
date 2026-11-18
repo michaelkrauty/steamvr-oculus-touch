@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.4.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.0) - 2026-11-19
+
 ### Changed
 
 - Native camera projection and undistortion use allocation-free C formulas for both lens models.
@@ -16,7 +18,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - Linux and Windows installations include the OpenCV license and notices for the adapted camera and pose code; Windows bundles include them too.
 - Cold correspondence searches initialize pose error metrics before returning them, avoiding undefined values when no prior pose is available.
 - The Windows source build instructions now note the LLVM version required by newer MSVC standard libraries.
-- Building from source with Rust 1.100 works again on Linux and Windows, including tests and release bundles. Rust 1.85 remains supported.
+- Building from source with Rust 1.100 works on Linux and Windows, including tests and release bundles. Rust 1.85 remains the minimum supported version.
 
 ## [0.3.4](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.3.4) - 2026-11-02
 
