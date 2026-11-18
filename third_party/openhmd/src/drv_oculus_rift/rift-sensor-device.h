@@ -20,6 +20,7 @@ typedef struct rift_sensor_device rift_sensor_device;
 typedef struct rift_sensor_device_funcs rift_sensor_device_funcs;
 
 typedef void (*rift_sensor_device_frame_cb)(struct rift_sensor_device *dev, ohmd_video_frame *frame, void *cb_data);
+struct libusb_device;
 
 struct rift_sensor_camera_params {
 	bool is_cv1; /* CV1 has fisheye distortion, DK2 does not */
@@ -53,6 +54,9 @@ struct rift_sensor_device {
 	uint64_t cv1touch_frames_dropped;
 	/* Retained after NO_DEVICE, read by the engine without taking the USB event lock. */
 	uint32_t usb_gone;
+	/* cv1touch: the USB device this one has open, for as long as it is open; compared, never
+	 * used. NULL for a device that is not on USB. */
+	const struct libusb_device *usb_device;
 };
 
 #define rift_sensor_device_start_video(d,min_frames,frame_cb,frame_cb_data) \

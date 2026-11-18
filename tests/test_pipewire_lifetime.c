@@ -4,7 +4,10 @@
  * threads. */
 #include "test_util.h"
 #include <pipewire/pipewire.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <time.h>
 static int calls, fail_at, live;
 static void *acquire(size_t size) {
   if (++calls == fail_at)
@@ -25,6 +28,27 @@ static void *stream_new(struct pw_properties *p) {
   return acquire(1);
 }
 static int maybe_fail(void) { return ++calls == fail_at ? -1 : 0; }
+/* The shared connection's start can be held while another thread asks for it. */
+static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gate_changed = PTHREAD_COND_INITIALIZER;
+static bool hold_start, starting;
+static int start_loop(void) {
+  CHECK(pthread_mutex_lock(&gate) == 0);
+  starting = true;
+  CHECK(pthread_cond_broadcast(&gate_changed) == 0);
+  struct timespec until;
+  CHECK(clock_gettime(CLOCK_REALTIME, &until) == 0);
+  until.tv_nsec += 300000000;
+  if (until.tv_nsec >= 1000000000) {
+    until.tv_sec++;
+    until.tv_nsec -= 1000000000;
+  }
+  while (hold_start && pthread_cond_timedwait(&gate_changed, &gate, &until) == 0) {
+  }
+  starting = false;
+  CHECK(pthread_mutex_unlock(&gate) == 0);
+  return maybe_fail();
+}
 #define calloc(n, size) acquire((n) * (size))
 #define free(p) release(p)
 #define pw_init(a, b) ((void)0)
@@ -33,7 +57,7 @@ static int maybe_fail(void) { return ++calls == fail_at ? -1 : 0; }
   ((struct pw_thread_loop *)acquire(1))
 #define pw_context_new(loop, props, size) ((struct pw_context *)acquire(1))
 #define pw_context_connect(ctx, props, size) ((struct pw_core *)acquire(1))
-#define pw_thread_loop_start(thread) maybe_fail()
+#define pw_thread_loop_start(thread) start_loop()
 #define pw_thread_loop_stop(thread) ((void)0)
 #define pw_thread_loop_lock(thread) ((void)0)
 #define pw_thread_loop_unlock(thread) ((void)0)
@@ -49,6 +73,37 @@ static int maybe_fail(void) { return ++calls == fail_at ? -1 : 0; }
 #include "ohmd-pipewire.c"
 #undef calloc
 #undef free
+static void *first_user(void *arg) {
+  (void)arg;
+  CHECK(ohmd_pipewire_global_init());
+  return NULL;
+}
+
+/* A sensor's streams are made on the engine's live-sensor worker while the engine thread can
+ * make a controller's: a second user never gets the shared connection before it has started. */
+static void a_second_user_waits_for_the_connection(void) {
+  calls = live = 0;
+  fail_at = 0;
+  hold_start = true;
+  pthread_t first;
+  CHECK(pthread_create(&first, NULL, first_user, NULL) == 0);
+  CHECK(pthread_mutex_lock(&gate) == 0);
+  while (!starting)
+    CHECK(pthread_cond_wait(&gate_changed, &gate) == 0);
+  CHECK(pthread_mutex_unlock(&gate) == 0);
+  ohmd_pw_global_data *second = ohmd_pipewire_global_init();
+  CHECK(pthread_mutex_lock(&gate) == 0);
+  bool still_starting = starting;
+  CHECK(pthread_mutex_unlock(&gate) == 0);
+  CHECK(second && !still_starting);
+  CHECK(pthread_join(first, NULL) == 0);
+  hold_start = false;
+  CHECK(ohmd_pw_global_data_ptr == second && second->use_count == 2);
+  ohmd_pipewire_global_deinit();
+  ohmd_pipewire_global_deinit();
+  CHECK(live == 0 && ohmd_pw_global_data_ptr == NULL);
+}
+
 int main(void) {
   for (int fail = 1; fail <= 6; fail++) {
     calls = live = 0;
@@ -80,6 +135,7 @@ int main(void) {
   CHECK(ohmd_pw_video_stream_new("TEST", "TEST", (ohmd_pw_video_format)99, 64,
                                  64, 60, 1) == NULL);
   CHECK(live == 0 && ohmd_pw_global_data_ptr == NULL);
+  a_second_user_waits_for_the_connection();
   puts("test_pipewire_lifetime: ok");
   return 0;
 }

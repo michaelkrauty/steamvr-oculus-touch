@@ -36,17 +36,21 @@ void rift_pose_finder_cv1touch_reset(void)
 	__atomic_store_n(&cv1touch_placed_sensors, 0, __ATOMIC_RELEASE);
 }
 
-static bool cv1touch_may_place(const rift_tracked_device_exposure_info *exp_dev_info)
+static bool cv1touch_may_place(rift_pose_finder *pf, const rift_tracked_device_exposure_info *exp_dev_info)
 {
 	int expected = 0;
 
-	if (__atomic_compare_exchange_n(&cv1touch_placed_sensors, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		return true;
-	if (exp_dev_info->had_pose_lock) {
+	/* A cleared camera pose does not relinquish this finder's placement. */
+	if (pf->cv1touch_owns_placement)
+		return exp_dev_info->had_pose_lock;
+
+	if (!__atomic_compare_exchange_n(&cv1touch_placed_sensors, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		if (!exp_dev_info->had_pose_lock)
+			return false;
 		__atomic_fetch_add(&cv1touch_placed_sensors, 1, __ATOMIC_ACQ_REL);
-		return true;
 	}
-	return false;
+	pf->cv1touch_owns_placement = true;
+	return true;
 }
 
 static int update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
@@ -58,6 +62,7 @@ void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *cali
 		rift_pose_finder_cb pose_cb, void *pose_cb_data)
 {
 	pf->have_camera_pose = false;
+	pf->cv1touch_owns_placement = false;
 	pf->cv1touch_allow_placement = true;
 	pf->calib = calib;
 	pf->cs = correspondence_search_new(calib);
@@ -345,8 +350,14 @@ bool rift_pose_finder_filter_inspection_labels(rift_pose_finder *pf, int device_
 
 void rift_pose_finder_clear(rift_pose_finder *pf)
 {
-	if (pf->cs != NULL)
+	if (pf->cv1touch_owns_placement) {
+		__atomic_fetch_sub(&cv1touch_placed_sensors, 1, __ATOMIC_ACQ_REL);
+		pf->cv1touch_owns_placement = false;
+	}
+	if (pf->cs != NULL) {
 		correspondence_search_free(pf->cs);
+		pf->cs = NULL;
+	}
 }
 
 void rift_pose_finder_exp_info_to_dev_state (rift_pose_finder *pf,
@@ -797,7 +808,7 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	 * so passing it means the device's fusion has converged its tilt (a sensor placed from an
 	 * unconverged device lands in a world tilted against gravity). */
 	if (!pf->have_camera_pose && pf->cv1touch_allow_placement && POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG) &&
-	    dev_state->gravity_error_rad <= DEG_TO_RAD(25.0) && cv1touch_may_place(exp_dev_info)) {
+	    dev_state->gravity_error_rad <= DEG_TO_RAD(25.0) && cv1touch_may_place(pf, exp_dev_info)) {
 		/* No camera pose yet. If this is the HMD, we had an IMU pose at capture time,
 		 * and the fusion has a good gravity vector from the IMU, use it to
 		 * initialise the camera (world->camera) pose using the current headset pose.

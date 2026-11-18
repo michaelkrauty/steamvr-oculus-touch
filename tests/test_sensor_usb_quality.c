@@ -93,7 +93,7 @@ static void constructor_quality(bool jpeg)
     usb_version = jpeg ? 0x200 : 0x300;
     ohmd_context ctx = {0};
     const uint8_t radio[5] = {0};
-    rift_sensor_device *device = rift_sensor_usb_new(&ctx, 0, "CAMERA1", (void *)4, (void *)2, radio);
+    rift_sensor_device *device = rift_sensor_usb_new(&ctx, 0, "CAMERA1", (void *)4, (void *)2, radio, NULL);
 #if !HAVE_LIBJPEG
     if (jpeg) {
         CHECK(device == NULL && closes == 1 && locks_destroyed == 1);

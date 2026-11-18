@@ -158,10 +158,14 @@ rift_sensor_read_calibration(rift_sensor_usb_device *dev)
 }
 
 rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const char *serial_no,
-	libusb_context *usb_ctx, libusb_device_handle *usb_devh, const uint8_t hmd_radio_id[5])
+	libusb_context *usb_ctx, libusb_device_handle *usb_devh, const uint8_t hmd_radio_id[5], int *error_code)
 {
 	rift_sensor_usb_device *dev = NULL;
 	int ret, i;
+	int unused_error;
+
+	if (!error_code)
+		error_code = &unused_error;
 
 	libusb_device *usb_dev = libusb_get_device(usb_devh);
 	struct libusb_device_descriptor desc;
@@ -169,12 +173,14 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	if (ret < 0) {
 		ohmd_log_printf ("Failed to read device descriptor!\n");
 		libusb_close (usb_devh);
+		*error_code = ret;
 		return NULL;
 	}
 
 	dev = ohmd_alloc(ohmd_ctx, sizeof (rift_sensor_usb_device));
-	if (!dev) { libusb_close(usb_devh); return NULL; }
+	if (!dev) { libusb_close(usb_devh); *error_code = LIBUSB_ERROR_NO_MEM; return NULL; }
 	dev->base.funcs = &usb_device_funcs;
+	dev->base.usb_device = usb_dev;
 	dev->uvc_stream.device_gone = &dev->base.usb_gone;
 
 	dev->ohmd_ctx = ohmd_ctx;
@@ -215,6 +221,7 @@ rift_sensor_device *rift_sensor_usb_new (ohmd_context* ohmd_ctx, int id, const c
 	return (rift_sensor_device *)(dev);
 
 fail:
+	*error_code = ret < 0 ? ret : -1;
 	if (dev)
 		rift_sensor_usb_free ((rift_sensor_device *) dev);
 	return NULL;

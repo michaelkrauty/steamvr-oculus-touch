@@ -102,11 +102,18 @@ static inline int rift_sensor_frame_blob_label(const rift_sensor_analysis_frame 
 	return device >= 0 && (frame->rejected_inspection_mask & (1u << device)) ? LED_INVALID_ID : blob->led_id;
 }
 
-/* Consumes dev on success and failure. */
+/* Consumes dev on success and failure. pose: the camera -> world pose it starts with when it
+ * names this sensor; NULL takes the context's configured pose, if any. */
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
-	rift_sensor_device *dev, rift_tracker_ctx *tracker);
+	rift_sensor_device *dev, rift_tracker_ctx *tracker, const ohmd_cv1touch_sensor_pose *pose);
 void rift_sensor_request_stop(rift_sensor_ctx *sensor_ctx);
 void rift_sensor_retire(rift_sensor_ctx *sensor);
+bool rift_sensor_retired(rift_sensor_ctx *sensor);
+/* Frames that start before start_ns (host clock) neither move a device, place the sensor nor
+ * reach the frame callback; their blobs are still tracked. A sensor starts with 0. */
+void rift_sensor_accept_frames_from(rift_sensor_ctx *sensor, uint64_t start_ns);
+/* The USB device the sensor has open (rift_sensor_device.usb_device). */
+const struct libusb_device *rift_sensor_get_usb_device(rift_sensor_ctx *sensor);
 void rift_sensor_retry(rift_sensor_ctx *sensor_ctx, uint64_t now_ns);
 void rift_sensor_free (rift_sensor_ctx *sensor_ctx);
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor);
