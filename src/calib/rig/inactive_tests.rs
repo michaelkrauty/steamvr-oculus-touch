@@ -235,8 +235,7 @@ fn replayed_problem(seed: u64) -> (Problem, State) {
     let rec = recorder::Recorder::new(32 << 20);
     const H0: u64 = 5_000_000_000_000;
     rec.start(&path, H0).unwrap();
-    for c in 0..3 {
-        let m = p.cameras[c];
+    for (c, m) in p.cameras.iter().take(3).enumerate() {
         let sensor = recorder::SensorInfo {
             serial: serial(c),
             width: m.width as i32,

@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+mod build_support;
 
 fn run(cmd: &mut Command) {
     let status = cmd
@@ -97,17 +98,17 @@ fn build_engine(root: &Path, out: &Path) {
     let lib_dir = native.join("third_party/openhmd");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=openhmd");
-    let profile_dir = out
-        .ancestors()
-        .nth(3)
-        .expect("Cargo OUT_DIR profile directory");
+    let profile_dir = build_support::profile_dir(out);
     if let Some(deps) = deps {
-        // No rpath on Windows: the engine and libusb DLLs go beside the executables Cargo
-        // builds (binaries, tests in deps, examples), as the installer puts them beside its own.
+        // Directly run binaries and bundles need adjacent DLLs. Cargo 1.100 puts test
+        // executables elsewhere: keep libusb beside openhmd in the link-search directory
+        // inside OUT_DIR too, which Cargo adds to the runtime search path.
         let dlls = [
             find_dll(&lib_dir, "openhmd"),
             find_dll(&deps.join("bin"), "libusb-1.0"),
         ];
+        fs::copy(&dlls[1], lib_dir.join(dlls[1].file_name().unwrap()))
+            .expect("copy libusb DLL for Cargo tests and runs");
         for dir in [
             profile_dir.to_path_buf(),
             profile_dir.join("deps"),
