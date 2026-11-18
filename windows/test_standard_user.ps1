@@ -18,6 +18,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not grant the test user access to its test files' }
     Copy-Item $Installer (Join-Path $work 'setup.exe')
     Copy-Item (Join-Path $PSScriptRoot 'test_install.py') $work
+    foreach ($notice in 'LICENSE-OpenCV', 'src\drv_oculus_rift\rift-sensor-camera.c', 'src\drv_oculus_rift\rift-sensor-pose.c') {
+        $destinationFile = Join-Path $work "expected-third-party\openhmd\$notice"
+        New-Item -ItemType Directory -Path (Split-Path $destinationFile) -Force | Out-Null
+        Copy-Item (Join-Path $PWD "target\bundle\third_party\openhmd\$notice") $destinationFile
+    }
     $python = (Get-Command python.exe).Source
     $credentials = [pscredential]::new("$env:COMPUTERNAME\$name", $password)
     Start-Service seclogon

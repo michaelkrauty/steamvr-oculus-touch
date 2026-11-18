@@ -136,6 +136,9 @@ def main(installer, work):
         uninstall = app / "unins000.exe"
         install_args = [installer, *flags, f"/DIR={app}", f"/LOG={work / f'install-{cycle}.log'}"]
         run_installer(install_args)
+        for name in ("LICENSE-OpenCV", "src/drv_oculus_rift/rift-sensor-camera.c",
+                     "src/drv_oculus_rift/rift-sensor-pose.c"):
+            assert (app / "third_party/openhmd" / name).read_bytes() == (Path("expected-third-party/openhmd") / name).read_bytes()
         print("Installed; checking daemon and shortcuts", flush=True)
         try:
             assert "cv1touch " in run([tool, "--version"])

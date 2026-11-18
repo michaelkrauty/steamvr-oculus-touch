@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,33 @@ def imports(*names):
 
 
 class WindowsBundleTests(unittest.TestCase):
+    def test_standard_user_notice_copy_preserves_account_name(self):
+        script = (Path(__file__).resolve().parents[1] / "windows/test_standard_user.ps1").read_text()
+        self.assertNotRegex(script, r"(?i)foreach\s*\(\s*\$name\b")
+        self.assertIn('target\\bundle\\third_party\\openhmd\\$notice', script)
+        self.assertIn('[pscredential]::new("$env:COMPUTERNAME\\$name", $password)', script)
+        self.assertIn('Remove-LocalUser -Name $name', script)
+
+    def test_opencv_notices_must_be_complete(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            for name in audit.OPENCV_NOTICES:
+                path = bundle / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source / name, path)
+            audit.check_notices(bundle, source)
+            for name in audit.OPENCV_NOTICES:
+                path = bundle / name
+                original = path.read_bytes()
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, "missing or altered OpenCV notice"):
+                    audit.check_notices(bundle, source)
+                path.write_bytes(original[:-1])
+                with self.assertRaisesRegex(ValueError, "missing or altered OpenCV notice"):
+                    audit.check_notices(bundle, source)
+                path.write_bytes(original)
+
     def test_inbox_libraries_but_not_optional_runtimes(self):
         for name in ("KERNEL32.dll", "setupapi.dll", "api-ms-win-crt-runtime-l1-1-0.dll"):
             self.assertTrue(audit.system_dll(name), name)

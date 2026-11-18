@@ -22,6 +22,18 @@ SYSTEM_DLLS = frozenset(name.lower() + ".dll" for name in (
     "newdev", "ntdll", "ole32", "setupapi", "shell32", "user32", "winmm",
 ))
 
+OPENCV_NOTICES = (
+    "third_party/openhmd/LICENSE-OpenCV",
+    "third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c",
+    "third_party/openhmd/src/drv_oculus_rift/rift-sensor-pose.c",
+)
+
+
+def check_notices(bundle, source):
+    for name in OPENCV_NOTICES:
+        if not (bundle / name).is_file() or (bundle / name).read_bytes() != (source / name).read_bytes():
+            raise ValueError(f"missing or altered OpenCV notice: {name}")
+
 
 def dependencies(output):
     return re.findall(r"^\s+Name: (\S+)\s*$", output, re.MULTILINE)
@@ -59,6 +71,7 @@ if __name__ == "__main__":
     parser.add_argument("--readobj", default="llvm-readobj")
     args = parser.parse_args()
     try:
+        check_notices(args.bundle, Path(__file__).resolve().parents[1])
         check(args.bundle, args.readobj)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Windows bundle: {error}\n")

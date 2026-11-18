@@ -64,7 +64,7 @@ Take (Join-Path $root 'driver\cv1touch\driver.vrdrivermanifest') (Join-Path $Out
 foreach ($file in 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md') {
     Take (Join-Path $root $file) (Join-Path $Out $file)
 }
-foreach ($file in 'openhmd\LICENSE', 'licenses\nxjson-MIT.txt', 'licenses\miniz-Unlicense.txt', 'openvr\LICENSE', 'openvr\PROVENANCE.md') {
+foreach ($file in 'openhmd\LICENSE', 'openhmd\LICENSE-OpenCV', 'openhmd\src\drv_oculus_rift\rift-sensor-camera.c', 'openhmd\src\drv_oculus_rift\rift-sensor-pose.c', 'licenses\nxjson-MIT.txt', 'licenses\miniz-Unlicense.txt', 'openvr\LICENSE', 'openvr\PROVENANCE.md') {
     Take (Join-Path $root "third_party\$file") (Join-Path $Out "third_party\$file")
 }
 
