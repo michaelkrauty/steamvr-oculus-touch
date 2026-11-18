@@ -9,6 +9,7 @@
 #include "rift-debug-draw.h"
 #include "rift-sensor-pose-helper.h"
 #include "rift-sensor-opencv.h"
+#include "rift-sensor-camera.h"
 
 /* This will draw RGB flipped on big-endian */
 #define WRITE_UINT24_BE(dest, colour) dest[2] = colour & 0xff; dest[1] = colour >> 8 & 0xff; dest[0] = colour >> 16 & 0xff

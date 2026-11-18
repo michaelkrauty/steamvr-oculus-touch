@@ -33,6 +33,7 @@
 
 #include "rift-sensor-maths.h"
 #include "rift-sensor-opencv.h"
+#include "rift-sensor-camera.h"
 #include "rift-sensor-pose-helper.h"
 
 #include "rift-debug-draw.h"

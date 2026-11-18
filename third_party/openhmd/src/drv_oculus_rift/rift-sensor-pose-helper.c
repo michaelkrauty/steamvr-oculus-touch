@@ -11,6 +11,7 @@
 
 #include "rift-sensor-pose-helper.h"
 #include "rift-sensor-opencv.h"
+#include "rift-sensor-camera.h"
 
 struct visible_led_info {
 	rift_led *led;

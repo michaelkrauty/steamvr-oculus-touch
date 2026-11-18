@@ -126,6 +126,7 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/rift-sensor.c',
 		'src/drv_oculus_rift/rift-sensor-usb.c',
 		'src/drv_oculus_rift/rift-sensor-opencv.cpp',
+		'src/drv_oculus_rift/rift-sensor-camera.c',
 		'src/drv_oculus_rift/rift-sensor-maths.c',
 		'src/drv_oculus_rift/rift-sensor-blobwatch.c',
 		'src/drv_oculus_rift/rift-sensor-flicker.c',

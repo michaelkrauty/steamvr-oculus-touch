@@ -18,13 +18,6 @@ bool estimate_initial_pose(struct blob *blobs, int num_blobs,
 			   posef *pose, int *num_leds_out,
 			   int *num_inliers, bool use_extrinsic_guess);
 
-void undistort_points (struct blob *blobs, int num_blobs,
-				vec3f *out_points,
-        rift_sensor_camera_params *calib);
-
-void rift_project_points(rift_led *leds, int num_led_pos,
-  rift_sensor_camera_params *calib, posef *pose, vec3f *out_points);
-
 bool refine_pose(struct blob *blobs, int num_blobs,
 		int device_id, rift_led *leds, int num_leds,
 		rift_sensor_camera_params *calib,
@@ -49,10 +42,6 @@ bool estimate_initial_pose(struct blob *blobs, int num_blobs,
 	(void)use_extrinsic_guess;
   return false;
 }
-#define rift_project_points(leds,num_led_pos,calib,pose,out_points)
-
-#define undistort_points(blobs,num_blobs,out_points,calib)
-
 #define refine_pose(blobs,num_blobs,device_id,leds,num_leds,calib,pose)
 
 #endif /* HAVE_OPENCV */
