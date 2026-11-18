@@ -3,6 +3,8 @@
 
 //! USB presence changes, debounced independently per sensor. A stream failure is not an
 //! attachment change; a definite device removal can retire a handle even between USB scans.
+//! A running engine adds a settled, ready sensor itself (`take_adds`); without one, the next
+//! engine start opens it (`before_open`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -11,6 +13,16 @@ use crate::platform::usb::Sensor;
 use crate::status::{same_sensor, sensor_identity};
 
 pub const DEBOUNCE_NS: u64 = 1_000_000_000;
+/// A live add that found no device, or one in use, is tried this many times more, this far apart:
+/// uvcvideo can hold a sensor's interfaces for a moment after it appears.
+pub const ADD_RETRIES: u32 = 3;
+pub const ADD_RETRY_NS: u64 = 1_000_000_000;
+
+/// libusb's error codes a live add can end with.
+pub const LIBUSB_ERROR_ACCESS: i32 = -3;
+pub const LIBUSB_ERROR_NO_DEVICE: i32 = -4;
+pub const LIBUSB_ERROR_NOT_FOUND: i32 = -5;
+pub const LIBUSB_ERROR_BUSY: i32 = -6;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Change {
@@ -25,7 +37,26 @@ pub struct Change {
 pub struct PendingSensor {
     pub serial: String,
     pub state: &'static str,
-    pub detail: &'static str,
+    pub detail: String,
+}
+
+/// What the engine thread does with a finished live add (`Monitor::add_finished`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddVerdict {
+    /// The sensor joined the engine: it is in use from now on.
+    Use,
+    /// The watch no longer waits for this add (`closed`, `before_open`): release it at once.
+    Release,
+    /// Its USB device went away while it was being opened, as a native NO_DEVICE says: retire it
+    /// (`Change::unplugged`); it gets one recovery once two scans confirm it is back.
+    Gone(Change),
+    /// Tried again once `ADD_RETRY_NS` have passed.
+    Retry { attempt: u32 },
+    /// Not tried again before it is plugged in again; `pending` says why, with what to do.
+    Failed(String),
+    /// Nothing more to do: a failed start is recorded with the engine's start records, as at an
+    /// engine start, and is not tried again before the next attachment.
+    Done,
 }
 
 /// The watcher's view of the sensors and of the current engine's sensor objects. One rule
@@ -43,18 +74,31 @@ pub struct PendingSensor {
 ///   first may have been read before the starts). From `before_open` until then, nothing
 ///   settles: no departure can be blamed on an object yet unknown, and nothing logged or
 ///   reported about a sensor the engine may open claims what it will do with it.
-#[derive(Clone, Debug)]
+/// - A running engine adds a settled, ready sensor itself (`take_adds`), and the object it starts
+///   joins the roster as one the open started does: from its adoption the serial is in use, by
+///   no attachment yet. From `take_adds` until the add ends nothing about that serial settles,
+///   and the first scan applied after its adoption, which may have been read before its start,
+///   settles nothing about it either; the next ones are read after its start. So only those
+///   listings or its own NO_DEVICE retire it.
+/// - The roster rebuilds the attempts: each attachment gets one per engine, at its open or in an
+///   add. A start, whether its video started or not, spends it until the next engine start or a
+///   replug; a device that was not there yet or was busy is tried again, a few times; a
+///   NO_DEVICE gets the one recovery a native NO_DEVICE gets, held against the attachment it was
+///   reported for. Without a running engine a ready sensor waits for the next engine start, and
+///   so does one the running engine refused, with the reason.
+#[derive(Clone, Debug, Hash)]
 pub struct Monitor {
     present: BTreeMap<String, Sensor>,
     membership: BTreeMap<String, (Option<Sensor>, u64)>,
     readiness: BTreeMap<String, (String, bool, u64)>,
     attempted: BTreeMap<String, String>,
-    /// Native objects outlive a detach; reject callbacks until engine replacement.
+    /// Detached serials: their native objects stay excluded until the engine has released them
+    /// (`released`), or until the next engine start.
     detached: BTreeSet<String>,
     gone_seen: BTreeMap<String, String>,
-    /// One recovery of an attachment whose native handle reported NO_DEVICE: once back, it
-    /// waits for the next engine start. A new OS generation resets this budget; the same
-    /// attachment failing again asks for a replug.
+    /// One recovery of an attachment whose native handle reported NO_DEVICE: once back, the
+    /// running engine adds it again (or the next engine start opens it). A new OS generation
+    /// resets this budget; the same attachment failing again asks for a replug.
     gone_retried: BTreeMap<String, String>,
     back: BTreeMap<String, Option<(String, u64)>>,
     opening: bool,
@@ -70,6 +114,21 @@ pub struct Monitor {
     /// The current engine's live sensor objects, with the attachment a listing read after the
     /// start last showed for that serial, if one has.
     in_use: BTreeMap<String, Option<String>>,
+    /// An engine is open and past its first update: it adds settled, ready sensors itself.
+    running: bool,
+    /// Live adds the engine is working on: serial -> attachment.
+    adding: BTreeMap<String, String>,
+    /// Serials whose object joined the running engine after the last scan applied was read.
+    fresh: BTreeSet<String>,
+    /// Live adds that found no device, or one in use: serial -> (attachment, tries so far, not
+    /// before).
+    retry: BTreeMap<String, (String, u32, u64)>,
+    /// Live adds that failed for good: serial -> (attachment, the reason with what to do).
+    add_failed: BTreeMap<String, (String, String)>,
+    /// Attachments the running engine could not be asked to add: they wait for its next start.
+    refused: BTreeMap<String, String>,
+    /// When a scan first listed each attachment: serial -> (attachment, host ns).
+    seen: BTreeMap<String, (String, u64)>,
     scan_error: Option<String>,
 }
 
@@ -88,13 +147,59 @@ const CHECKING_DETAIL: &str = "Its USB connection just changed; the daemon is ch
 /// A sensor the opening engine may still open.
 const OPENING_DETAIL: &str = "Waiting for the engine to finish opening.";
 
-/// A ready sensor the running engine did not open: engines open sensors only as they start.
+/// A sensor the engine is opening, or that the running engine opens on its next pass.
+const ADDING_DETAIL: &str = "The engine is opening this sensor.";
+
+/// A ready sensor no running engine adds: the next engine start opens it.
 fn engine_start_detail() -> &'static str {
     if cfg!(windows) {
         "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (choose Stop cv1touch, then Start cv1touch in the Start menu)."
     } else {
         "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (systemctl --user restart cv1touchd)."
     }
+}
+
+/// Why a live add failed for good, in plain words, with what to do.
+pub fn add_failure_detail(outcome: crate::engine::AddOutcome, error_code: i32) -> String {
+    use crate::engine::AddOutcome;
+    let replug = "unplug the sensor and plug it back in";
+    match (outcome, error_code) {
+        (AddOutcome::Rejected, _) => format!(
+            "The engine turned this sensor down: it reported another serial, or it is set to be ignored. Check the daemon log, then {replug}."
+        ),
+        (AddOutcome::NotFound | AddOutcome::Stale, _) | (_, LIBUSB_ERROR_NOT_FOUND) => format!(
+            "Its USB connection kept dropping while the engine opened it. Check its cable, then {replug}."
+        ),
+        (_, LIBUSB_ERROR_BUSY) => format!(
+            "Another program or driver is using this sensor's USB device. Close it, then {replug}."
+        ),
+        (_, LIBUSB_ERROR_ACCESS) if cfg!(windows) => format!(
+            "Windows didn't let the daemon open this sensor's USB device. Run cv1touch sensors to check its driver, then {replug}."
+        ),
+        (_, LIBUSB_ERROR_ACCESS) => format!(
+            "The daemon isn't allowed to use this sensor's USB device (permissions). Run cv1touch sensors to check USB access, then {replug}."
+        ),
+        (_, code) => format!(
+            "The engine could not open this sensor (USB error {code}). {}; if that keeps happening, try another USB port.",
+            capitalized(replug)
+        ),
+    }
+}
+
+/// The running engine could not be asked to open a sensor at all: only an engine start opens it.
+fn add_refused_detail() -> String {
+    format!(
+        "The running engine could not take this sensor. {}",
+        engine_start_detail()
+    )
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
 }
 
 fn listing(sensors: Vec<Sensor>, ignored: &[String]) -> BTreeMap<String, Sensor> {
@@ -133,6 +238,13 @@ impl Monitor {
             opening_attachments: BTreeMap::new(),
             engine_waiting: false,
             in_use: BTreeMap::new(),
+            running: false,
+            adding: BTreeMap::new(),
+            fresh: BTreeSet::new(),
+            retry: BTreeMap::new(),
+            add_failed: BTreeMap::new(),
+            refused: BTreeMap::new(),
+            seen: BTreeMap::new(),
             scan_error,
         }
     }
@@ -160,9 +272,12 @@ impl Monitor {
         listed: io::Result<Vec<Sensor>>,
         ignored: &[String],
     ) -> Option<Change> {
-        // Whether this listing can settle anything, and whether the next one can.
-        let settles = self.settling;
+        // Whether this listing can settle anything, and whether the next one can. Nothing about
+        // a sensor settles while the engine adds it, nor by the first listing applied after it
+        // joined: that one may have been read before its start.
+        let settles_any = self.settling;
         self.settling = !self.discovering;
+        let fresh = std::mem::take(&mut self.fresh);
         let mut next = match listed {
             Ok(devices) => {
                 self.scan_error = None;
@@ -189,6 +304,15 @@ impl Monitor {
                 unknown.insert(serial.clone());
             }
         }
+        self.seen.retain(|serial, _| next.contains_key(serial));
+        for (serial, sensor) in &next {
+            if !sensor.attachment.is_empty()
+                && self.seen.get(serial).map(|(a, _)| a) != Some(&sensor.attachment)
+            {
+                self.seen
+                    .insert(serial.clone(), (sensor.attachment.clone(), now));
+            }
+        }
         // A new serial that disappears before admission must start its debounce again.
         self.membership
             .retain(|serial, _| self.present.contains_key(serial) || next.contains_key(serial));
@@ -197,6 +321,8 @@ impl Monitor {
         let serials: BTreeSet<_> = self.present.keys().chain(next.keys()).cloned().collect();
         let mut change = Change::default();
         for serial in serials {
+            let settles =
+                settles_any && !fresh.contains(&serial) && !self.adding.contains_key(&serial);
             let old = self.present.get(&serial).cloned();
             let new = next.get(&serial);
             // Filling in the first arrival property is not an unplug/replug.
@@ -296,6 +422,8 @@ impl Monitor {
             } else {
                 self.readiness.remove(&serial);
             }
+            // The attachment this listing has is the only one a live add may still remember.
+            self.drop_unlisted_add(&serial);
         }
         // A native NO_DEVICE is evidence the old handle died. Confirm a ready USB attachment
         // on two later scans, even if a platform reused its persistent device instance ID.
@@ -335,7 +463,9 @@ impl Monitor {
             return None;
         }
         let generation = self.present.get(&serial)?.attachment.clone();
-        if self.gone_seen.contains_key(&serial) {
+        // Reported already: an object still in the roster reports it again on every snapshot
+        // until it is released. Another attachment's object is another report.
+        if self.gone_seen.get(&serial) == Some(&generation) {
             return None;
         }
         self.gone_seen
@@ -364,6 +494,13 @@ impl Monitor {
         // omitted now must remain eligible when access returns, unless native discovery tried it.
         self.attempted.clear();
         self.in_use.clear();
+        // An engine start opens every ready attachment again, including failed live adds.
+        self.running = false;
+        self.adding.clear();
+        self.fresh.clear();
+        self.retry.clear();
+        self.add_failed.clear();
+        self.refused.clear();
         self.opening = true;
         self.discovering = true;
         self.settling = false;
@@ -394,6 +531,7 @@ impl Monitor {
         self.discovering = false;
         self.settling = true;
         self.engine_waiting = true;
+        self.running = false;
     }
 
     /// The engine opened; it still initializes until `opened`.
@@ -401,20 +539,296 @@ impl Monitor {
         self.engine_waiting = false;
     }
 
-    /// The opened engine's first update is done: its sensors are in its roster.
+    /// The opened engine's first update is done: its sensors are in its roster, and from now on
+    /// it adds sensors plugged in while it runs.
     pub fn opened(&mut self) {
         self.opening = false;
         self.discovering = false;
         self.opening_serials.clear();
+        self.running = true;
     }
 
-    /// The engine closed: none of its objects is in use any more.
+    /// The engine closed: none of its objects is in use any more, and the adds it was working
+    /// on, or could not finish, went with it: the next engine start opens their sensors.
     pub fn closed(&mut self) {
         self.in_use.clear();
         self.opening = false;
         self.discovering = false;
         self.settling = true;
         self.opening_serials.clear();
+        self.running = false;
+        let unfinished = self
+            .adding
+            .iter()
+            .chain(self.add_failed.iter().map(|(s, (a, _))| (s, a)))
+            .chain(&self.refused);
+        for (serial, attachment) in unfinished {
+            if self.attempted.get(serial) == Some(attachment) {
+                self.attempted.remove(serial);
+            }
+        }
+        self.adding.clear();
+        self.fresh.clear();
+        self.retry.clear();
+        self.add_failed.clear();
+        self.refused.clear();
+    }
+
+    /// Whether a settled, ready attachment is due its first attempt in this engine, by an add.
+    fn wants_add(&self, serial: &str, sensor: &Sensor, now: u64) -> bool {
+        sensor.ready
+            && !sensor.attachment.is_empty()
+            && !self.membership.contains_key(serial)
+            && !self.back.contains_key(serial)
+            && !self.in_use.contains_key(serial)
+            && !self.adding.contains_key(serial)
+            // its old object is released first
+            && !self.detached.contains(serial)
+            && self.attempted.get(serial) != Some(&sensor.attachment)
+            && self
+                .retry
+                .get(serial)
+                .is_none_or(|(a, _, not_before)| *a != sensor.attachment || *not_before <= now)
+    }
+
+    /// The sensors the running engine is to add now, each marked as being added, its attempt
+    /// spent. A detached serial waits until the engine has released its old object (`released`).
+    pub fn take_adds(&mut self, now: u64) -> Vec<Sensor> {
+        if !self.running || self.scan_error.is_some() {
+            return Vec::new();
+        }
+        let due: Vec<(String, Sensor)> = self
+            .present
+            .iter()
+            .filter(|(serial, sensor)| self.wants_add(serial, sensor, now))
+            .map(|(serial, sensor)| (serial.clone(), sensor.clone()))
+            .collect();
+        for (serial, sensor) in &due {
+            self.attempted
+                .insert(serial.clone(), sensor.attachment.clone());
+            self.adding
+                .insert(serial.clone(), sensor.attachment.clone());
+        }
+        due.into_iter().map(|(_, sensor)| sensor).collect()
+    }
+
+    /// A removal or replacement has settled. A retry, a failed add or a refusal for an
+    /// attachment this listing no longer has went with that attachment: the engine loop must
+    /// not keep servicing it, and status must not keep its reason.
+    fn drop_unlisted_add(&mut self, serial: &str) {
+        let listed = self
+            .present
+            .get(serial)
+            .map(|sensor| sensor.attachment.clone());
+        let unlisted = |attachment: &String| listed.as_deref() != Some(attachment.as_str());
+        if self
+            .retry
+            .get(serial)
+            .is_some_and(|(attachment, ..)| unlisted(attachment))
+        {
+            self.retry.remove(serial);
+        }
+        if self
+            .add_failed
+            .get(serial)
+            .is_some_and(|(attachment, _)| unlisted(attachment))
+        {
+            self.add_failed.remove(serial);
+        }
+        if self.refused.get(serial).is_some_and(unlisted) {
+            self.refused.remove(serial);
+        }
+    }
+
+    /// When the next live-add retry is due, if one is waiting for an attachment that is
+    /// present and ready. Anything else is not a retry the engine loop waits on: a time in
+    /// the past would make it service sensors on every pass.
+    pub fn next_retry(&self) -> Option<u64> {
+        self.retry
+            .iter()
+            .filter(|(serial, (attachment, _, _))| {
+                self.present.get(*serial).is_some_and(|sensor| {
+                    sensor.ready
+                        && !sensor.attachment.is_empty()
+                        && sensor.attachment == *attachment
+                })
+            })
+            .map(|(_, (_, _, at))| *at)
+            .min()
+    }
+
+    /// Every retry, failed add and refusal names the attachment still listed for its serial,
+    /// and [`Self::next_retry`] names only one that is present and ready.
+    pub fn live_add_records_current(&self) -> bool {
+        let listed = |serial: &String, attachment: &String| {
+            self.present
+                .get(serial)
+                .is_some_and(|sensor| sensor.attachment == *attachment)
+        };
+        let records = self
+            .retry
+            .iter()
+            .all(|(serial, (attachment, _, _))| listed(serial, attachment))
+            && self
+                .add_failed
+                .iter()
+                .all(|(serial, (attachment, _))| listed(serial, attachment))
+            && self
+                .refused
+                .iter()
+                .all(|(serial, attachment)| listed(serial, attachment));
+        let due = self.next_retry().is_none_or(|at| {
+            self.retry.iter().any(|(serial, (attachment, _, when))| {
+                *when == at
+                    && self
+                        .present
+                        .get(serial)
+                        .is_some_and(|sensor| sensor.ready && sensor.attachment == *attachment)
+            })
+        });
+        records && due
+    }
+
+    /// A finished live add of `attachment`, and what the engine thread does with it. Called with
+    /// the watch held while the engine adopts it: nothing about the serial settled while it was
+    /// added, so the sensor it started is in use now, as one an open started, by no attachment
+    /// yet; scans read after its start decide what its device is.
+    pub fn add_finished(
+        &mut self,
+        serial: &str,
+        attachment: &str,
+        outcome: crate::engine::AddOutcome,
+        error_code: i32,
+        now: u64,
+    ) -> AddVerdict {
+        use crate::engine::AddOutcome;
+        let serial = sensor_identity(serial);
+        if self.adding.get(&serial).map(String::as_str) != Some(attachment) {
+            return if outcome == AddOutcome::Started {
+                AddVerdict::Release
+            } else {
+                AddVerdict::Done
+            };
+        }
+        self.adding.remove(&serial);
+        let transient = matches!(outcome, AddOutcome::NotFound | AddOutcome::Stale)
+            || (outcome == AddOutcome::OpenFailed
+                && matches!(
+                    error_code,
+                    LIBUSB_ERROR_ACCESS | LIBUSB_ERROR_BUSY | LIBUSB_ERROR_NOT_FOUND
+                ));
+        match outcome {
+            AddOutcome::Started => {
+                self.retry.remove(&serial);
+                // a recovered attachment is open again: losing it again is a removal to report
+                self.gone_seen.remove(&serial);
+                self.in_use.insert(serial.clone(), None);
+                self.fresh.insert(serial);
+                AddVerdict::Use
+            }
+            // Recorded with the engine's start records, where a NO_DEVICE start is retired like
+            // any other (`native_gone`); not tried again before the next attachment.
+            AddOutcome::StartFailed => {
+                self.retry.remove(&serial);
+                AddVerdict::Done
+            }
+            AddOutcome::OpenFailed if error_code == LIBUSB_ERROR_NO_DEVICE => {
+                self.retry.remove(&serial);
+                self.native_gone(&serial)
+                    .map_or(AddVerdict::Done, AddVerdict::Gone)
+            }
+            _ if transient => {
+                let tries = match self.retry.get(&serial) {
+                    Some((a, tries, _)) if a == attachment => *tries + 1,
+                    _ => 1,
+                };
+                if tries > ADD_RETRIES {
+                    self.retry.remove(&serial);
+                    let detail = add_failure_detail(outcome, error_code);
+                    self.add_failed
+                        .insert(serial, (attachment.to_string(), detail.clone()));
+                    return AddVerdict::Failed(detail);
+                }
+                self.retry.insert(
+                    serial.clone(),
+                    (attachment.to_string(), tries, now + ADD_RETRY_NS),
+                );
+                self.attempted.remove(&serial);
+                AddVerdict::Retry { attempt: tries }
+            }
+            _ => {
+                self.retry.remove(&serial);
+                let detail = add_failure_detail(outcome, error_code);
+                self.add_failed
+                    .insert(serial, (attachment.to_string(), detail.clone()));
+                AddVerdict::Failed(detail)
+            }
+        }
+    }
+
+    /// The engine already holds a live object of this serial: it is in use, as an add's would be.
+    pub fn already_open(&mut self, serial: &str, attachment: &str) {
+        let serial = sensor_identity(serial);
+        if self.adding.get(&serial).map(String::as_str) == Some(attachment) {
+            self.adding.remove(&serial);
+            self.in_use.entry(serial.clone()).or_insert(None);
+            self.fresh.insert(serial);
+        }
+    }
+
+    /// The running engine could not be asked to add this sensor: the next engine start opens it.
+    pub fn add_refused(&mut self, serial: &str, attachment: &str) {
+        let serial = sensor_identity(serial);
+        if self.adding.get(&serial).map(String::as_str) == Some(attachment) {
+            self.adding.remove(&serial);
+            self.refused.insert(serial, attachment.to_string());
+        }
+    }
+
+    /// The engine released the detached serial's native object and forgot its start record: a
+    /// new attachment of it can be added.
+    pub fn released(&mut self, serial: &str) {
+        self.detached.remove(&sensor_identity(serial));
+    }
+
+    /// When a scan first listed this attachment, if it still lists it.
+    pub fn plugged_at(&self, serial: &str, attachment: &str) -> Option<u64> {
+        self.seen
+            .get(&sensor_identity(serial))
+            .filter(|(a, _)| a == attachment)
+            .map(|(_, at)| *at)
+    }
+
+    /// Whether an engine runs and adds plugged-in sensors itself.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Whether an engine opens a sensor plugged in now: one that runs, or one opening, which
+    /// opens it or adds it once it runs.
+    pub fn engine_adds(&self) -> bool {
+        self.running || self.opening
+    }
+
+    /// Whether the engine has sensor work: an old object to release (a retirement need not say
+    /// unplugged twice), or, running, a sensor to add, now or when its retry is due.
+    pub fn engine_work(&self) -> bool {
+        !self.detached.is_empty() || self.addable()
+    }
+
+    /// Whether the running engine has a sensor to add, now or when its retry is due.
+    pub fn addable(&self) -> bool {
+        self.running
+            && self.scan_error.is_none()
+            && self
+                .present
+                .iter()
+                .any(|(serial, sensor)| self.wants_add(serial, sensor, u64::MAX))
+    }
+
+    /// Whether a live add is under way.
+    pub fn adding(&self) -> bool {
+        !self.adding.is_empty()
     }
 
     pub fn pending(&self) -> Vec<PendingSensor> {
@@ -431,11 +845,21 @@ impl Monitor {
                         *ready && *attachment == sensor.attachment
                     })
                 };
+            // Why this attachment's add failed, unless a change of it is being checked now, or USB
+            // cannot be read to tell.
+            let known = !checking && self.scan_error.is_none();
+            let ours = |attachment: &String| known && *attachment == sensor.attachment;
+            let failed = self.add_failed.get(serial).filter(|(a, _)| ours(a));
+            let refused = self.refused.get(serial).is_some_and(ours);
             let (state, detail) = if self.engine_waiting && self.opening_serials.contains(serial) {
                 ("waiting_headset", "Waiting for the headset; this sensor is opened with it.")
-            } else if self.opening && self.opening_serials.contains(serial) {
-                ("opening", "The engine is opening this sensor.")
-            } else if self.gone_seen.contains_key(serial) && !waiting {
+            } else if (self.opening && self.opening_serials.contains(serial)) || self.adding.contains_key(serial) {
+                ("opening", ADDING_DETAIL)
+            } else if let Some((_, detail)) = failed {
+                return Some(PendingSensor { serial: sensor.serial.clone(), state: "open_failed", detail: detail.clone() });
+            } else if refused {
+                return Some(PendingSensor { serial: sensor.serial.clone(), state: "waiting_engine_start", detail: add_refused_detail() });
+            } else if self.gone_seen.get(serial) == Some(&sensor.attachment) && !waiting {
                 ("waiting_replug", "Its USB device went away; unplug this sensor and plug it back in.")
             } else if !waiting { return None; }
             // Until its roster is known, the opening engine may be using it.
@@ -449,8 +873,11 @@ impl Monitor {
                 ("waiting_usb", usb_access_detail())
             } else if self.opening { ("opening", OPENING_DETAIL) }
             else if self.engine_waiting { ("waiting_headset", "Waiting for the headset; this sensor is opened with it.") }
+            // the running engine adds it on its next pass, once its old object is released, or
+            // when its retry is due
+            else if self.running { ("opening", ADDING_DETAIL) }
             else { ("waiting_engine_start", engine_start_detail()) };
-            Some(PendingSensor { serial: sensor.serial.clone(), state, detail })
+            Some(PendingSensor { serial: sensor.serial.clone(), state, detail: detail.to_string() })
         }).collect()
     }
 
@@ -625,6 +1052,18 @@ impl Monitor {
             .any(|p| p.state == "waiting_engine_start")
     }
 
+    /// Whether a settled, ready attachment waits for its first attempt: a running engine adds it
+    /// (`take_adds`) once its old object is released, or the next engine start opens it.
+    #[cfg(test)]
+    pub(crate) fn wants_open(&self) -> bool {
+        self.scan_error.is_none()
+            && self.present.iter().any(|(serial, sensor)| {
+                let mut released = self.clone();
+                released.detached.remove(serial);
+                released.wants_add(serial, sensor, u64::MAX)
+            })
+    }
+
     pub fn scan_error(&self) -> Option<&str> {
         self.scan_error.as_deref()
     }
@@ -661,7 +1100,7 @@ mod tests {
         let pending = m.pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].state, "waiting_usb");
-        let detail = pending[0].detail;
+        let detail = pending[0].detail.as_str();
         if cfg!(windows) {
             assert_eq!(detail, "This sensor's driver interfaces aren't active yet.");
             assert!(!detail.to_ascii_lowercase().contains("permission"));
@@ -675,16 +1114,61 @@ mod tests {
         assert!(!detail.contains("Windows"));
     }
 
-    #[test]
-    fn hotplug_a_sensor_plugged_into_a_running_engine_waits_for_its_next_start() {
+    use crate::engine::AddOutcome;
+
+    /// A running engine with no sensors yet.
+    fn running() -> Monitor {
         let mut m = Monitor::new(Ok(vec![]), &[]);
         m.before_open();
         m.opened();
-        change(&mut m, 1, vec![sensor("SENSORALPHA", "port-a-1", true)]).unwrap();
+        m
+    }
+
+    /// A sensor plugged into a running engine is added by it, which status shows as the engine
+    /// opening it; once added it is in use, and nothing reopens the engine.
+    #[test]
+    fn hotplug_a_running_engine_adds_a_plugged_in_sensor_itself() {
+        let mut m = running();
+        let a = sensor("SENSORALPHA", "port-a-1", true);
+        assert!(m.update(10, Ok(vec![a.clone()]), &[]).is_none());
+        // still settling: not yet
+        assert!(m.take_adds(10).is_empty() && !m.addable());
+        assert!(m.pending().is_empty());
+        m.update(10 + DEBOUNCE_NS, Ok(vec![a.clone()]), &[])
+            .unwrap();
+        assert_eq!(m.plugged_at(&a.serial, &a.attachment), Some(10));
+        // ready and settled: the engine takes it on its next pass
+        assert!(m.addable());
+        assert_eq!(details(&m), [("opening", ADDING_DETAIL.to_string())]);
+        assert_eq!(m.take_adds(10 + DEBOUNCE_NS), std::slice::from_ref(&a));
+        assert!(m.adding() && m.take_adds(10 + DEBOUNCE_NS).is_empty() && !m.addable());
+        assert_eq!(states(&m), ["opening"]);
+        assert_eq!(
+            m.add_finished("sensoralpha", &a.attachment, AddOutcome::Started, 0, 0),
+            AddVerdict::Use
+        );
+        assert!(m.in_use(&a.serial));
+        assert!(!m.adding() && m.pending().is_empty() && !m.wants_open());
+        // no reopen, and the next scans leave it alone
+        assert!(m
+            .update(5 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[])
+            .is_none());
+        assert!(m.take_adds(5 * DEBOUNCE_NS).is_empty());
+        assert!(m.in_use(&a.serial));
+    }
+
+    /// No engine runs (no headset, one closing for a mode change, or before the first): the next
+    /// engine start opens the sensor, and only then is the next start the reason it waits.
+    #[test]
+    fn hotplug_without_a_running_engine_the_next_start_opens_the_sensor() {
+        let a = sensor("SENSORALPHA", "port-a-1", true);
+        let mut m = running();
+        m.closed();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        assert!(m.take_adds(2 * DEBOUNCE_NS).is_empty() && !m.addable());
         let pending = m.pending();
-        assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].state, "waiting_engine_start");
-        let detail = pending[0].detail;
+        let detail = pending[0].detail.as_str();
         assert!(
             detail
                 .starts_with("This sensor will be used the next time the tracking engine starts."),
@@ -695,11 +1179,480 @@ mod tests {
         } else {
             assert!(detail.contains("systemctl --user restart cv1touchd"));
         }
-        // An engine start, a restart or a mode change, opens it.
+        m.before_open();
+        m.open_failed();
+        assert_eq!(states(&m), ["waiting_headset"]);
+        assert!(m.take_adds(3 * DEBOUNCE_NS).is_empty());
+        m.before_open();
+        m.open_succeeded();
+        assert_eq!(states(&m), ["opening"]);
+        m.opened();
+        assert!(m.pending().is_empty());
+        assert!(
+            m.take_adds(4 * DEBOUNCE_NS).is_empty(),
+            "the start opened it"
+        );
+    }
+
+    /// An engine that closes during an add leaves the sensor to the next engine start, which
+    /// opens it; the closed engine's result is never adopted.
+    #[test]
+    fn hotplug_an_add_the_closing_engine_took_with_it_is_opened_at_the_next_start() {
+        let a = sensor("SENSORALPHA", "port-a-1", true);
+        let mut m = running();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        assert_eq!(m.take_adds(2 * DEBOUNCE_NS), std::slice::from_ref(&a));
+        m.closed();
+        assert!(!m.adding());
+        assert_eq!(states(&m), ["waiting_engine_start"]);
+        assert_eq!(
+            m.add_finished(&a.serial, &a.attachment, AddOutcome::Started, 0, 0),
+            AddVerdict::Release
+        );
+        assert!(!m.in_use(&a.serial));
         m.before_open();
         assert_eq!(states(&m), ["opening"]);
         m.opened();
         assert!(m.pending().is_empty());
+    }
+
+    /// Unplugged, or replugged elsewhere, while it is added: nothing about it settles until its
+    /// add ends, so nothing logged or shown claims what the add will do. The sensor the engine
+    /// started is in use, by no connection yet: a departure retires it only once listings read
+    /// after its start settle it, from the second scan applied after its adoption, and a
+    /// replacement does not (the engine may have opened that one), until its own NO_DEVICE.
+    #[test]
+    fn hotplug_a_sensor_unplugged_during_its_add_is_judged_by_listings_read_after_its_start() {
+        for replaced in [false, true] {
+            let a = sensor("SENSORALPHA", "port-a-1", true);
+            let mut m = running();
+            change(&mut m, 1, vec![a.clone()]).unwrap();
+            assert_eq!(m.take_adds(2 * DEBOUNCE_NS), std::slice::from_ref(&a));
+            let mut now_listed = vec![];
+            if replaced {
+                now_listed.push(sensor("SENSORALPHA", "port-a-2", true));
+            }
+            assert!(change(&mut m, 3 * DEBOUNCE_NS, now_listed.clone()).is_none());
+            assert!(m.admitted(&a.serial));
+            assert_eq!(states(&m), ["opening"]);
+            assert_eq!(
+                m.add_finished(
+                    &a.serial,
+                    &a.attachment,
+                    AddOutcome::Started,
+                    0,
+                    4 * DEBOUNCE_NS
+                ),
+                AddVerdict::Use
+            );
+            assert!(m.in_use(&a.serial));
+            assert!(
+                m.update(5 * DEBOUNCE_NS, Ok(now_listed.clone()), &[])
+                    .is_none(),
+                "read before its start, maybe"
+            );
+            let settled = m.update(6 * DEBOUNCE_NS, Ok(now_listed.clone()), &[]);
+            if replaced {
+                assert!(settled.is_none(), "{settled:?}");
+                assert!(m.in_use(&a.serial) && m.admitted(&a.serial));
+                assert!(m.pending().is_empty());
+                // its own NO_DEVICE: retired; the replacement is added once two scans confirm it
+                assert_eq!(
+                    m.native_gone(&a.serial).unwrap().unplugged,
+                    std::slice::from_ref(&a.serial)
+                );
+                m.released(&a.serial);
+                m.update(7 * DEBOUNCE_NS, Ok(now_listed.clone()), &[]);
+                m.update(8 * DEBOUNCE_NS, Ok(now_listed.clone()), &[])
+                    .unwrap();
+                assert_eq!(m.take_adds(8 * DEBOUNCE_NS), now_listed);
+            } else {
+                assert_eq!(settled.unwrap().unplugged, std::slice::from_ref(&a.serial));
+                assert!(!m.in_use(&a.serial) && !m.admitted(&a.serial));
+                m.released(&a.serial);
+                assert!(m.pending().is_empty() && m.take_adds(7 * DEBOUNCE_NS).is_empty());
+            }
+        }
+    }
+
+    /// Replugged faster than a scan settles: one change unplugs and plugs it; the old object is
+    /// released before the new connection is added.
+    #[test]
+    fn hotplug_a_quick_replug_releases_before_it_adds() {
+        let mut a = sensor("SENSORALPHA", "port-a-1", true);
+        let mut m = Monitor::new(Ok(vec![a.clone()]), &[]);
+        m.before_open();
+        m.reconcile_open(
+            1,
+            &[stream_start(&a.serial, &a.attachment, false)],
+            Some(&[a.clone()]),
+        );
+        m.opened();
+        a.attachment = "port-a-2".into();
+        assert!(m.update(2, Ok(vec![a.clone()]), &[]).is_none());
+        let c = change(&mut m, 3, vec![a.clone()]).unwrap();
+        assert_eq!((c.unplugged.len(), c.plugged.len()), (1, 1));
+        assert!(m.take_adds(2 * DEBOUNCE_NS).is_empty());
+        assert_eq!(m.detached().iter().collect::<Vec<_>>(), ["SENSORALPHA"]);
+        assert_eq!(states(&m), ["opening"]);
+        m.released(&a.serial);
+        assert_eq!(m.take_adds(2 * DEBOUNCE_NS), [a]);
+    }
+
+    /// A device that is not there yet, or busy for a moment (uvcvideo letting go of it), is
+    /// tried again a second later, up to three times; then the reason is shown, until a replug.
+    #[test]
+    fn hotplug_transient_open_failures_are_retried_three_times() {
+        for (outcome, code) in [
+            (AddOutcome::OpenFailed, LIBUSB_ERROR_BUSY),
+            (AddOutcome::OpenFailed, LIBUSB_ERROR_ACCESS),
+            (AddOutcome::OpenFailed, LIBUSB_ERROR_NOT_FOUND),
+            (AddOutcome::NotFound, 0),
+            (AddOutcome::Stale, 0),
+        ] {
+            let a = sensor("SENSORALPHA", "port-a-1", true);
+            let mut m = running();
+            change(&mut m, 1, vec![a.clone()]).unwrap();
+            let mut now = 2 * DEBOUNCE_NS;
+            for attempt in 1..=ADD_RETRIES {
+                assert_eq!(
+                    m.take_adds(now),
+                    std::slice::from_ref(&a),
+                    "{outcome:?} {attempt}"
+                );
+                assert_eq!(
+                    m.add_finished(&a.serial, &a.attachment, outcome, code, now),
+                    AddVerdict::Retry { attempt }
+                );
+                assert_eq!(states(&m), ["opening"]);
+                assert!(m.take_adds(now + ADD_RETRY_NS - 1).is_empty(), "too early");
+                assert_eq!(m.next_retry(), Some(now + ADD_RETRY_NS));
+                now += ADD_RETRY_NS;
+            }
+            assert_eq!(m.take_adds(now), std::slice::from_ref(&a));
+            let AddVerdict::Failed(detail) =
+                m.add_finished(&a.serial, &a.attachment, outcome, code, now)
+            else {
+                panic!("{outcome:?} {code} was retried a fourth time");
+            };
+            assert_eq!(m.next_retry(), None);
+            assert!(
+                detail.ends_with("unplug the sensor and plug it back in."),
+                "{detail}"
+            );
+            assert_eq!(states(&m), ["open_failed"]);
+            assert_eq!(m.pending()[0].detail, detail);
+            for later in 1..4 {
+                assert!(m.take_adds(now + later * ADD_RETRY_NS).is_empty());
+            }
+            // plugged in again: a new attachment, a new attempt
+            let b = sensor("SENSORALPHA", "port-a-2", true);
+            change(&mut m, now + 10 * DEBOUNCE_NS, vec![b.clone()]).unwrap();
+            m.released(&b.serial);
+            assert_eq!(m.take_adds(now + 12 * DEBOUNCE_NS), [b]);
+            assert_eq!(states(&m), ["opening"]);
+        }
+    }
+
+    /// Other failures are not retried: a failed start is recorded with the engine's start
+    /// records (doctor gives its advice), and an open that failed otherwise says why. A sensor
+    /// the engine could not be asked to add waits for the next engine start, which opens it.
+    #[test]
+    fn hotplug_lasting_failures_are_not_retried() {
+        let a = sensor("SENSORALPHA", "port-a-1", true);
+        for (outcome, code, state) in [
+            (AddOutcome::StartFailed, -1, None),
+            (AddOutcome::StartFailed, LIBUSB_ERROR_NO_DEVICE, None),
+            (AddOutcome::OpenFailed, -99, Some("open_failed")),
+            (AddOutcome::Rejected, 0, Some("open_failed")),
+        ] {
+            let mut m = running();
+            change(&mut m, 1, vec![a.clone()]).unwrap();
+            assert_eq!(m.take_adds(2 * DEBOUNCE_NS), std::slice::from_ref(&a));
+            let verdict = m.add_finished(&a.serial, &a.attachment, outcome, code, 2 * DEBOUNCE_NS);
+            assert_eq!(
+                states(&m),
+                state.into_iter().collect::<Vec<_>>(),
+                "{outcome:?}"
+            );
+            assert_eq!(matches!(verdict, AddVerdict::Failed(_)), state.is_some());
+            assert!(!m.in_use(&a.serial));
+            for later in 3..8 {
+                m.update(later * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
+                assert!(
+                    m.take_adds(later * DEBOUNCE_NS).is_empty() && !m.addable(),
+                    "{outcome:?} looped"
+                );
+            }
+            // a closed engine leaves it to the next start, which tries again
+            let mut closed = m.clone();
+            closed.closed();
+            if state.is_some() {
+                assert_eq!(states(&closed), ["waiting_engine_start"]);
+            }
+            closed.before_open();
+            closed.opened();
+            assert!(closed.pending().is_empty());
+        }
+        let mut m = running();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        m.take_adds(2 * DEBOUNCE_NS);
+        m.add_refused(&a.serial, &a.attachment);
+        assert_eq!(states(&m), ["waiting_engine_start"]);
+        let detail = m.pending()[0].detail.clone();
+        assert!(
+            detail.starts_with("The running engine could not take this sensor. This sensor will be used the next time the tracking engine starts."),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(if cfg!(windows) {
+                "Start cv1touch"
+            } else {
+                "systemctl --user restart cv1touchd"
+            }),
+            "{detail}"
+        );
+        assert!(!m.adding() && !m.addable());
+        // the next engine start tries everything again
+        m.before_open();
+        m.opened();
+        assert!(m.pending().is_empty());
+    }
+
+    /// A USB device that went away while it was being opened is retired like a native removal:
+    /// once two scans confirm it is back, it is added again, once.
+    #[test]
+    fn hotplug_no_device_while_opening_gets_one_bounded_recovery() {
+        let a = sensor("SENSORALPHA", "same-instance", true);
+        let mut m = running();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        assert_eq!(m.take_adds(2 * DEBOUNCE_NS), std::slice::from_ref(&a));
+        let AddVerdict::Gone(gone) = m.add_finished(
+            &a.serial,
+            &a.attachment,
+            AddOutcome::OpenFailed,
+            LIBUSB_ERROR_NO_DEVICE,
+            2 * DEBOUNCE_NS,
+        ) else {
+            panic!("NO_DEVICE was not a removal");
+        };
+        assert_eq!(gone.unplugged, std::slice::from_ref(&a.serial));
+        assert!(!m.admitted(&a.serial));
+        m.released(&a.serial);
+        assert!(
+            m.take_adds(3 * DEBOUNCE_NS).is_empty(),
+            "not before two scans"
+        );
+        assert!(m
+            .update(3 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[])
+            .is_none());
+        assert_eq!(
+            m.update(4 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[])
+                .unwrap()
+                .plugged,
+            std::slice::from_ref(&a)
+        );
+        assert_eq!(m.take_adds(4 * DEBOUNCE_NS), std::slice::from_ref(&a));
+        // the same attachment failing again asks for a replug
+        assert_eq!(
+            m.add_finished(
+                &a.serial,
+                &a.attachment,
+                AddOutcome::OpenFailed,
+                LIBUSB_ERROR_NO_DEVICE,
+                4 * DEBOUNCE_NS,
+            ),
+            AddVerdict::Done
+        );
+        for later in 5..9 {
+            m.update(later * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
+            assert!(m.take_adds(later * DEBOUNCE_NS).is_empty());
+        }
+        assert_eq!(states(&m), ["waiting_replug"]);
+        // after a recovery that worked, losing it again is reported, and asks for a replug
+        let mut m = running();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        m.take_adds(2 * DEBOUNCE_NS);
+        assert!(matches!(
+            m.add_finished(
+                &a.serial,
+                &a.attachment,
+                AddOutcome::OpenFailed,
+                LIBUSB_ERROR_NO_DEVICE,
+                0
+            ),
+            AddVerdict::Gone(_)
+        ));
+        m.released(&a.serial);
+        m.update(3 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
+        m.update(4 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]).unwrap();
+        assert_eq!(m.take_adds(4 * DEBOUNCE_NS), std::slice::from_ref(&a));
+        assert_eq!(
+            m.add_finished(&a.serial, &a.attachment, AddOutcome::Started, 0, 0),
+            AddVerdict::Use
+        );
+        assert_eq!(
+            m.native_gone(&a.serial).unwrap().unplugged,
+            std::slice::from_ref(&a.serial)
+        );
+        m.released(&a.serial);
+        m.update(5 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
+        assert_eq!(states(&m), ["waiting_replug"]);
+        assert!(m.take_adds(6 * DEBOUNCE_NS).is_empty());
+    }
+
+    /// A NO_DEVICE reported for the replacement of a sensor whose own NO_DEVICE was handled is a
+    /// report of its own, with its own recovery: the first one's is not held against it.
+    #[test]
+    fn hotplug_a_replacements_no_device_is_its_own_report() {
+        let a1 = sensor("SENSORALPHA", "port-a-1", true);
+        let a2 = sensor("SENSORALPHA", "port-a-2", true);
+        let mut m = Monitor::new(Ok(vec![a1.clone()]), &[]);
+        m.before_open();
+        m.reconcile_open(
+            1,
+            &[stream_start(&a1.serial, &a1.attachment, false)],
+            Some(std::slice::from_ref(&a1)),
+        );
+        m.opened();
+        assert!(m.native_gone(&a1.serial).is_some());
+        assert!(m.native_gone(&a1.serial).is_none(), "the same report again");
+        m.released(&a1.serial);
+        change(&mut m, 2 * DEBOUNCE_NS, vec![a2.clone()]).unwrap();
+        m.released(&a2.serial);
+        assert_eq!(m.take_adds(3 * DEBOUNCE_NS), std::slice::from_ref(&a2));
+        // its start failed with NO_DEVICE: the start record reports it
+        assert_eq!(
+            m.add_finished(
+                &a2.serial,
+                &a2.attachment,
+                AddOutcome::StartFailed,
+                LIBUSB_ERROR_NO_DEVICE,
+                0
+            ),
+            AddVerdict::Done
+        );
+        let gone = m
+            .native_gone(&a2.serial)
+            .expect("the replacement's NO_DEVICE was ignored");
+        assert_eq!(gone.unplugged, std::slice::from_ref(&a2.serial));
+        assert_eq!(states(&m), ["checking_usb"], "it gets its own recovery");
+    }
+
+    /// The engine already holds a live object of the serial: it is in use, as an add's is.
+    #[test]
+    fn hotplug_a_sensor_the_engine_already_has_is_in_use() {
+        let a = sensor("SENSORALPHA", "port-a-1", true);
+        let mut m = running();
+        change(&mut m, 1, vec![a.clone()]).unwrap();
+        assert_eq!(m.take_adds(2 * DEBOUNCE_NS), std::slice::from_ref(&a));
+        m.already_open(&a.serial, &a.attachment);
+        assert!(m.in_use(&a.serial) && !m.adding() && m.pending().is_empty());
+        assert!(m.take_adds(3 * DEBOUNCE_NS).is_empty());
+    }
+
+    /// A settled reopen and repeated add cycles leave nothing behind: what an add, a retry or a
+    /// failure kept goes with the engine, or with the sensor's listing. An unplug while a retry
+    /// waits does too, and a sensor that is not ready does not keep a retry due.
+    #[test]
+    fn hotplug_live_adds_keep_nothing_once_their_sensor_is_gone() {
+        let mut m = running();
+        m.update(0, Ok(vec![]), &[]);
+        let settled = format!("{m:?}");
+        for round in 0..3u64 {
+            let at = |tick: u64| (10 * round + tick) * DEBOUNCE_NS;
+            let a = sensor("SENSORALPHA", &format!("port-a-{round}"), true);
+            change(&mut m, at(1), vec![a.clone()]).unwrap();
+            assert_eq!(m.take_adds(at(2)), std::slice::from_ref(&a));
+            m.add_finished(
+                &a.serial,
+                &a.attachment,
+                AddOutcome::OpenFailed,
+                LIBUSB_ERROR_BUSY,
+                at(2),
+            );
+            assert_eq!(m.take_adds(at(3)), std::slice::from_ref(&a));
+            m.add_finished(&a.serial, &a.attachment, AddOutcome::Started, 0, at(3));
+            change(&mut m, at(4), vec![]).unwrap();
+            m.update(at(6), Ok(vec![]), &[]);
+            m.released(&a.serial);
+        }
+        assert_eq!(format!("{m:?}"), settled);
+
+        // Access drops while a retry waits. The entry stays, for when the sensor is ready
+        // again, but it is not due: the engine loop would otherwise service on every pass.
+        let a = sensor("SENSORALPHA", "port-a-retry", true);
+        let t0 = 100 * DEBOUNCE_NS;
+        change(&mut m, t0, vec![a.clone()]).unwrap();
+        let now = t0 + DEBOUNCE_NS;
+        assert_eq!(m.take_adds(now), std::slice::from_ref(&a));
+        assert_eq!(
+            m.add_finished(
+                &a.serial,
+                &a.attachment,
+                AddOutcome::OpenFailed,
+                LIBUSB_ERROR_BUSY,
+                now
+            ),
+            AddVerdict::Retry { attempt: 1 }
+        );
+        let due = now + ADD_RETRY_NS;
+        assert_eq!(m.next_retry(), Some(due));
+        let mut dark = a.clone();
+        dark.ready = false;
+        assert!(m.update(due - 1, Ok(vec![dark]), &[]).is_none());
+        assert_eq!(m.next_retry(), None, "an unready sensor left a retry due");
+        assert!(m.live_add_records_current());
+        assert!(m.update(due - 1, Ok(vec![a.clone()]), &[]).is_none());
+        assert_eq!(m.next_retry(), None, "access came back before it settled");
+        m.update(due - 1 + DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
+        assert_eq!(
+            m.next_retry(),
+            Some(due),
+            "the retry was dropped while it waited"
+        );
+
+        // Unplugged before that retry runs. The first scan clears readiness, so it is not
+        // due while the removal settles; once it has settled the entry is gone.
+        let leaving = due + DEBOUNCE_NS;
+        assert!(m.update(leaving, Ok(vec![]), &[]).is_none());
+        assert_eq!(
+            m.next_retry(),
+            None,
+            "a sensor on its way out left a retry due"
+        );
+        assert!(m.live_add_records_current());
+        m.update(leaving + DEBOUNCE_NS, Ok(vec![]), &[]).unwrap();
+        m.released(&a.serial);
+        assert_eq!(m.next_retry(), None);
+        assert!(m.live_add_records_current());
+        assert_eq!(format!("{m:?}"), settled, "a retry outlived its sensor");
+
+        // A failed add and a refusal are the same: nothing remains once the sensor is gone.
+        for (kind, fail) in [("failed", true), ("refused", false)] {
+            let b = sensor("SENSORALPHA", &format!("port-a-{kind}"), true);
+            let base = (300 + if fail { 0 } else { 20 }) * DEBOUNCE_NS;
+            change(&mut m, base, vec![b.clone()]).unwrap();
+            assert_eq!(m.take_adds(base + DEBOUNCE_NS), std::slice::from_ref(&b));
+            if fail {
+                m.add_finished(
+                    &b.serial,
+                    &b.attachment,
+                    AddOutcome::Rejected,
+                    0,
+                    base + DEBOUNCE_NS,
+                );
+                assert_eq!(states(&m), ["open_failed"]);
+            } else {
+                m.add_refused(&b.serial, &b.attachment);
+                assert_eq!(states(&m), ["waiting_engine_start"]);
+            }
+            change(&mut m, base + 3 * DEBOUNCE_NS, vec![]).unwrap();
+            m.released(&b.serial);
+            assert_eq!(m.next_retry(), None);
+            assert!(m.live_add_records_current());
+            assert_eq!(format!("{m:?}"), settled, "{kind} outlived its sensor");
+        }
     }
 
     #[test]
@@ -736,7 +1689,7 @@ mod tests {
         m.before_open();
         m.opened();
         assert!(m.update(3 * DEBOUNCE_NS, Ok(vec![a]), &[]).is_none());
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
 
     #[test]
@@ -751,7 +1704,7 @@ mod tests {
         for now in [2, 10, 100, 3600].map(|s| s * DEBOUNCE_NS) {
             assert!(m.update(now, Ok(vec![a.clone()]), &[]).is_none());
             assert!(
-                !m.waits_for_engine_start(),
+                !m.wants_open(),
                 "a failed stream cannot cause another attempt"
             );
         }
@@ -781,18 +1734,18 @@ mod tests {
         let mut m = Monitor::new(Ok(vec![a.clone()]), &[]);
         m.before_open();
         m.opened();
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
         a.ready = true;
         let c = change(&mut m, 5 * DEBOUNCE_NS, vec![a.clone()]).unwrap();
         assert_eq!(c.ready, [a.serial.clone()]);
         assert!(c.plugged.is_empty());
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
         m.before_open();
         m.opened();
         for (now, ready) in [(10, false), (20, true), (30, false), (40, true)] {
             a.ready = ready;
             change(&mut m, now * DEBOUNCE_NS, vec![a.clone()]);
-            assert!(!m.waits_for_engine_start());
+            assert!(!m.wants_open());
         }
     }
 
@@ -841,7 +1794,7 @@ mod tests {
         assert!(m.waits_for_engine_start());
         m.before_open();
         m.opened();
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
 
     #[test]
@@ -870,7 +1823,7 @@ mod tests {
                 .plugged,
             [a]
         );
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
     #[test]
     fn hotplug_debounces_each_sensor_while_a_peer_flaps() {
@@ -900,7 +1853,7 @@ mod tests {
             assert!(m
                 .update(i * DEBOUNCE_NS + 1, Ok(vec![peer.clone(), c.clone()]), &[])
                 .is_none());
-            assert!(!m.waits_for_engine_start());
+            assert!(!m.wants_open());
         }
     }
 
@@ -947,7 +1900,7 @@ mod tests {
             assert!(m
                 .update(i * DEBOUNCE_NS, Ok(vec![a.clone()]), &[])
                 .is_none());
-            assert!(!m.waits_for_engine_start());
+            assert!(!m.wants_open());
         }
         assert_eq!(m.pending()[0].state, "waiting_replug");
         let b = sensor("SENSORALPHA", "new-arrival", true);
@@ -957,7 +1910,7 @@ mod tests {
             "native removal was already reported"
         );
         assert_eq!(change.plugged, [b]);
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     #[test]
@@ -1029,7 +1982,7 @@ mod tests {
         assert!(m.waits_for_engine_start());
         m.before_open();
         m.opened();
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
     #[test]
     fn hotplug_a_changing_attachment_blocks_old_readiness_immediately() {
@@ -1125,10 +2078,7 @@ mod tests {
             change(&mut m, 1, vec![b.clone()]);
             m.opened();
             assert_eq!(m.pending().len(), 1, "B lost its pending reason");
-            assert!(
-                m.waits_for_engine_start(),
-                "A's failed start consumed B's attempt"
-            );
+            assert!(m.wants_open(), "A's failed start consumed B's attempt");
             // The next engine start attempts B; even another ordinary start failure must
             // consume this matching attachment once, without a retry loop.
             m.before_open();
@@ -1154,7 +2104,7 @@ mod tests {
         change(&mut m, 1, vec![a]);
         m.opened();
         assert_eq!(m.pending().len(), 1);
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     #[test]
@@ -1176,7 +2126,7 @@ mod tests {
             );
             m.opened();
             assert!(
-                !m.waits_for_engine_start(),
+                !m.wants_open(),
                 "a native attempt, including failure, is not attempted again"
             );
             assert!(m.pending().is_empty());
@@ -1192,7 +2142,7 @@ mod tests {
         m.reconcile_open(1, &[], Some(std::slice::from_ref(&a)));
         change(&mut m, 1, vec![a]).unwrap();
         m.opened();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     #[test]
@@ -1223,7 +2173,7 @@ mod tests {
                 m.update(3 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
                 m.update(4 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]).unwrap();
             }
-            assert!(m.waits_for_engine_start());
+            assert!(m.wants_open());
         }
     }
 
@@ -1244,7 +2194,7 @@ mod tests {
         m.opened();
         a.ready = true;
         change(&mut m, 3 * DEBOUNCE_NS, vec![a]);
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
 
     #[test]
@@ -1265,7 +2215,7 @@ mod tests {
         assert_eq!(found.plugged, std::slice::from_ref(&a));
         assert!(change(&mut m, 1, vec![a]).is_none());
         m.opened();
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
         change(&mut m, 3 * DEBOUNCE_NS, vec![]).unwrap();
         assert!(!m.admitted("sensoralpha"));
         assert!(!m.admitted("SENSORALPHA"));
@@ -1315,7 +2265,7 @@ mod tests {
                 a.ready = true;
                 change(&mut m, 3 * DEBOUNCE_NS, vec![a]);
                 assert!(
-                    m.waits_for_engine_start() != property_at_completion,
+                    m.wants_open() != property_at_completion,
                     "an ambiguous completion must leave the attachment eligible for its own attempt"
                 );
             }
@@ -1371,7 +2321,7 @@ mod tests {
         assert_eq!(changed.plugged, [a.clone()]);
         assert!(!m.admitted(&a.serial));
         m.opened();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     /// The post-open listing raced an unplug and still shows the old node, and the unplug cannot
@@ -1403,7 +2353,7 @@ mod tests {
         change(&mut m, 5 * DEBOUNCE_NS, vec![a2.clone()]).unwrap();
         assert!(!m.admitted(&a2.serial));
         assert!(
-            m.waits_for_engine_start(),
+            m.wants_open(),
             "a late old record spent the reattached sensor's attempt"
         );
     }
@@ -1422,7 +2372,7 @@ mod tests {
         m.opened();
         a.ready = true;
         change(&mut m, 1, vec![a]);
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
 
     #[test]
@@ -1442,7 +2392,7 @@ mod tests {
         assert!(m.in_use(&a.serial));
         assert_ne!(m.attempted.get(&a.serial), Some(&a.attachment));
         m.opened();
-        assert!(!m.waits_for_engine_start());
+        assert!(!m.wants_open());
     }
     #[test]
     fn hotplug_doctor_readiness_after_reopen_uses_only_that_engines_attempts() {
@@ -1465,15 +2415,18 @@ mod tests {
             a.ready = true;
             change(&mut m, 3 * DEBOUNCE_NS, vec![a]);
             assert_eq!(
-                m.waits_for_engine_start(),
+                m.wants_open(),
                 !actually_started,
                 "a previous engine's attempt cannot hide a sensor omitted by the current engine"
             );
         }
     }
 
-    fn details(m: &Monitor) -> Vec<(&'static str, &'static str)> {
-        m.pending().iter().map(|p| (p.state, p.detail)).collect()
+    fn details(m: &Monitor) -> Vec<(&'static str, String)> {
+        m.pending()
+            .into_iter()
+            .map(|p| (p.state, p.detail))
+            .collect()
     }
 
     /// A USB change that is still settling is being checked, whatever caused it: a replugged or
@@ -1481,8 +2434,8 @@ mod tests {
     /// is not given the USB access reason, which stays for access the OS does not grant.
     #[test]
     fn hotplug_a_usb_change_still_settling_is_checked_not_blamed_on_access() {
-        let checking = [("checking_usb", CHECKING_DETAIL)];
-        let access = [("waiting_usb", usb_access_detail())];
+        let checking = [("checking_usb", CHECKING_DETAIL.to_string())];
+        let access = [("waiting_usb", usb_access_detail().to_string())];
         // A NO_DEVICE: two scans of a ready attachment confirm it is back.
         let a = sensor("SENSORALPHA", "port-a-1", true);
         let mut m = Monitor::new(Ok(vec![a.clone()]), &[]);
@@ -1517,7 +2470,7 @@ mod tests {
         m.update(1, Ok(vec![a.clone()]), &[]);
         assert_eq!(details(&m), checking);
         m.update(1 + DEBOUNCE_NS, Ok(vec![a.clone()]), &[]).unwrap();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
         m.update(2 + DEBOUNCE_NS, Ok(vec![unready]), &[]);
         assert_eq!(details(&m), access);
     }
@@ -1604,7 +2557,7 @@ mod tests {
         let replaced = change(&mut m, 1, vec![a2.clone()]).unwrap();
         assert_eq!(replaced.unplugged, std::slice::from_ref(&a1.serial));
         assert!(!m.admitted(&a1.serial));
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     /// An unplug seen during an engine open settles after its roster is known, retiring the
@@ -1669,7 +2622,7 @@ mod tests {
             m.opened();
             change(&mut m, 3 * DEBOUNCE_NS, vec![a.clone()]);
             assert!(m.admitted(&a.serial));
-            assert_eq!(m.waits_for_engine_start(), !started);
+            assert_eq!(m.wants_open(), !started);
         }
     }
 
@@ -1717,7 +2670,7 @@ mod tests {
         let mut m = opened(true);
         assert!(!m.in_use(&a.serial));
         change(&mut m, 1, vec![a.clone()]).unwrap();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
         // Unplugging it, or a NO_DEVICE from its stream, retires it.
         let mut m = opened(false);
         change(&mut m, 1, vec![a.clone()]);
@@ -1731,7 +2684,7 @@ mod tests {
         assert!(!m.in_use(&a.serial));
         m.update(3 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]);
         m.update(4 * DEBOUNCE_NS, Ok(vec![a.clone()]), &[]).unwrap();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
         // A NO_DEVICE retires it before the watcher lists it, even when no listing showed it.
         for listed in [true, false] {
             let mut m = Monitor::new(Ok(vec![]), &[]);
@@ -1747,7 +2700,7 @@ mod tests {
             assert!(!m.in_use(&a.serial));
             change(&mut m, 1, vec![a.clone()]);
             change(&mut m, 3 * DEBOUNCE_NS, vec![a.clone()]);
-            assert!(m.waits_for_engine_start());
+            assert!(m.wants_open());
         }
     }
 
@@ -1903,7 +2856,7 @@ mod tests {
             let found = m.reconcile_open(1, &starts, Some(&inventory));
             assert_eq!(found.unopened, std::slice::from_ref(&a.serial));
             m.opened();
-            assert!(m.waits_for_engine_start());
+            assert!(m.wants_open());
         }
         let named = stream_start(&a.serial, &a.attachment, true);
         for (start, inventory) in [(named, None), (unnamed, Some(vec![a.clone()]))] {
@@ -1936,7 +2889,7 @@ mod tests {
             assert_eq!(m.reconcile_open(1, &starts, Some(&[])), Change::default());
             m.opened();
             assert_eq!(m.in_use(&a.serial), started);
-            let checking = [("checking_usb", CHECKING_DETAIL)];
+            let checking = [("checking_usb", CHECKING_DETAIL.to_string())];
             assert_eq!(details(&m), if started { &[][..] } else { &checking });
             let mut closed = m.clone();
             closed.closed();
@@ -1974,7 +2927,7 @@ mod tests {
             std::slice::from_ref(&a.serial)
         );
         m.opened();
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     /// The ready line and the wait it announces agree: an attempt this engine spent on an older
@@ -1994,7 +2947,7 @@ mod tests {
         a2.ready = true;
         let ready = change(&mut m, 4 * DEBOUNCE_NS, vec![a2.clone()]).unwrap();
         assert_eq!(ready.ready, [a2.serial.clone()]);
-        assert!(m.waits_for_engine_start());
+        assert!(m.wants_open());
     }
 
     /// While the engine discovers, a sensor it may open waits for that open, whatever the watcher
@@ -2005,10 +2958,10 @@ mod tests {
         let mut a = sensor("SENSORALPHA", "port-a-1", false);
         let mut m = Monitor::new(Ok(vec![a.clone()]), &[]);
         m.before_open();
-        assert_eq!(details(&m), [("opening", OPENING_DETAIL)]);
+        assert_eq!(details(&m), [("opening", OPENING_DETAIL.to_string())]);
         a.ready = true;
         assert!(change(&mut m, 1, vec![a.clone()]).is_none());
-        assert_eq!(details(&m), [("opening", OPENING_DETAIL)]);
+        assert_eq!(details(&m), [("opening", OPENING_DETAIL.to_string())]);
         m.reconcile_open(
             1 + DEBOUNCE_NS,
             &[stream_start(&a.serial, &a.attachment, false)],

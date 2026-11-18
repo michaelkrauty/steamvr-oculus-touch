@@ -126,6 +126,9 @@ fn main() {
         }
     }
     let r = replay::replay(&rec, &cal, &|l| factory::imu_position(&dir, l), &o).unwrap();
+    if let Some(message) = &r.stopped {
+        eprintln!("{message}");
+    }
     for h in 0..2 {
         eprintln!(
             "stats {}: acquisitions {} wrong_locks {} refused {}",

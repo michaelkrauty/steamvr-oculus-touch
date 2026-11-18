@@ -165,6 +165,21 @@ impl Mailbox {
             .collect();
     }
 
+    /// Admits one sensor a running engine added, with no notices: its native object numbers its
+    /// identities afresh, so nothing an earlier object of that serial left here may reach it.
+    pub fn add(&mut self, serial: &str) {
+        match self
+            .sensors
+            .iter_mut()
+            .find(|(s, _)| crate::status::same_sensor(s, serial))
+        {
+            Some((_, evidence)) => *evidence = Default::default(),
+            None => {
+                self.sensors.insert(serial.to_string(), Default::default());
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         for evidence in self.sensors.values_mut() {
             *evidence = Default::default();
@@ -327,6 +342,38 @@ mod tests {
         event.state = crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
         mailbox.note(&event);
         assert!(mailbox.take().is_empty());
+    }
+
+    /// A sensor plugged in while the engine runs gets its notices from its adoption on, and a
+    /// replugged one none of its earlier object's: that object numbered its identities from one
+    /// too.
+    #[test]
+    fn hotplug_an_added_sensor_starts_with_no_notices() {
+        let mut mailbox = Mailbox::default();
+        mailbox.register(["CAMERA".into()]);
+        let mut event = crate::engine::InspectionIdentity {
+            device_id: crate::calib::DEVICE_LEFT,
+            state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+            epoch: 1,
+            ..Default::default()
+        };
+        for (d, b) in event.serial.iter_mut().zip(b"OTHER") {
+            *d = *b as _;
+        }
+        mailbox.note(&event);
+        assert!(mailbox.take().is_empty(), "not admitted yet");
+        mailbox.add("other");
+        mailbox.note(&event);
+        assert_eq!(mailbox.take().len(), 1);
+        // replugged: what the earlier object noted after its removal is dropped at the add
+        mailbox.note(&event);
+        mailbox.add("OTHER");
+        mailbox.add("OTHER");
+        assert!(mailbox.take().is_empty());
+        mailbox.note(&event);
+        let delivery = mailbox.take();
+        assert_eq!(delivery.len(), 1);
+        assert_eq!(delivery[0].0, "other");
     }
 
     /// Native code invalidates only the live epoch and clears it on any end, so an ended epoch

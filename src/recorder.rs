@@ -15,6 +15,7 @@
 //! f32 frequency_hz, f32 amplitude (a haptic command as the daemon got it; amplitude 0 is off).
 //! INSPECTION_IDENTITY = ohmd_cv1touch_inspection_identity (start, normal end or retrospective
 //! invalidation). ENGINE_SESSION: no payload (the engine opened; its identity epochs start over).
+//! SENSOR_ADDED = a sensor addition was accepted, serial in UTF-8 (additive to v2).
 //! IDENTITIES_RETIRED = the sensor's serial, UTF-8 (its restored pose was acknowledged and its
 //! invalidated identities retired).
 //! Tracking threads only copy into a ring under a mutex (no I/O); a writer thread does the file I/O.
@@ -55,6 +56,8 @@ pub const ENGINE_SESSION: u16 = 10;
 /// A sensor's invalidated identities retired after its restored pose was acknowledged.
 /// Additive to v2.
 pub const IDENTITIES_RETIRED: u16 = 11;
+/// A live sensor addition was accepted; later frames may belong to a new object. Additive to v2.
+pub const SENSOR_ADDED: u16 = 12;
 
 pub fn decode_inspection_identity(payload: &[u8]) -> Option<crate::engine::InspectionIdentity> {
     (payload.len() == size_of::<crate::engine::InspectionIdentity>())
@@ -100,10 +103,12 @@ pub fn led_model_prefix(device_id: i32, n: usize) -> [u8; 8] {
 
 /// Which session-info records (sensor intrinsics, per-controller LED models) a recording still
 /// needs. Each is written as soon as it is available, so a controller that sleeps through the
-/// recording does not hold back the sensors or the other controller.
+/// recording does not hold back the sensors or the other controller, and a sensor plugged in
+/// during the recording is described once it is open.
 #[derive(Debug, Default, Clone)]
 pub struct SessionInfo {
-    sensors_written: bool,
+    /// Sensor serials (`status::sensor_identity`) whose intrinsics are written.
+    sensors_written: std::collections::BTreeSet<String>,
     models_written: Vec<i32>,
 }
 
@@ -113,11 +118,19 @@ impl SessionInfo {
         *self = SessionInfo::default();
     }
 
-    /// Given what is available now (sensors open; per controller device id: LED model known), returns
-    /// what to write now (sensor info?, device ids of LED models) and marks it written.
-    pub fn plan(&mut self, have_sensors: bool, models: &[(i32, bool)]) -> (bool, Vec<i32>) {
-        let sensors = have_sensors && !self.sensors_written;
-        self.sensors_written |= sensors;
+    /// Given what is available now (the open sensors' serials; per controller device id: LED model
+    /// known), returns what to write now (indices into `sensors`, device ids of LED models) and
+    /// marks it written.
+    pub fn plan(&mut self, sensors: &[String], models: &[(i32, bool)]) -> (Vec<usize>, Vec<i32>) {
+        let sensors: Vec<usize> = sensors
+            .iter()
+            .enumerate()
+            .filter(|(_, serial)| {
+                self.sensors_written
+                    .insert(crate::status::sensor_identity(serial))
+            })
+            .map(|(i, _)| i)
+            .collect();
         let new: Vec<i32> = models
             .iter()
             .filter(|(d, known)| *known && !self.models_written.contains(d))
@@ -127,9 +140,14 @@ impl SessionInfo {
         (sensors, new)
     }
 
-    /// True once the sensors and `controllers` LED models are written.
-    pub fn complete(&self, controllers: usize) -> bool {
-        self.sensors_written && self.models_written.len() >= controllers
+    /// True once `sensors` (the open serials) and `controllers` LED models are written.
+    pub fn complete(&self, sensors: &[String], controllers: usize) -> bool {
+        !sensors.is_empty()
+            && sensors.iter().all(|serial| {
+                self.sensors_written
+                    .contains(&crate::status::sensor_identity(serial))
+            })
+            && self.models_written.len() >= controllers
     }
 }
 
@@ -898,7 +916,13 @@ impl Recorder {
         #[cfg(test)]
         admission_tests::before_encode();
         let payload = encode_frame(info, width, height, stride, pixels, floor);
-        self.write_admitted(token, RAW_FRAME, info.frame_start_host_ns, &[&payload]);
+        self.write_admitted(
+            token,
+            RAW_FRAME,
+            info.frame_start_host_ns,
+            &[&payload],
+            false,
+        );
     }
 
     pub fn status(&self) -> Status {
@@ -913,10 +937,24 @@ impl Recorder {
         let Some(token) = self.admit(rtype) else {
             return;
         };
-        self.write_admitted(token, rtype, host_ns, parts);
+        self.write_admitted(token, rtype, host_ns, parts, false);
     }
 
-    fn write_admitted(&self, token: u64, rtype: u16, host_ns: u64, parts: &[&[u8]]) {
+    /// Write a boundary or stop recording if it cannot be queued.
+    pub fn write_boundary(&self, rtype: u16, host_ns: u64, parts: &[&[u8]]) {
+        if let Some(token) = self.admit(rtype) {
+            self.write_admitted(token, rtype, host_ns, parts, true);
+        }
+    }
+
+    fn write_admitted(
+        &self,
+        token: u64,
+        rtype: u16,
+        host_ns: u64,
+        parts: &[&[u8]],
+        boundary: bool,
+    ) {
         #[cfg(test)]
         admission_tests::before_write_lock();
         let payload_len: usize = parts.iter().map(|p| p.len()).sum();
@@ -933,6 +971,14 @@ impl Recorder {
             self.limit_reached(&mut ring);
         } else if ring.buf.len() - ring.used < len {
             ring.stats.dropped += 1;
+            if boundary {
+                ring.reason =
+                    Some("the recording could not keep up when a sensor was plugged in".into());
+                ring.stop = true;
+                self.shared.active.store(0, Ordering::Release);
+                drop(ring);
+                self.shared.cond.notify_all();
+            }
             return;
         } else {
             ring.put(&header);
@@ -2122,6 +2168,62 @@ mod tests {
     }
 
     #[test]
+    fn boundary_that_does_not_fit_stops_recording() {
+        let path = tmp("boundary-full");
+        let r = Recorder::new(64);
+        r.start(&path, 1).unwrap();
+        r.write_boundary(SENSOR_ADDED, 2, &[&[b'x'; 128]]);
+        assert!(!r.active());
+        assert!(r.shared.ring.lock().unwrap().stop);
+        assert!(r
+            .status()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not keep up"));
+        r.write(RAW_REPORT, 3, &[b"later"]);
+        let stats = r.stop();
+        assert_eq!((stats.dropped, stats.records), (1, 0));
+        assert_eq!(Reader::open(&path).unwrap().count(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn byte_limit_before_boundary_stops_later_records() {
+        let path = tmp("boundary-limit");
+        let r = Recorder::new(4096);
+        r.start(&path, 1).unwrap();
+        {
+            let mut ring = r.shared.ring.lock().unwrap();
+            ring.byte_limit = ring.accepted_bytes + RECORD_HEADER_LEN as u64;
+        }
+        r.write_boundary(SENSOR_ADDED, 2, &[b"fictional"]);
+        assert!(!r.active());
+        assert!(r.status().reason.as_deref().unwrap().contains("size limit"));
+        r.write(RAW_REPORT, 3, &[b"later"]);
+        r.stop();
+        assert_eq!(Reader::open(&path).unwrap().count(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn boundary_is_an_additive_v2_record() {
+        let path = tmp("boundary-legacy");
+        let r = Recorder::new(4096);
+        r.start(&path, 1).unwrap();
+        r.write_boundary(SENSOR_ADDED, 2, &[b"fictional"]);
+        r.write(FRAME_OBS, 3, &[b"frame"]);
+        r.stop();
+        let records: Vec<_> = Reader::open(&path).unwrap().collect();
+        assert_eq!(
+            records.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [12, FRAME_OBS]
+        );
+        assert_eq!(records[0].payload, b"fictional");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn oversized_record_dropped() {
         let path = tmp("small");
         let r = Recorder::new(64);
@@ -2377,14 +2479,43 @@ mod tests {
     /// controller's LED model) out of the recording.
     #[test]
     fn session_info_is_written_piecewise() {
+        let open = ["CAMERA1".to_string(), "CAMERA2".to_string()];
         let mut s = SessionInfo::default();
-        assert_eq!(s.plan(false, &[]), (false, vec![]));
-        assert_eq!(s.plan(true, &[(1, true), (2, false)]), (true, vec![1]));
-        assert_eq!(s.plan(true, &[(1, true), (2, false)]), (false, vec![]));
-        assert!(!s.complete(2));
-        assert_eq!(s.plan(true, &[(1, true), (2, true)]), (false, vec![2]));
-        assert!(s.complete(2));
+        assert_eq!(s.plan(&[], &[]), (vec![], vec![]));
+        assert_eq!(
+            s.plan(&open, &[(1, true), (2, false)]),
+            (vec![0, 1], vec![1])
+        );
+        assert_eq!(s.plan(&open, &[(1, true), (2, false)]), (vec![], vec![]));
+        assert!(!s.complete(&open, 2));
+        assert_eq!(s.plan(&open, &[(1, true), (2, true)]), (vec![], vec![2]));
+        assert!(s.complete(&open, 2));
         s.reset();
-        assert_eq!(s.plan(true, &[(1, true), (2, true)]), (true, vec![1, 2]));
+        assert_eq!(
+            s.plan(&open, &[(1, true), (2, true)]),
+            (vec![0, 1], vec![1, 2])
+        );
+    }
+
+    /// A sensor plugged in during a recording is described once it is open, and only once, even
+    /// when it is unplugged and plugged back in.
+    #[test]
+    fn hotplug_session_info_describes_a_sensor_added_mid_recording_once() {
+        let mut s = SessionInfo::default();
+        let models = [(1, true), (2, true)];
+        assert_eq!(s.plan(&["CAMERA1".into()], &models).0, vec![0]);
+        assert!(s.complete(&["CAMERA1".into()], 2));
+        let more = ["CAMERA1".to_string(), "CAMERA2".to_string()];
+        assert!(
+            !s.complete(&more, 2),
+            "a sensor added since is not described yet"
+        );
+        assert_eq!(s.plan(&more, &models).0, vec![1]);
+        assert!(s.complete(&more, 2));
+        assert!(
+            s.plan(&["camera2".into()], &models).0.is_empty(),
+            "replugged"
+        );
+        assert!(s.plan(&more, &models).0.is_empty());
     }
 }

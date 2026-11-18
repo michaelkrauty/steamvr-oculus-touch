@@ -57,6 +57,23 @@ impl<F> FrameQueue<F> {
         }
     }
 
+    /// Admit one sensor a running engine added, without disturbing other queues: its frames are
+    /// queued from now on. Adding a serial already admitted changes nothing.
+    pub fn add(&mut self, serial: &str) {
+        if self
+            .roster
+            .iter()
+            .any(|s| crate::status::same_sensor(s, serial))
+        {
+            return;
+        }
+        self.frames.insert(
+            serial.to_string(),
+            VecDeque::with_capacity(FRAMES_PER_SENSOR),
+        );
+        self.roster.push(serial.to_string());
+    }
+
     /// Retire one sensor, rejecting its later callbacks without disturbing other queues.
     pub fn remove(&mut self, serial: &str) {
         if let Some(index) = self
@@ -194,6 +211,31 @@ mod tests {
         q.remove("SENSORBETA");
         q.remove("SENSORBETA");
         assert_eq!(q.pop_frame(), None);
+    }
+
+    #[test]
+    fn hotplug_an_added_sensor_queues_its_frames_from_then_on() {
+        let mut q = FrameQueue::default();
+        q.register(["SENSORALPHA".into()]);
+        q.push_frame("SENSORALPHA", 1, 1);
+        q.push_frame("SENSORBETA", 2, 2);
+        assert_eq!(q.stats().unknown_frames, 1, "not admitted yet");
+        q.add("SENSORBETA");
+        q.add("sensorbeta");
+        assert_eq!(q.stats().sensors, 2);
+        q.push_frame("SENSORBETA", 3, 3);
+        q.push_frame("SENSORALPHA", 4, 4);
+        assert_eq!(q.pop_frame(), Some(1));
+        assert_eq!(q.pop_frame(), Some(3));
+        assert_eq!(q.pop_frame(), Some(4));
+        assert_eq!(q.pop_frame(), None);
+        // replugged: removed, then added again
+        q.remove("SENSORBETA");
+        q.push_frame("SENSORBETA", 5, 5);
+        q.add("SENSORBETA");
+        q.push_frame("SENSORBETA", 6, 6);
+        assert_eq!(q.pop_frame(), Some(6));
+        assert_eq!(q.stats().unknown_frames, 2);
     }
 
     #[test]

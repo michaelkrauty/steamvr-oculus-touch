@@ -2649,7 +2649,60 @@ mod tests {
             "fifth sensor never updated replay"
         );
         assert!(!replay.hands[HAND_RIGHT].is_empty());
+        let records: Vec<_> = crate::recorder::Reader::open(&path).unwrap().collect();
+        std::fs::remove_file(&path).unwrap();
+        let split = records.len() * 3 / 4;
+        let prefix_path = path.with_extension("prefix.rec");
+        let _ = std::fs::remove_file(&prefix_path);
+        for (file, marked) in [(&prefix_path, false), (&path, true)] {
+            recorder.start(file, H0).unwrap();
+            for (i, record) in records.iter().enumerate() {
+                if i == split {
+                    if !marked {
+                        break;
+                    }
+                    recorder.write_boundary(
+                        crate::recorder::SENSOR_ADDED,
+                        H0 + 1_000_000_000,
+                        &[b"fictional"],
+                    );
+                }
+                recorder.write(record.rtype, record.host_ns, &[&record.payload]);
+            }
+            assert_eq!(recorder.stop().dropped, 0);
+        }
+        let run = |file: &std::path::Path| {
+            super::super::replay::replay(
+                file,
+                &calibration,
+                &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+                &p.opts,
+            )
+            .unwrap()
+        };
+        let prefix = run(&prefix_path);
+        let stopped = run(&path);
+        assert!(prefix.stopped.is_none());
+        let warning = stopped.stopped.as_deref().unwrap();
+        assert!(
+            warning.contains("fictional")
+                && warning.contains("1.0 s")
+                && warning.contains("cannot be reproduced exactly")
+        );
+        assert!(!prefix.hands[HAND_RIGHT].is_empty());
+        for hand in 0..2 {
+            assert_eq!(prefix.hands[hand].len(), stopped.hands[hand].len());
+            for (before, after) in prefix.hands[hand].iter().zip(&stopped.hands[hand]) {
+                assert_eq!(before.t_ns, after.t_ns);
+                assert_eq!(before.pose, after.pose);
+                assert_eq!(before.vel, after.vel);
+                assert_eq!(before.ang_vel_world, after.ang_vel_world);
+            }
+        }
+        assert!(replay.hands[HAND_RIGHT].len() > prefix.hands[HAND_RIGHT].len());
+        assert_eq!(prefix.events.len(), stopped.events.len());
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(prefix_path).unwrap();
     }
 
     /// A recording outlives an engine reopen, and the new engine numbers its identities afresh.

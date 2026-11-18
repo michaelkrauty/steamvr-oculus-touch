@@ -204,6 +204,8 @@ const RESTART: &str =
     "then restart the daemon: choose Stop cv1touch, then Start cv1touch in the Start menu";
 #[cfg(not(windows))]
 const RESTART: &str = "then restart the daemon: systemctl --user restart cv1touchd";
+/// The running daemon adds a sensor plugged in while it runs.
+const USED_AGAIN: &str = "the daemon tries to use it again after it is plugged back in";
 
 fn stream_failure(current: &serde_json::Value, serial: &str) -> Option<String> {
     let stream = current["sensor_streams"].as_array()?.iter().find(|s| {
@@ -213,8 +215,8 @@ fn stream_failure(current: &serde_json::Value, serial: &str) -> Option<String> {
             && s["error_kind"].as_str() != Some("none")
     })?;
     match stream["error_kind"].as_str()? {
-        "likely_usb_bandwidth" => Some(format!("most likely not enough USB bandwidth on this controller: plug it into a different USB controller, {RESTART}")),
-        "other" => Some(format!("USB video couldn't start (error {}, system error {}): check USB access and daemon logs; after reconnecting, {RESTART}",
+        "likely_usb_bandwidth" => Some("most likely not enough USB bandwidth on this controller: plug it into a different USB controller; the daemon tries to start it there".to_string()),
+        "other" => Some(format!("USB video couldn't start (error {}, system error {}): check USB access and daemon logs, then unplug it and plug it back in; {USED_AGAIN}",
             stream["error_code"].as_i64().unwrap_or(0), stream["os_error"].as_i64().unwrap_or(0))),
         _ => None,
     }
@@ -243,7 +245,8 @@ fn usb_wait_advice() -> &'static str {
 }
 
 /// A calibrated sensor the daemon has seen and not yet opened. Waiting to open is not a
-/// bandwidth or cable failure. `waiting_replug` still is a failure, in its own words.
+/// bandwidth or cable failure. `waiting_replug` and `open_failed` still are failures, in their
+/// own words.
 /// Each line uses the daemon's reason once: the lead does not say the same thing again. The
 /// reason's last full stop is dropped, as this check's other clauses have none.
 fn sensor_waiting(current: &serde_json::Value, serial: &str) -> Option<SensorWait> {
@@ -266,7 +269,7 @@ fn sensor_waiting(current: &serde_json::Value, serial: &str) -> Option<SensorWai
             "{serial} is plugged in. {detail}. {}",
             usb_wait_advice()
         )),
-        "waiting_replug" => SensorWait::Replug(format!("{serial}: {detail}")),
+        "waiting_replug" | "open_failed" => SensorWait::Replug(format!("{serial}: {detail}")),
         _ => return None,
     })
 }
@@ -381,7 +384,7 @@ fn with_sources(
         if connected.as_ref().is_ok_and(|list| !list.contains(serial)) {
             failed = true;
             detail.push(format!(
-                "{serial} isn't connected: check its USB cable; after reconnecting, {RESTART}"
+                "{serial} isn't connected: check its USB cable; {USED_AGAIN}"
             ));
         } else if old
             .get(serial)
@@ -475,11 +478,11 @@ fn with_sources(
                 });
                 detail.push(format!("{serial}: {capture}; check daemon logs for JPEG decode errors or delayed analysis{connection}"));
             } else if connected.as_ref().is_ok_and(|list| list.contains(serial)) {
-                detail.push(format!("{serial} is connected but sending no video; USB bandwidth may be exhausted: plug it into a different USB controller, {RESTART}; also check USB access and daemon logs"));
+                detail.push(format!("{serial} is connected but sending no video; USB bandwidth may be exhausted: plug it into a different USB controller, and the daemon tries to start it there; also check USB access and daemon logs"));
             } else if new.contains_key(serial) {
-                detail.push(format!("{serial}'s video counter is stalled; its USB connection couldn't be checked: {}; check its USB cable, USB access and daemon logs; after reconnecting, {RESTART}", connected.as_ref().unwrap_err()));
+                detail.push(format!("{serial}'s video counter is stalled; its USB connection couldn't be checked: {}; check its USB cable, USB access and daemon logs; {USED_AGAIN}", connected.as_ref().unwrap_err()));
             } else {
-                detail.push(format!("{serial} isn't reported by the daemon; its USB connection couldn't be checked: {}; check its USB cable and daemon logs; after reconnecting, {RESTART}", connected.as_ref().unwrap_err()));
+                detail.push(format!("{serial} isn't reported by the daemon; its USB connection couldn't be checked: {}; check its USB cable and daemon logs; {USED_AGAIN}", connected.as_ref().unwrap_err()));
             }
         }
     }
@@ -831,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn cable_recovery_advice_includes_restarting_the_daemon() {
+    fn cable_recovery_advice_says_the_daemon_uses_it_again() {
         let expected = cameras(&["CAMERA1"]);
         let current = snapshot(&[("CAMERA1", 40)]);
         for connected in [&[][..], expected.as_slice()] {
@@ -841,7 +844,8 @@ mod tests {
                 Some(&current),
                 Ok(connected),
             );
-            assert!(detail.contains("restart"), "{detail}");
+            assert!(detail.contains("daemon tries"), "{detail}");
+            assert!(!detail.contains("restart"), "{detail}");
         }
     }
 
@@ -1211,7 +1215,7 @@ mod tests {
                 assert!(
                     text.contains("USB cable")
                         && text.contains("daemon logs")
-                        && text.contains("restart"),
+                        && text.contains(USED_AGAIN),
                     "{text}"
                 );
             }
@@ -1882,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn hotplug_aware_stream_advice_still_restarts_the_daemon() {
+    fn hotplug_aware_stream_advice_says_the_daemon_uses_a_reconnected_sensor_again() {
         for connected in [false, true] {
             for kind in [None, Some("likely_usb_bandwidth"), Some("other")] {
                 let mut current = snapshot(&[("CAMERA1", 40)]);
@@ -1906,8 +1910,9 @@ mod tests {
                 );
                 let (ok, detail) = result.conclusion();
                 assert!(!ok);
-                // a reconnected sensor is used only when the engine starts again
-                assert!(detail.contains(RESTART), "{detail}");
+                // the running engine adds a reconnected sensor itself
+                assert!(detail.contains("daemon tries"), "{detail}");
+                assert!(!detail.contains(RESTART), "{detail}");
             }
         }
     }
@@ -2116,5 +2121,23 @@ mod tests {
             waiting_check("waiting_replug", detail).board_line(),
             "FAIL sensor_streams: SENSORX: Its USB device went away; unplug this sensor and plug it back in"
         );
+    }
+
+    /// A sensor the running engine could not open is a failure, in the daemon's words, with what
+    /// to do: not a bandwidth failure, and not a wait.
+    #[test]
+    fn a_sensor_the_engine_could_not_open_is_a_failure_in_its_own_words() {
+        let detail = "Another program or driver is using this sensor's USB device. Close it, then unplug the sensor and plug it back in.";
+        let result = waiting_check("open_failed", detail);
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(!result.pending);
+        assert_eq!(
+            result.conclusion(),
+            (false, format!("SENSORX: {}", detail.trim_end_matches('.')))
+        );
+        assert!(!waiting_check("open_failed", detail)
+            .board_line()
+            .to_ascii_lowercase()
+            .contains("bandwidth"));
     }
 }

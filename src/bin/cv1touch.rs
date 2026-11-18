@@ -3846,13 +3846,14 @@ fn eval_rig(base: &Path, replay: bool) -> i32 {
         let hands = if replay {
             let cal = file::load(&file::default_path())?;
             let dir = track::factory::openhmd_config_dir();
-            track::replay::replay(
+            let r = track::replay::replay(
                 &base.with_extension("rec"),
                 &cal,
                 &|l| track::factory::imu_position(&dir, l),
                 &track::replay::Options::default(),
-            )?
-            .hands
+            )?;
+            replay_warning(&r);
+            r.hands
         } else {
             engine_published(&base.with_extension("rec"))?
         };
@@ -4053,13 +4054,20 @@ fn replayed_with_calibration(
     cal: &file::CalibrationFile,
 ) -> Result<[Vec<eval::Published>; 2], String> {
     let dir = track::factory::openhmd_config_dir();
-    Ok(track::replay::replay(
+    let r = track::replay::replay(
         &base.with_extension("rec"),
         cal,
         &|l| track::factory::imu_position(&dir, l),
         &track::replay::Options::default(),
-    )?
-    .hands)
+    )?;
+    replay_warning(&r);
+    Ok(r.hands)
+}
+
+fn replay_warning(r: &track::replay::Replay) {
+    if let Some(message) = &r.stopped {
+        eprintln!("cv1touch: {message}");
+    }
 }
 
 fn eval_cmd(base: &Path) -> i32 {
@@ -5414,6 +5422,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
         let dir = track::factory::openhmd_config_dir();
         let imu = |l: &[cv1touch::calib::capture::Led]| track::factory::imu_position(&dir, l);
         let mut changed = Vec::new();
+        let mut warned = false;
         for round in 1..=3 {
             let mut results = Vec::new();
             for entry in &cal.sensors {
@@ -5425,6 +5434,10 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
                     ..Default::default()
                 };
                 let r = track::replay::replay(rec, &cal, &imu, &o)?;
+                if !warned && r.stopped.is_some() {
+                    replay_warning(&r);
+                    warned = true;
+                }
                 let initial = calib::iso_from_xyzw(entry.orient_xyzw, entry.pos);
                 match track::refine::refine_sensor(
                     model,
@@ -5642,6 +5655,7 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
             ..Default::default()
         };
         let r = track::replay::replay(rec, &without, &imu, &o)?;
+        replay_warning(&r);
         let bodies = [leds[0].as_deref(), leds[1].as_deref()];
         let placed = track::refine::place_sensor(model, bodies, &r.probes, 0.002)?;
         println!(
@@ -5843,6 +5857,7 @@ fn calibrate_gravity_with(
         // by a fraction that the secant steps below measure; the loose accelerometer noise keeps
         // that fraction small.
         let mut first = true;
+        let mut warned = false;
         let mut measure = |cal: &file::CalibrationFile,
                            round: usize|
          -> Result<Vector3<f64>, String> {
@@ -5853,6 +5868,10 @@ fn calibrate_gravity_with(
                 o.params.noise.accel_per_accel,
             ) = (0.05, 2e-3, 0.0);
             let r = track::replay::replay(rec, cal, &imu, &o)?;
+            if !warned && r.stopped.is_some() {
+                replay_warning(&r);
+                warned = true;
+            }
             let (mut sum, mut n) = (Vector3::zeros(), 0usize);
             for (h, hand_accel) in accel.iter().enumerate() {
                 let poses: Vec<eval::TruthSample> = r.hands[h]
@@ -6010,6 +6029,7 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
     };
     match run() {
         Ok(r) => {
+            replay_warning(&r);
             for (hand, st) in r.stats.iter().enumerate() {
                 if st.frames > 0 {
                     println!(

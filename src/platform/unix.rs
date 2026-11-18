@@ -1756,7 +1756,7 @@ mod tests {
             "B was suppressed by A's old or unknown incarnation"
         );
         assert!(
-            monitor.waits_for_engine_start(),
+            monitor.wants_open(),
             "B was suppressed by A's old or unknown incarnation"
         );
         monitor.before_open();
@@ -1839,7 +1839,7 @@ mod tests {
         assert!(monitor.waits_for_engine_start());
         monitor.before_open();
         monitor.opened();
-        assert!(!monitor.waits_for_engine_start());
+        assert!(!monitor.wants_open());
         std::fs::remove_file(sys.join("1-2/serial")).unwrap();
         assert!(
             usb_sensors_in(&sys, &dev).unwrap().is_empty(),
