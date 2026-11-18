@@ -284,7 +284,7 @@ correspondence_search_project_pose (correspondence_search_t *cs, led_search_mode
 		}
 	}
 
-	rift_pose_metrics score;
+	rift_pose_metrics score = {0};
 
 	/* Check how many LEDs have matching blobs in this pose,
 	 * if there's enough we have a good match */
