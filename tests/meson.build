@@ -196,15 +196,13 @@ test_inspection_tracking = executable('test_inspection_tracking',
   link_args: ['-lm'])
 test('inspection_tracking', test_inspection_tracking)
 
-# Real projection + complete cold-search allocation/equivalence regression. The
-# optional glibc heap-entry layer overlaps the portable Mat and C++ new layers.
+# Real C camera + complete cold-search regression on frozen synthetic scenarios.
 projection_args = ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'),
   '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections']
 test_projection_search = executable('test_projection_search',
-  ['test_projection_search.c', 'test_projection_camera.c', 'test_projection_opencv.cpp', 'support/projection_alloc.cpp'],
+  ['test_projection_search.c', 'test_projection_camera.c'],
   c_args: projection_args + ['-Wno-sign-compare'],
-  cpp_args: projection_args,
-  dependencies: [openhmd_proj.get_variable('dep_opencv'), threads_dep],
+  dependencies: [threads_dep],
   link_args: ['-Wl,--gc-sections', '-lm'])
 test('projection_search', test_projection_search, timeout: 120)
 

@@ -7,7 +7,9 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 ### Changed
 
 - Native camera projection and undistortion use allocation-free C formulas for both lens models.
-- Native pose estimation uses allocation-free C formulas based on OpenCV 4.12. In traced recordings it selects the same matched LEDs; five-LED results match OpenCV 4.12 and 5.1 bit for bit. With exactly four LEDs its solver finds no pose for about two thirds of recorded four-LED sets. A failed estimate leaves the pose unchanged, and zero rotation no longer produces an invalid pose. On systems that ran OpenCV 5, acquisition poses change in a small fraction of search frames because OpenCV 5 changed the optimizer and four-point solver; matches and labels were identical in every sampled case. OpenCV remains linked during the transition; tracking and acquisition policy is unchanged.
+- Native pose estimation uses allocation-free C formulas based on OpenCV 4.12. In traced recordings it selects the same matched LEDs; five-LED results match OpenCV 4.12 and 5.1 bit for bit. With exactly four LEDs its solver finds no pose for about two thirds of recorded four-LED sets. A failed estimate leaves the pose unchanged, and zero rotation no longer produces an invalid pose. On systems that ran OpenCV 5, acquisition poses change in a small fraction of search frames because OpenCV 5 changed the optimizer and four-point solver; matches and labels were identical in every sampled case. Tracking and acquisition policy is unchanged.
+
+- Native camera and pose calculations no longer require OpenCV. Source builds no longer need it, and Windows bundles no longer include it or zlib, which only OpenCV used. The SteamVR driver still requires a C++ compiler.
 
 ### Fixed
 

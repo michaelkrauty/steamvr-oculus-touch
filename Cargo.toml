@@ -11,7 +11,7 @@ description = "SteamVR Oculus Touch: Rift CV1 controller tracking daemon and too
 
 [features]
 default = ["engine"]
-# The native acquisition engine (OpenHMD, OpenCV): built and linked by build.rs. Without it the
+# The native acquisition engine (OpenHMD): built and linked by build.rs. Without it the
 # library's tracking, calibration and protocol code still builds and tests on any platform.
 engine = []
 

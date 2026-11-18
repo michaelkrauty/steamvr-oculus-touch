@@ -108,7 +108,7 @@ jobs:
         run: cargo run --locked --no-default-features --example native_clock_pose -- build-driver\driver\test_native_clock_pose.exe
   engine:
     # The native engine on the maintainer's persistent Windows runner, whose vcpkg binary cache
-    # keeps OpenCV built between runs; Rust, LLVM, Python with meson and vcpkg are preinstalled.
+    # caches dependencies between runs; Rust, LLVM, Python with meson and vcpkg are preinstalled.
     # Fork PRs must pass GitHub's server-side approval gate before this job starts. These
     # conditions select jobs; they cannot replace that repository setting. Pull requests only
     # read the binary cache; pushes to main also write it.
@@ -188,8 +188,12 @@ jobs:
           path: target/bundle
       - name: The bundle runs without the build's libraries
         run: |
+          $opencv = @(Get-ChildItem target\bundle -Recurse -File | Where-Object { $_.Name -match '^opencv.*\.dll$' })
+          if ($opencv.Count -ne 0) { throw "Bundle contains OpenCV DLLs: $opencv" }
+          Write-Host 'Bundle contains no OpenCV DLLs'
           python windows\check_bundle.py target\bundle --readobj "C:\Program Files\LLVM\bin\llvm-readobj.exe"
           if ($LASTEXITCODE -ne 0) { throw 'The bundle requires an unshipped DLL' }
+          Write-Host 'Windows bundle dependency check passed'
           & target\bundle\bin\cv1touchd.exe --version
           if ($LASTEXITCODE -ne 0) { throw "cv1touchd exit $LASTEXITCODE" }
           & target\bundle\bin\cv1touch.exe --version

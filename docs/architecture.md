@@ -4,7 +4,7 @@
 CV1 headset radio / USB sensors
           │
           ▼
-Modified OpenHMD acquisition engine (C/C++)
+Modified OpenHMD acquisition engine (C)
   radio reports, IMU, factory calibration, images, blobs
           │
           ▼
