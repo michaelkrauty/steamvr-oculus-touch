@@ -21,7 +21,7 @@
 #include "rift-sensor-blobwatch.h"
 
 #include "rift-sensor-maths.h"
-#include "rift-sensor-opencv.h"
+#include "rift-sensor-pose.h"
 #include "rift-sensor-camera.h"
 
 /* cv1touch provisional sensor placement (replaced by fixed calibration in Phase 3). The headset is

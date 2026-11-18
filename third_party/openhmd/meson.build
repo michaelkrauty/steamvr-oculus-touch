@@ -73,6 +73,14 @@ else
 endif
 
 c_args = ['-DOHMD_NONBLOCK_LOG']
+# cv1touch: the pose solver reproduces OpenCV's rounding operation for operation, which
+# fused multiply-add contraction would change (MSVC's /fp:precise does not contract)
+fp_contract_off = meson.get_compiler('c').first_supported_argument(
+	'-ffp-contract=off', '/clang:-ffp-contract=off', '/fp:precise')
+if fp_contract_off.length() == 0
+	error('no compiler option to disable floating-point contraction')
+endif
+c_args += fp_contract_off
 if host_machine.system() == 'windows'
 	# cv1touch: the C library functions are used as on Linux; M_PI from math.h
 	c_args += ['-D_CRT_SECURE_NO_WARNINGS', '-D_USE_MATH_DEFINES']
@@ -125,7 +133,7 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/packet.c',
 		'src/drv_oculus_rift/rift-sensor.c',
 		'src/drv_oculus_rift/rift-sensor-usb.c',
-		'src/drv_oculus_rift/rift-sensor-opencv.cpp',
+		'src/drv_oculus_rift/rift-sensor-pose.c',
 		'src/drv_oculus_rift/rift-sensor-camera.c',
 		'src/drv_oculus_rift/rift-sensor-maths.c',
 		'src/drv_oculus_rift/rift-sensor-blobwatch.c',
@@ -145,7 +153,6 @@ if _drivers.contains('rift')
 		'src/ext_deps/nxjson.c'
 	]
 	c_args += '-DDRIVER_OCULUS_RIFT'
-	c_args += '-DHAVE_OPENCV=1'
 	deps += dep_hidapi
 	deps += dep_opencv
 	if dep_jpeg.found()

@@ -14,7 +14,7 @@
 
 #include "lambdatwist/lambdatwist_p3p.h"
 #include "correspondence_search.h"
-#include "rift-sensor-opencv.h"
+#include "rift-sensor-camera.h"
 #include "rift-sensor-camera.h"
 #include "rift-sensor-blobwatch.h"
 #include "rift-sensor-pose-helper.h"

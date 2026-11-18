@@ -76,6 +76,13 @@ test('win32_cache_paths', test_win32_cache, args: ['paths'])
 test('win32_cache_errors', test_win32_cache, args: ['errors'])
 test('win32_cache_separators', test_win32_cache, args: ['separators'])
 
+# Portable unity test compiles the actual kernels without linking the engine.
+fp_contract_off = openhmd_proj.get_variable('fp_contract_off')
+test_pose = executable('test_pose', 'test_pose.c',
+  c_args: ['-I' + (rift_dir / 'include'), '-I' + (rift_dir / 'src' / 'drv_oculus_rift')] + fp_contract_off,
+  link_args: libm)
+test('pose', test_pose)
+
 # Below: a POSIX hardware probe, and harnesses that stub libusb or hidapi inside unity builds of the
 # engine (GNU ld drops what they leave unresolved) or use POSIX threads and clocks. Linux only.
 if windows
@@ -177,22 +184,21 @@ test_sensor_video = executable('test_sensor_video', 'test_sensor_video.c',
 test('sensor_video', test_sensor_video)
 
 # The brute-force search leaves out the devices cv1touch's tracker holds or that are asleep.
-test_search_skip = executable('test_search_skip', 'test_search_skip.c',
+test_search_skip = executable('test_search_skip', ['test_search_skip.c', 'support/pose_stub.c'],
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections',
     '-Wno-sign-compare'],
   link_args: ['-Wl,--gc-sections', '-lm'])
 test('search_skip', test_search_skip)
 # Identity-checked cold correspondences feed fast PnP at frame rate, without recorded labels.
 test_inspection_tracking = executable('test_inspection_tracking',
-  ['test_inspection_tracking.c', 'test_inspection_opencv.cpp'],
-  c_args: ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-Wno-sign-compare'],
-  cpp_args: ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include')],
-  dependencies: [openhmd_proj.get_variable('dep_opencv')], link_args: ['-lm'])
+  ['test_inspection_tracking.c', 'test_inspection_pose.c'],
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-Wno-sign-compare'] + fp_contract_off,
+  link_args: ['-lm'])
 test('inspection_tracking', test_inspection_tracking)
 
 # Real projection + complete cold-search allocation/equivalence regression. The
 # optional glibc heap-entry layer overlaps the portable Mat and C++ new layers.
-projection_args = ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'),
+projection_args = ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'),
   '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections']
 test_projection_search = executable('test_projection_search',
   ['test_projection_search.c', 'test_projection_camera.c', 'test_projection_opencv.cpp', 'support/projection_alloc.cpp'],
@@ -208,12 +214,12 @@ test('camera', test_camera)
 
 # An inspection's timeout cancels an active correspondence search; restoration is acknowledged
 # only after the search exits and the fast worker installs the pose.
-test_search_cancel = executable('test_search_cancel', 'test_search_cancel.c',
+test_search_cancel = executable('test_search_cancel', ['test_search_cancel.c', 'support/pose_stub.c'],
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),
     '-ffunction-sections', '-fdata-sections', '-Wno-sign-compare'],
   dependencies: [openhmd_dep, threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
 test('search_cancel', test_search_cancel, timeout: 10)
-test_inspection_handoff = executable('test_inspection_handoff', 'test_inspection_handoff.c',
+test_inspection_handoff = executable('test_inspection_handoff', ['test_inspection_handoff.c', 'support/pose_stub.c'],
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'),
     '-ffunction-sections', '-fdata-sections', '-Wno-sign-compare'],
   dependencies: [openhmd_dep, threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])

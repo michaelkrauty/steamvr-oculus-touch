@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later OR BSL-1.0
 // Copyright 2015 Philipp Zabel
 /* Frozen vector projection oracle from the OpenHMD bridge. */
+static void
+quatf_to_3x3 (cv::Mat &mat, quatf *me) {
+        mat.at<double>(0,0) = 1 - 2 * me->y * me->y - 2 * me->z * me->z;
+        mat.at<double>(0,1) =     2 * me->x * me->y - 2 * me->w * me->z;
+        mat.at<double>(0,2) =     2 * me->x * me->z + 2 * me->w * me->y;
+
+        mat.at<double>(1,0) =     2 * me->x * me->y + 2 * me->w * me->z;
+        mat.at<double>(1,1) = 1 - 2 * me->x * me->x - 2 * me->z * me->z;
+        mat.at<double>(1,2) =     2 * me->y * me->z - 2 * me->w * me->x;
+
+        mat.at<double>(2,0) =     2 * me->x * me->z - 2 * me->w * me->y;
+        mat.at<double>(2,1) =     2 * me->y * me->z + 2 * me->w * me->x;
+        mat.at<double>(2,2) = 1 - 2 * me->x * me->x - 2 * me->y * me->y;
+}
 static void reference_project_points(rift_led *leds, int num_led_pos,
                                      rift_sensor_camera_params *calib, posef *pose,
                                      vec3f *out_points) {
