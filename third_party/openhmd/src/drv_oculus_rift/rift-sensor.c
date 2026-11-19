@@ -611,6 +611,10 @@ static bool sensor_images_wanted(void *data)
 	rift_sensor_ctx *sensor = data;
 	if (!__atomic_load_n(&sensor->images_unwanted, __ATOMIC_RELAXED))
 		return true;
+	/* A connected sensor viewer shows every image. */
+	if (ohmd_pw_video_stream_connected(sensor->debug_vid_raw) ||
+		ohmd_pw_video_stream_connected(sensor->debug_vid))
+		return true;
 
 	ohmd_lock_mutex(sensor->sensor_lock);
 	bool wanted = pending_image_work(sensor) || sensor->pf.inspection_mask ||

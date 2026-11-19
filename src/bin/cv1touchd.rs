@@ -4336,11 +4336,12 @@ fn refresh_radio_hands(
             // The engine can let go of the hand just before this pass ends, its controller still
             // reporting. Only once nothing has published the hand for the connect timeout have
             // its samples stopped, a radio gap like any other. Meanwhile this thread looks after
-            // the hand, which keeps the heartbeat off it, and tries again on its next pass.
+            // the hand, which keeps the heartbeat off it, and tries again on its next refresh.
             if now.saturating_sub(publisher.worker_publish_ns)
                 < HandConfig::default().connect_timeout_ns
             {
                 d.hand_workers[h].store(now, Ordering::Release);
+                own.last_publish[h] = now;
                 continue;
             }
             let mut gaps = GapNotices::default();
@@ -17109,6 +17110,11 @@ mod tests {
                 d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
                 0
             );
+            // waiting for the engine's sample, the radio thread sleeps until its next refresh
+            assert_eq!(
+                radio_deadline(&link.hands, &own, now + at, [u64::MAX; 3]),
+                now + at + RADIO_REFRESH_NS
+            );
         }
         publish_unavailable_with_log(&d, now + 101_000_000, |n| notices.push(n));
         assert!(refresh_radio_hands(
@@ -17117,7 +17123,7 @@ mod tests {
             &mut own,
             &mut pipe,
             &mut sensors,
-            || now + 102_000_000,
+            || now + 106_000_000,
             |n| notices.push(n),
         ));
         assert_ne!(

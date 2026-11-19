@@ -13,6 +13,9 @@ static ohmd_thread *test_thread(ohmd_context *, void *);
 static void test_pose_init(rift_pose_finder *, rift_sensor_camera_params *);
 #define ohmd_create_thread(ctx, routine, arg) test_thread(ctx, arg)
 #define rift_pose_finder_init(pf, calib, cb, data) test_pose_init(pf, calib)
+static void *viewer;
+#undef ohmd_pw_video_stream_connected
+#define ohmd_pw_video_stream_connected(v) ((v) && (void *)(v) == viewer)
 #include "omath.c"
 #include "rift-sensor.c"
 #include "test_util.h"
@@ -258,6 +261,16 @@ static void sensor_demand(void)
   DEMAND(long_analysis_busy);
   DEMAND(accept_from_ns);
 #undef DEMAND
+  /* a sensor viewer on either stream */
+  sensor.debug_vid_raw = (void *)&viewer;
+  sensor.debug_vid = (void *)&sensor;
+  viewer = sensor.debug_vid_raw;
+  CHECK(sensor_images_wanted(&sensor));
+  viewer = sensor.debug_vid;
+  CHECK(sensor_images_wanted(&sensor));
+  viewer = NULL;
+  CHECK(!sensor_images_wanted(&sensor));
+  sensor.debug_vid_raw = sensor.debug_vid = NULL;
   rift_sensor_set_images_wanted(&sensor, true);
   CHECK(sensor_images_wanted(&sensor));
 }
