@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-/* Actual correspondence search and OpenCV PnP, with fictional geometry. A cold match must
+/* Actual correspondence search and C pose estimation, with fictional geometry. A cold match must
  * supply subsequent independent frames at camera rate despite the disputed calibration;
  * forty serial cold searches per five seconds are not assumed. No devices or recorded labels. */
 #define _GNU_SOURCE

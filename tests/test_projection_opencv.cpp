@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-/* Exercise the actual bridge and its frozen vector oracle in the same process. */
+/* Exercise the C camera and its frozen vector oracle in the same process. */
 #include <opencv2/core/version.hpp>
 #if CV_VERSION_MAJOR >= 5
 #include <opencv2/calib3d.hpp>
@@ -7,7 +7,10 @@
 #include <opencv2/calib3d/calib3d.hpp>
 #endif
 
-#include "rift-sensor-opencv.cpp"
+extern "C" {
+#include "rift-sensor-camera.h"
+}
+
 #include "support/projection_reference.inc"
 #include "test_util.h"
 #include <cstring>

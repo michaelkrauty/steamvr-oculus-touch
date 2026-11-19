@@ -5,6 +5,18 @@ project(openhmd C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# cv1touch: the pose solver reproduces OpenCV's rounding operation for operation, which
+# fused multiply-add contraction would change (MSVC's /fp:precise does not contract)
+include(CheckCCompilerFlag)
+check_c_compiler_flag(-ffp-contract=off HAVE_FP_CONTRACT_OFF)
+if(HAVE_FP_CONTRACT_OFF)
+	add_compile_options(-ffp-contract=off)
+elseif(MSVC)
+	add_compile_options(/fp:precise)
+else()
+	message(FATAL_ERROR "no compiler option to disable floating-point contraction")
+endif()
+
 # choose glvnd over legacy gl when available
 if (POLICY CMP0072)
 	cmake_policy (SET CMP0072 NEW)
@@ -74,7 +86,7 @@ if(OPENHMD_DRIVER_OCULUS_RIFT)
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-maths.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-pose-helper.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-blobwatch.c
-	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-opencv.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-pose.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-camera.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-tracker.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-kalman-6dof.c
@@ -86,7 +98,6 @@ if(OPENHMD_DRIVER_OCULUS_RIFT)
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/ohmd-video.c
 	)
 	add_definitions(-DDRIVER_OCULUS_RIFT)
-  add_definitions(-DHAVE_OPENCV=1)
 
 	find_package(HIDAPI REQUIRED)
   include_directories(${HIDAPI_INCLUDE_DIRS} ${libusb-1.0_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
