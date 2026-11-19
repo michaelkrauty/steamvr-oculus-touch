@@ -721,7 +721,10 @@ impl EngineSink for Daemon {
         }
         if self.tracker == TrackerKind::Rust && source == 0 {
             if let Some(us) = pipeline::hmd_report_timestamp(data) {
-                self.track_in.lock().unwrap().push_clock(ts, us);
+                let ready = self.track_in.lock().unwrap().push_clock(ts, us);
+                if ready {
+                    self.wake_radio();
+                }
             }
         }
     }
@@ -3779,9 +3782,8 @@ impl BodyFinder {
     }
 }
 
-/// How long the radio thread sleeps with nothing to do, ms: it keeps the hands' published state
-/// current (a controller set down stops sending) about this often.
-const RADIO_IDLE_WAKE_MS: u64 = 20;
+/// How often the radio thread republishes a hand it publishes without a new report, keeping its
+/// published state current (a controller set down stops sending).
 const RADIO_REFRESH_NS: u64 = 20_000_000;
 
 /// The radio thread's own newest sample of each hand, and when it last published each.
@@ -4100,8 +4102,13 @@ fn radio_main(
     let mut rest = Rest::new();
     let started = shm::now_ns();
     while !link.stop.load(Ordering::Acquire) && !radio_failed {
-        let idle_ms = if d.track_in.lock().unwrap().is_empty() {
-            RADIO_IDLE_WAKE_MS
+        // Queued frames need immediate service; clock samples wake us in batches.
+        let idle_ms = if !d.track_in.lock().unwrap().has_frames() {
+            let now = shm::now_ns();
+            let timers = [next_stats, sensors.reposing.next_tick, biases.next_save];
+            radio_deadline(&link.hands, &own, now, timers)
+                .saturating_sub(now)
+                .div_ceil(1_000_000)
         } else {
             0
         };
@@ -4246,6 +4253,28 @@ fn radio_main(
     if let Some(f) = biases.take_changed() {
         *link.biases.lock().unwrap() = Some(f);
     }
+}
+
+/// When the radio thread next has timed work with no report or frame to wake it: each hand it
+/// publishes is republished, or expired, `RADIO_REFRESH_NS` after its last publish, and a hand
+/// it asked for is looked at as often until the engine lets go; then the earliest of `timers`
+/// (statistics, repose tick, bias save). The landmark watch closes its windows and takes its
+/// results on the pass the repose tick (`REPOSE_TICK_NS`) brings at the latest.
+fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u64; 3]) -> u64 {
+    [HAND_LEFT, HAND_RIGHT]
+        .into_iter()
+        .filter_map(|h| {
+            if hands.radio_publishes(h) {
+                Some(own.last_publish[h] + RADIO_REFRESH_NS)
+            } else {
+                hands.wanted[h]
+                    .load(Ordering::Acquire)
+                    .then_some(now + RADIO_REFRESH_NS)
+            }
+        })
+        .chain(timers)
+        .min()
+        .unwrap_or(u64::MAX)
 }
 
 fn refresh_radio_hands(
@@ -5626,6 +5655,7 @@ fn status_json(d: &Daemon) -> String {
 fn recording_started(d: &Daemon, started: Result<(), String>) -> String {
     match started {
         Ok(()) => {
+            d.wake_radio();
             d.session.lock().unwrap().reset();
             "ok".into()
         }
@@ -6410,6 +6440,7 @@ fn wait_for_recording_start(
         };
         if let Some(result) = pending.poll() {
             if result.is_ok() && !d.stop_requested.load(Ordering::Acquire) {
+                d.wake_radio();
                 *starting = None;
                 return Ok(true);
             }
@@ -10772,6 +10803,67 @@ mod tests {
         let dir = socket_dir::SocketDir::new();
         d.rec.start(&dir.path().join("demand.rec"), awake).unwrap();
         assert!(all_sensor_images_wanted(&d, start, awake + 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_hmd_reports_wake_the_radio_in_batches_without_losing_clocks() {
+        let d = status_daemon();
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("report-source");
+        std::fs::write(&path, []).unwrap();
+        let mut radio = hid::Device::open(&path).unwrap();
+        let mut data = [0; 64];
+        data[0] = pipeline::HMD_SENSORS_REPORT;
+        let mut clocks = Vec::new();
+        let mut passes = 0;
+        let mut samples = 0;
+        // Twelve seconds at 500 Hz with no frames or radio reports. Model the 250 ms
+        // stats deadline and up to 18 ms of delay in servicing the real waker.
+        for i in 1..=6_000u32 {
+            let us = i * 2_000;
+            data[8..12].copy_from_slice(&us.to_le_bytes());
+            d.report(0, u64::from(us) * 1_000, &data);
+            let timer = i % 125 == 0;
+            let woken = (timer || i % 10 == 0)
+                && radio
+                    .wait(&d.radio_wake, Some(Duration::ZERO))
+                    .unwrap()
+                    .waker;
+            if timer || woken {
+                let mut ingress = d.track_in.lock().unwrap();
+                assert!(!ingress.has_frames());
+                ingress.take_clocks_into(&mut clocks);
+                samples += clocks.len();
+                passes += 1;
+            }
+        }
+        assert_eq!(d.track_in.lock().unwrap().stats().dropped_clocks, 0);
+        assert_eq!(samples, 6_000);
+        assert!(passes <= 12 * 36, "{passes} passes in twelve seconds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_recording_wakes_the_radio() {
+        let d = status_daemon();
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("report-source");
+        std::fs::write(&path, []).unwrap();
+        let mut radio = hid::Device::open(&path).unwrap();
+        let woke = |radio: &mut hid::Device| {
+            radio
+                .wait(&d.radio_wake, Some(Duration::ZERO))
+                .unwrap()
+                .waker
+        };
+        assert!(!woke(&mut radio));
+        let command = format!(
+            "record start {} frames",
+            dir.path().join("wake.rec").display()
+        );
+        assert_eq!(handle(&d, &command), "ok");
+        assert!(woke(&mut radio));
     }
 
     #[test]
@@ -17887,6 +17979,39 @@ mod tests {
     /// OpenHMD's brute-force search leaves out a controller our tracker fitted within the last
     /// SEARCH_SKIP_FIX_NS, or one silent on the radio for SEARCH_SKIP_ASLEEP_NS, and searches for
     /// any other: never fitted, fits stopped, or a short radio dropout.
+    #[test]
+    fn the_radio_sleeps_until_its_next_timed_duty() {
+        let ms = 1_000_000;
+        let (now, timers) = (1000 * ms, [1250 * ms, 2000 * ms, 31_000 * ms]);
+        let hands = HandOwnership::default();
+        let own = RadioHands {
+            last_publish: [995 * ms, 990 * ms],
+            ..Default::default()
+        };
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1250 * ms,
+            "idle: statistics"
+        );
+        hands.request(HAND_RIGHT);
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1020 * ms,
+            "a hand the engine has yet to let go"
+        );
+        assert!(!hands.engine_publishes(HAND_RIGHT));
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1010 * ms,
+            "a published hand's refresh"
+        );
+        assert_eq!(
+            radio_deadline(&hands, &own, now, [999 * ms, 2000 * ms, 31_000 * ms]),
+            999 * ms,
+            "an overdue timer"
+        );
+    }
+
     #[test]
     fn the_search_skips_freshly_fitted_and_sleeping_controllers_only() {
         let ms = 1_000_000;

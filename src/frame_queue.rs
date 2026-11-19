@@ -138,12 +138,14 @@ impl<F> FrameQueue<F> {
         queue.insert(at, (timestamp_ns, frame));
     }
 
-    pub fn push_clock(&mut self, host_ns: u64, device_us: u32) {
+    /// Returns true once per batch, leaving half the queue free while the reader wakes.
+    pub fn push_clock(&mut self, host_ns: u64, device_us: u32) -> bool {
         if self.clocks.len() == CLOCK_SAMPLES {
             self.clocks.pop_front();
             self.stats.dropped_clocks = self.stats.dropped_clocks.saturating_add(1);
         }
         self.clocks.push_back((host_ns, device_us));
+        self.clocks.len() == CLOCK_SAMPLES / 2
     }
 
     pub fn take_clocks(&mut self) -> Vec<(u64, u32)> {
@@ -189,7 +191,11 @@ impl<F> FrameQueue<F> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clocks.is_empty() && self.frames.values().all(|(_, f)| f.is_empty())
+        self.clocks.is_empty() && !self.has_frames()
+    }
+
+    pub fn has_frames(&self) -> bool {
+        self.frames.values().any(|(_, queue)| !queue.is_empty())
     }
 
     pub fn stats(&self) -> QueueStats {
