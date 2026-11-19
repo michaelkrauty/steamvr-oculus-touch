@@ -1631,9 +1631,16 @@ enum SensorEvent {
 
 /// Queues `event` for the radio thread, after the ones before it, and has it applied on the
 /// radio's next pass: until then a removed sensor's queued frames still reach its own camera.
+/// Each event retires the sensor's earlier object, so each advances its count of removals.
 /// Its list node is allocated before the lock is taken: splicing it in allocates nothing, and the
 /// radio thread takes the whole list and applies it after releasing the lock.
 fn queue_sensor_event(d: &Daemon, event: SensorEvent) {
+    let (SensorEvent::Removed(serial) | SensorEvent::Added { serial, .. }) = &event;
+    *d.sensor_removals
+        .lock()
+        .unwrap()
+        .entry(cv1touch::status::sensor_identity(serial))
+        .or_default() += 1;
     let mut node = std::collections::LinkedList::new();
     node.push_back(event);
     d.sensor_events.lock().unwrap().append(&mut node);
@@ -1703,11 +1710,6 @@ fn retire_sensor_state(
     for serial in &change.unplugged {
         // the radio thread takes it out of the queues as it applies this, never before
         queue_sensor_event(d, SensorEvent::Removed(serial.clone()));
-        *d.sensor_removals
-            .lock()
-            .unwrap()
-            .entry(cv1touch::status::sensor_identity(serial))
-            .or_default() += 1;
         d.sensor_poses
             .lock()
             .unwrap()
@@ -3876,7 +3878,7 @@ fn with_radio_sensors<T>(
         // read first: every event queued before this revision is in the take
         let revision = d.sensor_revision.load(Ordering::Acquire);
         let events = mem::take(&mut *d.sensor_events.lock().unwrap());
-        if events.iter().any(|e| matches!(e, SensorEvent::Removed(_))) {
+        if !events.is_empty() {
             // Identity notices still waiting can retract judgments that a removed sensor's
             // evidence supported: they reach the monitor before the sensor is forgotten.
             cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| {
@@ -3886,23 +3888,9 @@ fn with_radio_sensors<T>(
         for event in events {
             match event {
                 SensorEvent::Removed(serial) => {
-                    reposing.forget(&serial, pipe);
-                    d.sensor_poses
-                        .lock()
-                        .unwrap()
-                        .retain(|s, _| !cv1touch::status::same_sensor(s, &serial));
-                    d.sensor_agreement
-                        .lock()
-                        .unwrap()
-                        .retain(|s, _| !cv1touch::status::same_sensor(s, &serial));
-                    d.landmark_shifts
-                        .lock()
-                        .unwrap()
-                        .retain(|s, _| !cv1touch::status::same_sensor(s, &serial));
-                    if let Some(w) = watch.as_mut() {
-                        w.forget(d, &serial);
-                    }
-                    // removed here, in order, so that an add applied before cannot readmit it
+                    retire_radio_sensor(d, pipe, reposing, watch, &serial);
+                    // removed here, in order, so that an add applied before cannot readmit it;
+                    // an add replaces its earlier object's entry itself
                     d.track_in.lock().unwrap().remove(&serial);
                     d.track_searches.lock().unwrap().remove(&serial);
                     d.track_identities.lock().unwrap().remove(&serial);
@@ -3917,14 +3905,17 @@ fn with_radio_sensors<T>(
                         .entry(cv1touch::status::sensor_identity(&serial))
                         .or_default();
                     if lifetime <= *newest {
+                        // counted as the engine thread counted it, retiring nothing
+                        *reposing
+                            .removals
+                            .entry(cv1touch::status::sensor_identity(&serial))
+                            .or_default() += 1;
                         continue;
                     }
                     *newest = lifetime;
                     // a new camera, even when no removal came between: nothing an earlier object
                     // of the serial left is attributed to this one
-                    if let Some(camera) = pipe.remove_sensor(&serial) {
-                        reposing.reposer.forget(camera);
-                    }
+                    retire_radio_sensor(d, pipe, reposing, watch, &serial);
                     if let Some((model, world_from_cam)) = camera {
                         pipe.sensor(&serial, model, world_from_cam);
                     }
@@ -3945,6 +3936,34 @@ fn with_radio_sensors<T>(
         *sensor_revision = revision;
     }
     consume(pipe, watch)
+}
+
+/// Retires the sensor's object on the radio thread, for a removal or an add that replaces it:
+/// its camera, probation, placements, landmark watch and status go, and its
+/// count of removals advances as the engine thread's did when it queued the event.
+fn retire_radio_sensor(
+    d: &Daemon,
+    pipe: &mut Pipeline,
+    reposing: &mut Reposing,
+    watch: &mut Option<LandmarkWatch>,
+    serial: &str,
+) {
+    reposing.forget(serial, pipe);
+    d.sensor_poses
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    d.sensor_agreement
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    d.landmark_shifts
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    if let Some(w) = watch.as_mut() {
+        w.forget(d, serial);
+    }
 }
 
 /// The radio thread: reads the radio through its own HID handle and publishes each controller
@@ -11568,6 +11587,65 @@ mod tests {
             "predecessor callbacks admitted"
         );
         assert_eq!(current, (true, true, 1), "successor callbacks dropped");
+    }
+
+    /// An add of a newer object with no removal before it, once or repeatedly, retires the
+    /// earlier object as a removal does: a pose change made for its camera is not applied, and
+    /// its probation, placements and status go. A change made after the add is applied.
+    #[test]
+    fn hotplug_an_add_without_a_removal_retires_the_earlier_object() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        for lifetime in [2, 3] {
+            let r = &mut sensors.reposing;
+            r.probed_since.insert("SENSORALPHA".into(), 1);
+            r.placements.insert("SENSORALPHA".into(), vec![1]);
+            r.releases.insert("SENSORALPHA".into(), (1, 1));
+            d.landmark_shifts
+                .lock()
+                .unwrap()
+                .insert("SENSORALPHA".into(), (1.0, 1.0, 1));
+            let change = PoseChange::Placing("SENSORALPHA".into());
+            let stale = r.removals("SENSORALPHA");
+            queue_lifetime_event(&d, added("SENSORALPHA", lifetime));
+            apply_sensor_events(&d, &mut sensors, &mut pipe);
+            let r = &sensors.reposing;
+            assert!(
+                !made_for_its_camera(&d, &change, stale),
+                "a change for the earlier object was applied to object {lifetime}"
+            );
+            assert!(
+                made_for_its_camera(&d, &change, r.removals("SENSORALPHA")),
+                "a change for object {lifetime} was dropped"
+            );
+            assert!(
+                r.probed_since.is_empty() && r.placements.is_empty() && r.releases.is_empty(),
+                "the earlier object's probation or placements survived"
+            );
+            assert!(d.landmark_shifts.lock().unwrap().is_empty());
+        }
+        // an older object's late add changes nothing, and keeps the counts in step
+        sensors
+            .reposing
+            .placements
+            .insert("SENSORALPHA".into(), vec![1]);
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let r = &sensors.reposing;
+        assert_eq!(
+            r.placements.len(),
+            1,
+            "a late add retired the current object"
+        );
+        assert!(made_for_its_camera(
+            &d,
+            &PoseChange::Placing("SENSORALPHA".into()),
+            r.removals("SENSORALPHA")
+        ));
     }
 
     /// A frame of the old object queued before [Removed, Added] must not be consumed into the
