@@ -195,12 +195,16 @@ test('inspection_tracking', test_inspection_tracking)
 projection_args = ['-DHAVE_OPENCV=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'),
   '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections']
 test_projection_search = executable('test_projection_search',
-  ['test_projection_search.c', 'test_projection_opencv.cpp', 'support/projection_alloc.cpp'],
+  ['test_projection_search.c', 'test_projection_camera.c', 'test_projection_opencv.cpp', 'support/projection_alloc.cpp'],
   c_args: projection_args + ['-Wno-sign-compare'],
   cpp_args: projection_args,
   dependencies: [openhmd_proj.get_variable('dep_opencv'), threads_dep],
   link_args: ['-Wl,--gc-sections', '-lm'])
 test('projection_search', test_projection_search, timeout: 120)
+
+test_camera = executable('test_camera', 'test_camera.c',
+  c_args: projection_args, link_args: ['-lm'])
+test('camera', test_camera)
 
 # An inspection's timeout cancels an active correspondence search; restoration is acknowledged
 # only after the search exits and the fast worker installs the pose.

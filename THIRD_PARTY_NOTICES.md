@@ -32,6 +32,8 @@ Local OpenHMD cache writes use a consistent negative-error convention, publish a
 
 ## Build and runtime dependencies
 
+The camera model in `third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c` adapts projection and undistortion formulas from OpenCV 5.1.0 (cross-checked against 4.12.0), under Apache-2.0. Its upstream license and retained source notices are in `third_party/openhmd/LICENSE-OpenCV`. This code is modified to use plain C, normalised quaternions and the engine's float boundaries without OpenCV containers or allocations. OpenCV is still linked for pose estimation.
+
 Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.
 
 ## Windows bundle

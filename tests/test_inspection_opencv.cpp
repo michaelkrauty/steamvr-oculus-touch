@@ -3,3 +3,7 @@
 
 /* Unity build of the actual OpenCV bridge for the hardware-free inspection regression. */
 #include "rift-sensor-opencv.cpp"
+
+extern "C" {
+#include "rift-sensor-camera.c"
+}

@@ -22,6 +22,7 @@
 
 #include "rift-sensor-maths.h"
 #include "rift-sensor-opencv.h"
+#include "rift-sensor-camera.h"
 
 /* cv1touch provisional sensor placement (replaced by fixed calibration in Phase 3). The headset is
  * normally untracked, so a strongly matched controller places a sensor. Only the first sensor may

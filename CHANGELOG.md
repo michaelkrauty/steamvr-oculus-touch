@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Changed
+
+- Native camera projection and undistortion use allocation-free C formulas for both lens models. OpenCV remains required for pose estimation; this does not change the tracking or acquisition policy.
+
 ### Fixed
 
 - Cold correspondence searches initialize pose error metrics before returning them, avoiding undefined values when no prior pose is available.

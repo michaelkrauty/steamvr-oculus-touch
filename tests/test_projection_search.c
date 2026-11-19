@@ -24,6 +24,23 @@ struct result {
     uint64_t allocations[6]; /* Mat payload, C++ new, glibc heap: overlapping, never summed. */
 };
 
+static void compare_scores(const rift_pose_metrics *a, const rift_pose_metrics *b) {
+    CHECK(a->match_flags == b->match_flags);
+    CHECK(a->matched_blobs == b->matched_blobs);
+    CHECK(a->unmatched_blobs == b->unmatched_blobs);
+    CHECK(a->visible_leds == b->visible_leds);
+    CHECK(memcmp(&a->orient_error, &b->orient_error, sizeof(a->orient_error)) == 0);
+    CHECK(memcmp(&a->pos_error, &b->pos_error, sizeof(a->pos_error)) == 0);
+    /* Projection permits 0.001 px per coordinate. For n matched points the
+     * metric is S = sum(dx*dx + dy*dy), so Cauchy-Schwarz gives
+     * |S' - S| <= 2*epsilon*sqrt(2*n*S) + 2*n*epsilon*epsilon.
+     * The old float-matrix/Rodrigues round trip need not preserve score bits. */
+    const double camera_pixel_tolerance = 0.001;
+    double bound = 2 * camera_pixel_tolerance * sqrt(2 * a->matched_blobs * a->reprojection_error)
+                 + 2 * a->matched_blobs * camera_pixel_tolerance * camera_pixel_tolerance;
+    CHECK_NEAR(a->reprojection_error, b->reprojection_error, bound);
+}
+
 static quatf turn(float deg) {
     vec3f axis = {{.3f, .8f, .4f}};
     ovec3f_normalize_me(&axis);
@@ -117,7 +134,7 @@ int main(void) {
                     }
                     CHECK(a.accepted == b.accepted && a.trials == b.trials && a.checks == b.checks);
                     CHECK(memcmp(&a.pose, &b.pose, sizeof(a.pose)) == 0);
-                    CHECK(memcmp(&a.score, &b.score, sizeof(a.score)) == 0);
+                    compare_scores(&a.score, &b.score);
                     CHECK(memcmp(a.labels, b.labels, sizeof(a.labels)) == 0);
                     for (int layer = 0; layer < 6; layer++) {
                         if (projection_fast_path() && a.checks &&
@@ -140,7 +157,7 @@ int main(void) {
             }
     }
     CHECK(accepted && rejected);
-    printf("projection search: %u complete-operation exact comparisons; %u accepted, %u rejected\n",
+    printf("projection search: %u complete-operation comparisons; %u accepted, %u rejected\n",
            passed, accepted, rejected);
     return 0;
 }

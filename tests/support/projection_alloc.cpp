@@ -105,7 +105,9 @@ extern "C" void count_end(uint64_t *out) {
     out[5] = heap_bytes;
 }
 
-extern "C" int projection_fast_path(void) { return CV_VERSION_MAJOR == 5; }
+/* Production is allocation-free C on both OpenCV 4 and 5 builds. The frozen
+ * reference still constructs Mat payloads and vectors on either version. */
+extern "C" int projection_fast_path(void) { return 1; }
 
 extern "C" int projection_heap_counters(void) {
 #if defined(__GLIBC__)
