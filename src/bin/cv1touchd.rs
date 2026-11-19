@@ -18,7 +18,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -171,6 +171,8 @@ struct Daemon {
     /// The radio's recent traffic, recorded around a controller's dropout.
     flight: FlightRecorder,
     quit: AtomicBool,
+    /// Wakes every `sleep_until` to look at `quit` and its condition (`wake_sleepers`).
+    naps: (Mutex<()>, Condvar),
     /// The first critical worker that stopped unexpectedly; read without any worker locks.
     failed_worker: AtomicU8,
     /// A client asked the daemon to stop (control `stop`).
@@ -304,6 +306,13 @@ impl Daemon {
 
     fn wake_radio(&self) {
         self.radio_wake.wake();
+    }
+
+    /// After `quit` or a sleeper's condition is set: taking the lock orders this after any
+    /// sleeper's check, so none misses it.
+    fn wake_sleepers(&self) {
+        drop(self.naps.0.lock().unwrap_or_else(PoisonError::into_inner));
+        self.naps.1.notify_all();
     }
 }
 
@@ -852,6 +861,7 @@ fn shutdown_and_drain<T>(d: &Daemon, drain: impl FnOnce() -> T) -> T {
 
 fn begin_shutdown(d: &Daemon) {
     d.quit.store(true, Ordering::Release);
+    d.wake_sleepers();
     publish_disconnected(d);
 }
 
@@ -1618,13 +1628,21 @@ fn sleep_interruptible(d: &Daemon, ms: u64) {
     sleep_until(d, ms, || false);
 }
 
-/// Sleeps `ms`, or until quitting or `wake` says so.
+/// Sleeps `ms`, or until quitting or `wake` says so (`Daemon::wake_sleepers`).
 fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
-    for _ in 0..ms / 50 {
-        if d.quit.load(Ordering::Acquire) || wake() {
+    let end = std::time::Instant::now() + Duration::from_millis(ms);
+    let mut nap = d.naps.0.lock().unwrap_or_else(PoisonError::into_inner);
+    while !d.quit.load(Ordering::Acquire) && !wake() {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
             return;
         }
-        thread::sleep(Duration::from_millis(50));
+        nap = d
+            .naps
+            .1
+            .wait_timeout(nap, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -5883,6 +5901,7 @@ fn handle(d: &Daemon, line: &str) -> String {
                 .filter(|p| Some(p.0) == created)
                 .map(|p| p.1);
             d.universe_recheck.store(true, Ordering::Release);
+            d.wake_sleepers();
             let (alignment, notes) = align::load_with(shift.as_ref());
             publish_alignment(d, alignment);
             format!("ok {}", notes.join("; "))
@@ -6505,6 +6524,7 @@ fn finish_recording_startup(
 ) -> i32 {
     let _no_more_requests = control.stop();
     d.quit.store(true, Ordering::Release);
+    d.wake_sleepers();
     let status = d
         .rec
         .stop_timeout(None, RECORD_SHUTDOWN_WAIT)
@@ -6774,6 +6794,7 @@ fn main() {
         record_command: Mutex::new(()),
         flight: FlightRecorder::new(),
         quit: AtomicBool::new(false),
+        naps: Default::default(),
         failed_worker: AtomicU8::new(0),
         stop_requested: AtomicBool::new(false),
         haptics: Mutex::new([None; 2]),
@@ -8567,6 +8588,37 @@ mod tests {
         assert!(events[0].1[HAND_RIGHT].epochs.is_empty());
     }
 
+    #[test]
+    fn a_sleeping_watcher_wakes_at_once_for_shutdown_or_its_condition() {
+        let d = status_daemon();
+        let recheck = AtomicBool::new(false);
+        let woke = |set: &dyn Fn()| {
+            thread::scope(|scope| {
+                let sleeper = scope.spawn(|| {
+                    let start = std::time::Instant::now();
+                    sleep_until(&d, 60_000, || recheck.swap(false, Ordering::AcqRel));
+                    start.elapsed()
+                });
+                thread::sleep(Duration::from_millis(20));
+                set();
+                sleeper.join().unwrap()
+            })
+        };
+        let rechecked = woke(&|| {
+            recheck.store(true, Ordering::Release);
+            d.wake_sleepers();
+        });
+        assert!(rechecked < Duration::from_secs(1), "{rechecked:?}");
+        let quit = woke(&|| begin_shutdown(&d));
+        assert!(quit < Duration::from_secs(1), "{quit:?}");
+        let start = std::time::Instant::now();
+        sleep_until(&d, 60_000, || false);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "already quitting"
+        );
+    }
+
     pub(crate) fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -8580,6 +8632,7 @@ mod tests {
             record_command: Mutex::new(()),
             flight: FlightRecorder::new(),
             quit: AtomicBool::new(false),
+            naps: Default::default(),
             failed_worker: AtomicU8::new(0),
             stop_requested: AtomicBool::new(false),
             haptics: Mutex::new([None; 2]),
