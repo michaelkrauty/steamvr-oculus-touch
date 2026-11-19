@@ -476,6 +476,8 @@ impl LiveSensors for ModelEngine<'_> {
                 error_code,
                 open_ms: 65,
                 start_ms: 1130,
+                // no callbacks are modelled, so any lifetime a started object has will do
+                lifetime: u64::from(outcome == engine::AddOutcome::Started),
             });
         }
         finished

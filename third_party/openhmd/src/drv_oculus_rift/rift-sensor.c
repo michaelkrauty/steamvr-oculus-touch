@@ -100,6 +100,8 @@ struct rift_sensor_ctx_s
 
 	int shutdown;
 	bool retired; /* sensor_lock fences retirement against an in-flight pose commit */
+	/* Callback lifetime: unique in the process, set before any thread can read it, never changed. */
+	uint64_t lifetime;
 	/* cv1touch: frames that start before this neither move a device, place the sensor nor reach
 	 * the frame callback. 0 for a sensor opened with the engine; one added to a running engine
 	 * stays closed until it is adopted (rift_sensor_accept_frames_from). */
@@ -283,9 +285,9 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 			blobs[i] = (ohmd_cv1touch_blob) { b->x, b->y, b->width, b->height, b->area, rift_sensor_frame_blob_label(frame, b) };
 		}
 		if (sensor->ohmd_ctx->cv1touch_image_cb && frame->vframe->data && frame->vframe->format == OHMD_VIDEO_FRAME_FORMAT_GRAY8)
-			sensor->ohmd_ctx->cv1touch_image_cb(sensor->ohmd_ctx->cv1touch_image_user, &info, frame->vframe->width,
+			sensor->ohmd_ctx->cv1touch_image_cb(sensor->ohmd_ctx->cv1touch_image_user, sensor->lifetime, &info, frame->vframe->width,
 				frame->vframe->height, frame->vframe->stride, frame->vframe->data);
-		sensor->ohmd_ctx->cv1touch_frame_cb(sensor->ohmd_ctx->cv1touch_frame_user, &info, n, blobs);
+		sensor->ohmd_ctx->cv1touch_frame_cb(sensor->ohmd_ctx->cv1touch_frame_user, sensor->lifetime, &info, n, blobs);
 	}
 	if (frame->bwobs) {
 		if (!frame->detached_observation)
@@ -446,7 +448,7 @@ static void hold_inspection_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_
 	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 	uint64_t remaining = deadline > now ? ohmd_monotonic_conv(deadline - now,
 		ohmd_monotonic_per_sec(sensor->ohmd_ctx), 1000000000) : 0;
-	sensor->ohmd_ctx->cv1touch_search_cb(sensor->ohmd_ctx->cv1touch_search_user, &info, remaining);
+	sensor->ohmd_ctx->cv1touch_search_cb(sensor->ohmd_ctx->cv1touch_search_user, sensor->lifetime, &info, remaining);
 }
 
 static unsigned int fast_analysis_thread(void *arg);
@@ -485,7 +487,8 @@ static void report_inspection_identity(rift_sensor_ctx *sensor, int device_id, u
 	event.state = state;
 	uint64_t now = ohmd_monotonic_conv(ohmd_monotonic_get(sensor->ohmd_ctx),
 	    ohmd_monotonic_per_sec(sensor->ohmd_ctx), 1000000000);
-	sensor->ohmd_ctx->cv1touch_identity_cb(sensor->ohmd_ctx->cv1touch_identity_user, &event, now);
+	sensor->ohmd_ctx->cv1touch_identity_cb(sensor->ohmd_ctx->cv1touch_identity_user, sensor->lifetime,
+	    sensor->retired, &event, now);
 }
 
 static void end_inspection_identity(rift_sensor_ctx *sensor, int device_id, uint32_t state)
@@ -612,6 +615,9 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 
 	sensor_ctx->ohmd_ctx = ohmd_ctx;
 	sensor_ctx->dev = dev;
+	/* libopenhmd is loaded once per process, so no two objects ever share a lifetime */
+	static uint64_t next_lifetime;
+	sensor_ctx->lifetime = __atomic_add_fetch(&next_lifetime, 1, __ATOMIC_SEQ_CST);
 
 	sensor_ctx->pf.sensor_id = sensor_ctx->id = id;
 	strcpy ((char *) sensor_ctx->serial_no, (char *) serial_no);
@@ -1176,6 +1182,11 @@ void rift_sensor_retire(rift_sensor_ctx *sensor)
 	 * without waiting for a restoration acknowledgement. */
 	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
 	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
+uint64_t rift_sensor_lifetime(rift_sensor_ctx *sensor)
+{
+	return sensor->lifetime;
 }
 
 bool rift_sensor_retired(rift_sensor_ctx *sensor)

@@ -889,25 +889,33 @@ static void live_outlier(struct stream *s)
 }
 
 static ohmd_cv1touch_inspection_identity identity_notices[8];
+static uint64_t identity_lifetimes[8];
+static bool identity_retired[8];
 static unsigned n_identity_notices;
-static void identity_notice(void *data, const ohmd_cv1touch_inspection_identity *event, uint64_t at)
+static void identity_notice(void *data, uint64_t lifetime, bool retired,
+    const ohmd_cv1touch_inspection_identity *event, uint64_t at)
 {
     (void)data; (void)at;
     CHECK(n_identity_notices < 8);
+    identity_lifetimes[n_identity_notices] = lifetime;
+    identity_retired[n_identity_notices] = retired;
     identity_notices[n_identity_notices++] = *event;
 }
 
 static ohmd_cv1touch_frame_info released_identity_frame;
-static void identity_frame(void *data, const ohmd_cv1touch_frame_info *info, int n,
+static uint64_t released_identity_lifetime;
+static void identity_frame(void *data, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, int n,
     const ohmd_cv1touch_blob *blobs)
 {
     (void)data; (void)n; (void)blobs;
+    released_identity_lifetime = lifetime;
     released_identity_frame = *info;
 }
 
 static void epoch_lifetimes(struct stream *s)
 {
     n_identity_notices = 0;
+    s->sensor->lifetime = 41;
     s->sensor->ohmd_ctx->cv1touch_identity_cb = identity_notice;
     s->sensor->pf.next_identity_epoch = (1ULL << 32);
     uint64_t at = validate_stream(s, 240000000000ULL);
@@ -937,13 +945,25 @@ static void epoch_lifetimes(struct stream *s)
     CHECK(s->frame.capture_state[0].identity_epoch == 0);
     apply(s->sensor);
     CHECK(n_identity_notices == 4); /* label cleanup cannot reclassify it as a normal end */
+    for (unsigned i = 0; i < n_identity_notices; i++)
+        CHECK(identity_lifetimes[i] == 41 && !identity_retired[i]);
+    /* A retired object still reports, so that its consumer can retract, and says it is retired. */
+    ohmd_lock_mutex(s->sensor->sensor_lock);
+    s->sensor->retired = true;
+    s->sensor->pf.inspection_identity[s->dev->id].evidence_epoch = second;
+    report_inspection_identity(s->sensor, s->dev->id, OHMD_CV1TOUCH_IDENTITY_INVALIDATED);
+    s->sensor->pf.inspection_identity[s->dev->id].evidence_epoch = 0;
+    s->sensor->retired = false;
+    ohmd_unlock_mutex(s->sensor->sensor_lock);
+    CHECK(n_identity_notices == 5 && identity_notices[4].epoch == second);
+    CHECK(identity_lifetimes[4] == 41 && identity_retired[4]);
     /* An old completed frame keeps its own full-width tag after a newer epoch ended. */
     s->sensor->ohmd_ctx->cv1touch_frame_cb = identity_frame;
     ohmd_lock_mutex(s->sensor->sensor_lock);
     release_capture_frame(s->sensor, &delayed);
     CHECK(POP_QUEUE(&s->sensor->capture_frame_q) == &delayed);
     ohmd_unlock_mutex(s->sensor->sensor_lock);
-    CHECK(released_identity_frame.n_devices > 0);
+    CHECK(released_identity_frame.n_devices > 0 && released_identity_lifetime == 41);
     CHECK(released_identity_frame.devices[0].device_id == s->dev->id);
     CHECK(released_identity_frame.devices[0].identity_epoch_lo == 1);
     CHECK(released_identity_frame.devices[0].identity_epoch_hi == 1);

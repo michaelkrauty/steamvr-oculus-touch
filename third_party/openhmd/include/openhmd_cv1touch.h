@@ -184,13 +184,15 @@ typedef struct ohmd_cv1touch_frame_info {
 #define OHMD_CV1TOUCH_REPORT_HMD 0
 #define OHMD_CV1TOUCH_REPORT_RADIO 1
 
-/* Called from sensor analysis threads with the sensor lock held: copy and return quickly. */
-typedef void (*ohmd_cv1touch_frame_cb)(void *user, const ohmd_cv1touch_frame_info *info,
+/* Called from sensor analysis threads with the sensor lock held: copy and return quickly.
+ * lifetime: the sensor object's, never 0 and never reused in the process, so that a consumer can
+ * tell a replugged sensor's frames from those of the object it replaced (see sensor_added). */
+typedef void (*ohmd_cv1touch_frame_cb)(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info,
                                        int n_blobs, const ohmd_cv1touch_blob *blobs);
 /* Called from sensor analysis threads, just before the frame callback for the same frame, with its
  * GRAY8 pixels (valid only during the call): copy what is needed and return quickly. */
-typedef void (*ohmd_cv1touch_image_cb)(void *user, const ohmd_cv1touch_frame_info *info, int width, int height,
-                                       int stride, const uint8_t *pixels);
+typedef void (*ohmd_cv1touch_image_cb)(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info,
+                                       int width, int height, int stride, const uint8_t *pixels);
 /* Called from the update thread for every HID report read from the headset or its radio. */
 typedef void (*ohmd_cv1touch_report_cb)(void *user, int source, uint64_t host_ns, const uint8_t *data, int len);
 /* Ordered Touch activity from the decoder that owns the clock: reader 0 is the engine, 1 the
@@ -223,14 +225,18 @@ typedef struct ohmd_cv1touch_inspection_identity {
 	int32_t device_id;
 	uint32_t state;
 } ohmd_cv1touch_inspection_identity;   /* 48 bytes */
-typedef void (*ohmd_cv1touch_identity_cb)(void *user,
+/* Notices continue after the sensor object is retired, with retired set, so that a consumer can
+ * still retract judgments it made from that object. */
+typedef void (*ohmd_cv1touch_identity_cb)(void *user, uint64_t lifetime, bool retired,
         const ohmd_cv1touch_inspection_identity *identity, uint64_t host_ns);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_identity_callback(ohmd_context *ctx,
         ohmd_cv1touch_identity_cb cb, void *user);
 
 /* Called before an inspection frame enters long search, so the consumer can retain its
- * exposure-time prior. remaining_ns is the search deadline's remaining duration. */
-typedef void (*ohmd_cv1touch_search_cb)(void *user, const ohmd_cv1touch_frame_info *info, uint64_t remaining_ns);
+ * exposure-time prior. remaining_ns is the search deadline's remaining duration. It may still come
+ * after the sensor object is retired. */
+typedef void (*ohmd_cv1touch_search_cb)(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info,
+        uint64_t remaining_ns);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_search_callback(ohmd_context *ctx, ohmd_cv1touch_search_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_frame_callback(ohmd_context *ctx, ohmd_cv1touch_frame_cb cb, void *user);
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_image_callback(ohmd_context *ctx, ohmd_cv1touch_image_cb cb, void *user);
@@ -301,6 +307,9 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video_quality(ohmd_d
 /* Last start-attempt results, keyed by serial, including failed starts. Indices
  * change as sensors are added or forgotten; returns -1 past the last record. Engine thread only. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_stream(ohmd_device *device, int index, ohmd_cv1touch_sensor_stream *out);
+/* The callback lifetime of this serial's open sensor object that is not retired. Returns 0, or -1
+ * when there is none or on invalid arguments. Engine thread only. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_lifetime(ohmd_device *device, const char *serial, uint64_t *out);
 /* Forget a detached serial's last-start record and its attachment pin. A sensor object of that
  * serial is freed by ohmd_cv1touch_release_sensor, not here. Idempotent; returns 0, or -1 on
  * invalid arguments/context. Engine thread only. */
@@ -333,7 +342,8 @@ typedef struct ohmd_cv1touch_sensor_added {
 	int32_t error_code;
 	uint32_t open_ms;
 	uint32_t start_ms;
-} ohmd_cv1touch_sensor_added;          /* 80 bytes */
+	uint64_t lifetime;                 /* STARTED: the object's callback lifetime; else 0 */
+} ohmd_cv1touch_sensor_added;          /* 88 bytes */
 
 /* Asks the worker to open and start the sensor serial at attachment `key`. SYSFS keys (Linux) must
  * match the device's pinned directory inode, or the add is STALE without opening it. WINDOWS keys

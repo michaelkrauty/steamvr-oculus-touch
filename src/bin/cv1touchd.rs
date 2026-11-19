@@ -575,11 +575,17 @@ impl LandmarkWatch {
 /// Locks `queue` only for the push. Analysis threads call this, and the radio thread locks
 /// the same queues on every pass. The serial, timestamp and frame are arguments, so the
 /// caller builds them before this function runs and takes the lock.
-fn enqueue_frame<T>(queue: &Mutex<FrameQueue<T>>, serial: String, timestamp_ns: u64, frame: T) {
+fn enqueue_frame<T>(
+    queue: &Mutex<FrameQueue<T>>,
+    serial: String,
+    lifetime: u64,
+    timestamp_ns: u64,
+    frame: T,
+) {
     queue
         .lock()
         .unwrap()
-        .push_frame(&serial, timestamp_ns, frame);
+        .push_frame(&serial, lifetime, timestamp_ns, frame);
 }
 
 impl EngineSink for Daemon {
@@ -603,8 +609,17 @@ impl EngineSink for Daemon {
         }
     }
 
-    fn inspection_identity(&self, event: &engine::InspectionIdentity, host_ns: u64) {
-        if self.rec.active() {
+    fn inspection_identity(
+        &self,
+        event: &engine::InspectionIdentity,
+        lifetime: u64,
+        retired: bool,
+        host_ns: u64,
+    ) {
+        // A retired object's notice could be written after its successor's first records with
+        // no boundary between them, and replay would apply it to the successor. Tracking still
+        // gets it, to retract what the object's evidence supported.
+        if self.rec.active() && !retired {
             self.rec.write(
                 recorder::INSPECTION_IDENTITY,
                 host_ns,
@@ -612,16 +627,17 @@ impl EngineSink for Daemon {
             );
         }
         if self.tracker == TrackerKind::Rust {
-            self.track_identities.lock().unwrap().note(event);
+            self.track_identities.lock().unwrap().note(event, lifetime);
             self.wake_radio();
         }
     }
 
-    fn search_started(&self, info: &engine::FrameInfo, remaining_ns: u64) {
+    fn search_started(&self, info: &engine::FrameInfo, lifetime: u64, remaining_ns: u64) {
         if self.tracker == TrackerKind::Rust {
             enqueue_frame(
                 &self.track_searches,
                 engine::cstr_field(&info.serial),
+                lifetime,
                 info.frame_start_host_ns,
                 (Box::new(*info), remaining_ns),
             );
@@ -629,7 +645,7 @@ impl EngineSink for Daemon {
         }
     }
 
-    fn frame(&self, info: &engine::FrameInfo, blobs: &[Blob]) {
+    fn frame(&self, info: &engine::FrameInfo, lifetime: u64, blobs: &[Blob]) {
         if self.rec.active() {
             self.rec.write(
                 recorder::FRAME_OBS,
@@ -641,6 +657,7 @@ impl EngineSink for Daemon {
             enqueue_frame(
                 &self.track_in,
                 engine::cstr_field(&info.serial),
+                lifetime,
                 info.frame_start_host_ns,
                 (Box::new(*info), blobs.to_vec()),
             );
@@ -1603,21 +1620,25 @@ fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
 /// added: a new camera with nothing of the old one's repose, inspection or agreement state.
 enum SensorEvent {
     Removed(String),
-    /// The serial as its frames spell it; its camera model and calibrated pose (camera ->
-    /// world), if it has one; without one it only watches.
+    /// The serial as its frames spell it; the native object's callback lifetime; its camera model
+    /// and calibrated pose (camera -> world), if it has one; without one it only watches.
     Added {
         serial: String,
+        lifetime: u64,
         camera: Option<(calib::camera::CameraModel, nalgebra::Isometry3<f64>)>,
     },
 }
 
-/// Queues `event` for the radio thread, after the ones before it. Its list node is allocated
-/// before the lock is taken: splicing it in allocates nothing, and the radio thread takes the
-/// whole list and applies it after releasing the lock.
+/// Queues `event` for the radio thread, after the ones before it, and has it applied on the
+/// radio's next pass: until then a removed sensor's queued frames still reach its own camera.
+/// Its list node is allocated before the lock is taken: splicing it in allocates nothing, and the
+/// radio thread takes the whole list and applies it after releasing the lock.
 fn queue_sensor_event(d: &Daemon, event: SensorEvent) {
     let mut node = std::collections::LinkedList::new();
     node.push_back(event);
     d.sensor_events.lock().unwrap().append(&mut node);
+    d.sensor_revision.fetch_add(1, Ordering::Release);
+    d.wake_radio();
 }
 
 /// Drops the queued sensor events, which no radio thread applies. The list is freed after the
@@ -1680,8 +1701,7 @@ fn retire_sensor_state(
     change: &sensor_hotplug::Change,
 ) {
     for serial in &change.unplugged {
-        d.track_in.lock().unwrap().remove(serial);
-        d.track_searches.lock().unwrap().remove(serial);
+        // the radio thread takes it out of the queues as it applies this, never before
         queue_sensor_event(d, SensorEvent::Removed(serial.clone()));
         *d.sensor_removals
             .lock()
@@ -2005,11 +2025,10 @@ fn service_sensors(
                             d,
                             SensorEvent::Added {
                                 serial: serial.clone(),
+                                lifetime: added.lifetime,
                                 camera,
                             },
                         );
-                        d.sensor_revision.fetch_add(1, Ordering::Release);
-                        d.wake_radio();
                     }
                     let unposed = !modes::unposed_sensors(
                         &d.opts.lock().unwrap(),
@@ -2197,7 +2216,12 @@ fn engine_session(
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
     {
         let watch = d.sensor_watch.lock().unwrap();
-        let admitted: Vec<String> = open.iter().filter(|s| watch.admitted(s)).cloned().collect();
+        // each as its open native object, whose callbacks alone are admitted
+        let admitted: Vec<(String, u64)> = open
+            .iter()
+            .filter(|s| watch.admitted(s))
+            .filter_map(|s| Some((s.clone(), e.sensor_lifetime(s)?)))
+            .collect();
         d.track_in
             .lock()
             .unwrap()
@@ -2768,6 +2792,9 @@ struct Reposing {
     /// Sensors placed again this session: their landmarks were learned where they stood
     /// before, so plugging one back in does not watch them again.
     stale_landmarks: std::collections::BTreeSet<String>,
+    /// Per sensor (`status::sensor_identity`): the native object last added. An add of an older
+    /// one comes too late, and changes nothing.
+    lifetimes: std::collections::BTreeMap<String, u64>,
 }
 
 impl Reposing {
@@ -2803,6 +2830,7 @@ impl Reposing {
             releases: Default::default(),
             removals: Default::default(),
             stale_landmarks: Default::default(),
+            lifetimes: Default::default(),
         }
     }
 
@@ -3805,6 +3833,30 @@ fn publish_radio_state(
     );
 }
 
+/// Consumes one fairly scheduled camera frame, if there is one; callbacks cannot grow a stalled
+/// consumer's queue. The frame is taken after the sensor events are applied, so a frame of an
+/// object replaced meanwhile went with its queue and never reaches its successor's camera. The
+/// ingress lock is released before any tracking work.
+fn consume_camera_frame(d: &Daemon, sensors: &mut RadioSensors<'_>, pipe: &mut Pipeline) -> bool {
+    with_radio_sensors(
+        d,
+        &mut sensors.revision,
+        pipe,
+        &mut sensors.reposing,
+        sensors.watch,
+        |pipe, watch| {
+            let Some((info, blobs)) = d.track_in.lock().unwrap().pop_frame() else {
+                return false;
+            };
+            if let Some(w) = watch.as_mut() {
+                w.frame(&info, &blobs);
+            }
+            pipe.frame(&info, &blobs);
+            true
+        },
+    )
+}
+
 /// Apply sensor removals and additions, in order, before this IMU sample or frame is consumed.
 /// The events are taken only when the sensor revision changed, with their own lock held just for
 /// the take: never the sensor watch, which the engine thread holds across native calls, so
@@ -3850,17 +3902,37 @@ fn with_radio_sensors<T>(
                     if let Some(w) = watch.as_mut() {
                         w.forget(d, &serial);
                     }
+                    // removed here, in order, so that an add applied before cannot readmit it
+                    d.track_in.lock().unwrap().remove(&serial);
+                    d.track_searches.lock().unwrap().remove(&serial);
+                    d.track_identities.lock().unwrap().remove(&serial);
                 }
-                SensorEvent::Added { serial, camera } => {
-                    // a new camera: a serial removed before is registered afresh
+                SensorEvent::Added {
+                    serial,
+                    lifetime,
+                    camera,
+                } => {
+                    let newest = reposing
+                        .lifetimes
+                        .entry(cv1touch::status::sensor_identity(&serial))
+                        .or_default();
+                    if lifetime <= *newest {
+                        continue;
+                    }
+                    *newest = lifetime;
+                    // a new camera, even when no removal came between: nothing an earlier object
+                    // of the serial left is attributed to this one
+                    if let Some(camera) = pipe.remove_sensor(&serial) {
+                        reposing.reposer.forget(camera);
+                    }
                     if let Some((model, world_from_cam)) = camera {
                         pipe.sensor(&serial, model, world_from_cam);
                     }
                     // its frames, searches and identity notices are taken from now on: none of
                     // an earlier object of the serial
-                    d.track_in.lock().unwrap().add(&serial);
-                    d.track_searches.lock().unwrap().add(&serial);
-                    d.track_identities.lock().unwrap().add(&serial);
+                    d.track_in.lock().unwrap().add(&serial, lifetime);
+                    d.track_searches.lock().unwrap().add(&serial, lifetime);
+                    d.track_identities.lock().unwrap().add(&serial, lifetime);
                     if let Some(w) = watch
                         .as_mut()
                         .filter(|_| !reposing.landmarks_stale(&serial))
@@ -3983,13 +4055,7 @@ fn radio_main(
         for (serial, evidence) in identities {
             pipe.inspection_lifecycle(&serial, &evidence);
         }
-        // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
-        // consumer's queue. Release the ingress lock before any tracking work.
-        let frame = {
-            let mut ingress = d.track_in.lock().unwrap();
-            ingress.take_clocks_into(&mut clocks);
-            ingress.pop_frame()
-        };
+        d.track_in.lock().unwrap().take_clocks_into(&mut clocks);
         for &(host, us) in &clocks {
             pipe.hmd_clock_sample(host, us);
         }
@@ -3997,21 +4063,7 @@ fn radio_main(
         if let Some((info, remaining_ns)) = search {
             pipe.hold_inspection(&info, remaining_ns);
         }
-        if let Some((info, blobs)) = frame {
-            with_radio_sensors(
-                d,
-                &mut sensors.revision,
-                pipe,
-                &mut sensors.reposing,
-                sensors.watch,
-                |pipe, watch| {
-                    if let Some(w) = watch.as_mut() {
-                        w.frame(&info, &blobs);
-                    }
-                    pipe.frame(&info, &blobs);
-                },
-            );
-        }
+        consume_camera_frame(d, sensors, pipe);
         // A handoff can happen after the radio's last report. Persistent publication still
         // refreshes and expires that hand even before this worker has a sample of its own.
         let now = shm::now_ns();
@@ -8317,8 +8369,8 @@ mod tests {
         d.track_identities
             .lock()
             .unwrap()
-            .register(["camera1".into()]);
-        d.track_in.lock().unwrap().register(["camera1".into()]);
+            .register([("camera1".into(), 1)]);
+        d.track_in.lock().unwrap().register([("camera1".into(), 1)]);
         let mut event = engine::InspectionIdentity {
             epoch: 1,
             device_id: cv1touch::calib::DEVICE_LEFT,
@@ -8328,10 +8380,10 @@ mod tests {
         for (slot, byte) in event.serial.iter_mut().zip(b"camera1") {
             *slot = *byte as _;
         }
-        d.inspection_identity(&event, 1);
+        d.inspection_identity(&event, 1, false, 1);
         event.epoch = 2;
         event.state = cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
-        d.inspection_identity(&event, 2);
+        d.inspection_identity(&event, 1, false, 2);
         for t in 0..10 {
             d.frame(
                 &engine::FrameInfo {
@@ -8339,6 +8391,7 @@ mod tests {
                     frame_start_host_ns: t,
                     ..Default::default()
                 },
+                1,
                 &[],
             );
         }
@@ -8462,7 +8515,10 @@ mod tests {
                 original,
             );
             pipe.probe(serial, true);
-            d.track_identities.lock().unwrap().register([serial.into()]);
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register([(serial.into(), 1)]);
             let mut reposing = Reposing::start();
             reposing.reposer.watch(0);
             let batch = || {
@@ -8530,7 +8586,7 @@ mod tests {
             for (dst, byte) in event.serial.iter_mut().zip(serial.bytes()) {
                 *dst = byte as _;
             }
-            d.track_identities.lock().unwrap().note(&event);
+            d.track_identities.lock().unwrap().note(&event, 1);
             sender.send((second, Ok(result))).unwrap();
             reposing.tick(&d, &link, &mut pipe, &mut None, 1);
             assert_eq!(pipe.camera(serial).unwrap().world_from_cam, original);
@@ -8569,7 +8625,10 @@ mod tests {
                         nalgebra::Isometry3::identity(),
                     );
                 }
-                d.track_identities.lock().unwrap().register(["C".into()]);
+                d.track_identities
+                    .lock()
+                    .unwrap()
+                    .register([("C".into(), 1)]);
                 let mut reposing = Reposing::start();
                 let agreement = |w: u64| {
                     ["A", "B", "C"]
@@ -8635,17 +8694,17 @@ mod tests {
                     },
                     state,
                 };
-                d.track_identities
-                    .lock()
-                    .unwrap()
-                    .note(&event(1, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED));
+                d.track_identities.lock().unwrap().note(
+                    &event(1, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED),
+                    1,
+                );
                 if overflow {
                     // A stalled mailbox: only invalidations are kept, so they fill it.
                     for epoch in 2..=2048 {
-                        d.track_identities.lock().unwrap().note(&event(
-                            epoch,
-                            cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
-                        ));
+                        d.track_identities.lock().unwrap().note(
+                            &event(epoch, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED),
+                            1,
+                        );
                     }
                 }
                 reposing.tick(&d, &link, &mut pipe, &mut None, 1 + 41_000_000_000);
@@ -8715,16 +8774,15 @@ mod tests {
                     nalgebra::Isometry3::identity(),
                 );
             }
-            d.track_identities
-                .lock()
-                .unwrap()
-                .register(["A".into(), "B".into(), "C".into()]);
+            d.track_identities.lock().unwrap().register([
+                ("A".into(), 1),
+                ("B".into(), 1),
+                ("C".into(), 1),
+            ]);
             let mut reposing = Reposing::start();
             let note = |epoch, state| {
-                d.track_identities
-                    .lock()
-                    .unwrap()
-                    .note(&engine::InspectionIdentity {
+                d.track_identities.lock().unwrap().note(
+                    &engine::InspectionIdentity {
                         serial: serial_field("C"),
                         epoch,
                         device_id: if hand == HAND_LEFT {
@@ -8733,7 +8791,9 @@ mod tests {
                             calib::DEVICE_RIGHT
                         },
                         state,
-                    });
+                    },
+                    1,
+                );
             };
             // Earlier inspections and placements: every break started and ended an epoch,
             // and the tick took the mailbox once a second.
@@ -8865,8 +8925,11 @@ mod tests {
                 },
                 nalgebra::Isometry3::identity(),
             );
-            d.track_identities.lock().unwrap().register(["C".into()]);
-            d.track_in.lock().unwrap().register(["C".into()]);
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register([("C".into(), 1)]);
+            d.track_in.lock().unwrap().register([("C".into(), 1)]);
             let mut reposing = Reposing::start();
             let device_id = if hand == HAND_LEFT {
                 calib::DEVICE_LEFT
@@ -8895,11 +8958,13 @@ mod tests {
                         device_id,
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
+                    1,
+                    false,
                     now,
                 );
                 // the invalidated search's last frame, and a later one that ended normally
-                d.frame(&frame(search, now), &[]);
-                d.frame(&frame(search + 10_000, now + 1), &[]);
+                d.frame(&frame(search, now), 1, &[]);
+                d.frame(&frame(search + 10_000, now + 1), 1, &[]);
                 link.restored.lock().unwrap().push("C".into());
                 reposing.tick(&d, &link, &mut pipe, &mut None, now);
                 assert_eq!(pipe.frames_skipped, search - 1, "no frame work at the ack");
@@ -8975,11 +9040,11 @@ mod tests {
         d.track_identities
             .lock()
             .unwrap()
-            .register(sensors.map(String::from));
+            .register(sensors.map(|s| (s.to_string(), 1)));
         d.track_in
             .lock()
             .unwrap()
-            .register(sensors.map(String::from));
+            .register(sensors.map(|s| (s.to_string(), 1)));
         let mut reposing = Reposing::start();
         // A and B see the left controller; C and D miss it among unlabelled blobs.
         let agreement = |w: u64| {
@@ -9019,6 +9084,8 @@ mod tests {
                 device_id: calib::DEVICE_LEFT,
                 state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
             },
+            1,
+            false,
             at(7),
         );
         // The deadline passes in the tick: the engine gets C's pose back, and C holds the slot.
@@ -9087,11 +9154,11 @@ mod tests {
             d.track_identities
                 .lock()
                 .unwrap()
-                .register(sensors.map(String::from));
+                .register(sensors.map(|s| (s.to_string(), 1)));
             d.track_in
                 .lock()
                 .unwrap()
-                .register(sensors.map(String::from));
+                .register(sensors.map(|s| (s.to_string(), 1)));
             let mut reposing = Reposing::start();
             // A and B see the left controller; C misses it among unlabelled blobs; D misses 80 of
             // its 100 observed LED checks in windows 3 and 4.
@@ -9163,6 +9230,8 @@ mod tests {
                         device_id: calib::DEVICE_LEFT,
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
+                    1,
+                    false,
                     at(4) + 500_000_000,
                 );
             }
@@ -9664,15 +9733,15 @@ mod tests {
     #[test]
     fn a_camera_frame_push_releases_the_queue() {
         let queue = Mutex::new(FrameQueue::<u32>::default());
-        queue.lock().unwrap().register(["cam".into()]);
-        enqueue_frame(&queue, "cam".into(), 7, 11);
+        queue.lock().unwrap().register([("cam".into(), 1)]);
+        enqueue_frame(&queue, "cam".into(), 1, 7, 11);
         assert!(
             queue.try_lock().is_ok(),
             "camera queue locked after the frame is pushed"
         );
         assert_eq!(queue.lock().unwrap().pop_frame(), Some(11));
         copy_waits_only_while_held(&queue, || {
-            enqueue_frame(&queue, "cam".into(), 8, 12);
+            enqueue_frame(&queue, "cam".into(), 1, 8, 12);
         });
         assert_eq!(queue.lock().unwrap().pop_frame(), Some(12));
     }
@@ -9693,6 +9762,8 @@ mod tests {
                     device_id: calib::DEVICE_LEFT,
                     state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED,
                 },
+                1,
+                false,
                 at,
             )
         };
@@ -9919,6 +9990,9 @@ mod tests {
         frame_on_poll: std::sync::atomic::AtomicBool,
         open: Mutex<Vec<engine::Sensor>>,
         require_release_before_add: bool,
+        /// The native lifetime the next finished add reports, as the engine numbers objects:
+        /// fixtures register the objects open at engine start as lifetime 1.
+        next_lifetime: std::sync::atomic::AtomicU64,
     }
 
     impl<'a> FakeLive<'a> {
@@ -9933,11 +10007,27 @@ mod tests {
                 frame_on_poll: std::sync::atomic::AtomicBool::new(false),
                 open: Mutex::new(Vec::new()),
                 require_release_before_add: false,
+                next_lifetime: std::sync::atomic::AtomicU64::new(2),
             }
         }
 
         /// The worker finished an add of `serial` at `attachment`.
         fn finish(&self, serial: &str, attachment: &str, outcome: engine::AddOutcome, code: i32) {
+            let lifetime = self
+                .next_lifetime
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.finish_as(serial, attachment, outcome, code, lifetime);
+        }
+
+        /// As `finish`, for the native object `lifetime`; only a started object has one.
+        fn finish_as(
+            &self,
+            serial: &str,
+            attachment: &str,
+            outcome: engine::AddOutcome,
+            code: i32,
+            lifetime: u64,
+        ) {
             let mut raw = ffi::ohmd_cv1touch_sensor_stream::default();
             for (out, byte) in raw.serial.iter_mut().zip(serial.bytes()) {
                 *out = byte as std::ffi::c_char;
@@ -9951,6 +10041,11 @@ mod tests {
                 error_code: code,
                 open_ms: 65,
                 start_ms: 1130,
+                lifetime: if outcome == engine::AddOutcome::Started {
+                    lifetime
+                } else {
+                    0
+                },
             });
             if outcome == engine::AddOutcome::Started {
                 let mut sensor = engine::Sensor {
@@ -10340,11 +10435,11 @@ mod tests {
         let mut sensor = SensorStatus::default();
         shm::set_serial(&mut sensor, serial);
         publish_sensor_snapshot(&d, &[sensor], &[], &[], &[]);
-        d.track_in.lock().unwrap().register([serial.into()]);
+        d.track_in.lock().unwrap().register([(serial.into(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(serial, 1, (Box::default(), Vec::new()));
+            .push_frame(serial, 1, 1, (Box::default(), Vec::new()));
         d.sensor_poses.lock().unwrap().insert(
             serial.into(),
             PoseNote::Moved {
@@ -10398,11 +10493,11 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .register([a.serial.clone(), b.serial.clone()]);
+            .register([(a.serial.clone(), 1), (b.serial.clone(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
         d.sensor_agreement
             .lock()
             .unwrap()
@@ -10415,6 +10510,9 @@ mod tests {
         poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
         assert!(hotplug_states(&d).is_empty());
         assert!(!d.reopen.load(Ordering::Acquire));
+        let mut watch = None;
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        apply_sensor_events(&d, &mut radio_sensors(&mut watch), &mut pipe);
         assert!(d.track_in.lock().unwrap().pop_frame().is_none());
         assert!(!d.sensor_agreement.lock().unwrap().contains_key(&a.serial));
         assert!(!d.landmark_shifts.lock().unwrap().contains_key(&a.serial));
@@ -10675,11 +10773,11 @@ mod tests {
             d.track_identities
                 .lock()
                 .unwrap()
-                .register(serials.map(String::from));
+                .register(serials.map(|s| (s.to_string(), 1)));
             d.track_searches
                 .lock()
                 .unwrap()
-                .register(serials.map(String::from));
+                .register(serials.map(|s| (s.to_string(), 1)));
             let mut pipe = Pipeline::new(pipeline::Options::default());
             for serial in serials {
                 let model = calib::camera::CameraModel {
@@ -10722,10 +10820,12 @@ mod tests {
             for (dst, b) in info.serial.iter_mut().zip(inspected.serial.bytes()) {
                 *dst = b as _;
             }
-            d.track_searches
-                .lock()
-                .unwrap()
-                .push_frame(&inspected.serial, 1, (Box::new(info), 1));
+            d.track_searches.lock().unwrap().push_frame(
+                &inspected.serial,
+                1,
+                1,
+                (Box::new(info), 1),
+            );
             if pending_invalidation {
                 d.inspection_identity(
                     &engine::InspectionIdentity {
@@ -10735,12 +10835,14 @@ mod tests {
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
                     1,
+                    false,
+                    1,
                 );
             }
             poll_sensors(&d, 1, Ok(vec![]));
             poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
-            assert!(d.track_searches.lock().unwrap().pop_frame().is_none());
             forget(&mut sensors, &mut pipe);
+            assert!(d.track_searches.lock().unwrap().pop_frame().is_none());
             assert!(pipe.camera(&inspected.serial).is_none());
             let monitor = &mut sensors.reposing.monitor;
             assert!(monitor.restoring().is_empty(), "{pending_invalidation}");
@@ -10765,11 +10867,11 @@ mod tests {
         let mut state = SensorStatus::default();
         shm::set_serial(&mut state, &a.serial);
         publish_sensor_snapshot(&d, &[state], &[], &[], &[]);
-        d.track_in.lock().unwrap().register([a.serial.clone()]);
+        d.track_in.lock().unwrap().register([(a.serial.clone(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
         let mut native = engine::Sensor::default();
         for (slot, byte) in native.serial.iter_mut().zip(a.serial.bytes()) {
             *slot = byte as _;
@@ -10778,6 +10880,9 @@ mod tests {
         retire_gone_sensors(&d, &[native], &[]);
         assert!(d.sensors.lock().unwrap().is_empty());
         assert!(d.shm.sensors().unwrap().is_empty());
+        let mut watch = None;
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        apply_sensor_events(&d, &mut radio_sensors(&mut watch), &mut pipe);
         assert!(d.track_in.lock().unwrap().pop_frame().is_none());
         assert_eq!(hotplug_states(&d), ["checking_usb"]);
         publish_sensor_snapshot(&d, &[state], &[], &[], &[]);
@@ -10936,7 +11041,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame("SensorAlpha", 1, (Box::default(), Vec::new()));
+            .push_frame("SensorAlpha", 2, 1, (Box::default(), Vec::new()));
         assert!(
             d.track_in.lock().unwrap().pop_frame().is_none(),
             "its frames were admitted before its camera was registered"
@@ -10955,7 +11060,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame("SensorAlpha", 2, (Box::default(), Vec::new()));
+            .push_frame("SensorAlpha", 2, 2, (Box::default(), Vec::new()));
         assert!(
             d.track_in.lock().unwrap().pop_frame().is_some(),
             "its frames are queued"
@@ -10963,7 +11068,7 @@ mod tests {
         d.track_searches
             .lock()
             .unwrap()
-            .push_frame("SensorAlpha", 2, (Box::default(), 1));
+            .push_frame("SensorAlpha", 2, 2, (Box::default(), 1));
         assert!(
             d.track_searches.lock().unwrap().pop_frame().is_some(),
             "its search exposures are queued"
@@ -10977,7 +11082,7 @@ mod tests {
         for (dst, b) in notice.serial.iter_mut().zip(b"SensorAlpha") {
             *dst = *b as _;
         }
-        d.inspection_identity(&notice, 1);
+        d.inspection_identity(&notice, 2, false, 1);
         assert_eq!(
             d.track_identities.lock().unwrap().take().len(),
             1,
@@ -11209,7 +11314,7 @@ mod tests {
             orient: [0.0, 0.0, 0.0, 1.0],
             pos: [0.5, 0.0, 0.0],
         });
-        let serials = [a.serial.clone()];
+        let serials = [(a.serial.clone(), 1)];
         d.track_identities.lock().unwrap().register(serials.clone());
         d.track_searches.lock().unwrap().register(serials.clone());
         let model = calib::camera::CameraModel {
@@ -11236,7 +11341,7 @@ mod tests {
         d.track_searches
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, (Box::new(info), 1));
+            .push_frame(&a.serial, 1, 1, (Box::new(info), 1));
         // unplugged: the radio thread makes a change for the old camera before it takes the
         // removal, and the engine thread releases the sensor before it takes that change
         poll_sensors(&d, 1, Ok(vec![]));
@@ -11264,7 +11369,7 @@ mod tests {
             device_id: calib::DEVICE_LEFT,
             state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
         };
-        d.inspection_identity(&notice, 1);
+        d.inspection_identity(&notice, 1, false, 1);
         // plugged back in, at the same place, and added
         let b = live_sensor("SENSORALPHA", 9);
         poll_sensors(&d, 3 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
@@ -11304,6 +11409,314 @@ mod tests {
             applied.push(made_for_its_camera(&d, &change, removals));
         });
         assert_eq!(applied, [false, true]);
+    }
+
+    #[test]
+    fn hotplug_delayed_add_does_not_readmit_a_retired_sensor() {
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![]);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+
+        // The radio thread has taken the add, but has not yet applied it when the watcher
+        // retires the sensor and queues the removal for its next pass.
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish(&a.serial, &a.attachment, engine::AddOutcome::Started, 0);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        let added = mem::take(&mut *d.sensor_events.lock().unwrap());
+        poll_sensors(&d, 3 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
+        poll_sensors(&d, 4 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
+        let removed = mem::replace(&mut *d.sensor_events.lock().unwrap(), added);
+        assert!(removed.iter().any(|e| matches!(e, SensorEvent::Removed(_))));
+        // Until the radio applies the removal, the retired object stays admitted for its own
+        // camera, whose evidence the removal wipes; the native retirement stops its frames.
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let admitted_after_retirement = d.track_in.lock().unwrap().stats().sensors;
+
+        // A native callback may arrive between the delayed add and the removal.
+        enqueue_frame(
+            &d.track_in,
+            a.serial.clone(),
+            2,
+            1,
+            (Box::default(), Vec::new()),
+        );
+        *d.sensor_events.lock().unwrap() = removed;
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let admitted_after_removal = d.track_in.lock().unwrap().stats().sensors;
+
+        let b = live_sensor("SENSORALPHA", 9);
+        poll_sensors(&d, 5 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        poll_sensors(&d, 6 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 7 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish(&b.serial, &b.attachment, engine::AddOutcome::Started, 0);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            7 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let predecessor = d.track_in.lock().unwrap().pop_frame().is_some();
+        assert_eq!(
+            (
+                admitted_after_retirement,
+                admitted_after_removal,
+                predecessor
+            ),
+            (1, 0, false),
+            "a delayed add admitted retired ingress or retained a predecessor frame"
+        );
+    }
+
+    fn lifetime_frame(serial: &str, at: u64) -> engine::FrameInfo {
+        engine::FrameInfo {
+            serial: serial_field(serial),
+            frame_start_host_ns: at,
+            ..Default::default()
+        }
+    }
+
+    fn lifetime_notice(serial: &str, epoch: u64) -> engine::InspectionIdentity {
+        engine::InspectionIdentity {
+            serial: serial_field(serial),
+            epoch,
+            device_id: calib::DEVICE_LEFT,
+            state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+        }
+    }
+
+    fn lifetime_camera() -> (calib::camera::CameraModel, nalgebra::Isometry3<f64>) {
+        let sensor = engine::Sensor {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            ..Default::default()
+        };
+        (
+            calib::camera::CameraModel::from_sensor(&sensor),
+            nalgebra::Isometry3::identity(),
+        )
+    }
+
+    /// Queues `event` as the engine and watch threads do, for the radio's next pass.
+    fn queue_lifetime_event(d: &Daemon, event: SensorEvent) {
+        queue_sensor_event(d, event);
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+    }
+
+    fn added(serial: &str, lifetime: u64) -> SensorEvent {
+        SensorEvent::Added {
+            serial: serial.into(),
+            lifetime,
+            camera: Some(lifetime_camera()),
+        }
+    }
+
+    /// Every callback carries the native object it came from. Once the radio has applied the
+    /// successor's add, the predecessor's frames, searches and identity notices are dropped,
+    /// and the successor's are kept.
+    #[test]
+    fn hotplug_callbacks_of_a_replaced_object_are_not_attributed_to_its_successor() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let before = d.track_in.lock().unwrap().stats().unknown_frames;
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        d.search_started(&lifetime_frame("SENSORALPHA", 11), 1, 5);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 1, false, 12);
+        let unknown = d.track_in.lock().unwrap().stats().unknown_frames - before;
+        let stale = (
+            d.track_in.lock().unwrap().pop_frame().is_some(),
+            d.track_searches.lock().unwrap().pop_frame().is_some(),
+            d.track_identities.lock().unwrap().take().len(),
+            unknown,
+        );
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        d.search_started(&lifetime_frame("SENSORALPHA", 21), 2, 5);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 2, false, 22);
+        let current = (
+            d.track_in.lock().unwrap().pop_frame().is_some(),
+            d.track_searches.lock().unwrap().pop_frame().is_some(),
+            d.track_identities.lock().unwrap().take().len(),
+        );
+        assert_eq!(
+            stale,
+            (false, false, 0, 1),
+            "predecessor callbacks admitted"
+        );
+        assert_eq!(current, (true, true, 1), "successor callbacks dropped");
+    }
+
+    /// A frame of the old object queued before [Removed, Added] must not be consumed into the
+    /// new object's camera: the radio takes the frame only after applying the events.
+    #[test]
+    fn hotplug_a_frame_queued_before_a_replacement_is_not_consumed_after_it() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let old = pipe.camera_id("SENSORALPHA");
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        let consumed_stale = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        let new = pipe.camera_id("SENSORALPHA");
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        let consumed_current = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        assert!(old.is_some() && new.is_some() && old != new);
+        assert_eq!(
+            (consumed_stale, consumed_current),
+            (false, true),
+            "the old object's frame reached the new camera"
+        );
+    }
+
+    /// Every admission is a fresh camera, even when an add arrives without a removal, and an
+    /// add older than the newest applied one for the serial changes nothing.
+    #[test]
+    fn hotplug_a_stale_added_is_ignored_and_every_admission_is_a_new_camera() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let first = pipe.camera_id("SENSORALPHA");
+        queue_lifetime_event(&d, added("sensoralpha", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let second = pipe.camera_id("sensoralpha");
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let after_stale = pipe.camera_id("sensoralpha");
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        let stale = d.track_in.lock().unwrap().pop_frame().is_some();
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        let current = d.track_in.lock().unwrap().pop_frame().is_some();
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "an add reused the camera"
+        );
+        assert_eq!(after_stale, second, "a stale add replaced the camera");
+        assert_eq!((stale, current), (false, true));
+        // A removal after the successor's add only drops the successor (liveness, not G1).
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        d.frame(&lifetime_frame("SENSORALPHA", 30), 2, &[]);
+        assert!(d.track_in.lock().unwrap().pop_frame().is_none());
+        assert_eq!(pipe.camera_id("sensoralpha"), None);
+        assert_eq!(pipe.camera_id("SENSORALPHA"), None);
+    }
+
+    /// An add that the engine finished as started is queued for the radio with the native
+    /// object's lifetime.
+    #[test]
+    fn hotplug_a_started_add_reaches_the_radio_with_its_lifetime() {
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![]);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish_as(&a.serial, &a.attachment, engine::AddOutcome::Started, 0, 41);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        assert!(matches!(
+            take_sensor_events(&d)[..],
+            [SensorEvent::Added { lifetime: 41, .. }]
+        ));
+    }
+
+    /// At engine start the queues admit the opened objects' lifetimes; after a reopen, the old
+    /// engine's objects, whose lifetimes are all lower, are dropped.
+    #[test]
+    fn cold_start_and_reopen_admit_only_the_open_engines_objects() {
+        let d = live_daemon(vec![]);
+        let register = |lifetime: u64| {
+            let roster = [("SENSORALPHA".to_string(), lifetime)];
+            d.track_in.lock().unwrap().register(roster.clone());
+            d.track_searches.lock().unwrap().register(roster.clone());
+            d.track_identities.lock().unwrap().register(roster);
+        };
+        let admitted = |lifetime: u64| {
+            d.frame(&lifetime_frame("SENSORALPHA", lifetime), lifetime, &[]);
+            d.search_started(&lifetime_frame("SENSORALPHA", lifetime), lifetime, 5);
+            d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), lifetime, false, 1);
+            (
+                d.track_in.lock().unwrap().pop_frame().is_some(),
+                d.track_searches.lock().unwrap().pop_frame().is_some(),
+                d.track_identities.lock().unwrap().take().len(),
+            )
+        };
+        // callbacks before registration are dropped
+        assert_eq!(admitted(3), (false, false, 0));
+        register(3);
+        assert_eq!(admitted(3), (true, true, 1));
+        register(8);
+        assert_eq!(admitted(3), (false, false, 0), "the old engine's object");
+        assert_eq!(admitted(8), (true, true, 1));
+    }
+
+    /// An identity notice the native object emits after it was retired reaches tracking, where
+    /// it can still retract judgments, but is not recorded: in a recording it could land after
+    /// its successor's start with no boundary between them.
+    #[test]
+    fn recorder_a_retired_objects_identity_notice_is_delivered_but_not_recorded() {
+        let d = live_daemon(vec![]);
+        d.track_identities
+            .lock()
+            .unwrap()
+            .register([("SENSORALPHA".to_string(), 1)]);
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("retired.rec");
+        d.rec.start(&path, 1).unwrap();
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 1, false, 2);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 2), 1, true, 3);
+        d.rec.stop();
+        let delivered = d.track_identities.lock().unwrap().take();
+        let mut reader = recorder::Reader::open(&path).unwrap();
+        let identities = reader
+            .by_ref()
+            .filter(|r| r.rtype == recorder::INSPECTION_IDENTITY)
+            .count();
+        assert_eq!(reader.error(), None);
+        assert_eq!(identities, 1, "a retired object's notice was recorded");
+        assert_eq!(delivered.len(), 1);
+        let left = &delivered[0].1[HAND_LEFT];
+        assert!(
+            !left.permits(1) && !left.permits(2),
+            "a notice was not delivered"
+        );
     }
 
     /// The radio thread takes the sensor events without the sensor watch, which the engine
@@ -11365,6 +11778,7 @@ mod tests {
                 SensorEvent::Removed("SENSORALPHA".into()),
                 SensorEvent::Added {
                     serial: "SensorAlpha".into(),
+                    lifetime: 2,
                     camera: None,
                 },
             ] {
@@ -11602,9 +12016,13 @@ mod tests {
                     reconcile_engine_sensors(&d, 1, &[], &[start], Ok(vec![a2.clone()]));
                     assert!(d.sensor_watch.lock().unwrap().detached().is_empty());
                     // registered as engine_session does, with a frame waiting for the tracker
-                    d.track_in.lock().unwrap().register([a2.serial.clone()]);
+                    d.track_in
+                        .lock()
+                        .unwrap()
+                        .register([(a2.serial.clone(), 1)]);
                     d.track_in.lock().unwrap().push_frame(
                         &a2.serial,
+                        1,
                         1,
                         (Box::default(), Vec::new()),
                     );

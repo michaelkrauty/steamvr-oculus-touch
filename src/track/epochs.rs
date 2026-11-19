@@ -151,42 +151,53 @@ impl State {
 
 /// Lifecycle notices cannot share the dropping camera-frame queue. Coalesce the invalidations
 /// by epoch, bounded per registered sensor and hand, and transfer ownership before doing
-/// tracking work.
+/// tracking work. Like the frame queues, it admits each sensor as one native object (its
+/// callback lifetime).
 #[derive(Default)]
 pub struct Mailbox {
-    sensors: BTreeMap<String, [Evidence; 2]>,
+    sensors: BTreeMap<String, (u64, [Evidence; 2])>,
 }
 
 impl Mailbox {
-    pub fn register(&mut self, serials: impl IntoIterator<Item = String>) {
-        self.sensors = serials
+    pub fn register(&mut self, sensors: impl IntoIterator<Item = (String, u64)>) {
+        self.sensors = sensors
             .into_iter()
-            .map(|s| (s, Default::default()))
+            .map(|(s, lifetime)| (s, (lifetime, Default::default())))
             .collect();
     }
 
-    /// Admits one sensor a running engine added, with no notices: its native object numbers its
-    /// identities afresh, so nothing an earlier object of that serial left here may reach it.
-    pub fn add(&mut self, serial: &str) {
+    /// Admits the native object `lifetime` a running engine added, with no notices: it numbers
+    /// its identities afresh, so nothing an earlier object of that serial left here may reach it.
+    /// Adding the object already admitted changes nothing.
+    pub fn add(&mut self, serial: &str, lifetime: u64) {
         match self
             .sensors
             .iter_mut()
             .find(|(s, _)| crate::status::same_sensor(s, serial))
         {
-            Some((_, evidence)) => *evidence = Default::default(),
+            Some((_, admitted)) if admitted.0 == lifetime => {}
+            Some((_, admitted)) => *admitted = (lifetime, Default::default()),
             None => {
-                self.sensors.insert(serial.to_string(), Default::default());
+                self.sensors
+                    .insert(serial.to_string(), (lifetime, Default::default()));
             }
         }
     }
 
+    /// Retires one sensor with its pending notices, rejecting its later ones.
+    pub fn remove(&mut self, serial: &str) {
+        self.sensors
+            .retain(|s, _| !crate::status::same_sensor(s, serial));
+    }
+
     pub fn clear(&mut self) {
-        for evidence in self.sensors.values_mut() {
+        for (_, evidence) in self.sensors.values_mut() {
             *evidence = Default::default();
         }
     }
 
-    pub fn note(&mut self, event: &crate::engine::InspectionIdentity) {
+    /// Keeps a notice of the native object `lifetime`, if that object is the one admitted.
+    pub fn note(&mut self, event: &crate::engine::InspectionIdentity, lifetime: u64) {
         let Some(hand) = super::pipeline::device_hand(event.device_id) else {
             return;
         };
@@ -194,11 +205,9 @@ impl Mailbox {
             return;
         };
         let serial = crate::engine::cstr_field(&event.serial);
-        if let Some((_, evidence)) = self
-            .sensors
-            .iter_mut()
-            .find(|(s, _)| crate::status::same_sensor(s, &serial))
-        {
+        if let Some((_, (_, evidence))) = self.sensors.iter_mut().find(|(s, (admitted, _))| {
+            *admitted == lifetime && crate::status::same_sensor(s, &serial)
+        }) {
             evidence[hand].note(event.epoch, state);
         }
     }
@@ -206,7 +215,7 @@ impl Mailbox {
     pub fn take(&mut self) -> Vec<(String, [Evidence; 2])> {
         self.sensors
             .iter_mut()
-            .filter_map(|(serial, evidence)| {
+            .filter_map(|(serial, (_, evidence))| {
                 evidence
                     .iter()
                     .any(|e| !e.epochs.is_empty() || e.forgotten_through != 0)
@@ -278,7 +287,7 @@ mod tests {
     #[test]
     fn lifecycle_delivery_is_bounded_and_independent_of_dropped_frames() {
         let mut mailbox = Mailbox::default();
-        mailbox.register(["CAMERA".into()]);
+        mailbox.register([("CAMERA".into(), 1)]);
         let mut event = crate::engine::InspectionIdentity {
             device_id: crate::calib::DEVICE_LEFT,
             state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
@@ -288,14 +297,14 @@ mod tests {
             *d = *b as _;
         }
         let mut frames = crate::frame_queue::FrameQueue::default();
-        frames.register(["CAMERA".into()]);
+        frames.register([("CAMERA".into(), 1)]);
         for epoch in 1..=2 * MAX_EPOCHS as u64 {
             event.epoch = epoch;
-            mailbox.note(&event);
+            mailbox.note(&event, 1);
             event.state = crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED;
-            mailbox.note(&event);
+            mailbox.note(&event, 1);
             event.state = crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
-            frames.push_frame("CAMERA", epoch, ());
+            frames.push_frame("CAMERA", 1, epoch, ());
         }
         frames.clear();
         let delivery = mailbox.take();
@@ -334,13 +343,13 @@ mod tests {
             crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED,
         ] {
             event.state = state;
-            mailbox.note(&event);
+            mailbox.note(&event, 1);
         }
         assert!(mailbox.take().is_empty());
         assert_eq!(consumer.epochs[&event.epoch].observed.checks, 7);
         mailbox.register([]);
         event.state = crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
-        mailbox.note(&event);
+        mailbox.note(&event, 1);
         assert!(mailbox.take().is_empty());
     }
 
@@ -350,7 +359,7 @@ mod tests {
     #[test]
     fn hotplug_an_added_sensor_starts_with_no_notices() {
         let mut mailbox = Mailbox::default();
-        mailbox.register(["CAMERA".into()]);
+        mailbox.register([("CAMERA".into(), 1)]);
         let mut event = crate::engine::InspectionIdentity {
             device_id: crate::calib::DEVICE_LEFT,
             state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
@@ -360,17 +369,17 @@ mod tests {
         for (d, b) in event.serial.iter_mut().zip(b"OTHER") {
             *d = *b as _;
         }
-        mailbox.note(&event);
+        mailbox.note(&event, 1);
         assert!(mailbox.take().is_empty(), "not admitted yet");
-        mailbox.add("other");
-        mailbox.note(&event);
+        mailbox.add("other", 1);
+        mailbox.note(&event, 1);
         assert_eq!(mailbox.take().len(), 1);
         // replugged: what the earlier object noted after its removal is dropped at the add
-        mailbox.note(&event);
-        mailbox.add("OTHER");
-        mailbox.add("OTHER");
+        mailbox.note(&event, 1);
+        mailbox.add("OTHER", 2);
+        mailbox.add("OTHER", 2);
         assert!(mailbox.take().is_empty());
-        mailbox.note(&event);
+        mailbox.note(&event, 2);
         let delivery = mailbox.take();
         assert_eq!(delivery.len(), 1);
         assert_eq!(delivery[0].0, "other");
@@ -447,5 +456,47 @@ mod tests {
             "a real overflow still bounds it"
         );
         assert_eq!(evidence.epochs[&0].observed.checks, 5);
+    }
+
+    /// Each native object numbers its identity epochs from one, so epoch k of an earlier
+    /// object of a serial must never land in its successor's epoch k.
+    #[test]
+    fn hotplug_identity_epochs_do_not_cross_lifetimes() {
+        let mut mailbox = Mailbox::default();
+        mailbox.register([("CAMERA".to_string(), 1)]);
+        let mut event = crate::engine::InspectionIdentity {
+            device_id: crate::calib::DEVICE_LEFT,
+            state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+            epoch: 1,
+            ..Default::default()
+        };
+        for (d, b) in event.serial.iter_mut().zip(b"CAMERA") {
+            *d = *b as _;
+        }
+        mailbox.note(&event, 2);
+        mailbox.note(&event, 0);
+        assert!(mailbox.take().is_empty(), "lifetime not rostered");
+        // pending notices of the old object are dropped when its successor is added
+        mailbox.note(&event, 1);
+        mailbox.add("CAMERA", 2);
+        assert!(mailbox.take().is_empty());
+        mailbox.note(&event, 1);
+        assert!(mailbox.take().is_empty(), "old object after replacement");
+        mailbox.note(&event, 2);
+        let delivery = mailbox.take();
+        assert_eq!(delivery.len(), 1);
+        assert!(!delivery[0].1[crate::shm::HAND_LEFT].permits(1));
+        // removal rejects every lifetime of the serial
+        mailbox.note(&event, 2);
+        mailbox.remove("camera");
+        mailbox.note(&event, 2);
+        mailbox.note(&event, 3);
+        assert!(mailbox.take().is_empty());
+        // a reopened engine admits only its own lifetimes
+        mailbox.register([("CAMERA".to_string(), 7)]);
+        mailbox.note(&event, 2);
+        assert!(mailbox.take().is_empty());
+        mailbox.note(&event, 7);
+        assert_eq!(mailbox.take().len(), 1);
     }
 }

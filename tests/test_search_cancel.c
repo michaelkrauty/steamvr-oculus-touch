@@ -86,9 +86,9 @@ void blobwatch_update_labels(blobwatch *bw, blobservation *ob, int dev)
     (void)bw; (void)ob; (void)dev;
     label_updates++;
 }
-static void search_started(void *data, const ohmd_cv1touch_frame_info *info, uint64_t remaining)
+static void search_started(void *data, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, uint64_t remaining)
 {
-    (void)data;
+    (void)data; (void)lifetime;
     CHECK(strcmp(info->serial, "CameraA") == 0);
     CHECK(info->exposure_hmd_ts == 1234);
     CHECK(remaining > 0);

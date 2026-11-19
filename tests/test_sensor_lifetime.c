@@ -56,9 +56,11 @@ ohmd_cond *ohmd_create_cond(ohmd_context *ctx) {
 void ohmd_destroy_cond(ohmd_cond *p) { release(p); }
 void ohmd_cond_broadcast(ohmd_cond *p) { CHECK(p); }
 void ohmd_cond_signal(ohmd_cond *p) { CHECK(p); }
+/* The lifetime an analysis thread could read when it starts. */
+static uint64_t thread_lifetime;
 static ohmd_thread *test_thread(ohmd_context *ctx, void *arg) {
   (void)ctx;
-  (void)arg;
+  thread_lifetime = ((rift_sensor_ctx *)arg)->lifetime;
   return allocate(1);
 }
 void ohmd_destroy_thread(ohmd_thread *p) { release(p); }
@@ -106,9 +108,9 @@ void rift_tracker_frame_release(rift_tracker_ctx *t, uint64_t now, uint64_t star
 }
 void blobwatch_release_observation(blobwatch *bw, blobservation *ob) { (void)bw; (void)ob; }
 void ohmd_video_frame_release(ohmd_video_frame *f) { CHECK(f); video_releases++; }
-static void count_frame(void *user, const ohmd_cv1touch_frame_info *info, int n,
+static void count_frame(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, int n,
                         const ohmd_cv1touch_blob *blobs) {
-  (void)user; (void)info; (void)n; (void)blobs;
+  (void)user; (void)lifetime; (void)info; (void)n; (void)blobs;
   callbacks++;
 }
 static void stop(rift_sensor_device *d) { CHECK(d); }
@@ -210,7 +212,33 @@ static void free_releases_frames_queued_for_analysis(void) {
   CHECK(closed == 1);
 }
 
+/* Every native object of a serial has its own lifetime, never zero, numbered upward across
+ * objects, and fixed before its analysis threads can read it. */
+static void native_lifetimes_are_unique_and_set_before_threads(void) {
+  calls = owned = closed = fail_at = 0;
+  ohmd_context ctx = {0};
+  rift_sensor_device_funcs funcs = {.stop = stop, .free = close_device};
+  uint64_t seen[3] = {0};
+  for (int i = 0; i < 3; i++) {
+    rift_sensor_device *device = calloc(1, sizeof *device);
+    CHECK(device);
+    device->funcs = &funcs;
+    device->calib.width = 1280;
+    device->calib.height = 960;
+    thread_lifetime = 0;
+    rift_sensor_ctx *sensor = rift_sensor_new(&ctx, 0, "TEST000001", device, NULL, NULL);
+    CHECK(sensor);
+    seen[i] = sensor->lifetime;
+    CHECK(seen[i] != 0);
+    CHECK(thread_lifetime == seen[i]);
+    CHECK(i == 0 || seen[i] > seen[i - 1]);
+    rift_sensor_free(sensor);
+  }
+  CHECK(closed == 3);
+}
+
 int main(void) {
+  native_lifetimes_are_unique_and_set_before_threads();
   free_releases_frames_queued_for_analysis();
   pin_ownership_survives_sensor_free(false);
   pin_ownership_survives_sensor_free(true);

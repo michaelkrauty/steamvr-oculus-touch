@@ -217,6 +217,8 @@ pub struct SensorAdded {
     pub open_ms: u32,
     /// Starting its video, through its radio setup.
     pub start_ms: u32,
+    /// For `Started`, the lifetime its callbacks carry; else 0.
+    pub lifetime: u64,
 }
 
 impl SensorAdded {
@@ -238,6 +240,7 @@ impl SensorAdded {
             error_code: added.error_code,
             open_ms: added.open_ms,
             start_ms: added.start_ms,
+            lifetime: added.lifetime,
         })
     }
 }
@@ -366,12 +369,22 @@ pub const MATCH_INSPECTION_MOTION: u32 = ffi::OHMD_CV1TOUCH_MATCH_INSPECTION_MOT
 
 /// Engine callbacks. `frame` runs on sensor analysis threads with the sensor lock held and
 /// `report` on the engine thread: both must only copy data.
+/// `lifetime` names the native sensor object a callback came from: never 0 and never reused in
+/// the process (`SensorAdded::lifetime`, `Engine::sensor_lifetime`).
 pub trait EngineSink: Send + Sync {
-    fn frame(&self, info: &FrameInfo, blobs: &[Blob]);
+    fn frame(&self, info: &FrameInfo, lifetime: u64, blobs: &[Blob]);
     /// A native label search is about to start; retain its exposure until its deadline.
-    fn search_started(&self, _info: &FrameInfo, _remaining_ns: u64) {}
+    fn search_started(&self, _info: &FrameInfo, _lifetime: u64, _remaining_ns: u64) {}
     /// Identity lifetimes are control evidence; retain invalidations even when dropping frames.
-    fn inspection_identity(&self, _event: &InspectionIdentity, _host_ns: u64) {}
+    /// `retired`: the object was retired first, so this may follow its successor's start.
+    fn inspection_identity(
+        &self,
+        _event: &InspectionIdentity,
+        _lifetime: u64,
+        _retired: bool,
+        _host_ns: u64,
+    ) {
+    }
     fn report(&self, source: i32, host_ns: u64, data: &[u8]);
     /// Runs in decoded message order on the named reader. Copy and return without waiting.
     #[allow(clippy::too_many_arguments)]
@@ -761,6 +774,22 @@ impl Engine {
             .collect()
     }
 
+    /// The lifetime the callbacks of this serial's open, unretired sensor object carry. Call on
+    /// the engine thread.
+    pub fn sensor_lifetime(&self, serial: &str) -> Option<u64> {
+        let serial_c = self::serial(serial).ok()?;
+        let mut lifetime = 0;
+        // SAFETY: this engine owns the device; serial is NUL-terminated and the output valid.
+        (unsafe {
+            ffi::ohmd_cv1touch_get_sensor_lifetime(
+                self.hands[HAND_RIGHT],
+                serial_c.as_ptr(),
+                &mut lifetime,
+            )
+        } == 0)
+            .then_some(lifetime)
+    }
+
     /// Drop a detached serial's diagnostic without freeing its native sensor object.
     /// Repeated detach notifications are harmless. Call on the engine thread.
     pub fn forget_sensor_stream(&self, serial: &str) -> Result<(), String> {
@@ -1119,6 +1148,7 @@ mod tests {
             error_code: -1,
             open_ms: 65,
             start_ms: 1130,
+            lifetime: 41,
             ..Default::default()
         };
         for (out, byte) in native.stream.serial.iter_mut().zip(b"SENSORALPHA") {
@@ -1129,8 +1159,13 @@ mod tests {
         let added = super::SensorAdded::from_native(&native).unwrap();
         assert_eq!(added.outcome, super::AddOutcome::StartFailed);
         assert_eq!(
-            (added.error_code, added.open_ms, added.start_ms),
-            (-1, 65, 1130)
+            (
+                added.error_code,
+                added.open_ms,
+                added.start_ms,
+                added.lifetime
+            ),
+            (-1, 65, 1130, 41)
         );
         assert_eq!(added.start.serial, "SENSORALPHA");
         assert_eq!(added.start.error_kind, "likely_usb_bandwidth");
@@ -1140,7 +1175,7 @@ mod tests {
         );
         native.outcome = 99;
         assert!(super::SensorAdded::from_native(&native).is_none());
-        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_added>(), 80);
+        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_added>(), 88);
     }
 
     #[cfg(feature = "engine")]

@@ -1863,6 +1863,16 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_stream(ohmd_device *
 	return rift_tracker_get_sensor_stream(hmd->tracker_ctx, index, out);
 }
 
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_lifetime(ohmd_device *device, const char *serial, uint64_t *out)
+{
+	if (device == NULL || device->getf != getf || serial == NULL || out == NULL)
+		return -1;
+	rift_hmd_t *hmd = rift_device_priv_get(device)->hmd;
+	if (hmd->tracker_ctx == NULL)
+		return -1;
+	return rift_tracker_get_sensor_lifetime(hmd->tracker_ctx, serial, out);
+}
+
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_forget_sensor_stream(ohmd_device *device, const char *serial)
 {
 	if (device == NULL || device->getf != getf || serial == NULL || serial[0] == '\0')

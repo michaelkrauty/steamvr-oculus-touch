@@ -1376,21 +1376,24 @@ mod tests {
             1
         );
         let mut mailbox = super::super::epochs::Mailbox::default();
-        mailbox.register(["SENSOR2".into()]);
+        mailbox.register([("SENSOR2".into(), 1)]);
         let epoch = (1 << 32) | 1;
         // A stalled consumer: normal ends leave nothing to deliver, so only invalidations of
         // later epochs can fill the mailbox, which forgets the oldest behind its watermark.
         for offset in 0..4096 {
-            mailbox.note(&crate::engine::InspectionIdentity {
-                serial: serial(2),
-                epoch: epoch + offset,
-                device_id: DEVICE_RIGHT,
-                state: if offset < 2048 {
-                    crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED
-                } else {
-                    crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED
+            mailbox.note(
+                &crate::engine::InspectionIdentity {
+                    serial: serial(2),
+                    epoch: epoch + offset,
+                    device_id: DEVICE_RIGHT,
+                    state: if offset < 2048 {
+                        crate::ffi::OHMD_CV1TOUCH_IDENTITY_ENDED
+                    } else {
+                        crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED
+                    },
                 },
-            });
+                1,
+            );
         }
         let updates = mailbox.take();
         assert!(updates[0].1[HAND_RIGHT].forgotten_through >= epoch);
@@ -1840,17 +1843,15 @@ mod tests {
                 },
             );
             let mailbox = Arc::new(Mutex::new(epochs::Mailbox::default()));
-            mailbox.lock().unwrap().register(["SENSOR2".into()]);
+            mailbox.lock().unwrap().register([("SENSOR2".into(), 1)]);
             // The radio loop extracted its mailbox, then tracking ran while a native callback arrived.
             assert!(mailbox.lock().unwrap().take().is_empty());
             let barrier = Arc::new(Barrier::new(2));
             std::thread::scope(|scope| {
                 let (incoming, ready) = (Arc::clone(&mailbox), Arc::clone(&barrier));
                 scope.spawn(move || {
-                    incoming
-                        .lock()
-                        .unwrap()
-                        .note(&crate::engine::InspectionIdentity {
+                    incoming.lock().unwrap().note(
+                        &crate::engine::InspectionIdentity {
                             serial: serial(2),
                             epoch: 2,
                             device_id: if hand == HAND_LEFT {
@@ -1859,7 +1860,9 @@ mod tests {
                                 DEVICE_RIGHT
                             },
                             state: crate::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
-                        });
+                        },
+                        1,
+                    );
                     ready.wait();
                 });
                 barrier.wait();

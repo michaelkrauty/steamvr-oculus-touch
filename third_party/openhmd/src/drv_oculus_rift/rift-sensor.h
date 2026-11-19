@@ -109,6 +109,8 @@ rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *se
 void rift_sensor_request_stop(rift_sensor_ctx *sensor_ctx);
 void rift_sensor_retire(rift_sensor_ctx *sensor);
 bool rift_sensor_retired(rift_sensor_ctx *sensor);
+/* The lifetime the sensor's callbacks carry (ohmd_cv1touch_frame_cb). */
+uint64_t rift_sensor_lifetime(rift_sensor_ctx *sensor);
 /* Frames that start before start_ns (host clock) neither move a device, place the sensor nor
  * reach the frame callback; their blobs are still tracked. A sensor starts with 0. */
 void rift_sensor_accept_frames_from(rift_sensor_ctx *sensor, uint64_t start_ns);
