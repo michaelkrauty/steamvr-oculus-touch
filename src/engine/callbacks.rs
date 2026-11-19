@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub(super) unsafe extern "C" fn frame_cb(
     user: *mut c_void,
+    lifetime: u64,
     info: *const FrameInfo,
     n: c_int,
     blobs: *const Blob,
@@ -21,12 +22,14 @@ pub(super) unsafe extern "C" fn frame_cb(
         } else {
             &[]
         };
-        sink.frame(&*info, blobs);
+        sink.frame(&*info, lifetime, blobs);
     });
 }
 
 pub(super) unsafe extern "C" fn identity_cb(
     user: *mut c_void,
+    lifetime: u64,
+    retired: bool,
     event: *const InspectionIdentity,
     host_ns: u64,
 ) {
@@ -35,12 +38,13 @@ pub(super) unsafe extern "C" fn identity_cb(
             return;
         }
         let sink = &*(user as *const Arc<dyn EngineSink>);
-        sink.inspection_identity(&*event, host_ns);
+        sink.inspection_identity(&*event, lifetime, retired, host_ns);
     });
 }
 
 pub(super) unsafe extern "C" fn search_cb(
     user: *mut c_void,
+    lifetime: u64,
     info: *const FrameInfo,
     remaining_ns: u64,
 ) {
@@ -49,12 +53,13 @@ pub(super) unsafe extern "C" fn search_cb(
             return;
         }
         let sink = &*(user as *const Arc<dyn EngineSink>);
-        sink.search_started(&*info, remaining_ns);
+        sink.search_started(&*info, lifetime, remaining_ns);
     });
 }
 
 pub(super) unsafe extern "C" fn image_cb(
     user: *mut c_void,
+    _lifetime: u64,
     info: *const FrameInfo,
     width: c_int,
     height: c_int,

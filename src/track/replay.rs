@@ -34,6 +34,8 @@ pub struct Replay {
     /// With `Options::trace`: each tracker's miss diagnostics (see `Tracker::misses`).
     pub misses: [Vec<(usize, usize, usize, usize)>; 2],
     pub fits: [Vec<(usize, usize)>; 2],
+    /// Why replay stopped before the end of the recording, if applicable.
+    pub stopped: Option<String>,
     pub frames_skipped: u64,
     /// Pending frames evicted by each registered camera's bounded backlog.
     pub frames_dropped: u64,
@@ -53,8 +55,16 @@ pub fn replay(
     let mut p = Pipeline::new(o.clone());
     let mut out = Replay::default();
     let o_delayed = o.delayed_ns;
-    for rec in Reader::open(path)? {
+    let reader = Reader::open(path)?;
+    let start_host_ns = reader.start_host_ns;
+    for rec in reader {
         match rec.rtype {
+            recorder::SENSOR_ADDED => {
+                let serial = String::from_utf8_lossy(&rec.payload);
+                let elapsed = rec.host_ns.saturating_sub(start_host_ns) as f64 * 1e-9;
+                out.stopped = Some(format!("replay stopped {elapsed:.1} s into the recording when sensor {serial} was plugged in: the recording cannot be reproduced exactly past that point, so the rest was left out"));
+                break;
+            }
             recorder::SENSOR_INFO => {
                 let Some(s) = recorder::decode_sensor_info(&rec.payload) else {
                     continue;

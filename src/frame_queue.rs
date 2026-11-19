@@ -2,7 +2,9 @@
 // Copyright 2026 michaelkrauty
 
 //! Bounded camera ingress. Each admitted sensor keeps its two newest frames, and
-//! round-robin service prevents a fast camera from displacing a slower camera.
+//! round-robin service prevents a fast camera from displacing a slower camera. A sensor is
+//! admitted as one native object (its callback lifetime): frames of any other object of its
+//! serial, such as the one a replug replaced, are never queued for it.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -19,7 +21,8 @@ pub struct QueueStats {
 }
 
 pub struct FrameQueue<F> {
-    frames: BTreeMap<String, VecDeque<(u64, F)>>,
+    /// Per admitted serial: its object's lifetime, and its frames by exposure time.
+    frames: BTreeMap<String, (u64, VecDeque<(u64, F)>)>,
     roster: Vec<String>,
     next: usize,
     clocks: VecDeque<(u64, u32)>,
@@ -40,21 +43,45 @@ impl<F> Default for FrameQueue<F> {
 
 impl<F> FrameQueue<F> {
     /// Replace the admitted roster on engine startup/reopen. Callback-provided
-    /// names never grow the registry, so an inactive consumer cannot grow memory.
-    pub fn register(&mut self, serials: impl IntoIterator<Item = String>) {
+    /// names never grow the registry, so an inactive consumer cannot grow memory. Each serial
+    /// comes with the lifetime of its open native object.
+    pub fn register(&mut self, sensors: impl IntoIterator<Item = (String, u64)>) {
         self.frames.clear();
         self.roster.clear();
         self.clocks.clear();
         self.next = 0;
-        for serial in serials {
+        for (serial, lifetime) in sensors {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.frames.entry(serial.clone())
             {
                 // Allocate before callbacks start, and never temporarily exceed this bound.
-                entry.insert(VecDeque::with_capacity(FRAMES_PER_SENSOR));
+                entry.insert((lifetime, VecDeque::with_capacity(FRAMES_PER_SENSOR)));
                 self.roster.push(serial);
             }
         }
+    }
+
+    /// Admit the native object `lifetime` a running engine added, without disturbing other
+    /// queues: its frames are queued from now on. It replaces another object of its serial and
+    /// discards that one's frames; adding the object already admitted changes nothing.
+    pub fn add(&mut self, serial: &str, lifetime: u64) {
+        if let Some(admitted) = self
+            .roster
+            .iter()
+            .find(|s| crate::status::same_sensor(s, serial))
+        {
+            let (admitted, frames) = self.frames.get_mut(admitted).unwrap();
+            if *admitted != lifetime {
+                *admitted = lifetime;
+                frames.clear();
+            }
+            return;
+        }
+        self.frames.insert(
+            serial.to_string(),
+            (lifetime, VecDeque::with_capacity(FRAMES_PER_SENSOR)),
+        );
+        self.roster.push(serial.to_string());
     }
 
     /// Retire one sensor, rejecting its later callbacks without disturbing other queues.
@@ -76,14 +103,19 @@ impl<F> FrameQueue<F> {
     }
 
     pub fn clear(&mut self) {
-        for frames in self.frames.values_mut() {
+        for (_, frames) in self.frames.values_mut() {
             frames.clear();
         }
         self.clocks.clear();
     }
 
-    pub fn push_frame(&mut self, serial: &str, timestamp_ns: u64, frame: F) {
-        let Some(queue) = self.frames.get_mut(serial) else {
+    /// Queues a frame of the native object `lifetime`, if that object is the one admitted.
+    pub fn push_frame(&mut self, serial: &str, lifetime: u64, timestamp_ns: u64, frame: F) {
+        let Some((_, queue)) = self
+            .frames
+            .get_mut(serial)
+            .filter(|(admitted, _)| *admitted == lifetime)
+        else {
             self.stats.unknown_frames = self.stats.unknown_frames.saturating_add(1);
             return;
         };
@@ -130,7 +162,7 @@ impl<F> FrameQueue<F> {
     /// Takes the admitted sensor's queued frames that `take` selects, oldest exposure first;
     /// the others stay queued in order.
     pub fn take_sensor_frames(&mut self, serial: &str, mut take: impl FnMut(&F) -> bool) -> Vec<F> {
-        let Some(queue) = self.frames.get_mut(serial) else {
+        let Some((_, queue)) = self.frames.get_mut(serial) else {
             return Vec::new();
         };
         let mut taken = Vec::new();
@@ -149,7 +181,7 @@ impl<F> FrameQueue<F> {
         for _ in 0..self.roster.len() {
             let serial = &self.roster[self.next];
             self.next = (self.next + 1) % self.roster.len();
-            if let Some(frame) = self.frames.get_mut(serial).unwrap().pop_front() {
+            if let Some(frame) = self.frames.get_mut(serial).unwrap().1.pop_front() {
                 return Some(frame.1);
             }
         }
@@ -157,13 +189,13 @@ impl<F> FrameQueue<F> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clocks.is_empty() && self.frames.values().all(VecDeque::is_empty)
+        self.clocks.is_empty() && self.frames.values().all(|(_, f)| f.is_empty())
     }
 
     pub fn stats(&self) -> QueueStats {
         QueueStats {
             sensors: self.frames.len(),
-            queued_frames: self.frames.values().map(VecDeque::len).sum(),
+            queued_frames: self.frames.values().map(|(_, f)| f.len()).sum(),
             ..self.stats
         }
     }
@@ -180,12 +212,12 @@ mod tests {
     #[test]
     fn hotplug_removal_keeps_other_sensors_frames_and_rejects_late_callbacks() {
         let mut q = FrameQueue::default();
-        q.register(["SENSORALPHA".into(), "SENSORBETA".into()]);
-        q.push_frame("SENSORALPHA", 1, 1);
-        q.push_frame("SENSORBETA", 2, 2);
+        q.register([("SENSORALPHA".into(), 1), ("SENSORBETA".into(), 1)]);
+        q.push_frame("SENSORALPHA", 1, 1, 1);
+        q.push_frame("SENSORBETA", 1, 2, 2);
         q.push_clock(3, 4);
         q.remove("SENSORALPHA");
-        q.push_frame("SENSORALPHA", 5, 5);
+        q.push_frame("SENSORALPHA", 1, 5, 5);
         assert_eq!(q.pop_frame(), Some(2));
         assert_eq!(q.pop_frame(), None);
         assert_eq!(q.take_clocks(), [(3, 4)]);
@@ -197,12 +229,37 @@ mod tests {
     }
 
     #[test]
+    fn hotplug_an_added_sensor_queues_its_frames_from_then_on() {
+        let mut q = FrameQueue::default();
+        q.register([("SENSORALPHA".into(), 1)]);
+        q.push_frame("SENSORALPHA", 1, 1, 1);
+        q.push_frame("SENSORBETA", 1, 2, 2);
+        assert_eq!(q.stats().unknown_frames, 1, "not admitted yet");
+        q.add("SENSORBETA", 1);
+        q.add("sensorbeta", 1);
+        assert_eq!(q.stats().sensors, 2);
+        q.push_frame("SENSORBETA", 1, 3, 3);
+        q.push_frame("SENSORALPHA", 1, 4, 4);
+        assert_eq!(q.pop_frame(), Some(1));
+        assert_eq!(q.pop_frame(), Some(3));
+        assert_eq!(q.pop_frame(), Some(4));
+        assert_eq!(q.pop_frame(), None);
+        // replugged: removed, then added again as another object
+        q.remove("SENSORBETA");
+        q.push_frame("SENSORBETA", 1, 5, 5);
+        q.add("SENSORBETA", 2);
+        q.push_frame("SENSORBETA", 2, 6, 6);
+        assert_eq!(q.pop_frame(), Some(6));
+        assert_eq!(q.stats().unknown_frames, 2);
+    }
+
+    #[test]
     fn late_analysis_keeps_the_two_newest_exposures_in_order() {
         for times in [[30, 40, 20], [30, 20, 40]] {
             let mut q = FrameQueue::default();
-            q.register(["camera".into()]);
+            q.register([("camera".into(), 1)]);
             for t in times {
-                q.push_frame("camera", t, t);
+                q.push_frame("camera", 1, t, t);
             }
             assert_eq!(q.pop_frame(), Some(30));
             assert_eq!(q.pop_frame(), Some(40));
@@ -213,12 +270,12 @@ mod tests {
     #[test]
     fn a_busy_sensor_cannot_displace_a_quiet_sensors_pending_frames() {
         let mut q = FrameQueue::default();
-        q.register(["slow".into(), "fast".into()]);
+        q.register([("slow".into(), 1), ("fast".into(), 1)]);
         for t in 0..2 {
-            q.push_frame("slow", t, ("slow", t));
+            q.push_frame("slow", 1, t, ("slow", t));
         }
         for t in 0..100 {
-            q.push_frame("fast", t, ("fast", t));
+            q.push_frame("fast", 1, t, ("fast", t));
         }
         assert_eq!(q.stats().queued_frames, 4);
         assert_eq!(q.stats().dropped_frames, 98);
@@ -232,10 +289,10 @@ mod tests {
     #[test]
     fn a_sensors_selected_frames_are_taken_and_the_rest_keep_their_turn() {
         let mut q = FrameQueue::default();
-        q.register(["a".into(), "b".into()]);
-        q.push_frame("a", 20, ("a", 20));
-        q.push_frame("a", 10, ("a", 10));
-        q.push_frame("b", 15, ("b", 15));
+        q.register([("a".into(), 1), ("b".into(), 1)]);
+        q.push_frame("a", 1, 20, ("a", 20));
+        q.push_frame("a", 1, 10, ("a", 10));
+        q.push_frame("b", 1, 15, ("b", 15));
         assert_eq!(q.take_sensor_frames("a", |f| f.1 == 10), [("a", 10)]);
         assert!(q.take_sensor_frames("unregistered", |_| true).is_empty());
         assert_eq!(q.stats().queued_frames, 2);
@@ -262,10 +319,10 @@ mod tests {
     #[test]
     fn all_sixty_five_sensors_receive_fair_service_and_reopen_replaces_the_roster() {
         let mut q = FrameQueue::default();
-        q.register((0..65).map(|i| format!("camera-{i}")));
+        q.register((0..65).map(|i| (format!("camera-{i}"), 1)));
         for i in 0..65 {
             for t in 0..100 {
-                q.push_frame(&format!("camera-{i}"), t, (i, t));
+                q.push_frame(&format!("camera-{i}"), 1, t, (i, t));
             }
         }
         for round in [98, 99] {
@@ -274,17 +331,59 @@ mod tests {
             }
         }
         assert!(q.is_empty());
-        q.push_frame("unregistered", 0, (100, 0));
+        q.push_frame("unregistered", 1, 0, (100, 0));
         assert_eq!(q.stats().unknown_frames, 1);
         assert_eq!(q.stats().sensors, 65);
-        q.push_frame("camera-0", 101, (0, 101));
-        q.register(["replacement".into()]);
+        q.push_frame("camera-0", 1, 101, (0, 101));
+        q.register([("replacement".into(), 1)]);
         assert_eq!(q.pop_frame(), None);
-        q.push_frame("camera-0", 102, (0, 102));
-        q.push_frame("replacement", 0, (200, 0));
+        q.push_frame("camera-0", 1, 102, (0, 102));
+        q.push_frame("replacement", 1, 0, (200, 0));
         assert_eq!(q.pop_frame(), Some((200, 0)));
         assert_eq!(q.stats().sensors, 1);
         q.register([]);
+        assert_eq!(q.pop_frame(), None);
+    }
+
+    /// Admission is by native object, not serial: a callback of an earlier object of a serial
+    /// is never queued for its successor, and replacing the object discards what it queued.
+    #[test]
+    fn hotplug_frames_are_admitted_only_for_the_rostered_lifetime() {
+        let mut q = FrameQueue::default();
+        q.register([("SENSORALPHA".to_string(), 1)]);
+        q.push_frame("SENSORALPHA", 1, 1, 1);
+        q.push_frame("SENSORALPHA", 2, 2, 2);
+        assert_eq!(q.stats().unknown_frames, 1, "a lifetime not yet rostered");
+        q.push_frame("SENSORALPHA", 0, 3, 3);
+        assert_eq!(
+            q.stats().unknown_frames,
+            2,
+            "lifetime zero is never admitted"
+        );
+        // a replacing add drops the old object's queued frame and rejects its later ones
+        q.add("SENSORALPHA", 2);
+        assert_eq!(q.stats().sensors, 1);
+        assert_eq!(q.stats().queued_frames, 0);
+        q.push_frame("SENSORALPHA", 1, 4, 4);
+        q.push_frame("SENSORALPHA", 2, 5, 5);
+        assert_eq!(q.pop_frame(), Some(5));
+        assert_eq!(q.pop_frame(), None);
+        assert_eq!(q.stats().unknown_frames, 3);
+        // re-adding the rostered lifetime keeps its frames
+        q.push_frame("SENSORALPHA", 2, 6, 6);
+        q.add("sensoralpha", 2);
+        assert_eq!(q.pop_frame(), Some(6));
+        // after removal no lifetime of the serial is admitted
+        q.remove("SENSORALPHA");
+        q.push_frame("SENSORALPHA", 2, 7, 7);
+        q.push_frame("SENSORALPHA", 3, 8, 8);
+        assert_eq!(q.pop_frame(), None);
+        assert_eq!(q.stats().unknown_frames, 5);
+        // a reopened engine's roster admits only its own lifetimes
+        q.register([("SENSORALPHA".to_string(), 9)]);
+        q.push_frame("SENSORALPHA", 2, 9, 9);
+        q.push_frame("SENSORALPHA", 9, 10, 10);
+        assert_eq!(q.pop_frame(), Some(10));
         assert_eq!(q.pop_frame(), None);
     }
 }

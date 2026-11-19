@@ -341,7 +341,8 @@ pub fn sensor_hotplug_note(
 
 /// The doctor's `sensor_hotplug` check: whether it passes, and the note. A sensor the engine is
 /// opening, one waiting for the headset the engine opens with, or one whose USB change is still
-/// settling needs nothing of its own.
+/// settling needs nothing of its own; one the engine could not open (`open_failed`), or that must
+/// be plugged in again, does.
 pub fn sensor_hotplug_check(
     value: &serde_json::Value,
     explained: &BTreeSet<String>,
@@ -884,6 +885,7 @@ mod tests {
             (&["waiting_engine_start"][..], false),
             (&["opening", "waiting_usb"][..], false),
             (&["waiting_replug"][..], false),
+            (&["open_failed"][..], false),
         ] {
             let (passed, note) = sensor_hotplug_check(&pending(states), &none).unwrap();
             assert_eq!(passed, ok, "{states:?}");

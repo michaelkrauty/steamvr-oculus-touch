@@ -18,9 +18,10 @@
 static FILE *dump_file;
 static pthread_mutex_t dump_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void dump_frame(void *user, const ohmd_cv1touch_frame_info *info, int n, const ohmd_cv1touch_blob *blobs)
+static void dump_frame(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, int n,
+	const ohmd_cv1touch_blob *blobs)
 {
-	(void)user;
+	(void)user; (void)lifetime;
 	pthread_mutex_lock(&dump_lock);
 	fprintf(dump_file, "%s %llu", info->serial, (unsigned long long)info->frame_start_host_ns);
 	for (int i = 0; i < n; i++)

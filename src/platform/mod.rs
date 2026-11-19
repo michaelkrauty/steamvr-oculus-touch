@@ -863,7 +863,7 @@ pub mod usb {
     }
 
     /// A Rift sensor's USB presence, without opening or claiming its USB interfaces.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct Sensor {
         pub serial: String,
         /// Identifies this attachment; a new USB address at the same port is a new attachment.
@@ -1286,7 +1286,7 @@ pub mod usb {
             assert!(monitor.waits_for_engine_start());
             monitor.before_open();
             monitor.opened();
-            assert!(!monitor.waits_for_engine_start());
+            assert!(!monitor.wants_open());
         }
 
         #[test]
@@ -1316,7 +1316,7 @@ pub mod usb {
                 monitor.before_open();
                 monitor.opened();
                 assert!(monitor.update(2 * DEBOUNCE_NS, Ok(ready), &[]).is_none());
-                assert!(!monitor.waits_for_engine_start());
+                assert!(!monitor.wants_open());
             }
         }
     }

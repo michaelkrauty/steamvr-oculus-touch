@@ -15,13 +15,13 @@ mod callbacks;
 struct PoisonedSink(Mutex<()>);
 
 impl EngineSink for PoisonedSink {
-    fn frame(&self, _: &engine::FrameInfo, _: &[Blob]) {
+    fn frame(&self, _: &engine::FrameInfo, _: u64, _: &[Blob]) {
         drop(self.0.lock().unwrap());
     }
-    fn inspection_identity(&self, _: &engine::InspectionIdentity, _: u64) {
+    fn inspection_identity(&self, _: &engine::InspectionIdentity, _: u64, _: bool, _: u64) {
         drop(self.0.lock().unwrap());
     }
-    fn search_started(&self, _: &engine::FrameInfo, _: u64) {
+    fn search_started(&self, _: &engine::FrameInfo, _: u64, _: u64) {
         drop(self.0.lock().unwrap());
     }
     fn report(&self, _: i32, _: u64, _: &[u8]) {
@@ -51,12 +51,16 @@ fn run(kind: &str, test: &str) {
         // SAFETY: valid input buffers and a live Arc; none of these callbacks touches hardware.
         unsafe {
             match kind {
-                "frame" => callbacks::frame_cb(user, &info, 0, std::ptr::null()),
-                "search" => callbacks::search_cb(user, &info, 1),
-                "identity" => {
-                    callbacks::identity_cb(user, &engine::InspectionIdentity::default(), 1)
-                }
-                "image" => callbacks::image_cb(user, &info, 1, 1, 1, [0u8].as_ptr()),
+                "frame" => callbacks::frame_cb(user, 1, &info, 0, std::ptr::null()),
+                "search" => callbacks::search_cb(user, 1, &info, 1),
+                "identity" => callbacks::identity_cb(
+                    user,
+                    1,
+                    false,
+                    &engine::InspectionIdentity::default(),
+                    1,
+                ),
+                "image" => callbacks::image_cb(user, 1, &info, 1, 1, 1, [0u8].as_ptr()),
                 "report" => callbacks::report_cb(user, 0, 0, std::ptr::null(), 0),
                 "activity" => callbacks::activity_cb(user, 1, 2, 0, 0, false, 0.0),
                 _ => unreachable!(),

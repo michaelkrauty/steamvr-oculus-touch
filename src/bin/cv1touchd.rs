@@ -184,9 +184,19 @@ struct Daemon {
     engine_applied: std::sync::atomic::AtomicU64,
     mode: Mutex<String>,
     reopen: AtomicBool,
+    /// Held by the engine thread across its native live-add calls (see `service_sensors`): the
+    /// radio thread never takes it.
     sensor_watch: Mutex<sensor_hotplug::Monitor>,
     sensor_retirement: Mutex<Option<engine::SensorRetirement>>,
+    /// Advanced after each change to the sensors: events queued, a sensor to add.
     sensor_revision: std::sync::atomic::AtomicU64,
+    /// Sensors removed from and added to the running engine, in order, for the radio thread
+    /// (`queue_sensor_event`, `with_radio_sensors`).
+    sensor_events: Mutex<std::collections::LinkedList<SensorEvent>>,
+    /// Per sensor (`status::sensor_identity`): the removals queued for this session's radio
+    /// thread, counted with the sensor watch held. The radio thread never takes this lock. A pose
+    /// change it made for the sensor before it took a removal counts fewer (`RadioLink::reposed`).
+    sensor_removals: Mutex<std::collections::BTreeMap<String, u64>>,
     tracker: TrackerKind,
     track_in: Mutex<FrameQueue<QueuedFrame>>,
     track_searches: Mutex<FrameQueue<(Box<engine::FrameInfo>, u64)>>,
@@ -482,6 +492,16 @@ impl LandmarkWatch {
         }
     }
 
+    /// Watches the sensor `serial` again from `now`, plugged back in where it stood, against the
+    /// landmarks it had: its alerts and misses start over.
+    fn resume(&mut self, serial: &str, now: u64) {
+        self.monitor.resume(serial, now);
+        self.alerts
+            .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+        self.missing
+            .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    }
+
     /// Stops watching the sensor `serial`: its landmarks were learned where it stood.
     fn forget(&mut self, d: &Daemon, serial: &str) {
         self.monitor.forget(serial);
@@ -555,11 +575,17 @@ impl LandmarkWatch {
 /// Locks `queue` only for the push. Analysis threads call this, and the radio thread locks
 /// the same queues on every pass. The serial, timestamp and frame are arguments, so the
 /// caller builds them before this function runs and takes the lock.
-fn enqueue_frame<T>(queue: &Mutex<FrameQueue<T>>, serial: String, timestamp_ns: u64, frame: T) {
+fn enqueue_frame<T>(
+    queue: &Mutex<FrameQueue<T>>,
+    serial: String,
+    lifetime: u64,
+    timestamp_ns: u64,
+    frame: T,
+) {
     queue
         .lock()
         .unwrap()
-        .push_frame(&serial, timestamp_ns, frame);
+        .push_frame(&serial, lifetime, timestamp_ns, frame);
 }
 
 impl EngineSink for Daemon {
@@ -583,8 +609,17 @@ impl EngineSink for Daemon {
         }
     }
 
-    fn inspection_identity(&self, event: &engine::InspectionIdentity, host_ns: u64) {
-        if self.rec.active() {
+    fn inspection_identity(
+        &self,
+        event: &engine::InspectionIdentity,
+        lifetime: u64,
+        retired: bool,
+        host_ns: u64,
+    ) {
+        // A retired object's notice could be written after its successor's first records with
+        // no boundary between them, and replay would apply it to the successor. Tracking still
+        // gets it, to retract what the object's evidence supported.
+        if self.rec.active() && !retired {
             self.rec.write(
                 recorder::INSPECTION_IDENTITY,
                 host_ns,
@@ -592,16 +627,17 @@ impl EngineSink for Daemon {
             );
         }
         if self.tracker == TrackerKind::Rust {
-            self.track_identities.lock().unwrap().note(event);
+            self.track_identities.lock().unwrap().note(event, lifetime);
             self.wake_radio();
         }
     }
 
-    fn search_started(&self, info: &engine::FrameInfo, remaining_ns: u64) {
+    fn search_started(&self, info: &engine::FrameInfo, lifetime: u64, remaining_ns: u64) {
         if self.tracker == TrackerKind::Rust {
             enqueue_frame(
                 &self.track_searches,
                 engine::cstr_field(&info.serial),
+                lifetime,
                 info.frame_start_host_ns,
                 (Box::new(*info), remaining_ns),
             );
@@ -609,7 +645,7 @@ impl EngineSink for Daemon {
         }
     }
 
-    fn frame(&self, info: &engine::FrameInfo, blobs: &[Blob]) {
+    fn frame(&self, info: &engine::FrameInfo, lifetime: u64, blobs: &[Blob]) {
         if self.rec.active() {
             self.rec.write(
                 recorder::FRAME_OBS,
@@ -621,6 +657,7 @@ impl EngineSink for Daemon {
             enqueue_frame(
                 &self.track_in,
                 engine::cstr_field(&info.serial),
+                lifetime,
                 info.frame_start_host_ns,
                 (Box::new(*info), blobs.to_vec()),
             );
@@ -907,14 +944,15 @@ fn sensor_status(s: &engine::Sensor) -> SensorStatus {
     out
 }
 
-/// Writes whatever session info (sensor intrinsics, each controller's LED model) has become
-/// available and is not in the recording yet.
-fn write_session_info(d: &Daemon, e: &Engine) {
+/// Writes whatever session info (the open sensors' intrinsics, each controller's LED model) has
+/// become available and is not in the recording yet: a sensor added while the engine runs is
+/// described once it is open. `sensors`: the engine's sensors, as just read.
+fn write_session_info(d: &Daemon, e: &Engine, sensors: &[engine::Sensor]) {
+    let serials: Vec<String> = sensors.iter().map(engine::sensor_serial).collect();
     let mut session = d.session.lock().unwrap();
-    if session.complete(2) {
+    if session.complete(&serials, 2) {
         return;
     }
-    let sensors = e.sensors();
     let models: Vec<(i32, Vec<engine::LedEntry>)> = [HAND_LEFT, HAND_RIGHT]
         .iter()
         .filter_map(|&h| Some((e.controller(h)?.device_id, e.led_model(h))))
@@ -923,13 +961,14 @@ fn write_session_info(d: &Daemon, e: &Engine) {
         .iter()
         .map(|(dev, m)| (*dev, !m.is_empty()))
         .collect();
-    let (write_sensors, devices) = session.plan(!sensors.is_empty(), &known);
+    let (write_sensors, devices) = session.plan(&serials, &known);
     let now = shm::now_ns();
-    if write_sensors {
-        for s in &sensors {
-            d.rec
-                .write(recorder::SENSOR_INFO, now, &[recorder::as_bytes(s)]);
-        }
+    for &i in &write_sensors {
+        d.rec.write(
+            recorder::SENSOR_INFO,
+            now,
+            &[recorder::as_bytes(&sensors[i])],
+        );
     }
     for (device, model) in models.iter().filter(|(dev, _)| devices.contains(dev)) {
         d.rec.write(
@@ -1576,41 +1615,101 @@ fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
     }
 }
 
+/// A sensor taken out of the running engine, or put into it, in the order the radio thread
+/// applies them (`with_radio_sensors`). Unplugged and plugged back in, a sensor is removed, then
+/// added: a new camera with nothing of the old one's repose, inspection or agreement state.
+enum SensorEvent {
+    Removed(String),
+    /// The serial as its frames spell it; the native object's callback lifetime; its camera model
+    /// and calibrated pose (camera -> world), if it has one; without one it only watches.
+    Added {
+        serial: String,
+        lifetime: u64,
+        camera: Option<(calib::camera::CameraModel, nalgebra::Isometry3<f64>)>,
+    },
+}
+
+/// Queues `event` for the radio thread, after the ones before it, and has it applied on the
+/// radio's next pass: until then a removed sensor's queued frames still reach its own camera.
+/// Each event retires the sensor's earlier object, so each advances its count of removals.
+/// Its list node is allocated before the lock is taken: splicing it in allocates nothing, and the
+/// radio thread takes the whole list and applies it after releasing the lock.
+fn queue_sensor_event(d: &Daemon, event: SensorEvent) {
+    let (SensorEvent::Removed(serial) | SensorEvent::Added { serial, .. }) = &event;
+    *d.sensor_removals
+        .lock()
+        .unwrap()
+        .entry(cv1touch::status::sensor_identity(serial))
+        .or_default() += 1;
+    let mut node = std::collections::LinkedList::new();
+    node.push_back(event);
+    d.sensor_events.lock().unwrap().append(&mut node);
+    d.sensor_revision.fetch_add(1, Ordering::Release);
+    d.wake_radio();
+}
+
+/// Drops the queued sensor events, which no radio thread applies. The list is freed after the
+/// lock is released.
+fn clear_sensor_events(d: &Daemon) {
+    let events = mem::take(&mut *d.sensor_events.lock().unwrap());
+    drop(events);
+}
+
 fn poll_sensors(d: &Daemon, now: u64, listed: io::Result<Vec<platform::usb::Sensor>>) {
     let ignored = d.opts.lock().unwrap().ignore_sensors.clone();
     let mut watch = d.sensor_watch.lock().unwrap();
-    let Some(change) = watch.update(now, listed, &ignored) else {
+    let change = watch.update(now, listed, &ignored);
+    if watch.engine_work() {
+        // the engine looks for sensors to release and to add
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+    }
+    let Some(change) = change else {
         return;
     };
     retire_sensor_state(d, &watch, &change);
-    // Capture the engine under the same lock as the attachment change. A delayed
-    // retirement must not target a replacement engine that opened this serial again.
-    let retirement = d.sensor_retirement.lock().unwrap().clone();
+    let running = watch.engine_adds();
+    let retirements = decide_retirements(d, &change.unplugged);
     drop(watch);
-    retire_native_sensors(retirement.as_ref(), &change.unplugged);
-    log_sensor_change(change);
+    retire_native_sensors(retirements);
+    log_sensor_change(change, running);
 }
 
-fn retire_native_sensors(retirement: Option<&engine::SensorRetirement>, serials: &[String]) {
-    if let Some(retirement) = retirement {
-        for serial in serials {
-            #[cfg(test)]
-            hotplug_explorer::note_retired(serial);
-            if let Err(err) = retirement.retire(serial) {
-                log!("{err}");
+/// Native retirements decided with the sensor watch held, for after it is released.
+type Retirements = Option<(engine::SensorRetirement, Vec<engine::RetirementStamp>)>;
+
+/// The native retirements `serials` need, decided now: the caller holds the sensor watch. They
+/// target the engine of this attachment change: a delayed retirement must not reach a replacement
+/// engine that opened this serial again, nor a sensor this engine adds after releasing the ones
+/// decided about.
+fn decide_retirements(d: &Daemon, serials: &[String]) -> Retirements {
+    let retirement = d.sensor_retirement.lock().unwrap().clone()?;
+    let stamps = serials.iter().map(|s| retirement.stamp(s)).collect();
+    Some((retirement, stamps))
+}
+
+fn retire_native_sensors(retirements: Retirements) {
+    if let Some((retirement, stamps)) = retirements {
+        for stamp in stamps {
+            match retirement.retire(&stamp) {
+                #[cfg(test)]
+                Ok(true) => hotplug_explorer::note_retired(&stamp.serial),
+                Ok(_) => {}
+                Err(err) => log!("{err}"),
             }
         }
     }
 }
 
+/// The caller holds the sensor watch, so the radio thread sees the removal in its place among the
+/// sensor events, and the removal is counted as the watch saw it.
 fn retire_sensor_state(
     d: &Daemon,
     watch: &sensor_hotplug::Monitor,
     change: &sensor_hotplug::Change,
 ) {
     for serial in &change.unplugged {
-        d.track_in.lock().unwrap().remove(serial);
-        d.track_searches.lock().unwrap().remove(serial);
+        // the radio thread takes it out of the queues as it applies this, never before
+        queue_sensor_event(d, SensorEvent::Removed(serial.clone()));
         d.sensor_poses
             .lock()
             .unwrap()
@@ -1667,66 +1766,29 @@ fn retire_sensor_state(
     }
 }
 
-struct RetiredSensorStreams {
-    revision: u64,
-    forgotten: std::collections::BTreeSet<String>,
-}
-
-impl Default for RetiredSensorStreams {
-    fn default() -> Self {
-        Self {
-            revision: u64::MAX,
-            forgotten: Default::default(),
-        }
-    }
-}
-
-impl RetiredSensorStreams {
-    /// Called only by the engine thread. Copy the serials and release the watch before the
-    /// native forget call. Forget (`rift_tracker_forget_sensor_stream`) is lock-free,
-    /// engine-thread-only bookkeeping; the watch is held only for the copy.
-    fn flush(&mut self, d: &Daemon, mut forget: impl FnMut(&str) -> Result<(), String>) {
-        if d.sensor_revision.load(Ordering::Acquire) == self.revision {
-            return;
-        }
-        let serials = {
-            let watch = d.sensor_watch.lock().unwrap();
-            self.revision = d.sensor_revision.load(Ordering::Acquire);
-            watch
-                .detached()
-                .iter()
-                .filter(|s| !self.forgotten.contains(*s))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        for serial in serials {
-            self.forgotten.insert(serial.clone());
-            if let Err(err) = forget(&serial) {
-                log!("{err}");
-            }
-        }
-    }
-}
-
-/// A running engine opens no sensors: a new one waits for the next engine start.
-fn log_sensor_change(change: sensor_hotplug::Change) {
+/// What the watcher noticed. A running engine opens a plugged-in sensor itself; without one, the
+/// next engine start does.
+fn log_sensor_change(change: sensor_hotplug::Change, running: bool) {
     for serial in change.unplugged {
         log!("sensor unplugged: {serial}");
     }
-    let waiting = "it will be used the next time the tracking engine starts";
+    let opening = if running {
+        "opening it"
+    } else {
+        "it will be used the next time the tracking engine starts"
+    };
     for sensor in change.plugged {
-        log!(
-            "sensor plugged in: {}; {}",
-            sensor.serial,
-            if sensor.ready {
-                waiting
-            } else {
-                "waiting for access to its USB device"
-            }
-        );
+        if sensor.ready {
+            log!("sensor plugged in: {}; {opening}", sensor.serial);
+        } else {
+            log!(
+                "sensor plugged in: {}; waiting for access to its USB device",
+                sensor.serial
+            );
+        }
     }
     for serial in change.ready {
-        log!("sensor USB access ready: {serial}; {waiting}");
+        log!("sensor USB access ready: {serial}; {opening}");
     }
 }
 
@@ -1759,12 +1821,274 @@ fn retire_gone_sensors(
     for change in &changes {
         retire_sensor_state(d, &watch, change);
     }
-    let retirement = d.sensor_retirement.lock().unwrap().clone();
+    let retirements: Vec<_> = changes
+        .iter()
+        .map(|c| decide_retirements(d, &c.unplugged))
+        .collect();
+    let running = watch.engine_adds();
     drop(watch);
-    for change in changes {
-        retire_native_sensors(retirement.as_ref(), &change.unplugged);
-        log_sensor_change(change);
+    for (change, retirements) in changes.into_iter().zip(retirements) {
+        retire_native_sensors(retirements);
+        log_sensor_change(change, running);
     }
+}
+
+/// What `service_sensors` asks of the engine: the engine thread's own, or a test's stand-in.
+trait LiveSensors {
+    fn add_sensor(
+        &self,
+        serial: &str,
+        attachment: &str,
+        pose: Option<&engine::SensorPose>,
+    ) -> Result<bool, String>;
+    fn poll_sensor_adds(&self) -> Vec<engine::SensorAdded>;
+    fn release_sensor(&self, serial: &str) -> Result<(), String>;
+    fn forget_sensor_stream(&self, serial: &str) -> Result<(), String>;
+    fn sensors(&self) -> Vec<engine::Sensor>;
+}
+
+impl LiveSensors for Engine {
+    fn add_sensor(
+        &self,
+        serial: &str,
+        attachment: &str,
+        pose: Option<&engine::SensorPose>,
+    ) -> Result<bool, String> {
+        Engine::add_sensor(self, serial, attachment, pose)
+    }
+    fn poll_sensor_adds(&self) -> Vec<engine::SensorAdded> {
+        Engine::poll_sensor_adds(self)
+    }
+    fn release_sensor(&self, serial: &str) -> Result<(), String> {
+        Engine::release_sensor(self, serial)
+    }
+    fn forget_sensor_stream(&self, serial: &str) -> Result<(), String> {
+        Engine::forget_sensor_stream(self, serial)
+    }
+    fn sensors(&self) -> Vec<engine::Sensor> {
+        Engine::sensors(self)
+    }
+}
+
+/// The engine thread's side of sensors plugged in and unplugged while it runs.
+#[derive(Clone, Debug)]
+struct LiveSensorState {
+    /// The sensor revision last looked at; u64::MAX looks now.
+    revision: u64,
+    /// Live adds the engine works on: serial identity -> (the watcher's spelling, the
+    /// attachment asked for, the calibrated pose it was given).
+    adding: std::collections::BTreeMap<String, (String, String, Option<engine::SensorPose>)>,
+    /// When a live-add retry is due.
+    retry_at: Option<u64>,
+}
+
+impl Default for LiveSensorState {
+    fn default() -> Self {
+        Self {
+            revision: u64::MAX,
+            adding: Default::default(),
+            retry_at: None,
+        }
+    }
+}
+
+/// A transient reason a live add is tried again, in a few plain words.
+fn add_trouble(outcome: engine::AddOutcome, error_code: i32) -> &'static str {
+    match (outcome, error_code) {
+        (engine::AddOutcome::Stale, _) => "another USB connection took its place",
+        (engine::AddOutcome::NotFound, _) | (_, sensor_hotplug::LIBUSB_ERROR_NOT_FOUND) => {
+            "its USB device was not there yet"
+        }
+        (_, sensor_hotplug::LIBUSB_ERROR_BUSY) => "its USB device was busy",
+        (_, sensor_hotplug::LIBUSB_ERROR_ACCESS) => "its USB device could not be opened yet",
+        _ => "its USB device could not be opened",
+    }
+}
+
+/// Seconds since `since`, or "?" when the daemon did not see when it was plugged in.
+fn seconds_since(since: Option<u64>, now: u64) -> String {
+    since.map_or("?".into(), |at| {
+        format!("{:.1}", now.saturating_sub(at) as f64 / 1e9)
+    })
+}
+
+/// The engine thread's work for hot-plugging, each pass of its loop; true when the engine's
+/// sensors changed. Releases come first: a sensor unplugged and plugged back in between two
+/// passes is released, its start record forgotten, before its new connection is asked for. A
+/// started sensor joins the engine with the sensor watch held, which the watcher holds to settle
+/// anything about it: nothing about a sensor settles while it is added, so the sensor is in use
+/// from its adoption, and only USB scans read after its start, its own NO_DEVICE or a release
+/// retire it. Native callbacks never take the watch; no native call is made with a lock the radio
+/// thread takes held, and the radio thread registers an added sensor itself, before its frames.
+fn service_sensors(
+    d: &Daemon,
+    e: &impl LiveSensors,
+    radio: bool,
+    state: &mut LiveSensorState,
+    now: u64,
+) -> bool {
+    let mut changed = false;
+    let revision = d.sensor_revision.load(Ordering::Acquire);
+    if revision != state.revision || state.retry_at.is_some_and(|at| now >= at) {
+        state.revision = revision;
+        let detached: Vec<String> = d
+            .sensor_watch
+            .lock()
+            .unwrap()
+            .detached()
+            .iter()
+            .cloned()
+            .collect();
+        for serial in &detached {
+            if let Err(err) = e.release_sensor(serial) {
+                log!("{err}");
+            }
+            if let Err(err) = e.forget_sensor_stream(serial) {
+                log!("{err}");
+            }
+        }
+        changed |= !detached.is_empty();
+        let adds = {
+            let mut watch = d.sensor_watch.lock().unwrap();
+            for serial in &detached {
+                watch.released(serial);
+            }
+            let adds = watch.take_adds(now);
+            state.retry_at = watch.next_retry();
+            adds
+        };
+        for sensor in adds {
+            let pose = modes::calibrated_pose(&d.opts.lock().unwrap(), &sensor.serial).cloned();
+            match e.add_sensor(&sensor.serial, &sensor.attachment, pose.as_ref()) {
+                Ok(true) => {
+                    d.rec
+                        .write_boundary(recorder::SENSOR_ADDED, now, &[sensor.serial.as_bytes()]);
+                    state.adding.insert(
+                        cv1touch::status::sensor_identity(&sensor.serial),
+                        (sensor.serial, sensor.attachment, pose),
+                    );
+                }
+                // a live object of it is in the roster already
+                Ok(false) => d
+                    .sensor_watch
+                    .lock()
+                    .unwrap()
+                    .already_open(&sensor.serial, &sensor.attachment),
+                Err(err) => {
+                    log!("sensor {}: {err}; it will be used the next time the tracking engine starts", sensor.serial);
+                    d.sensor_watch
+                        .lock()
+                        .unwrap()
+                        .add_refused(&sensor.serial, &sensor.attachment);
+                }
+            }
+        }
+    }
+    if state.adding.is_empty() {
+        return changed;
+    }
+    let mut notes = Vec::new();
+    let mut gone = Vec::new();
+    {
+        let mut watch = d.sensor_watch.lock().unwrap();
+        let finished = e.poll_sensor_adds();
+        if finished.is_empty() {
+            return changed;
+        }
+        let native = e.sensors();
+        let mut stale = Vec::new();
+        for added in finished {
+            let identity = cv1touch::status::sensor_identity(&added.start.serial);
+            let Some((asked, attachment, pose)) = state.adding.remove(&identity) else {
+                if added.outcome == engine::AddOutcome::Started {
+                    stale.push(added.start.serial.clone());
+                }
+                continue;
+            };
+            // the spelling its frames carry
+            let serial = added.start.serial.clone();
+            let plugged = seconds_since(watch.plugged_at(&asked, &attachment), now);
+            let times = format!(
+                "opened in {} ms, video started in {} ms",
+                added.open_ms, added.start_ms
+            );
+            match watch.add_finished(&asked, &attachment, added.outcome, added.error_code, now) {
+                sensor_hotplug::AddVerdict::Use => {
+                    let model = native
+                        .iter()
+                        .find(|s| cv1touch::status::same_sensor(&engine::sensor_serial(s), &serial))
+                        .map(calib::camera::CameraModel::from_sensor);
+                    let camera = pose
+                        .as_ref()
+                        .zip(model)
+                        .map(|(p, model)| (model, calib::iso_from_xyzw(p.orient, p.pos)));
+                    if radio {
+                        queue_sensor_event(
+                            d,
+                            SensorEvent::Added {
+                                serial: serial.clone(),
+                                lifetime: added.lifetime,
+                                camera,
+                            },
+                        );
+                    }
+                    let unposed = !modes::unposed_sensors(
+                        &d.opts.lock().unwrap(),
+                        std::slice::from_ref(&serial),
+                    )
+                    .is_empty();
+                    notes.push(if unposed {
+                        format!("sensor {serial}: opened {plugged} s after it was plugged in ({times}); it has no calibrated pose, so it only observes (run `cv1touch calibrate`)")
+                    } else {
+                        format!("sensor {serial}: tracking with it now ({plugged} s after it was plugged in; {times})")
+                    });
+                    changed = true;
+                }
+                sensor_hotplug::AddVerdict::Release => stale.push(serial.clone()),
+                sensor_hotplug::AddVerdict::Gone(change) => {
+                    retire_sensor_state(d, &watch, &change);
+                    gone.push(decide_retirements(d, &change.unplugged));
+                    notes.push(format!(
+                        "sensor {serial}: its USB device went away while the engine opened it"
+                    ));
+                }
+                sensor_hotplug::AddVerdict::Retry { attempt } => notes.push(format!(
+                    "sensor {serial}: {}; trying again in {} s ({attempt} of {})",
+                    add_trouble(added.outcome, added.error_code),
+                    sensor_hotplug::ADD_RETRY_NS / 1_000_000_000,
+                    sensor_hotplug::ADD_RETRIES
+                )),
+                sensor_hotplug::AddVerdict::Failed(detail) => {
+                    notes.push(format!("sensor {serial}: could not be opened. {detail}"));
+                }
+                sensor_hotplug::AddVerdict::Done => {
+                    if added.outcome == engine::AddOutcome::StartFailed {
+                        changed = true;
+                        notes.push(if added.start.error_kind == "likely_usb_bandwidth" {
+                            format!("sensor {serial}: its video could not start, most likely for lack of USB bandwidth on that USB controller ({times}). Plug it into a different USB port or controller; the daemon starts it there by itself.")
+                        } else if added.error_code == sensor_hotplug::LIBUSB_ERROR_NO_DEVICE {
+                            format!("sensor {serial}: its USB device went away while its video started")
+                        } else {
+                            format!("sensor {serial}: its video could not start (USB error {}). Unplug it and plug it back in.", added.error_code)
+                        });
+                    }
+                }
+            }
+        }
+        state.retry_at = watch.next_retry();
+        // started for an add the watch no longer waits for: out again at once
+        for serial in &stale {
+            notes.extend(e.release_sensor(serial).err());
+            notes.extend(e.forget_sensor_stream(serial).err());
+        }
+    };
+    for retirements in gone {
+        retire_native_sensors(retirements);
+    }
+    for note in notes {
+        log(note);
+    }
+    changed
 }
 
 fn sensor_watch_main(d: Arc<Daemon>) {
@@ -1894,7 +2218,12 @@ fn engine_session(
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
     {
         let watch = d.sensor_watch.lock().unwrap();
-        let admitted: Vec<String> = open.iter().filter(|s| watch.admitted(s)).cloned().collect();
+        // each as its open native object, whose callbacks alone are admitted
+        let admitted: Vec<(String, u64)> = open
+            .iter()
+            .filter(|s| watch.admitted(s))
+            .filter_map(|s| Some((s.clone(), e.sensor_lifetime(s)?)))
+            .collect();
         d.track_in
             .lock()
             .unwrap()
@@ -1904,6 +2233,10 @@ fn engine_session(
             .unwrap()
             .register(admitted.iter().cloned());
         d.track_identities.lock().unwrap().register(admitted);
+        // the new radio thread's pipeline starts from this engine's admitted sensors, and counts
+        // their removals from here
+        clear_sensor_events(d);
+        d.sensor_removals.lock().unwrap().clear();
     }
     for serial in modes::unposed_sensors(opts, &open) {
         log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
@@ -1974,12 +2307,13 @@ fn admit_engine_sensors(
     // follows after releasing it: `rift_sensor_retire` takes the sensor's lock, which a pose
     // commit or frame callback can hold, so status, USB scans and the radio's removal check
     // do not wait. Forget is lock-free engine-thread bookkeeping and does not run here.
-    let detached = {
+    let retirements = {
         let watch = d.sensor_watch.lock().unwrap();
-        *d.sensor_retirement.lock().unwrap() = Some(retirement.clone());
-        watch.detached().iter().cloned().collect::<Vec<_>>()
+        *d.sensor_retirement.lock().unwrap() = Some(retirement);
+        let detached: Vec<_> = watch.detached().iter().cloned().collect();
+        decide_retirements(d, &detached)
     };
-    retire_native_sensors(Some(&retirement), &detached);
+    retire_native_sensors(retirements);
 }
 
 /// The engine closed: no object of it is in use, and nothing retires through it any more.
@@ -2031,7 +2365,7 @@ fn reconcile_engine_sensors(
         log!("sensor plugged in: {}; {found}", sensor.serial);
     }
     for serial in change.unopened {
-        log!("sensor {serial}: the engine did not open it; it will be used the next time the tracking engine starts");
+        log!("sensor {serial}: the engine did not open it as it started; opening it now");
     }
 }
 
@@ -2245,8 +2579,9 @@ struct RadioLink {
     /// The bias file's new contents from the radio thread, for the engine thread to write.
     biases: Mutex<Option<track::biases::BiasFile>>,
     /// Sensor pose changes from the radio thread, for the engine thread to give the engine (and
-    /// a sensor placed again to write into the calibration).
-    reposed: Mutex<Vec<PoseChange>>,
+    /// a sensor placed again to write into the calibration), each with how many times its sensor
+    /// had been removed this session when it was made (`Reposing::removals`).
+    reposed: Mutex<Vec<(PoseChange, u64)>>,
     /// Native acknowledgements that a restored pose has stopped its previous search.
     restored: Mutex<Vec<String>>,
 }
@@ -2297,6 +2632,15 @@ enum PoseChange {
     Set(Reposed),
 }
 
+impl PoseChange {
+    fn serial(&self) -> &str {
+        match self {
+            PoseChange::Inspect(serial, _) | PoseChange::Placing(serial) => serial,
+            PoseChange::Set(r) => &r.serial,
+        }
+    }
+}
+
 /// A sensor placed again from the others (`repose`): its new pose, and how far it is from the
 /// calibrated one; `write` is false for a pose given back as it was.
 struct Reposed {
@@ -2310,14 +2654,15 @@ struct Reposed {
     write: bool,
 }
 
-/// Gives the engine its calibrated pose back without writing the calibration.
-fn restore_engine_pose(link: &RadioLink, pipe: &mut Pipeline, serial: &str) {
+/// Gives the engine its calibrated pose back without writing the calibration. `removals`: the
+/// sensor's, as the radio thread counts them (`Reposing::removals`).
+fn restore_engine_pose(link: &RadioLink, pipe: &mut Pipeline, serial: &str, removals: u64) {
     pipe.cancel_inspection(serial);
     let Some(cam) = pipe.camera(serial) else {
         return;
     };
     let (orient_xyzw, pos) = calib::iso_to_xyzw(&cam.world_from_cam);
-    link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+    let change = PoseChange::Set(Reposed {
         serial: serial.to_string(),
         orient_xyzw,
         pos,
@@ -2326,7 +2671,8 @@ fn restore_engine_pose(link: &RadioLink, pipe: &mut Pipeline, serial: &str) {
         moved_mm: 0.0,
         turned_deg: 0.0,
         write: false,
-    }));
+    });
+    link.reposed.lock().unwrap().push((change, removals));
 }
 
 /// The log line for a movement verdict, from the evidence that decided it: the last window's
@@ -2441,6 +2787,16 @@ struct Reposing {
     /// Per sensor: releases in a row (false alarms, timeouts) and when the last was; each one
     /// doubles the cooldown, a placement or a quiet hour ends the run.
     releases: std::collections::BTreeMap<String, (u32, u64)>,
+    /// Per sensor (`status::sensor_identity`): how many times it was removed this session. Its
+    /// pose changes carry the count, and the engine thread applies none made for a camera that
+    /// was removed since, even when the sensor is back (`engine_loop`).
+    removals: std::collections::BTreeMap<String, u64>,
+    /// Sensors placed again this session: their landmarks were learned where they stood
+    /// before, so plugging one back in does not watch them again.
+    stale_landmarks: std::collections::BTreeSet<String>,
+    /// Per sensor (`status::sensor_identity`): the native object last added. An add of an older
+    /// one comes too late, and changes nothing.
+    lifetimes: std::collections::BTreeMap<String, u64>,
 }
 
 impl Reposing {
@@ -2474,10 +2830,31 @@ impl Reposing {
             probed_since: Default::default(),
             placements: Default::default(),
             releases: Default::default(),
+            removals: Default::default(),
+            stale_landmarks: Default::default(),
+            lifetimes: Default::default(),
         }
     }
 
+    fn removals(&self, serial: &str) -> u64 {
+        self.removals
+            .get(&cv1touch::status::sensor_identity(serial))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn landmarks_stale(&self, serial: &str) -> bool {
+        self.stale_landmarks
+            .iter()
+            .any(|s| cv1touch::status::same_sensor(s, serial))
+    }
+
+    /// The sensor was removed: whatever it left goes, and its count of removals advances.
     fn forget(&mut self, serial: &str, pipe: &mut Pipeline) {
+        *self
+            .removals
+            .entry(cv1touch::status::sensor_identity(serial))
+            .or_default() += 1;
         if let Some(camera) = pipe.remove_sensor(serial) {
             self.reposer.forget(camera);
         }
@@ -2523,7 +2900,7 @@ impl Reposing {
             repose::COOLDOWN_NS << (run.0 - 1).min(4)
         };
         self.monitor.released_until(serial, now + cooldown);
-        restore_engine_pose(link, pipe, serial);
+        restore_engine_pose(link, pipe, serial, self.removals(serial));
         d.sensor_poses.lock().unwrap().insert(
             serial.to_string(),
             PoseNote::Released {
@@ -2552,7 +2929,7 @@ impl Reposing {
             // it keeps moving, or something else is wrong: not again and again
             pipe.probe(&serial, true);
             pipe.ignore(&serial, true);
-            restore_engine_pose(link, pipe, &serial);
+            restore_engine_pose(link, pipe, &serial, self.removals(&serial));
             self.monitor.search_finished(&serial);
             d.sensor_poses.lock().unwrap().insert(
                 serial.clone(),
@@ -2569,10 +2946,11 @@ impl Reposing {
         pipe.probe(&serial, true);
         self.reposer.watch(camera);
         self.probed_since.insert(serial.clone(), now);
+        let change = PoseChange::Placing(serial.clone());
         link.reposed
             .lock()
             .unwrap()
-            .push(PoseChange::Placing(serial.clone()));
+            .push((change, self.removals(&serial)));
         d.sensor_poses.lock().unwrap().insert(
             serial.clone(),
             PoseNote::Moved {
@@ -2615,32 +2993,36 @@ impl Reposing {
                     pipe.begin_inspection(&serial);
                     // Missing sightings request labels for these hands without demoting the
                     // sensor or disturbing the other hand's native fast tracking.
-                    link.reposed.lock().unwrap().push(PoseChange::Inspect(
+                    let change = PoseChange::Inspect(
                         serial.clone(),
                         self.monitor.inspection_hands(&serial).unwrap(),
-                    ));
+                    );
+                    link.reposed
+                        .lock()
+                        .unwrap()
+                        .push((change, self.removals(&serial)));
                 }
                 repose::Change::Agreed(serial) => {
-                    restore_engine_pose(link, pipe, &serial);
+                    restore_engine_pose(link, pipe, &serial, self.removals(&serial));
                     say(format!(
                         "sensor {serial}: its LED sightings agree with the other sensors; label inspection finished, tracking kept its calibrated pose"
                     ));
                 }
                 repose::Change::Unconfirmed(serial) => {
-                    restore_engine_pose(link, pipe, &serial);
+                    restore_engine_pose(link, pipe, &serial, self.removals(&serial));
                     say(format!(
                         "sensor {serial}: label inspection did not confirm movement; tracking kept its calibrated pose"
                     ));
                 }
                 repose::Change::Starved { serial, retry_ns } => {
-                    restore_engine_pose(link, pipe, &serial);
+                    restore_engine_pose(link, pipe, &serial, self.removals(&serial));
                     say(format!(
                         "sensor {serial}: label inspection saw the controllers, but neither turned enough on its own to be told apart; tracking kept its calibrated pose, and it looks again in {} s",
                         retry_ns / 1_000_000_000
                     ));
                 }
                 repose::Change::Interrupted { serial, moved } => {
-                    restore_engine_pose(link, pipe, &serial);
+                    restore_engine_pose(link, pipe, &serial, self.removals(&serial));
                     say(format!(
                         "sensor {serial}: label inspection stopped early, because sensor {moved} was judged moved and is handled first; tracking kept its calibrated pose"
                     ));
@@ -2755,8 +3137,9 @@ impl Reposing {
                     if let Some(w) = watch.as_mut() {
                         w.forget(d, &serial);
                     }
+                    self.stale_landmarks.insert(serial.clone());
                     let (orient_xyzw, pos) = calib::iso_to_xyzw(&fit.world_from_cam);
-                    link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
+                    let change = PoseChange::Set(Reposed {
                         serial: serial.clone(),
                         orient_xyzw,
                         pos,
@@ -2765,7 +3148,11 @@ impl Reposing {
                         moved_mm,
                         turned_deg,
                         write: true,
-                    }));
+                    });
+                    link.reposed
+                        .lock()
+                        .unwrap()
+                        .push((change, self.removals(&serial)));
                     d.sensor_poses.lock().unwrap().insert(
                         serial.clone(),
                         PoseNote::Placed {
@@ -2789,7 +3176,7 @@ impl Reposing {
                     pipe.ignore(&serial, true);
                     self.probed_since.remove(&serial);
                     self.monitor.search_finished(&serial);
-                    restore_engine_pose(link, pipe, &serial);
+                    restore_engine_pose(link, pipe, &serial, self.removals(&serial));
                     d.sensor_poses.lock().unwrap().insert(
                         serial.clone(),
                         PoseNote::GivenUp {
@@ -3132,10 +3519,10 @@ fn acknowledge_restored(
 /// keeps the temporaries of its iterator expression until the loop ends, in every edition, so
 /// locking in that expression would hold the radio thread's queue across the engine call and
 /// the calibration write.
-fn deliver_pose_changes(link: &RadioLink, mut handle: impl FnMut(PoseChange)) {
+fn deliver_pose_changes(link: &RadioLink, mut handle: impl FnMut(PoseChange, u64)) {
     let changes = mem::take(&mut *link.reposed.lock().unwrap());
-    for change in changes {
-        handle(change);
+    for (change, removals) in changes {
+        handle(change, removals);
     }
 }
 
@@ -3154,7 +3541,7 @@ fn deliver_pending_biases(link: &RadioLink, save: impl FnOnce(&track::biases::Bi
 fn deliver_engine_queues(
     link: &RadioLink,
     save: impl FnOnce(&track::biases::BiasFile),
-    handle: impl FnMut(PoseChange),
+    handle: impl FnMut(PoseChange, u64),
 ) {
     deliver_pending_biases(link, save);
     deliver_pose_changes(link, handle);
@@ -3176,7 +3563,7 @@ fn deliver_new_bodies(queued: &Mutex<Vec<NewBody>>, mut install: impl FnMut(NewB
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
 /// from OpenHMD. Returns when the engine is to close.
 fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
-    let mut retired_streams = RetiredSensorStreams::default();
+    let mut live_sensors = LiveSensorState::default();
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
     let mut restoring = std::collections::BTreeSet::new();
@@ -3234,12 +3621,8 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         }
         d.shm.heartbeat(now);
         holds.note(arrived, shm::now_ns());
-        deliver_engine_queues(link, save_biases, |change| {
-            let serial = match &change {
-                PoseChange::Inspect(s, _) | PoseChange::Placing(s) => s,
-                PoseChange::Set(r) => &r.serial,
-            };
-            if !d.sensor_watch.lock().unwrap().admitted(serial) {
+        deliver_engine_queues(link, save_biases, |change, removals| {
+            if !made_for_its_camera(d, &change, removals) {
                 return;
             }
             match change {
@@ -3272,16 +3655,20 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
                 d.wake_radio();
             }
         } else {
-            // no tracker reads the frames: keep the queue from growing
+            // no tracker reads the frames or the sensor events: keep them from growing
             d.track_in.lock().unwrap().clear();
             d.track_searches.lock().unwrap().clear();
             d.track_identities.lock().unwrap().clear();
+            clear_sensor_events(d);
+        }
+        if service_sensors(d, &*e, radio, &mut live_sensors, now) {
+            // publish the engine's sensors now
+            next_sensors = 0;
         }
         if now >= next_sensors {
             let native = e.sensors();
             let streams = e.sensor_streams();
             retire_gone_sensors(d, &native, &streams);
-            retired_streams.flush(d, |serial| e.forget_sensor_stream(serial));
             let sensors: Vec<SensorStatus> = native.iter().map(sensor_status).collect();
             publish_sensor_snapshot(
                 d,
@@ -3292,18 +3679,37 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
             );
             next_sensors = now + SENSOR_PUBLISH_NS;
             if d.rec.active() {
-                write_session_info(d, e);
+                write_session_info(d, e, &native);
             }
         }
         engine_updated(d, updated, &mut opening);
     }
 }
 
-/// The engine's first successful update finishes its open: its sensors are in its roster. Only
-/// that update takes the sensor watch's lock.
+/// Whether a pose change from the radio thread is for the sensor's camera now: one made for a
+/// camera of the sensor removed since (unplugged, and maybe back as a new camera) counts fewer
+/// removals, and its pose and inspection are not the new camera's.
+fn made_for_its_camera(d: &Daemon, change: &PoseChange, removals: u64) -> bool {
+    let since = d
+        .sensor_removals
+        .lock()
+        .unwrap()
+        .get(&cv1touch::status::sensor_identity(change.serial()))
+        .copied()
+        .unwrap_or(0);
+    removals == since
+}
+
+/// The engine's first successful update finishes its open: its sensors are in its roster, and it
+/// adds any other sensor ready by then (see `service_sensors`). Only that update takes the
+/// sensor watch's lock.
 fn engine_updated(d: &Daemon, updated: bool, opening: &mut bool) {
     if updated && mem::take(opening) {
-        d.sensor_watch.lock().unwrap().opened();
+        let mut watch = d.sensor_watch.lock().unwrap();
+        watch.opened();
+        if watch.engine_work() {
+            d.sensor_revision.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -3429,11 +3835,37 @@ fn publish_radio_state(
     );
 }
 
-/// Apply sensor removals before this IMU sample or frame is consumed. The watch lock is taken
-/// only when a removal changed the sensor revision, so tracker work runs without it: status
-/// requests, USB scans and the engine's sensor snapshot never wait for a fit. A removal made
-/// while a sample or frame is consumed takes effect before the next one, and forgets whatever
-/// that one left of the sensor.
+/// Consumes one fairly scheduled camera frame, if there is one; callbacks cannot grow a stalled
+/// consumer's queue. The frame is taken after the sensor events are applied, so a frame of an
+/// object replaced meanwhile went with its queue and never reaches its successor's camera. The
+/// ingress lock is released before any tracking work.
+fn consume_camera_frame(d: &Daemon, sensors: &mut RadioSensors<'_>, pipe: &mut Pipeline) -> bool {
+    with_radio_sensors(
+        d,
+        &mut sensors.revision,
+        pipe,
+        &mut sensors.reposing,
+        sensors.watch,
+        |pipe, watch| {
+            let Some((info, blobs)) = d.track_in.lock().unwrap().pop_frame() else {
+                return false;
+            };
+            if let Some(w) = watch.as_mut() {
+                w.frame(&info, &blobs);
+            }
+            pipe.frame(&info, &blobs);
+            true
+        },
+    )
+}
+
+/// Apply sensor removals and additions, in order, before this IMU sample or frame is consumed.
+/// The events are taken only when the sensor revision changed, with their own lock held just for
+/// the take: never the sensor watch, which the engine thread holds across native calls, so
+/// tracker work never waits for a USB scan, a status request or the engine's sensor work, nor
+/// they for a fit. A change made while a sample or frame is consumed takes effect before the
+/// next one: a removal forgets whatever that one left of the sensor, and an added sensor is
+/// registered, its camera first, before its frames are admitted.
 fn with_radio_sensors<T>(
     d: &Daemon,
     sensor_revision: &mut u64,
@@ -3443,33 +3875,95 @@ fn with_radio_sensors<T>(
     consume: impl FnOnce(&mut Pipeline, &mut Option<LandmarkWatch>) -> T,
 ) -> T {
     if d.sensor_revision.load(Ordering::Acquire) != *sensor_revision {
-        // Identity notices still waiting can retract judgments that a removed sensor's
-        // evidence supported: they reach the monitor before the sensor is forgotten.
-        cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| reposing.lifecycle(pipe));
-        let sensors = d.sensor_watch.lock().unwrap();
-        // the detached sensors and their revision change together, under the watch lock
+        // read first: every event queued before this revision is in the take
         let revision = d.sensor_revision.load(Ordering::Acquire);
-        for serial in sensors.detached() {
-            reposing.forget(serial, pipe);
-            d.sensor_poses
-                .lock()
-                .unwrap()
-                .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
-            d.sensor_agreement
-                .lock()
-                .unwrap()
-                .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
-            d.landmark_shifts
-                .lock()
-                .unwrap()
-                .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
-            if let Some(w) = watch.as_mut() {
-                w.forget(d, serial);
+        let events = mem::take(&mut *d.sensor_events.lock().unwrap());
+        if !events.is_empty() {
+            // Identity notices still waiting can retract judgments that a removed sensor's
+            // evidence supported: they reach the monitor before the sensor is forgotten.
+            cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| {
+                reposing.lifecycle(pipe)
+            });
+        }
+        for event in events {
+            match event {
+                SensorEvent::Removed(serial) => {
+                    retire_radio_sensor(d, pipe, reposing, watch, &serial);
+                    // removed here, in order, so that an add applied before cannot readmit it;
+                    // an add replaces its earlier object's entry itself
+                    d.track_in.lock().unwrap().remove(&serial);
+                    d.track_searches.lock().unwrap().remove(&serial);
+                    d.track_identities.lock().unwrap().remove(&serial);
+                }
+                SensorEvent::Added {
+                    serial,
+                    lifetime,
+                    camera,
+                } => {
+                    let newest = reposing
+                        .lifetimes
+                        .entry(cv1touch::status::sensor_identity(&serial))
+                        .or_default();
+                    if lifetime <= *newest {
+                        // counted as the engine thread counted it, retiring nothing
+                        *reposing
+                            .removals
+                            .entry(cv1touch::status::sensor_identity(&serial))
+                            .or_default() += 1;
+                        continue;
+                    }
+                    *newest = lifetime;
+                    // a new camera, even when no removal came between: nothing an earlier object
+                    // of the serial left is attributed to this one
+                    retire_radio_sensor(d, pipe, reposing, watch, &serial);
+                    if let Some((model, world_from_cam)) = camera {
+                        pipe.sensor(&serial, model, world_from_cam);
+                    }
+                    // its frames, searches and identity notices are taken from now on: none of
+                    // an earlier object of the serial
+                    d.track_in.lock().unwrap().add(&serial, lifetime);
+                    d.track_searches.lock().unwrap().add(&serial, lifetime);
+                    d.track_identities.lock().unwrap().add(&serial, lifetime);
+                    if let Some(w) = watch
+                        .as_mut()
+                        .filter(|_| !reposing.landmarks_stale(&serial))
+                    {
+                        w.resume(&serial, shm::now_ns());
+                    }
+                }
             }
         }
         *sensor_revision = revision;
     }
     consume(pipe, watch)
+}
+
+/// Retires the sensor's object on the radio thread, for a removal or an add that replaces it:
+/// its camera, probation, placements, landmark watch and status go, and its
+/// count of removals advances as the engine thread's did when it queued the event.
+fn retire_radio_sensor(
+    d: &Daemon,
+    pipe: &mut Pipeline,
+    reposing: &mut Reposing,
+    watch: &mut Option<LandmarkWatch>,
+    serial: &str,
+) {
+    reposing.forget(serial, pipe);
+    d.sensor_poses
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    d.sensor_agreement
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    d.landmark_shifts
+        .lock()
+        .unwrap()
+        .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    if let Some(w) = watch.as_mut() {
+        w.forget(d, serial);
+    }
 }
 
 /// The radio thread: reads the radio through its own HID handle and publishes each controller
@@ -3580,13 +4074,7 @@ fn radio_main(
         for (serial, evidence) in identities {
             pipe.inspection_lifecycle(&serial, &evidence);
         }
-        // One fairly scheduled camera frame per pass; callbacks cannot grow a stalled
-        // consumer's queue. Release the ingress lock before any tracking work.
-        let frame = {
-            let mut ingress = d.track_in.lock().unwrap();
-            ingress.take_clocks_into(&mut clocks);
-            ingress.pop_frame()
-        };
+        d.track_in.lock().unwrap().take_clocks_into(&mut clocks);
         for &(host, us) in &clocks {
             pipe.hmd_clock_sample(host, us);
         }
@@ -3594,21 +4082,7 @@ fn radio_main(
         if let Some((info, remaining_ns)) = search {
             pipe.hold_inspection(&info, remaining_ns);
         }
-        if let Some((info, blobs)) = frame {
-            with_radio_sensors(
-                d,
-                &mut sensors.revision,
-                pipe,
-                &mut sensors.reposing,
-                sensors.watch,
-                |pipe, watch| {
-                    if let Some(w) = watch.as_mut() {
-                        w.frame(&info, &blobs);
-                    }
-                    pipe.frame(&info, &blobs);
-                },
-            );
-        }
+        consume_camera_frame(d, sensors, pipe);
         // A handoff can happen after the radio's last report. Persistent publication still
         // refreshes and expires that hand even before this worker has a sample of its own.
         let now = shm::now_ns();
@@ -6172,6 +6646,8 @@ fn main() {
         sensor_watch: Mutex::new(sensor_watch),
         sensor_retirement: Mutex::new(None),
         sensor_revision: std::sync::atomic::AtomicU64::new(0),
+        sensor_events: Mutex::new(Default::default()),
+        sensor_removals: Mutex::new(Default::default()),
         tracker,
         track_in: Mutex::new(FrameQueue::default()),
         track_searches: Mutex::new(FrameQueue::default()),
@@ -7912,8 +8388,8 @@ mod tests {
         d.track_identities
             .lock()
             .unwrap()
-            .register(["camera1".into()]);
-        d.track_in.lock().unwrap().register(["camera1".into()]);
+            .register([("camera1".into(), 1)]);
+        d.track_in.lock().unwrap().register([("camera1".into(), 1)]);
         let mut event = engine::InspectionIdentity {
             epoch: 1,
             device_id: cv1touch::calib::DEVICE_LEFT,
@@ -7923,10 +8399,10 @@ mod tests {
         for (slot, byte) in event.serial.iter_mut().zip(b"camera1") {
             *slot = *byte as _;
         }
-        d.inspection_identity(&event, 1);
+        d.inspection_identity(&event, 1, false, 1);
         event.epoch = 2;
         event.state = cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED;
-        d.inspection_identity(&event, 2);
+        d.inspection_identity(&event, 1, false, 2);
         for t in 0..10 {
             d.frame(
                 &engine::FrameInfo {
@@ -7934,6 +8410,7 @@ mod tests {
                     frame_start_host_ns: t,
                     ..Default::default()
                 },
+                1,
                 &[],
             );
         }
@@ -7975,6 +8452,8 @@ mod tests {
             sensor_watch: Mutex::new(sensor_hotplug::Monitor::new(Ok(Vec::new()), &[])),
             sensor_retirement: Mutex::new(None),
             sensor_revision: std::sync::atomic::AtomicU64::new(0),
+            sensor_events: Mutex::new(Default::default()),
+            sensor_removals: Mutex::new(Default::default()),
             tracker: TrackerKind::Rust,
             track_in: Mutex::new(FrameQueue::default()),
             track_searches: Mutex::new(FrameQueue::default()),
@@ -8055,7 +8534,10 @@ mod tests {
                 original,
             );
             pipe.probe(serial, true);
-            d.track_identities.lock().unwrap().register([serial.into()]);
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register([(serial.into(), 1)]);
             let mut reposing = Reposing::start();
             reposing.reposer.watch(0);
             let batch = || {
@@ -8123,7 +8605,7 @@ mod tests {
             for (dst, byte) in event.serial.iter_mut().zip(serial.bytes()) {
                 *dst = byte as _;
             }
-            d.track_identities.lock().unwrap().note(&event);
+            d.track_identities.lock().unwrap().note(&event, 1);
             sender.send((second, Ok(result))).unwrap();
             reposing.tick(&d, &link, &mut pipe, &mut None, 1);
             assert_eq!(pipe.camera(serial).unwrap().world_from_cam, original);
@@ -8162,7 +8644,10 @@ mod tests {
                         nalgebra::Isometry3::identity(),
                     );
                 }
-                d.track_identities.lock().unwrap().register(["C".into()]);
+                d.track_identities
+                    .lock()
+                    .unwrap()
+                    .register([("C".into(), 1)]);
                 let mut reposing = Reposing::start();
                 let agreement = |w: u64| {
                     ["A", "B", "C"]
@@ -8214,7 +8699,7 @@ mod tests {
                 }
                 pipe.begin_inspection("C");
                 pipe.inspection_lifecycle("C", &states);
-                restore_engine_pose(&link, &mut pipe, "C");
+                restore_engine_pose(&link, &mut pipe, "C", 0);
                 assert!(reposing.monitor.inspecting().is_none());
                 // The radio pass already extracted its mailbox. Native invalidation arrives
                 // during restoration, when no active inspection or probing counter remains.
@@ -8228,17 +8713,17 @@ mod tests {
                     },
                     state,
                 };
-                d.track_identities
-                    .lock()
-                    .unwrap()
-                    .note(&event(1, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED));
+                d.track_identities.lock().unwrap().note(
+                    &event(1, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED),
+                    1,
+                );
                 if overflow {
                     // A stalled mailbox: only invalidations are kept, so they fill it.
                     for epoch in 2..=2048 {
-                        d.track_identities.lock().unwrap().note(&event(
-                            epoch,
-                            cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
-                        ));
+                        d.track_identities.lock().unwrap().note(
+                            &event(epoch, cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED),
+                            1,
+                        );
                     }
                 }
                 reposing.tick(&d, &link, &mut pipe, &mut None, 1 + 41_000_000_000);
@@ -8273,7 +8758,7 @@ mod tests {
                         "hand {hand}, overflow {overflow}, window {w}"
                     );
                 }
-                assert!(link.reposed.lock().unwrap().iter().all(|p| !matches!(
+                assert!(link.reposed.lock().unwrap().iter().all(|(p, _)| !matches!(
                     p,
                     PoseChange::Placing(_) | PoseChange::Set(Reposed { write: true, .. })
                 )));
@@ -8308,16 +8793,15 @@ mod tests {
                     nalgebra::Isometry3::identity(),
                 );
             }
-            d.track_identities
-                .lock()
-                .unwrap()
-                .register(["A".into(), "B".into(), "C".into()]);
+            d.track_identities.lock().unwrap().register([
+                ("A".into(), 1),
+                ("B".into(), 1),
+                ("C".into(), 1),
+            ]);
             let mut reposing = Reposing::start();
             let note = |epoch, state| {
-                d.track_identities
-                    .lock()
-                    .unwrap()
-                    .note(&engine::InspectionIdentity {
+                d.track_identities.lock().unwrap().note(
+                    &engine::InspectionIdentity {
                         serial: serial_field("C"),
                         epoch,
                         device_id: if hand == HAND_LEFT {
@@ -8326,7 +8810,9 @@ mod tests {
                             calib::DEVICE_RIGHT
                         },
                         state,
-                    });
+                    },
+                    1,
+                );
             };
             // Earlier inspections and placements: every break started and ended an epoch,
             // and the tick took the mailbox once a second.
@@ -8458,8 +8944,11 @@ mod tests {
                 },
                 nalgebra::Isometry3::identity(),
             );
-            d.track_identities.lock().unwrap().register(["C".into()]);
-            d.track_in.lock().unwrap().register(["C".into()]);
+            d.track_identities
+                .lock()
+                .unwrap()
+                .register([("C".into(), 1)]);
+            d.track_in.lock().unwrap().register([("C".into(), 1)]);
             let mut reposing = Reposing::start();
             let device_id = if hand == HAND_LEFT {
                 calib::DEVICE_LEFT
@@ -8488,11 +8977,13 @@ mod tests {
                         device_id,
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
+                    1,
+                    false,
                     now,
                 );
                 // the invalidated search's last frame, and a later one that ended normally
-                d.frame(&frame(search, now), &[]);
-                d.frame(&frame(search + 10_000, now + 1), &[]);
+                d.frame(&frame(search, now), 1, &[]);
+                d.frame(&frame(search + 10_000, now + 1), 1, &[]);
                 link.restored.lock().unwrap().push("C".into());
                 reposing.tick(&d, &link, &mut pipe, &mut None, now);
                 assert_eq!(pipe.frames_skipped, search - 1, "no frame work at the ack");
@@ -8568,11 +9059,11 @@ mod tests {
         d.track_identities
             .lock()
             .unwrap()
-            .register(sensors.map(String::from));
+            .register(sensors.map(|s| (s.to_string(), 1)));
         d.track_in
             .lock()
             .unwrap()
-            .register(sensors.map(String::from));
+            .register(sensors.map(|s| (s.to_string(), 1)));
         let mut reposing = Reposing::start();
         // A and B see the left controller; C and D miss it among unlabelled blobs.
         let agreement = |w: u64| {
@@ -8612,6 +9103,8 @@ mod tests {
                 device_id: calib::DEVICE_LEFT,
                 state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
             },
+            1,
+            false,
             at(7),
         );
         // The deadline passes in the tick: the engine gets C's pose back, and C holds the slot.
@@ -8625,7 +9118,7 @@ mod tests {
         assert!(reposing.monitor.inspecting().is_none());
         assert!(matches!(
             link.reposed.lock().unwrap().as_slice(),
-            [PoseChange::Set(Reposed { serial, write: false, .. })] if serial == "C"
+            [(PoseChange::Set(Reposed { serial, write: false, .. }), 0)] if serial == "C"
         ));
         assert!(reposing.monitor.restoring().contains("C"));
         assert!(!reposing.monitor.identity_lifetimes("C")[HAND_LEFT].permits(1));
@@ -8680,11 +9173,11 @@ mod tests {
             d.track_identities
                 .lock()
                 .unwrap()
-                .register(sensors.map(String::from));
+                .register(sensors.map(|s| (s.to_string(), 1)));
             d.track_in
                 .lock()
                 .unwrap()
-                .register(sensors.map(String::from));
+                .register(sensors.map(|s| (s.to_string(), 1)));
             let mut reposing = Reposing::start();
             // A and B see the left controller; C misses it among unlabelled blobs; D misses 80 of
             // its 100 observed LED checks in windows 3 and 4.
@@ -8738,8 +9231,8 @@ mod tests {
             assert!(matches!(
                 mem::take(&mut *link.reposed.lock().unwrap()).as_slice(),
                 [
-                    PoseChange::Inspect(inspected, _),
-                    PoseChange::Set(Reposed { serial, write: false, .. }),
+                    (PoseChange::Inspect(inspected, _), 0),
+                    (PoseChange::Set(Reposed { serial, write: false, .. }), 0),
                 ] if inspected == "C" && serial == "C"
             ));
             assert!(d.sensor_poses.lock().unwrap().is_empty());
@@ -8756,6 +9249,8 @@ mod tests {
                         device_id: calib::DEVICE_LEFT,
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
+                    1,
+                    false,
                     at(4) + 500_000_000,
                 );
             }
@@ -8780,7 +9275,7 @@ mod tests {
             );
             assert!(matches!(
                 link.reposed.lock().unwrap().as_slice(),
-                [PoseChange::Placing(serial)] if serial == "D"
+                [(PoseChange::Placing(serial), 0)] if serial == "D"
             ));
             assert!(reposing.probed_since.contains_key("D"));
             assert!(matches!(
@@ -8963,7 +9458,7 @@ mod tests {
                     assert!(
                         matches!(
                             reposed.as_slice(),
-                            [PoseChange::Inspect(serial, h)] if serial == "C" && *h == hands
+                            [(PoseChange::Inspect(serial, h), 0)] if serial == "C" && *h == hands
                         ),
                         "at {} s",
                         (at - H0) / 1_000_000_000
@@ -9044,22 +9539,25 @@ mod tests {
         deliver_engine_queues(
             &link,
             |_| panic!("nothing was queued"),
-            |_| panic!("nothing was queued"),
+            |_, _| panic!("nothing was queued"),
         );
         link.reposed
             .lock()
             .unwrap()
-            .push(PoseChange::Inspect("CAM".into(), [true, false]));
-        link.reposed.lock().unwrap().push(PoseChange::Set(Reposed {
-            serial: "CAM".into(),
-            orient_xyzw: [0.0, 0.0, 0.0, 1.0],
-            pos: [0.1, 0.0, 0.0],
-            median_px: 0.2,
-            matches: 4,
-            moved_mm: 3.0,
-            turned_deg: 1.0,
-            write: true,
-        }));
+            .push((PoseChange::Inspect("CAM".into(), [true, false]), 0));
+        link.reposed.lock().unwrap().push((
+            PoseChange::Set(Reposed {
+                serial: "CAM".into(),
+                orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                pos: [0.1, 0.0, 0.0],
+                median_px: 0.2,
+                matches: 4,
+                moved_mm: 3.0,
+                turned_deg: 1.0,
+                write: true,
+            }),
+            2,
+        ));
         *link.biases.lock().unwrap() = Some(track::biases::BiasFile::default());
         let applied = std::cell::RefCell::new(Vec::new());
         deliver_engine_queues(
@@ -9076,7 +9574,7 @@ mod tests {
                 assert_eq!(file.format, track::biases::FORMAT);
                 applied.borrow_mut().push("bias".into());
             },
-            |change| {
+            |change, removals| {
                 assert!(
                     link.reposed.try_lock().is_ok(),
                     "reposed stays locked while a pose change is applied"
@@ -9086,15 +9584,17 @@ mod tests {
                     "biases stays locked while a pose change is applied"
                 );
                 applied.borrow_mut().push(match change {
-                    PoseChange::Inspect(serial, hands) => format!("inspect {serial} {hands:?}"),
-                    PoseChange::Placing(serial) => format!("placing {serial}"),
-                    PoseChange::Set(r) => format!("set {} {}", r.serial, r.write),
+                    PoseChange::Inspect(serial, hands) => {
+                        format!("inspect {serial} {hands:?} {removals}")
+                    }
+                    PoseChange::Placing(serial) => format!("placing {serial} {removals}"),
+                    PoseChange::Set(r) => format!("set {} {} {removals}", r.serial, r.write),
                 });
             },
         );
         assert_eq!(
             applied.borrow().as_slice(),
-            ["bias", "inspect CAM [true, false]", "set CAM true"]
+            ["bias", "inspect CAM [true, false] 0", "set CAM true 2"]
         );
         assert!(link.reposed.lock().unwrap().is_empty());
         assert!(link.biases.lock().unwrap().is_none());
@@ -9252,15 +9752,15 @@ mod tests {
     #[test]
     fn a_camera_frame_push_releases_the_queue() {
         let queue = Mutex::new(FrameQueue::<u32>::default());
-        queue.lock().unwrap().register(["cam".into()]);
-        enqueue_frame(&queue, "cam".into(), 7, 11);
+        queue.lock().unwrap().register([("cam".into(), 1)]);
+        enqueue_frame(&queue, "cam".into(), 1, 7, 11);
         assert!(
             queue.try_lock().is_ok(),
             "camera queue locked after the frame is pushed"
         );
         assert_eq!(queue.lock().unwrap().pop_frame(), Some(11));
         copy_waits_only_while_held(&queue, || {
-            enqueue_frame(&queue, "cam".into(), 8, 12);
+            enqueue_frame(&queue, "cam".into(), 1, 8, 12);
         });
         assert_eq!(queue.lock().unwrap().pop_frame(), Some(12));
     }
@@ -9281,13 +9781,15 @@ mod tests {
                     device_id: calib::DEVICE_LEFT,
                     state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_STARTED,
                 },
+                1,
+                false,
                 at,
             )
         };
         for at in [2, 3] {
             assert_eq!(
-                d.session.lock().unwrap().plan(true, &[(7, true)]),
-                (true, vec![7])
+                d.session.lock().unwrap().plan(&["C".into()], &[(7, true)]),
+                (vec![0], vec![7])
             );
             started(at);
             begin_engine_session(&d);
@@ -9380,7 +9882,7 @@ mod tests {
         link.reposed
             .lock()
             .unwrap()
-            .push(PoseChange::Placing(serial.to_string()));
+            .push((PoseChange::Placing(serial.to_string()), 0));
         let said = reposing.moved(
             &d,
             &link,
@@ -9392,8 +9894,8 @@ mod tests {
         assert!(said.is_some_and(|line| line.contains("judged moved again")));
         let changes = mem::take(&mut *link.reposed.lock().unwrap());
         assert_eq!(changes.len(), 2, "the inspection's engine search must end");
-        assert!(matches!(&changes[0], PoseChange::Placing(s) if s == serial));
-        let PoseChange::Set(pose) = &changes[1] else {
+        assert!(matches!(&changes[0], (PoseChange::Placing(s), 0) if s == serial));
+        let (PoseChange::Set(pose), 0) = &changes[1] else {
             panic!("the engine must get its pose back")
         };
         assert_eq!(pose.serial, serial);
@@ -9460,7 +9962,7 @@ mod tests {
             );
             assert!(matches!(
                 mem::take(&mut *link.reposed.lock().unwrap()).as_slice(),
-                [PoseChange::Set(r)] if r.serial == serial && !r.write
+                [(PoseChange::Set(r), 0)] if r.serial == serial && !r.write
             ));
         }
     }
@@ -9476,6 +9978,366 @@ mod tests {
     fn hotplug_states(d: &Daemon) -> Vec<&'static str> {
         let watch = d.sensor_watch.lock().unwrap();
         watch.pending().iter().map(|p| p.state).collect()
+    }
+
+    /// No lock the radio thread takes is held: a native call made now cannot stall it.
+    fn assert_no_radio_lock(d: &Daemon) {
+        assert!(d.track_in.try_lock().is_ok(), "the frame ingress is held");
+        assert!(
+            d.track_searches.try_lock().is_ok(),
+            "the search ingress is held"
+        );
+        assert!(
+            d.track_identities.try_lock().is_ok(),
+            "the identity mailbox is held"
+        );
+        assert!(
+            d.sensor_events.try_lock().is_ok(),
+            "the sensor events are held"
+        );
+    }
+
+    /// The engine's stand-in for `service_sensors`: it records what it is asked and finishes
+    /// adds as the test says, checking the locks held at each call.
+    struct FakeLive<'a> {
+        d: &'a Daemon,
+        asked: Mutex<Vec<(String, String, Option<engine::SensorPose>)>>,
+        answer: Mutex<Result<bool, String>>,
+        finished: Mutex<Vec<engine::SensorAdded>>,
+        released: Mutex<Vec<String>>,
+        forgotten: Mutex<Vec<String>>,
+        frame_on_poll: std::sync::atomic::AtomicBool,
+        open: Mutex<Vec<engine::Sensor>>,
+        require_release_before_add: bool,
+        /// The native lifetime the next finished add reports, as the engine numbers objects:
+        /// fixtures register the objects open at engine start as lifetime 1.
+        next_lifetime: std::sync::atomic::AtomicU64,
+    }
+
+    impl<'a> FakeLive<'a> {
+        fn new(d: &'a Daemon) -> Self {
+            FakeLive {
+                d,
+                asked: Mutex::new(Vec::new()),
+                answer: Mutex::new(Ok(true)),
+                finished: Mutex::new(Vec::new()),
+                released: Mutex::new(Vec::new()),
+                forgotten: Mutex::new(Vec::new()),
+                frame_on_poll: std::sync::atomic::AtomicBool::new(false),
+                open: Mutex::new(Vec::new()),
+                require_release_before_add: false,
+                next_lifetime: std::sync::atomic::AtomicU64::new(2),
+            }
+        }
+
+        /// The worker finished an add of `serial` at `attachment`.
+        fn finish(&self, serial: &str, attachment: &str, outcome: engine::AddOutcome, code: i32) {
+            let lifetime = self
+                .next_lifetime
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.finish_as(serial, attachment, outcome, code, lifetime);
+        }
+
+        /// As `finish`, for the native object `lifetime`; only a started object has one.
+        fn finish_as(
+            &self,
+            serial: &str,
+            attachment: &str,
+            outcome: engine::AddOutcome,
+            code: i32,
+            lifetime: u64,
+        ) {
+            let mut raw = ffi::ohmd_cv1touch_sensor_stream::default();
+            for (out, byte) in raw.serial.iter_mut().zip(serial.bytes()) {
+                *out = byte as std::ffi::c_char;
+            }
+            raw.attachment = engine::attachment_key(attachment).unwrap_or_default();
+            let mut start = engine::SensorStreamStart::from(raw);
+            start.attachment = Some(attachment.into());
+            self.finished.lock().unwrap().push(engine::SensorAdded {
+                outcome,
+                start,
+                error_code: code,
+                open_ms: 65,
+                start_ms: 1130,
+                lifetime: if outcome == engine::AddOutcome::Started {
+                    lifetime
+                } else {
+                    0
+                },
+            });
+            if outcome == engine::AddOutcome::Started {
+                let mut sensor = engine::Sensor {
+                    width: 1280,
+                    height: 960,
+                    fx: 715.0,
+                    fy: 715.0,
+                    cx: 640.0,
+                    cy: 480.0,
+                    ..Default::default()
+                };
+                for (out, byte) in sensor.serial.iter_mut().zip(serial.bytes()) {
+                    *out = byte as _;
+                }
+                self.open.lock().unwrap().push(sensor);
+            }
+        }
+    }
+
+    impl LiveSensors for FakeLive<'_> {
+        fn add_sensor(
+            &self,
+            serial: &str,
+            attachment: &str,
+            pose: Option<&engine::SensorPose>,
+        ) -> Result<bool, String> {
+            if self.require_release_before_add {
+                assert!(
+                    self.released.lock().unwrap().iter().any(|s| s == serial),
+                    "old sensor must be released before add"
+                );
+            }
+            // asked without the watch: it may wait for the engine's worker queue
+            assert!(self.d.sensor_watch.try_lock().is_ok());
+            assert_no_radio_lock(self.d);
+            self.asked
+                .lock()
+                .unwrap()
+                .push((serial.into(), attachment.into(), pose.cloned()));
+            self.answer.lock().unwrap().clone()
+        }
+        fn poll_sensor_adds(&self) -> Vec<engine::SensorAdded> {
+            // adoption runs under the watch, so a detach cannot slip in between
+            assert!(
+                matches!(
+                    self.d.sensor_watch.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "adoption without the sensor watch"
+            );
+            assert_no_radio_lock(self.d);
+            assert!(self.d.sensors.try_lock().is_ok());
+            if self
+                .frame_on_poll
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.d.rec.write(recorder::FRAME_OBS, 99, &[b"synthetic"]);
+            }
+            mem::take(&mut *self.finished.lock().unwrap())
+        }
+        fn release_sensor(&self, serial: &str) -> Result<(), String> {
+            assert_no_radio_lock(self.d);
+            assert!(self.d.sensors.try_lock().is_ok() && self.d.sensor_streams.try_lock().is_ok());
+            self.released.lock().unwrap().push(serial.into());
+            self.open
+                .lock()
+                .unwrap()
+                .retain(|s| !cv1touch::status::same_sensor(&engine::sensor_serial(s), serial));
+            Ok(())
+        }
+        fn forget_sensor_stream(&self, serial: &str) -> Result<(), String> {
+            assert_no_radio_lock(self.d);
+            assert!(self.d.sensors.try_lock().is_ok() && self.d.sensor_streams.try_lock().is_ok());
+            self.forgotten.lock().unwrap().push(serial.into());
+            Ok(())
+        }
+        fn sensors(&self) -> Vec<engine::Sensor> {
+            self.open.lock().unwrap().clone()
+        }
+    }
+
+    fn live_sensor(serial: &str, address: u8) -> platform::usb::Sensor {
+        platform::usb::Sensor {
+            serial: serial.into(),
+            attachment: format!("sysfs:1:{address}@{:016x}", 0x1000 + u64::from(address)),
+            ready: true,
+        }
+    }
+
+    /// A daemon whose engine is open and past its first update.
+    fn live_daemon(sensors: Vec<platform::usb::Sensor>) -> Daemon {
+        let d = status_daemon();
+        *d.sensor_watch.lock().unwrap() = sensor_hotplug::Monitor::new(Ok(sensors), &[]);
+        d.sensor_watch.lock().unwrap().before_open();
+        d.sensor_watch.lock().unwrap().opened();
+        d
+    }
+
+    /// The sensor events queued, taken as the radio thread takes them.
+    fn take_sensor_events(d: &Daemon) -> Vec<SensorEvent> {
+        mem::take(&mut *d.sensor_events.lock().unwrap())
+            .into_iter()
+            .collect()
+    }
+
+    /// The radio thread applies the queued sensor events, as it does before each sample.
+    fn apply_sensor_events(d: &Daemon, sensors: &mut RadioSensors<'_>, pipe: &mut Pipeline) {
+        with_radio_sensors(
+            d,
+            &mut sensors.revision,
+            pipe,
+            &mut sensors.reposing,
+            sensors.watch,
+            |_, _| (),
+        );
+    }
+
+    #[test]
+    fn sensor_admission_is_recorded_before_poll_frames() {
+        for (answer, expected) in [
+            (Ok(true), true),
+            (Ok(false), false),
+            (Err("refused".to_string()), false),
+        ] {
+            let d = live_daemon(vec![]);
+            let fake = FakeLive::new(&d);
+            *fake.answer.lock().unwrap() = answer;
+            fake.frame_on_poll
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut state = LiveSensorState::default();
+            let sensor = live_sensor("SENSORALPHA", 7);
+            let path = std::env::temp_dir().join(format!(
+                "cv1t-admission-{}-{expected}-{}.rec",
+                std::process::id(),
+                shm::now_ns()
+            ));
+            d.rec.start(&path, 1).unwrap();
+            poll_sensors(&d, 1, Ok(vec![sensor.clone()]));
+            poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![sensor]));
+            service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+            d.rec.stop();
+            let records: Vec<_> = recorder::Reader::open(&path).unwrap().collect();
+            if expected {
+                assert_eq!(
+                    records.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+                    [recorder::SENSOR_ADDED, recorder::FRAME_OBS]
+                );
+                assert_eq!(records[0].payload, b"SENSORALPHA");
+            } else {
+                assert!(records.iter().all(|r| r.rtype != recorder::SENSOR_ADDED));
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn sensor_admission_stops_a_recording_that_cannot_fit_the_boundary() {
+        let d = live_daemon(vec![]);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        let sensor = live_sensor(&"S".repeat(5000), 7);
+        let path = std::env::temp_dir().join(format!(
+            "cv1t-admission-full-{}-{}.rec",
+            std::process::id(),
+            shm::now_ns()
+        ));
+        d.rec.start(&path, 1).unwrap();
+        poll_sensors(&d, 1, Ok(vec![sensor.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![sensor]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        assert!(!d.rec.active());
+        assert!(d
+            .rec
+            .status()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not keep up"));
+        d.rec.stop();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A NO_DEVICE start of a live add retires the sensor like a removal; once two scans confirm
+    /// it is back, the running engine adds it again, once. The same attachment failing again
+    /// asks for a replug, and plugging it in again is a new attempt.
+    #[test]
+    fn hotplug_a_live_add_no_device_gets_one_bounded_recovery() {
+        for code in [-1, -99, -4] {
+            let d = live_daemon(vec![]);
+            let fake = FakeLive::new(&d);
+            let mut state = LiveSensorState::default();
+            let mut a = live_sensor("SENSORALPHA", 7);
+            poll_sensors(&d, 1, Ok(vec![a.clone()]));
+            poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+            assert_eq!(fake.asked.lock().unwrap().len(), 1);
+            fake.finish(
+                &a.serial,
+                &a.attachment,
+                engine::AddOutcome::StartFailed,
+                code,
+            );
+            service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+            // the failed start's record, as the engine keeps it
+            let mut raw = ffi::ohmd_cv1touch_sensor_stream::default();
+            for (out, byte) in raw.serial.iter_mut().zip(a.serial.bytes()) {
+                *out = byte as std::ffi::c_char;
+            }
+            raw.error_kind = ffi::OHMD_CV1TOUCH_STREAM_ERROR_OTHER;
+            raw.error_code = code;
+            let starts = [engine::SensorStreamStart::from(raw)];
+            publish_sensor_snapshot(&d, &[], &starts, &[], &[]);
+            let revision = d.sensor_revision.load(Ordering::Acquire);
+            retire_gone_sensors(&d, &[], &starts);
+            if code != -4 {
+                assert!(d.sensor_watch.lock().unwrap().admitted(&a.serial));
+                assert_eq!(d.sensor_streams.lock().unwrap().len(), 1);
+                assert_eq!(d.sensor_revision.load(Ordering::Acquire), revision);
+                assert!(
+                    hotplug_states(&d).is_empty(),
+                    "a failed start is not tried again"
+                );
+                continue;
+            }
+            assert!(!d.sensor_watch.lock().unwrap().admitted(&a.serial));
+            assert!(d.sensor_streams.lock().unwrap().is_empty());
+            // still listed: it waits for two scans to confirm its USB device is back
+            assert_eq!(hotplug_states(&d), ["checking_usb"]);
+            service_sensors(&d, &fake, true, &mut state, 3 * sensor_hotplug::DEBOUNCE_NS);
+            assert_eq!(*fake.released.lock().unwrap(), [a.serial.clone()]);
+            assert_eq!(*fake.forgotten.lock().unwrap(), [a.serial.clone()]);
+            assert!(d.sensor_watch.lock().unwrap().admitted(&a.serial));
+            assert_eq!(fake.asked.lock().unwrap().len(), 1, "not before two scans");
+            poll_sensors(&d, 4 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            poll_sensors(&d, 5 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            assert_eq!(hotplug_states(&d), ["opening"]);
+            service_sensors(&d, &fake, true, &mut state, 5 * sensor_hotplug::DEBOUNCE_NS);
+            assert_eq!(fake.asked.lock().unwrap().len(), 2, "the one recovery");
+            // Another NO_DEVICE from this attempt asks for a replug instead.
+            fake.finish(
+                &a.serial,
+                &a.attachment,
+                engine::AddOutcome::StartFailed,
+                code,
+            );
+            service_sensors(&d, &fake, true, &mut state, 5 * sensor_hotplug::DEBOUNCE_NS);
+            retire_gone_sensors(&d, &[], &starts);
+            for tick in 6..10 {
+                poll_sensors(&d, tick * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+                service_sensors(
+                    &d,
+                    &fake,
+                    true,
+                    &mut state,
+                    tick * sensor_hotplug::DEBOUNCE_NS,
+                );
+                assert_eq!(hotplug_states(&d), ["waiting_replug"]);
+            }
+            assert_eq!(fake.asked.lock().unwrap().len(), 2);
+            a.attachment = "sysfs:1:8@0000000000002008".into();
+            poll_sensors(&d, 11 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            poll_sensors(&d, 12 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            service_sensors(
+                &d,
+                &fake,
+                true,
+                &mut state,
+                12 * sensor_hotplug::DEBOUNCE_NS,
+            );
+            assert_eq!(fake.asked.lock().unwrap().len(), 3);
+            assert_eq!(fake.asked.lock().unwrap()[2].1, a.attachment);
+            assert_eq!(hotplug_states(&d), ["opening"]);
+        }
     }
 
     #[test]
@@ -9525,10 +10387,11 @@ mod tests {
                 poll_sensors(&d, tick * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
                 assert_eq!(hotplug_states(&d), ["waiting_replug"]);
             }
+            // plugged in again: the running engine adds the new connection
             a.attachment.push_str("-new");
             poll_sensors(&d, 8 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
             poll_sensors(&d, 9 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![a]));
-            assert_eq!(hotplug_states(&d), ["waiting_engine_start"]);
+            assert_eq!(hotplug_states(&d), ["opening"]);
         }
     }
 
@@ -9561,29 +10424,25 @@ mod tests {
             d.sensor_video.lock().unwrap().is_empty(),
             "detach retained video counters"
         );
-        let mut native = RetiredSensorStreams::default();
-        let mut forgotten = Vec::new();
-        let mut forget = |serial: &str| {
-            assert!(d.sensor_watch.try_lock().is_ok());
-            assert!(d.sensors.try_lock().is_ok());
-            assert!(d.sensor_streams.try_lock().is_ok());
-            forgotten.push(serial.to_string());
-            Ok(())
-        };
-        native.flush(&d, &mut forget);
-        native.flush(&d, &mut forget);
-        // A later removal increments the revision, but must not repeat the first forget.
+        // The engine releases it and forgets its record once, outside the publication locks.
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        assert!(service_sensors(&d, &fake, true, &mut state, 2));
+        assert!(!service_sensors(&d, &fake, true, &mut state, 3));
+        // A later removal advances the revision, but must not repeat the first release.
         let b = hotplug_sensor("SENSORBETA");
         poll_sensors(&d, 3 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
         poll_sensors(&d, 4 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
         poll_sensors(&d, 5 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
         poll_sensors(&d, 6 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
-        native.flush(&d, &mut forget);
-        assert_eq!(forgotten, [a.serial, b.serial]);
-        publish_sensor_snapshot(&d, &[sensor], &streams, &video, &[]);
-        assert!(d.sensors.lock().unwrap().is_empty());
-        assert!(d.sensor_streams.lock().unwrap().is_empty());
-        assert!(d.sensor_video.lock().unwrap().is_empty());
+        service_sensors(&d, &fake, true, &mut state, 7 * sensor_hotplug::DEBOUNCE_NS);
+        assert_eq!(
+            *fake.released.lock().unwrap(),
+            [a.serial.clone(), b.serial.clone()]
+        );
+        assert_eq!(*fake.forgotten.lock().unwrap(), [a.serial, b.serial]);
+        // released and forgotten natively: nothing of either is left to filter
+        assert!(d.sensor_watch.lock().unwrap().detached().is_empty());
     }
 
     #[test]
@@ -9595,11 +10454,11 @@ mod tests {
         let mut sensor = SensorStatus::default();
         shm::set_serial(&mut sensor, serial);
         publish_sensor_snapshot(&d, &[sensor], &[], &[], &[]);
-        d.track_in.lock().unwrap().register([serial.into()]);
+        d.track_in.lock().unwrap().register([(serial.into(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(serial, 1, (Box::default(), Vec::new()));
+            .push_frame(serial, 1, 1, (Box::default(), Vec::new()));
         d.sensor_poses.lock().unwrap().insert(
             serial.into(),
             PoseNote::Moved {
@@ -9653,11 +10512,11 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .register([a.serial.clone(), b.serial.clone()]);
+            .register([(a.serial.clone(), 1), (b.serial.clone(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
         d.sensor_agreement
             .lock()
             .unwrap()
@@ -9670,6 +10529,9 @@ mod tests {
         poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
         assert!(hotplug_states(&d).is_empty());
         assert!(!d.reopen.load(Ordering::Acquire));
+        let mut watch = None;
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        apply_sensor_events(&d, &mut radio_sensors(&mut watch), &mut pipe);
         assert!(d.track_in.lock().unwrap().pop_frame().is_none());
         assert!(!d.sensor_agreement.lock().unwrap().contains_key(&a.serial));
         assert!(!d.landmark_shifts.lock().unwrap().contains_key(&a.serial));
@@ -9930,11 +10792,11 @@ mod tests {
             d.track_identities
                 .lock()
                 .unwrap()
-                .register(serials.map(String::from));
+                .register(serials.map(|s| (s.to_string(), 1)));
             d.track_searches
                 .lock()
                 .unwrap()
-                .register(serials.map(String::from));
+                .register(serials.map(|s| (s.to_string(), 1)));
             let mut pipe = Pipeline::new(pipeline::Options::default());
             for serial in serials {
                 let model = calib::camera::CameraModel {
@@ -9977,10 +10839,12 @@ mod tests {
             for (dst, b) in info.serial.iter_mut().zip(inspected.serial.bytes()) {
                 *dst = b as _;
             }
-            d.track_searches
-                .lock()
-                .unwrap()
-                .push_frame(&inspected.serial, 1, (Box::new(info), 1));
+            d.track_searches.lock().unwrap().push_frame(
+                &inspected.serial,
+                1,
+                1,
+                (Box::new(info), 1),
+            );
             if pending_invalidation {
                 d.inspection_identity(
                     &engine::InspectionIdentity {
@@ -9990,12 +10854,14 @@ mod tests {
                         state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
                     },
                     1,
+                    false,
+                    1,
                 );
             }
             poll_sensors(&d, 1, Ok(vec![]));
             poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
-            assert!(d.track_searches.lock().unwrap().pop_frame().is_none());
             forget(&mut sensors, &mut pipe);
+            assert!(d.track_searches.lock().unwrap().pop_frame().is_none());
             assert!(pipe.camera(&inspected.serial).is_none());
             let monitor = &mut sensors.reposing.monitor;
             assert!(monitor.restoring().is_empty(), "{pending_invalidation}");
@@ -10020,11 +10886,11 @@ mod tests {
         let mut state = SensorStatus::default();
         shm::set_serial(&mut state, &a.serial);
         publish_sensor_snapshot(&d, &[state], &[], &[], &[]);
-        d.track_in.lock().unwrap().register([a.serial.clone()]);
+        d.track_in.lock().unwrap().register([(a.serial.clone(), 1)]);
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
         let mut native = engine::Sensor::default();
         for (slot, byte) in native.serial.iter_mut().zip(a.serial.bytes()) {
             *slot = byte as _;
@@ -10033,6 +10899,9 @@ mod tests {
         retire_gone_sensors(&d, &[native], &[]);
         assert!(d.sensors.lock().unwrap().is_empty());
         assert!(d.shm.sensors().unwrap().is_empty());
+        let mut watch = None;
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        apply_sensor_events(&d, &mut radio_sensors(&mut watch), &mut pipe);
         assert!(d.track_in.lock().unwrap().pop_frame().is_none());
         assert_eq!(hotplug_states(&d), ["checking_usb"]);
         publish_sensor_snapshot(&d, &[state], &[], &[], &[]);
@@ -10077,10 +10946,11 @@ mod tests {
         assert_eq!(hotplug_doctor(&d).1, None);
     }
 
-    /// A sensor plugged in while the engine runs waits, in status and doctor, for the next engine
-    /// start, which opens it. Controllers in use do not change that, and it does not touch them.
+    /// A sensor plugged in while no engine runs (between engines, or before the first one)
+    /// waits, in status and doctor, for the next engine start, which opens it. Controllers in use
+    /// do not change that, and it does not touch them.
     #[test]
-    fn hotplug_a_sensor_plugged_in_while_the_engine_runs_waits_for_its_next_start() {
+    fn hotplug_a_sensor_plugged_in_without_a_running_engine_waits_for_its_next_start() {
         let d = status_daemon();
         let now = shm::now_ns();
         let mut c = reopen_controller(now);
@@ -10112,6 +10982,1038 @@ mod tests {
         assert_eq!(hotplug_doctor(&d).1, None);
     }
 
+    /// A sensor plugged in while the engine runs is added to it: status and doctor say the
+    /// engine is opening it, which is no failure, until it is in use. Controllers in use are not
+    /// touched, and nothing reopens the engine. The radio thread registers its camera, then
+    /// admits its frames; an uncalibrated one only observes.
+    #[test]
+    fn hotplug_a_sensor_plugged_in_while_the_engine_runs_is_added_to_it() {
+        let d = live_daemon(vec![]);
+        d.opts.lock().unwrap().fixed_poses.push(engine::SensorPose {
+            serial: "sensoralpha".into(),
+            orient: [0.0, 0.0, 0.0, 1.0],
+            pos: [1.0, 2.0, 3.0],
+        });
+        let now = shm::now_ns();
+        let mut c = reopen_controller(now);
+        c.imu_gyro = [2.0, 0.0, 0.0];
+        reopen_sample(&d, &c, now);
+        let live = d.shm.hand(HAND_RIGHT).unwrap();
+        let a = live_sensor("SENSORALPHA", 7);
+        let lines = daemon_log::capture(|| {
+            poll_sensors(&d, now, Ok(vec![a.clone()]));
+            poll_sensors(&d, now + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        });
+        assert_eq!(lines, ["sensor plugged in: SENSORALPHA; opening it"]);
+        let (value, check) = hotplug_doctor(&d);
+        assert_eq!(value["sensor_hotplug"]["pending"][0]["serial"], a.serial);
+        assert_eq!(value["sensor_hotplug"]["pending"][0]["state"], "opening");
+        assert_eq!(
+            value["sensor_hotplug"]["pending"][0]["detail"],
+            "The engine is opening this sensor."
+        );
+        assert_eq!(check.map(|(ok, _)| ok), Some(true));
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        let t = now + sensor_hotplug::DEBOUNCE_NS;
+        assert!(!service_sensors(&d, &fake, true, &mut state, t));
+        {
+            let asked = fake.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1);
+            assert_eq!(
+                (asked[0].0.as_str(), asked[0].1.as_str()),
+                (a.serial.as_str(), a.attachment.as_str())
+            );
+            assert_eq!(
+                asked[0].2.as_ref().map(|p| p.pos),
+                Some([1.0, 2.0, 3.0]),
+                "its calibrated pose"
+            );
+        }
+        assert!(
+            !service_sensors(&d, &fake, true, &mut state, t),
+            "still starting"
+        );
+        assert_eq!(
+            hotplug_doctor(&d).0["sensor_hotplug"]["pending"][0]["state"],
+            "opening"
+        );
+        fake.finish("SensorAlpha", &a.attachment, engine::AddOutcome::Started, 0);
+        let lines = daemon_log::capture(|| {
+            assert!(service_sensors(
+                &d,
+                &fake,
+                true,
+                &mut state,
+                t + 2_000_000_000
+            ));
+        });
+        assert_eq!(
+            lines,
+            ["sensor SensorAlpha: tracking with it now (3.0 s after it was plugged in; opened in 65 ms, video started in 1130 ms)"]
+        );
+        assert_eq!(hotplug_doctor(&d).1, None);
+        assert!(hotplug_states(&d).is_empty());
+        assert!(d.sensor_watch.lock().unwrap().in_use(&a.serial));
+        assert_eq!(fake.asked.lock().unwrap().len(), 1);
+        // the radio thread registers it, with the spelling its frames carry, before its frames
+        d.track_in
+            .lock()
+            .unwrap()
+            .push_frame("SensorAlpha", 2, 1, (Box::default(), Vec::new()));
+        assert!(
+            d.track_in.lock().unwrap().pop_frame().is_none(),
+            "its frames were admitted before its camera was registered"
+        );
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let camera = pipe.camera("SensorAlpha").expect("a camera for it");
+        assert_eq!((camera.model.width, camera.model.fx), (1280, 715.0));
+        assert!(
+            (camera.world_from_cam.translation.vector - nalgebra::Vector3::new(1.0, 2.0, 3.0))
+                .norm()
+                < 1e-9
+        );
+        d.track_in
+            .lock()
+            .unwrap()
+            .push_frame("SensorAlpha", 2, 2, (Box::default(), Vec::new()));
+        assert!(
+            d.track_in.lock().unwrap().pop_frame().is_some(),
+            "its frames are queued"
+        );
+        d.track_searches
+            .lock()
+            .unwrap()
+            .push_frame("SensorAlpha", 2, 2, (Box::default(), 1));
+        assert!(
+            d.track_searches.lock().unwrap().pop_frame().is_some(),
+            "its search exposures are queued"
+        );
+        let mut notice = engine::InspectionIdentity {
+            epoch: 1,
+            device_id: calib::DEVICE_LEFT,
+            state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+            ..Default::default()
+        };
+        for (dst, b) in notice.serial.iter_mut().zip(b"SensorAlpha") {
+            *dst = *b as _;
+        }
+        d.inspection_identity(&notice, 2, false, 1);
+        assert_eq!(
+            d.track_identities.lock().unwrap().take().len(),
+            1,
+            "its identity notices are kept"
+        );
+        assert_eq!(d.shm.hand(HAND_RIGHT).unwrap().flags, live.flags);
+        assert!(!d.reopen.load(Ordering::Acquire));
+        // the engine thread has looked at every change so far: a sensor plugged in now is
+        // looked for because the scan that settles it says so
+        assert!(!service_sensors(&d, &fake, true, &mut state, t));
+        assert_eq!(state.revision, d.sensor_revision.load(Ordering::Acquire));
+        // an uncalibrated sensor only observes: registered for its frames, with no camera
+        d.opts.lock().unwrap().fixed_poses_only = true;
+        let b = live_sensor("SENSORBETA", 8);
+        poll_sensors(&d, t, Ok(vec![a.clone(), b.clone()]));
+        poll_sensors(&d, t + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a, b.clone()]));
+        service_sensors(&d, &fake, true, &mut state, t + sensor_hotplug::DEBOUNCE_NS);
+        assert!(fake.asked.lock().unwrap()[1].2.is_none());
+        fake.finish(&b.serial, &b.attachment, engine::AddOutcome::Started, 0);
+        let lines = daemon_log::capture(|| {
+            service_sensors(&d, &fake, true, &mut state, t + sensor_hotplug::DEBOUNCE_NS);
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("it has no calibrated pose, so it only observes"),
+            "{lines:?}"
+        );
+        assert!(matches!(
+            &take_sensor_events(&d)[..],
+            [SensorEvent::Added { camera: None, .. }]
+        ));
+    }
+
+    /// Without the radio thread nothing reads the sensor events: the sensor is used all the
+    /// same, by the engine's own tracking.
+    #[test]
+    fn hotplug_without_the_radio_thread_a_sensor_is_still_added() {
+        let d = live_daemon(vec![]);
+        let a = live_sensor("SENSORALPHA", 7);
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        service_sensors(
+            &d,
+            &fake,
+            false,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS,
+        );
+        fake.finish(&a.serial, &a.attachment, engine::AddOutcome::Started, 0);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            false,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        assert!(d.sensor_events.lock().unwrap().is_empty());
+        assert!(hotplug_states(&d).is_empty());
+        assert!(d.sensor_watch.lock().unwrap().in_use(&a.serial));
+    }
+
+    /// Unplugged while the engine opened it: nothing about it settles while it is added, so the
+    /// started sensor joins the engine in use, by no connection yet. What USB scans read after
+    /// its start show decides: gone, it is retired and released; replugged elsewhere, it is kept
+    /// (it may be the replug the engine opened) until its own NO_DEVICE retires it, and the
+    /// replug is then added once two scans confirm it.
+    #[test]
+    fn hotplug_a_sensor_unplugged_during_its_add_is_judged_by_scans_read_after_its_start() {
+        for replugged in [false, true] {
+            let d = live_daemon(vec![]);
+            let a = live_sensor("SENSORALPHA", 7);
+            let b = live_sensor("SENSORALPHA", 9);
+            let after: Vec<_> = if replugged { vec![b.clone()] } else { vec![] };
+            poll_sensors(&d, 1, Ok(vec![a.clone()]));
+            poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+            let fake = FakeLive::new(&d);
+            let mut state = LiveSensorState::default();
+            let tick = |n: u64| n * sensor_hotplug::DEBOUNCE_NS;
+            service_sensors(&d, &fake, true, &mut state, tick(2));
+            // unplugged (and maybe back on another port) while it started: nothing settles
+            let lines = daemon_log::capture(|| {
+                poll_sensors(&d, tick(3), Ok(after.clone()));
+                poll_sensors(&d, tick(4), Ok(after.clone()));
+            });
+            assert!(lines.is_empty(), "{lines:?}");
+            assert_eq!(hotplug_states(&d), ["opening"]);
+            assert!(d.sensor_watch.lock().unwrap().admitted(&a.serial));
+            fake.finish(&a.serial, &a.attachment, engine::AddOutcome::Started, 0);
+            service_sensors(&d, &fake, true, &mut state, tick(4));
+            assert!(d.sensor_watch.lock().unwrap().in_use(&a.serial));
+            assert!(fake.released.lock().unwrap().is_empty());
+            assert!(matches!(
+                &take_sensor_events(&d)[..],
+                [SensorEvent::Added { .. }]
+            ));
+            // the first scan applied after the adoption may have been read before its start
+            let lines = daemon_log::capture(|| poll_sensors(&d, tick(5), Ok(after.clone())));
+            assert!(lines.is_empty(), "{lines:?}");
+            let lines = daemon_log::capture(|| poll_sensors(&d, tick(6), Ok(after.clone())));
+            if !replugged {
+                assert_eq!(lines, ["sensor unplugged: SENSORALPHA"]);
+                assert!(!d.sensor_watch.lock().unwrap().in_use(&a.serial));
+                assert!(matches!(
+                    &take_sensor_events(&d)[..],
+                    [SensorEvent::Removed(_)]
+                ));
+                service_sensors(&d, &fake, true, &mut state, tick(6));
+                assert_eq!(
+                    *fake.released.lock().unwrap(),
+                    std::slice::from_ref(&a.serial)
+                );
+                assert!(hotplug_states(&d).is_empty());
+                continue;
+            }
+            assert!(lines.is_empty(), "{lines:?}");
+            assert!(d.sensor_watch.lock().unwrap().in_use(&a.serial));
+            assert!(hotplug_states(&d).is_empty());
+            // its own NO_DEVICE: retired, released, and the replug added once confirmed
+            let mut native = engine::Sensor::default();
+            for (slot, byte) in native.serial.iter_mut().zip(a.serial.bytes()) {
+                *slot = byte as _;
+            }
+            native.usb_gone = 1;
+            retire_gone_sensors(&d, &[native], &[]);
+            assert!(!d.sensor_watch.lock().unwrap().in_use(&a.serial));
+            service_sensors(&d, &fake, true, &mut state, tick(6));
+            assert_eq!(
+                *fake.released.lock().unwrap(),
+                std::slice::from_ref(&a.serial)
+            );
+            assert_eq!(fake.asked.lock().unwrap().len(), 1);
+            poll_sensors(&d, tick(7), Ok(after.clone()));
+            poll_sensors(&d, tick(8), Ok(after.clone()));
+            service_sensors(&d, &fake, true, &mut state, tick(8));
+            let asked = fake.asked.lock().unwrap().clone();
+            assert_eq!(asked.len(), 2);
+            assert_eq!(asked[1].1, b.attachment);
+            assert_eq!(hotplug_states(&d), ["opening"]);
+        }
+    }
+
+    /// Unplugged and plugged back in: removed, then added, in that order, even when the radio
+    /// thread sees both at once. The sensor is a new camera, with nothing of the old one's
+    /// agreement or repose state, and the old object is released before the new one is asked for.
+    #[test]
+    fn hotplug_a_replugged_sensor_is_a_new_camera() {
+        use nalgebra::Isometry3;
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![a.clone()]);
+        d.opts.lock().unwrap().fixed_poses.push(engine::SensorPose {
+            serial: a.serial.clone(),
+            orient: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.5, 0.0, 0.0],
+        });
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        pipe.sensor(&a.serial, model, Isometry3::identity());
+        let old = pipe.camera_id(&a.serial).unwrap();
+        d.sensor_agreement
+            .lock()
+            .unwrap()
+            .insert(a.serial.clone(), Default::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        // unplugged and back on another port before the radio thread looks again
+        let mut fake = FakeLive::new(&d);
+        fake.require_release_before_add = true;
+        let mut state = LiveSensorState::default();
+        let b = live_sensor("SENSORALPHA", 9);
+        poll_sensors(&d, 1, Ok(vec![b.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        assert_eq!(
+            *fake.released.lock().unwrap(),
+            std::slice::from_ref(&a.serial)
+        );
+        assert_eq!(
+            fake.asked.lock().unwrap().len(),
+            1,
+            "released, then asked for"
+        );
+        fake.finish(&b.serial, &b.attachment, engine::AddOutcome::Started, 0);
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        with_radio_sensors(
+            &d,
+            &mut sensors.revision,
+            &mut pipe,
+            &mut sensors.reposing,
+            sensors.watch,
+            |pipe, _| {
+                let new = pipe.camera_id(&a.serial).expect("added again");
+                assert_ne!(new, old, "the old camera, with its state, was kept");
+                assert!(
+                    (pipe.camera(&a.serial).unwrap().world_from_cam.translation.x - 0.5).abs()
+                        < 1e-9
+                );
+            },
+        );
+        assert!(!d.sensor_agreement.lock().unwrap().contains_key(&a.serial));
+    }
+
+    /// A sensor unplugged while it was inspected and plugged back in is a fresh camera to
+    /// self-recalibration: no inspection, verdict, identity notice or held search exposure of the
+    /// old camera reaches it, and a pose change the radio thread made for the old camera after the
+    /// unplug is dropped, though the sensor is back. A change made for the new camera is applied.
+    #[test]
+    fn hotplug_a_replugged_sensor_inherits_nothing_of_its_old_camera() {
+        use nalgebra::Isometry3;
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![a.clone()]);
+        d.sensor_watch.lock().unwrap().reconcile_open(
+            1,
+            &[hotplug_start(&a.serial, Some(&a.attachment))],
+            Some(std::slice::from_ref(&a)),
+        );
+        d.opts.lock().unwrap().fixed_poses.push(engine::SensorPose {
+            serial: a.serial.clone(),
+            orient: [0.0, 0.0, 0.0, 1.0],
+            pos: [0.5, 0.0, 0.0],
+        });
+        let serials = [(a.serial.clone(), 1)];
+        d.track_identities.lock().unwrap().register(serials.clone());
+        d.track_searches.lock().unwrap().register(serials.clone());
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        pipe.sensor(&a.serial, model, Isometry3::identity());
+        let link = RadioLink::default();
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        // the old camera is inspected, holds a search exposure and has an identity notice waiting
+        pipe.begin_inspection(&a.serial);
+        let mut info = engine::FrameInfo::default();
+        for (dst, b) in info.serial.iter_mut().zip(a.serial.bytes()) {
+            *dst = b as _;
+        }
+        d.track_searches
+            .lock()
+            .unwrap()
+            .push_frame(&a.serial, 1, 1, (Box::new(info), 1));
+        // unplugged: the radio thread makes a change for the old camera before it takes the
+        // removal, and the engine thread releases the sensor before it takes that change
+        poll_sensors(&d, 1, Ok(vec![]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
+        restore_engine_pose(
+            &link,
+            &mut pipe,
+            &a.serial,
+            sensors.reposing.removals(&a.serial),
+        );
+        // the radio thread takes the removal; the old object's notices still arrive after that,
+        // before the object is freed
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        assert_eq!(
+            *fake.released.lock().unwrap(),
+            std::slice::from_ref(&a.serial)
+        );
+        // old notices still arriving from the old object, before it is freed
+        let notice = engine::InspectionIdentity {
+            serial: info.serial,
+            epoch: 1,
+            device_id: calib::DEVICE_LEFT,
+            state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+        };
+        d.inspection_identity(&notice, 1, false, 1);
+        // plugged back in, at the same place, and added
+        let b = live_sensor("SENSORALPHA", 9);
+        poll_sensors(&d, 3 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        poll_sensors(&d, 4 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 4 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish(&b.serial, &b.attachment, engine::AddOutcome::Started, 0);
+        service_sensors(&d, &fake, true, &mut state, 4 * sensor_hotplug::DEBOUNCE_NS);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let new = pipe.camera_id(&a.serial).expect("added again");
+        let none = <[cv1touch::track::epochs::Evidence; 2]>::default();
+        assert_eq!(
+            pipe.observed_evidence(&a.serial),
+            none,
+            "the new camera inherited the old inspection"
+        );
+        assert_eq!(pipe.identity_lifetimes(new), none);
+        assert!(sensors.reposing.monitor.inspecting().is_none());
+        assert!(!sensors.reposing.monitor.restoring().contains(&a.serial));
+        assert_eq!(sensors.reposing.monitor.identity_lifetimes(&a.serial), none);
+        assert!(
+            d.track_searches.lock().unwrap().pop_frame().is_none(),
+            "an old search exposure"
+        );
+        assert!(
+            d.track_identities.lock().unwrap().take().is_empty(),
+            "an old identity notice"
+        );
+        // the change made for the old camera is dropped; one for the new camera is applied
+        restore_engine_pose(
+            &link,
+            &mut pipe,
+            &a.serial,
+            sensors.reposing.removals(&a.serial),
+        );
+        let mut applied = Vec::new();
+        deliver_pose_changes(&link, |change, removals| {
+            applied.push(made_for_its_camera(&d, &change, removals));
+        });
+        assert_eq!(applied, [false, true]);
+    }
+
+    #[test]
+    fn hotplug_delayed_add_does_not_readmit_a_retired_sensor() {
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![]);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+
+        // The radio thread has taken the add, but has not yet applied it when the watcher
+        // retires the sensor and queues the removal for its next pass.
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish(&a.serial, &a.attachment, engine::AddOutcome::Started, 0);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        let added = mem::take(&mut *d.sensor_events.lock().unwrap());
+        poll_sensors(&d, 3 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
+        poll_sensors(&d, 4 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![]));
+        let removed = mem::replace(&mut *d.sensor_events.lock().unwrap(), added);
+        assert!(removed.iter().any(|e| matches!(e, SensorEvent::Removed(_))));
+        // Until the radio applies the removal, the retired object stays admitted for its own
+        // camera, whose evidence the removal wipes; the native retirement stops its frames.
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let admitted_after_retirement = d.track_in.lock().unwrap().stats().sensors;
+
+        // A native callback may arrive between the delayed add and the removal.
+        enqueue_frame(
+            &d.track_in,
+            a.serial.clone(),
+            2,
+            1,
+            (Box::default(), Vec::new()),
+        );
+        *d.sensor_events.lock().unwrap() = removed;
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let admitted_after_removal = d.track_in.lock().unwrap().stats().sensors;
+
+        let b = live_sensor("SENSORALPHA", 9);
+        poll_sensors(&d, 5 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        poll_sensors(&d, 6 * sensor_hotplug::DEBOUNCE_NS, Ok(vec![b.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 7 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish(&b.serial, &b.attachment, engine::AddOutcome::Started, 0);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            7 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let predecessor = d.track_in.lock().unwrap().pop_frame().is_some();
+        assert_eq!(
+            (
+                admitted_after_retirement,
+                admitted_after_removal,
+                predecessor
+            ),
+            (1, 0, false),
+            "a delayed add admitted retired ingress or retained a predecessor frame"
+        );
+    }
+
+    fn lifetime_frame(serial: &str, at: u64) -> engine::FrameInfo {
+        engine::FrameInfo {
+            serial: serial_field(serial),
+            frame_start_host_ns: at,
+            ..Default::default()
+        }
+    }
+
+    fn lifetime_notice(serial: &str, epoch: u64) -> engine::InspectionIdentity {
+        engine::InspectionIdentity {
+            serial: serial_field(serial),
+            epoch,
+            device_id: calib::DEVICE_LEFT,
+            state: cv1touch::ffi::OHMD_CV1TOUCH_IDENTITY_INVALIDATED,
+        }
+    }
+
+    fn lifetime_camera() -> (calib::camera::CameraModel, nalgebra::Isometry3<f64>) {
+        let sensor = engine::Sensor {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            ..Default::default()
+        };
+        (
+            calib::camera::CameraModel::from_sensor(&sensor),
+            nalgebra::Isometry3::identity(),
+        )
+    }
+
+    /// Queues `event` as the engine and watch threads do, for the radio's next pass.
+    fn queue_lifetime_event(d: &Daemon, event: SensorEvent) {
+        queue_sensor_event(d, event);
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+    }
+
+    fn added(serial: &str, lifetime: u64) -> SensorEvent {
+        SensorEvent::Added {
+            serial: serial.into(),
+            lifetime,
+            camera: Some(lifetime_camera()),
+        }
+    }
+
+    /// Every callback carries the native object it came from. Once the radio has applied the
+    /// successor's add, the predecessor's frames, searches and identity notices are dropped,
+    /// and the successor's are kept.
+    #[test]
+    fn hotplug_callbacks_of_a_replaced_object_are_not_attributed_to_its_successor() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let before = d.track_in.lock().unwrap().stats().unknown_frames;
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        d.search_started(&lifetime_frame("SENSORALPHA", 11), 1, 5);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 1, false, 12);
+        let unknown = d.track_in.lock().unwrap().stats().unknown_frames - before;
+        let stale = (
+            d.track_in.lock().unwrap().pop_frame().is_some(),
+            d.track_searches.lock().unwrap().pop_frame().is_some(),
+            d.track_identities.lock().unwrap().take().len(),
+            unknown,
+        );
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        d.search_started(&lifetime_frame("SENSORALPHA", 21), 2, 5);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 2, false, 22);
+        let current = (
+            d.track_in.lock().unwrap().pop_frame().is_some(),
+            d.track_searches.lock().unwrap().pop_frame().is_some(),
+            d.track_identities.lock().unwrap().take().len(),
+        );
+        assert_eq!(
+            stale,
+            (false, false, 0, 1),
+            "predecessor callbacks admitted"
+        );
+        assert_eq!(current, (true, true, 1), "successor callbacks dropped");
+    }
+
+    /// An add of a newer object with no removal before it, once or repeatedly, retires the
+    /// earlier object as a removal does: a pose change made for its camera is not applied, and
+    /// its probation, placements and status go. A change made after the add is applied.
+    #[test]
+    fn hotplug_an_add_without_a_removal_retires_the_earlier_object() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        for lifetime in [2, 3] {
+            let r = &mut sensors.reposing;
+            r.probed_since.insert("SENSORALPHA".into(), 1);
+            r.placements.insert("SENSORALPHA".into(), vec![1]);
+            r.releases.insert("SENSORALPHA".into(), (1, 1));
+            d.landmark_shifts
+                .lock()
+                .unwrap()
+                .insert("SENSORALPHA".into(), (1.0, 1.0, 1));
+            let change = PoseChange::Placing("SENSORALPHA".into());
+            let stale = r.removals("SENSORALPHA");
+            queue_lifetime_event(&d, added("SENSORALPHA", lifetime));
+            apply_sensor_events(&d, &mut sensors, &mut pipe);
+            let r = &sensors.reposing;
+            assert!(
+                !made_for_its_camera(&d, &change, stale),
+                "a change for the earlier object was applied to object {lifetime}"
+            );
+            assert!(
+                made_for_its_camera(&d, &change, r.removals("SENSORALPHA")),
+                "a change for object {lifetime} was dropped"
+            );
+            assert!(
+                r.probed_since.is_empty() && r.placements.is_empty() && r.releases.is_empty(),
+                "the earlier object's probation or placements survived"
+            );
+            assert!(d.landmark_shifts.lock().unwrap().is_empty());
+        }
+        // an older object's late add changes nothing, and keeps the counts in step
+        sensors
+            .reposing
+            .placements
+            .insert("SENSORALPHA".into(), vec![1]);
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let r = &sensors.reposing;
+        assert_eq!(
+            r.placements.len(),
+            1,
+            "a late add retired the current object"
+        );
+        assert!(made_for_its_camera(
+            &d,
+            &PoseChange::Placing("SENSORALPHA".into()),
+            r.removals("SENSORALPHA")
+        ));
+    }
+
+    /// A frame of the old object queued before [Removed, Added] must not be consumed into the
+    /// new object's camera: the radio takes the frame only after applying the events.
+    #[test]
+    fn hotplug_a_frame_queued_before_a_replacement_is_not_consumed_after_it() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let old = pipe.camera_id("SENSORALPHA");
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        queue_lifetime_event(&d, added("SENSORALPHA", 2));
+        let consumed_stale = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        let new = pipe.camera_id("SENSORALPHA");
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        let consumed_current = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        assert!(old.is_some() && new.is_some() && old != new);
+        assert_eq!(
+            (consumed_stale, consumed_current),
+            (false, true),
+            "the old object's frame reached the new camera"
+        );
+    }
+
+    /// Every admission is a fresh camera, even when an add arrives without a removal, and an
+    /// add older than the newest applied one for the serial changes nothing.
+    #[test]
+    fn hotplug_a_stale_added_is_ignored_and_every_admission_is_a_new_camera() {
+        let d = live_daemon(vec![]);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let first = pipe.camera_id("SENSORALPHA");
+        queue_lifetime_event(&d, added("sensoralpha", 2));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let second = pipe.camera_id("sensoralpha");
+        queue_lifetime_event(&d, added("SENSORALPHA", 1));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        let after_stale = pipe.camera_id("sensoralpha");
+        d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
+        let stale = d.track_in.lock().unwrap().pop_frame().is_some();
+        d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
+        let current = d.track_in.lock().unwrap().pop_frame().is_some();
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "an add reused the camera"
+        );
+        assert_eq!(after_stale, second, "a stale add replaced the camera");
+        assert_eq!((stale, current), (false, true));
+        // A removal after the successor's add only drops the successor (liveness, not G1).
+        queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        apply_sensor_events(&d, &mut sensors, &mut pipe);
+        d.frame(&lifetime_frame("SENSORALPHA", 30), 2, &[]);
+        assert!(d.track_in.lock().unwrap().pop_frame().is_none());
+        assert_eq!(pipe.camera_id("sensoralpha"), None);
+        assert_eq!(pipe.camera_id("SENSORALPHA"), None);
+    }
+
+    /// An add that the engine finished as started is queued for the radio with the native
+    /// object's lifetime.
+    #[test]
+    fn hotplug_a_started_add_reaches_the_radio_with_its_lifetime() {
+        let a = live_sensor("SENSORALPHA", 7);
+        let d = live_daemon(vec![]);
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        service_sensors(&d, &fake, true, &mut state, 2 * sensor_hotplug::DEBOUNCE_NS);
+        fake.finish_as(&a.serial, &a.attachment, engine::AddOutcome::Started, 0, 41);
+        assert!(service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        assert!(matches!(
+            take_sensor_events(&d)[..],
+            [SensorEvent::Added { lifetime: 41, .. }]
+        ));
+    }
+
+    /// At engine start the queues admit the opened objects' lifetimes; after a reopen, the old
+    /// engine's objects, whose lifetimes are all lower, are dropped.
+    #[test]
+    fn cold_start_and_reopen_admit_only_the_open_engines_objects() {
+        let d = live_daemon(vec![]);
+        let register = |lifetime: u64| {
+            let roster = [("SENSORALPHA".to_string(), lifetime)];
+            d.track_in.lock().unwrap().register(roster.clone());
+            d.track_searches.lock().unwrap().register(roster.clone());
+            d.track_identities.lock().unwrap().register(roster);
+        };
+        let admitted = |lifetime: u64| {
+            d.frame(&lifetime_frame("SENSORALPHA", lifetime), lifetime, &[]);
+            d.search_started(&lifetime_frame("SENSORALPHA", lifetime), lifetime, 5);
+            d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), lifetime, false, 1);
+            (
+                d.track_in.lock().unwrap().pop_frame().is_some(),
+                d.track_searches.lock().unwrap().pop_frame().is_some(),
+                d.track_identities.lock().unwrap().take().len(),
+            )
+        };
+        // callbacks before registration are dropped
+        assert_eq!(admitted(3), (false, false, 0));
+        register(3);
+        assert_eq!(admitted(3), (true, true, 1));
+        register(8);
+        assert_eq!(admitted(3), (false, false, 0), "the old engine's object");
+        assert_eq!(admitted(8), (true, true, 1));
+    }
+
+    /// An identity notice the native object emits after it was retired reaches tracking, where
+    /// it can still retract judgments, but is not recorded: in a recording it could land after
+    /// its successor's start with no boundary between them.
+    #[test]
+    fn recorder_a_retired_objects_identity_notice_is_delivered_but_not_recorded() {
+        let d = live_daemon(vec![]);
+        d.track_identities
+            .lock()
+            .unwrap()
+            .register([("SENSORALPHA".to_string(), 1)]);
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("retired.rec");
+        d.rec.start(&path, 1).unwrap();
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 1), 1, false, 2);
+        d.inspection_identity(&lifetime_notice("SENSORALPHA", 2), 1, true, 3);
+        d.rec.stop();
+        let delivered = d.track_identities.lock().unwrap().take();
+        let mut reader = recorder::Reader::open(&path).unwrap();
+        let identities = reader
+            .by_ref()
+            .filter(|r| r.rtype == recorder::INSPECTION_IDENTITY)
+            .count();
+        assert_eq!(reader.error(), None);
+        assert_eq!(identities, 1, "a retired object's notice was recorded");
+        assert_eq!(delivered.len(), 1);
+        let left = &delivered[0].1[HAND_LEFT];
+        assert!(
+            !left.permits(1) && !left.permits(2),
+            "a notice was not delivered"
+        );
+    }
+
+    /// The radio thread takes the sensor events without the sensor watch, which the engine
+    /// thread holds across native calls that can take milliseconds.
+    #[test]
+    fn hotplug_the_radio_thread_never_waits_for_the_sensor_watch() {
+        let d = status_daemon();
+        queue_sensor_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
+        d.sensor_revision.fetch_add(1, Ordering::Release);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        let (done, finished) = std::sync::mpsc::channel();
+        let waited = thread::scope(|scope| {
+            // held inside the scope, so a failure lets the radio thread go before the join
+            let held = d.sensor_watch.lock().unwrap();
+            scope.spawn(|| {
+                apply_sensor_events(&d, &mut sensors, &mut pipe);
+                done.send(()).unwrap();
+            });
+            let waited = finished.recv_timeout(Duration::from_secs(1)).is_err();
+            drop(held);
+            waited
+        });
+        assert!(!waited, "the radio thread waited for the sensor watch");
+        assert!(d.sensor_events.lock().unwrap().is_empty());
+    }
+
+    /// A sensor plugged back in where it stood is watched again against its landmarks, unless
+    /// it was placed again this session: those landmarks were learned where it stood before.
+    #[test]
+    fn hotplug_landmarks_resume_unless_a_placement_made_them_stale() {
+        for placed in [false, true] {
+            let d = status_daemon();
+            let mut watch = Some(LandmarkWatch {
+                monitor: track::landmarks::BackgroundMonitor::new(
+                    vec![track::landmarks::Landmark {
+                        serial: "SENSORALPHA".into(),
+                        x: 100.0,
+                        y: 300.0,
+                        seen: 0.5,
+                    }],
+                    LANDMARK_WINDOW_NS,
+                    20,
+                )
+                .unwrap(),
+                alerts: Default::default(),
+                missing: Default::default(),
+            });
+            let mut pipe = Pipeline::new(pipeline::Options::default());
+            let mut sensors = radio_sensors(&mut watch);
+            if placed {
+                sensors
+                    .reposing
+                    .stale_landmarks
+                    .insert("sensoralpha".into());
+            }
+            for event in [
+                SensorEvent::Removed("SENSORALPHA".into()),
+                SensorEvent::Added {
+                    serial: "SensorAlpha".into(),
+                    lifetime: 2,
+                    camera: None,
+                },
+            ] {
+                queue_sensor_event(&d, event);
+                d.sensor_revision.fetch_add(1, Ordering::Release);
+                apply_sensor_events(&d, &mut sensors, &mut pipe);
+            }
+            let watched = sensors
+                .watch
+                .as_ref()
+                .unwrap()
+                .monitor
+                .watches("SENSORALPHA");
+            assert_eq!(watched, !placed);
+        }
+    }
+
+    /// Open failures that pass (a busy or missing device) are tried again a second later, up to
+    /// three times; a failure for good is shown, with what to do, and doctor reports it. A sensor
+    /// the running engine could not be asked to add waits for the next engine start, and says so.
+    #[test]
+    fn hotplug_a_busy_sensor_is_tried_again_then_its_reason_is_shown() {
+        let d = live_daemon(vec![]);
+        let a = live_sensor("SENSORALPHA", 7);
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState::default();
+        let mut now = 2 * sensor_hotplug::DEBOUNCE_NS;
+        for attempt in 1..=sensor_hotplug::ADD_RETRIES + 1 {
+            service_sensors(&d, &fake, true, &mut state, now);
+            assert_eq!(fake.asked.lock().unwrap().len(), attempt as usize);
+            fake.finish(
+                &a.serial,
+                &a.attachment,
+                engine::AddOutcome::OpenFailed,
+                sensor_hotplug::LIBUSB_ERROR_BUSY,
+            );
+            service_sensors(&d, &fake, true, &mut state, now);
+            service_sensors(
+                &d,
+                &fake,
+                true,
+                &mut state,
+                now + sensor_hotplug::ADD_RETRY_NS - 1,
+            );
+            assert_eq!(
+                fake.asked.lock().unwrap().len(),
+                attempt as usize,
+                "too early"
+            );
+            now += sensor_hotplug::ADD_RETRY_NS;
+        }
+        service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            now + 10 * sensor_hotplug::ADD_RETRY_NS,
+        );
+        assert_eq!(fake.asked.lock().unwrap().len(), 4);
+        let (value, check) = hotplug_doctor(&d);
+        assert_eq!(
+            value["sensor_hotplug"]["pending"][0]["state"],
+            "open_failed"
+        );
+        let (ok, note) = check.unwrap();
+        assert!(!ok);
+        assert!(
+            note.contains("Another program or driver is using this sensor's USB device"),
+            "{note}"
+        );
+        // the engine could not be asked at all: the next engine start opens it
+        let b = live_sensor("SENSORBETA", 8);
+        *fake.answer.lock().unwrap() = Err("no worker".into());
+        poll_sensors(&d, now, Ok(vec![a.clone(), b.clone()]));
+        poll_sensors(&d, now + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a, b]));
+        service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            now + sensor_hotplug::DEBOUNCE_NS,
+        );
+        let (value, check) = hotplug_doctor(&d);
+        assert_eq!(
+            value["sensor_hotplug"]["pending"][1]["state"],
+            "waiting_engine_start"
+        );
+        let detail = value["sensor_hotplug"]["pending"][1]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(
+            detail.starts_with("The running engine could not take this sensor. This sensor will be used the next time the tracking engine starts."),
+            "{detail}"
+        );
+        assert!(!check.unwrap().0);
+    }
+
+    /// Asked to add a sensor, the engine says a live object of it is in its roster already: the
+    /// sensor is in use, as an added one would be, and is not asked for again.
+    #[test]
+    fn hotplug_a_sensor_the_engine_already_has_is_in_use() {
+        let d = live_daemon(vec![]);
+        let a = live_sensor("SENSORALPHA", 7);
+        poll_sensors(&d, 1, Ok(vec![a.clone()]));
+        poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a.clone()]));
+        let fake = FakeLive::new(&d);
+        *fake.answer.lock().unwrap() = Ok(false);
+        let mut state = LiveSensorState::default();
+        assert!(!service_sensors(
+            &d,
+            &fake,
+            true,
+            &mut state,
+            2 * sensor_hotplug::DEBOUNCE_NS
+        ));
+        assert!(hotplug_states(&d).is_empty());
+        assert!(d.sensor_watch.lock().unwrap().in_use(&a.serial));
+        assert!(state.adding.is_empty() && d.sensor_events.lock().unwrap().is_empty());
+        service_sensors(&d, &fake, true, &mut state, 9 * sensor_hotplug::DEBOUNCE_NS);
+        assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    }
+
+    /// An engine that runs adds a sensor its open did not account for, and a sensor ready by its
+    /// first update is looked for at once: nothing waits for the next USB scan.
+    #[test]
+    fn hotplug_the_first_update_looks_for_sensors_to_add() {
+        let d = status_daemon();
+        let a = live_sensor("SENSORALPHA", 7);
+        *d.sensor_watch.lock().unwrap() = sensor_hotplug::Monitor::new(Ok(vec![a.clone()]), &[]);
+        begin_engine_open(&d);
+        finish_engine_open(&d, &mut String::new(), Ok(()));
+        let lines = daemon_log::capture(|| {
+            admit_engine_sensors(
+                &d,
+                1,
+                &[],
+                &[],
+                Ok(vec![a.clone()]),
+                engine::SensorRetirement::default(),
+            )
+        });
+        assert_eq!(
+            lines,
+            ["sensor SENSORALPHA: the engine did not open it as it started; opening it now"]
+        );
+        let fake = FakeLive::new(&d);
+        let mut state = LiveSensorState {
+            revision: d.sensor_revision.load(Ordering::Acquire),
+            ..Default::default()
+        };
+        engine_updated(&d, true, &mut true);
+        service_sensors(&d, &fake, true, &mut state, 1);
+        assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    }
+
     fn hotplug_start(serial: &str, attachment: Option<&str>) -> engine::SensorStreamStart {
         let mut raw = ffi::ohmd_cv1touch_sensor_stream::default();
         for (out, byte) in raw.serial.iter_mut().zip(serial.bytes()) {
@@ -10139,11 +12041,22 @@ mod tests {
         engine_updated(&d, true, &mut opening);
         assert!(!opening);
         assert!(hotplug_states(&d).is_empty());
-        // so a sensor plugged in afterwards waits for the next engine start
+        // so the running engine adds a sensor plugged in afterwards
         let b = hotplug_sensor("SENSORBRAVO");
         poll_sensors(&d, 1, Ok(vec![a.clone(), b.clone()]));
         poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![a, b]));
-        assert_eq!(hotplug_states(&d), ["waiting_engine_start"]);
+        let pending: Vec<_> = d
+            .sensor_watch
+            .lock()
+            .unwrap()
+            .pending()
+            .into_iter()
+            .map(|p| (p.state, p.detail))
+            .collect();
+        assert_eq!(
+            pending,
+            [("opening", "The engine is opening this sensor.".to_string())]
+        );
         // Were a later update to mark an open finished again, this one would not stay opening.
         d.sensor_watch.lock().unwrap().before_open();
         for updated in [true, false, true] {
@@ -10181,9 +12094,13 @@ mod tests {
                     reconcile_engine_sensors(&d, 1, &[], &[start], Ok(vec![a2.clone()]));
                     assert!(d.sensor_watch.lock().unwrap().detached().is_empty());
                     // registered as engine_session does, with a frame waiting for the tracker
-                    d.track_in.lock().unwrap().register([a2.serial.clone()]);
+                    d.track_in
+                        .lock()
+                        .unwrap()
+                        .register([(a2.serial.clone(), 1)]);
                     d.track_in.lock().unwrap().push_frame(
                         &a2.serial,
+                        1,
                         1,
                         (Box::default(), Vec::new()),
                     );
@@ -17561,10 +19478,10 @@ mod tests {
         let request = |line: &str| control::request(&endpoint, line, Duration::from_secs(5));
         // The previous recording already wrote its session info.
         assert_eq!(
-            d.session.lock().unwrap().plan(true, &[(7, true)]),
-            (true, vec![7])
+            d.session.lock().unwrap().plan(&["C".into()], &[(7, true)]),
+            (vec![0], vec![7])
         );
-        assert!(d.session.lock().unwrap().complete(1));
+        assert!(d.session.lock().unwrap().complete(&["C".into()], 1));
         assert!(!d.rec.frames_enabled());
 
         let reply = request(&control::record_start_line(&path, true).unwrap()).unwrap();
@@ -17574,8 +19491,8 @@ mod tests {
         assert!(d.rec.frames_enabled());
         assert_eq!(d.rec.status().byte_limit, 16 << 30);
         assert_eq!(
-            d.session.lock().unwrap().plan(true, &[(7, true)]),
-            (true, vec![7]),
+            d.session.lock().unwrap().plan(&["C".into()], &[(7, true)]),
+            (vec![0], vec![7]),
             "the new recording must get its own sensor and LED model records"
         );
         let stopped = request(&control::record_stop_if_line(&path).unwrap()).unwrap();

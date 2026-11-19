@@ -347,6 +347,32 @@ impl BackgroundMonitor {
         }
     }
 
+    /// Watch `serial` again, from `host_ns`, against its original reference: the sensor was
+    /// unplugged (`forget`) and is back where it stood. A result from before cannot publish.
+    pub fn resume(&mut self, serial: &str, host_ns: u64) {
+        if let Some(s) = self
+            .sensors
+            .iter_mut()
+            .find(|s| same_sensor(&s.serial, serial))
+        {
+            s.generation += 1;
+            s.sequence += 1;
+            s.enabled = true;
+            s.start = Some(host_ns);
+            s.samples.clear();
+            s.ready = None;
+            s.overflow = false;
+            s.unknown = false;
+        }
+    }
+
+    /// Whether `serial`'s landmarks are watched now.
+    pub fn watches(&self, serial: &str) -> bool {
+        self.sensors
+            .iter()
+            .any(|s| s.enabled && same_sensor(&s.serial, serial))
+    }
+
     pub fn forget(&mut self, serial: &str) {
         if let Some(s) = self
             .sensors
@@ -517,6 +543,37 @@ mod tests {
             }
         }
     }
+    /// Unplugged and plugged back in: watched again against the reference it had, from the
+    /// resume on. A window collected before the unplug, still being analysed, cannot publish.
+    #[test]
+    fn hotplug_a_resumed_sensor_keeps_its_reference_and_drops_older_results() {
+        let (mut m, release, started) = gated();
+        fill(&mut m, 1);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        m.forget("A");
+        m.frame("A", 1001, [Vector2::new(101.5, 300.0)]);
+        assert!(
+            m.sensors[0].samples.is_empty(),
+            "forgotten sensors collect nothing"
+        );
+        assert!(!m.watches("a"));
+        m.resume("a", 2001);
+        assert!(m.watches("A"));
+        assert_eq!(m.sensors[0].start, Some(2001));
+        m.frame("A", 2000, [Vector2::new(101.5, 300.0)]);
+        assert!(
+            m.sensors[0].samples.is_empty(),
+            "a frame from before the resume"
+        );
+        drop(release);
+        wait_idle(&mut m, |_, s| {
+            panic!("a result from before the unplug {s:?}")
+        });
+        fill(&mut m, 2001);
+        assert!((drain(&mut m).unwrap().shift.x - 1.5).abs() < 1e-8);
+        assert_eq!(&*m.sensors[0].reference, &[Vector2::new(100.0, 300.0)]);
+    }
+
     #[test]
     fn a_panicking_analysis_leaves_its_window_unknown_and_the_worker_alive() {
         let mut two = reference();

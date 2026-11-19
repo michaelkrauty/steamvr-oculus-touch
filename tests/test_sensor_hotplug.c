@@ -43,6 +43,7 @@ static char sysfs_root[PATH_MAX];
 #define rift_sensor_serial_no fake_sensor_serial
 #define rift_sensor_retire fake_sensor_retire
 #define rift_sensor_retired fake_sensor_retired
+#define rift_sensor_lifetime fake_sensor_lifetime
 #define rift_sensor_accept_frames_from fake_sensor_accept
 #define rift_sensor_get_usb_device fake_sensor_usb_device
 #define rift_sensor_add_device fake_sensor_add_device
@@ -275,6 +276,7 @@ struct fake_sensor {
   rift_tracked_device *devices[8];
   int n_devices;
   int freed_seq;
+  uint64_t lifetime;
   bool have_pose;
   ohmd_cv1touch_sensor_pose pose;
 };
@@ -308,6 +310,7 @@ rift_sensor_ctx *fake_sensor_new(ohmd_context *ctx, int id, const char *serial,
   pthread_mutex_lock(&fake);
   CHECK(n_made < 256);
   made[n_made++] = s;
+  s->lifetime = (uint64_t)n_made;
   live++;
   pthread_mutex_unlock(&fake);
   if (on_worker()) {
@@ -393,6 +396,9 @@ void fake_sensor_retire(rift_sensor_ctx *sensor) {
   CHECK(!s->freed);
   s->retired = true;
   pthread_mutex_unlock(&fake);
+}
+uint64_t fake_sensor_lifetime(rift_sensor_ctx *sensor) {
+  return ((struct fake_sensor *)(void *)sensor)->lifetime;
 }
 bool fake_sensor_retired(rift_sensor_ctx *sensor) {
   struct fake_sensor *s = (void *)sensor;
@@ -624,6 +630,10 @@ static void a_plugged_in_sensor_joins_the_running_engine(int fds) {
   CHECK(s->n_devices == 2 && s->devices[0] == right && s->devices[1] == left);
   CHECK(s->accept_from >= before_start_done && s->accept_from != UINT64_MAX);
   CHECK(s->have_pose && !strcmp(s->pose.serial, "test000002") && s->pose.pos[2] == 3);
+  /* its callbacks' lifetime, as the engine reports it, and as the accessor does until retired */
+  uint64_t lifetime = 0;
+  CHECK(added.lifetime != 0 && added.lifetime == s->lifetime);
+  CHECK(rift_tracker_get_sensor_lifetime(tracker, "test000002", &lifetime) == 0 && lifetime == s->lifetime);
   ohmd_cv1touch_sensor_stream stream;
   CHECK(rift_tracker_get_sensor_stream(tracker, 1, &stream) == 0 && !strcmp(stream.serial, "TEST000002"));
   int pin = tracker->sensor_streams[1].pin_fd;
@@ -631,6 +641,9 @@ static void a_plugged_in_sensor_joins_the_running_engine(int fds) {
   CHECK(fd_count() == fds + 2);
   /* a later controller is attached by the tracker itself, as for any sensor */
   CHECK(rift_tracker_add_sensor(tracker, "TEST000002", &key, NULL) == 1);
+  CHECK(rift_tracker_retire_sensor(tracker, "TEST000002") == 0);
+  CHECK(rift_tracker_get_sensor_lifetime(tracker, "TEST000002", &lifetime) == -1);
+  CHECK(rift_tracker_get_sensor_lifetime(tracker, "TEST000003", &lifetime) == -1);
   close_tracker(fds);
   fixture_camera(2, false);
 }
@@ -753,6 +766,7 @@ static void a_failed_start_is_recorded_once(int fds) {
   CHECK(rift_tracker_add_sensor(tracker, "TEST000008", &key, NULL) == 0);
   ohmd_cv1touch_sensor_added added = finished();
   CHECK(added.outcome == OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED && added.error_code == LIBUSB_ERROR_IO);
+  CHECK(added.lifetime == 0); /* only a sensor that joined has callbacks */
   CHECK(added.stream.error_kind == OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH && added.stream.os_error == ENOSPC);
   CHECK(tracker->n_sensors == 0 && live == 0 && tracker->n_sensor_streams == 1);
   ohmd_cv1touch_sensor_stream stream;

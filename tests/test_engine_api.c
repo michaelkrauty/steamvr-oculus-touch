@@ -10,9 +10,10 @@
 
 static int frames_seen;
 
-static void on_frame(void *user, const ohmd_cv1touch_frame_info *info, int n, const ohmd_cv1touch_blob *blobs)
+static void on_frame(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, int n,
+	const ohmd_cv1touch_blob *blobs)
 {
-	(void)user; (void)info; (void)n; (void)blobs;
+	(void)user; (void)lifetime; (void)info; (void)n; (void)blobs;
 	frames_seen++;
 }
 
@@ -62,9 +63,12 @@ int main(void)
 	CHECK(ohmd_cv1touch_forget_sensor_stream(NULL, "CAMERA1") == -1);
 	CHECK(ohmd_cv1touch_forget_sensor_stream(NULL, NULL) == -1);
 	/* The live sensor lifecycle */
-	CHECK(sizeof(ohmd_cv1touch_sensor_added) == 80);
+	CHECK(sizeof(ohmd_cv1touch_sensor_added) == 88);
 	CHECK(offsetof(ohmd_cv1touch_sensor_added, outcome) == 64);
 	CHECK(offsetof(ohmd_cv1touch_sensor_added, start_ms) == 76);
+	CHECK(offsetof(ohmd_cv1touch_sensor_added, lifetime) == 80);
+	uint64_t lifetime;
+	CHECK(ohmd_cv1touch_get_sensor_lifetime(NULL, "CAMERA1", &lifetime) == -1);
 	ohmd_cv1touch_sensor_attachment key = {.kind = OHMD_CV1TOUCH_ATTACHMENT_SYSFS, .data = {1 | (2 << 8), 3, 0}};
 	ohmd_cv1touch_sensor_added added[2];
 	CHECK(ohmd_cv1touch_add_sensor(NULL, "CAMERA1", &key, NULL) == -1);

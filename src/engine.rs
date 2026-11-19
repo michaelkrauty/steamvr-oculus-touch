@@ -154,6 +154,97 @@ fn sensor_attachment(serial: &str, key: ffi::ohmd_cv1touch_sensor_attachment) ->
     }
 }
 
+/// The native key of a watcher attachment (`platform::usb::Sensor::attachment`): the inverse of
+/// `sensor_attachment`. Linux: "sysfs:{bus}:{address}@{inode:016x}", verified natively against the
+/// pinned directory. Windows: "USB\VID_2833&PID_0211\{SERIAL}@{arrival:016x}", recorded as given.
+/// None for anything else, such as an inode the scan could not read: that sensor is never opened
+/// by a live add.
+pub fn attachment_key(attachment: &str) -> Option<ffi::ohmd_cv1touch_sensor_attachment> {
+    let (place, incarnation) = attachment.rsplit_once('@')?;
+    let incarnation = u64::from_str_radix(incarnation, 16)
+        .ok()
+        .filter(|&i| i != 0)?;
+    if let Some(place) = place.strip_prefix("sysfs:") {
+        let (bus, address) = place.split_once(':')?;
+        let (bus, address) = (bus.parse::<u8>().ok()?, address.parse::<u8>().ok()?);
+        if bus == 0 || address == 0 {
+            return None;
+        }
+        return Some(ffi::ohmd_cv1touch_sensor_attachment {
+            kind: ffi::OHMD_CV1TOUCH_ATTACHMENT_SYSFS,
+            data: [
+                u32::from(bus) | (u32::from(address) << 8),
+                incarnation as u32,
+                (incarnation >> 32) as u32,
+            ],
+        });
+    }
+    place
+        .to_ascii_uppercase()
+        .starts_with(r"USB\VID_2833&PID_0211\")
+        .then_some(ffi::ohmd_cv1touch_sensor_attachment {
+            kind: ffi::OHMD_CV1TOUCH_ATTACHMENT_WINDOWS,
+            data: [incarnation as u32, (incarnation >> 32) as u32, 0],
+        })
+}
+
+/// How a live add ended (`Engine::poll_sensor_adds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// In the engine's roster now, with its last-start record.
+    Started,
+    /// Opened, but its video did not start; the start is recorded (`SensorStreamStart`).
+    StartFailed,
+    /// No such USB device when the engine looked.
+    NotFound,
+    /// Another connection was at that place by then: nothing was opened.
+    Stale,
+    /// Opening or setting up the USB device failed (`SensorAdded::error_code`).
+    OpenFailed,
+    /// Ignored, unreadable, another serial than the one asked for, or already open.
+    Rejected,
+}
+
+/// One finished live add.
+#[derive(Clone, Debug)]
+pub struct SensorAdded {
+    pub outcome: AddOutcome,
+    /// Serial and attachment as asked for; for `Started` and `StartFailed`, the start attempt.
+    pub start: SensorStreamStart,
+    /// libusb's code (or a negative errno) for `OpenFailed` and `StartFailed`.
+    pub error_code: i32,
+    /// Finding, opening and setting up the device, its calibration read included.
+    pub open_ms: u32,
+    /// Starting its video, through its radio setup.
+    pub start_ms: u32,
+    /// For `Started`, the lifetime its callbacks carry; else 0.
+    pub lifetime: u64,
+}
+
+impl SensorAdded {
+    // used by the engine, and by tests on any build
+    #[cfg_attr(not(feature = "engine"), allow(dead_code))]
+    fn from_native(added: &ffi::ohmd_cv1touch_sensor_added) -> Option<Self> {
+        let outcome = match added.outcome {
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_STARTED => AddOutcome::Started,
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED => AddOutcome::StartFailed,
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_NOT_FOUND => AddOutcome::NotFound,
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_STALE => AddOutcome::Stale,
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED => AddOutcome::OpenFailed,
+            ffi::OHMD_CV1TOUCH_SENSOR_ADD_REJECTED => AddOutcome::Rejected,
+            _ => return None,
+        };
+        Some(Self {
+            outcome,
+            start: added.stream.into(),
+            error_code: added.error_code,
+            open_ms: added.open_ms,
+            start_ms: added.start_ms,
+            lifetime: added.lifetime,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorPose {
     pub serial: String,
@@ -278,12 +369,22 @@ pub const MATCH_INSPECTION_MOTION: u32 = ffi::OHMD_CV1TOUCH_MATCH_INSPECTION_MOT
 
 /// Engine callbacks. `frame` runs on sensor analysis threads with the sensor lock held and
 /// `report` on the engine thread: both must only copy data.
+/// `lifetime` names the native sensor object a callback came from: never 0 and never reused in
+/// the process (`SensorAdded::lifetime`, `Engine::sensor_lifetime`).
 pub trait EngineSink: Send + Sync {
-    fn frame(&self, info: &FrameInfo, blobs: &[Blob]);
+    fn frame(&self, info: &FrameInfo, lifetime: u64, blobs: &[Blob]);
     /// A native label search is about to start; retain its exposure until its deadline.
-    fn search_started(&self, _info: &FrameInfo, _remaining_ns: u64) {}
+    fn search_started(&self, _info: &FrameInfo, _lifetime: u64, _remaining_ns: u64) {}
     /// Identity lifetimes are control evidence; retain invalidations even when dropping frames.
-    fn inspection_identity(&self, _event: &InspectionIdentity, _host_ns: u64) {}
+    /// `retired`: the object was retired first, so this may follow its successor's start.
+    fn inspection_identity(
+        &self,
+        _event: &InspectionIdentity,
+        _lifetime: u64,
+        _retired: bool,
+        _host_ns: u64,
+    ) {
+    }
     fn report(&self, source: i32, host_ns: u64, data: &[u8]);
     /// Runs in decoded message order on the named reader. Copy and return without waiting.
     #[allow(clippy::too_many_arguments)]
@@ -319,31 +420,80 @@ struct RetirementDevice(*mut ffi::ohmd_device);
 // SAFETY: only SensorRetirement uses the pointer, under its lifetime mutex, for retirement.
 unsafe impl Send for RetirementDevice {}
 
+/// The device a retirement targets, and per serial (`status::sensor_identity`) how many times the
+/// engine thread released that serial's sensors (`Engine::release_sensor`).
+#[cfg(feature = "engine")]
+#[derive(Default)]
+struct RetirementTarget {
+    device: Option<RetirementDevice>,
+    releases: std::collections::BTreeMap<String, u64>,
+}
+
 #[cfg(feature = "engine")]
 #[derive(Clone, Default)]
-pub struct SensorRetirement(Arc<Mutex<Option<RetirementDevice>>>);
+pub struct SensorRetirement(Arc<Mutex<RetirementTarget>>);
+
+/// A retirement as it was decided: of the serial's sensors in the engine's roster then. Taken
+/// with the sensor watch held, it reaches no sensor the engine adds after releasing those.
+#[cfg(feature = "engine")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetirementStamp {
+    pub serial: String,
+    releases: u64,
+}
 
 #[cfg(feature = "engine")]
 impl SensorRetirement {
-    fn with_device<T>(&self, f: impl FnOnce(*mut ffi::ohmd_device) -> T) -> Option<T> {
-        let target = self.0.lock().unwrap();
-        target.as_ref().map(|d| f(d.0))
-    }
-
     fn invalidate(&self) {
-        self.0.lock().unwrap().take();
+        self.0.lock().unwrap().device.take();
     }
 
-    pub fn retire(&self, serial: &str) -> Result<(), String> {
-        let serial = self::serial(serial)?;
+    /// A retirement of `serial`'s sensors in the roster now.
+    pub fn stamp(&self, serial: &str) -> RetirementStamp {
+        let serial = serial.to_string();
+        let releases = self.0.lock().unwrap().releases_of(&serial);
+        RetirementStamp { serial, releases }
+    }
+
+    /// The engine thread released `serial`'s sensors: retirements decided before reach none of
+    /// its later ones.
+    fn released(&self, serial: &str) {
+        *self
+            .0
+            .lock()
+            .unwrap()
+            .releases
+            .entry(sensor_identity(serial))
+            .or_default() += 1;
+    }
+
+    /// Retires the sensors `stamp` was decided about; Ok(false) when the engine released them
+    /// since, and any sensor of that serial in the roster now is a later one.
+    pub fn retire(&self, stamp: &RetirementStamp) -> Result<bool, String> {
+        let serial = self::serial(&stamp.serial)?;
+        let target = self.0.lock().unwrap();
+        if target.releases_of(&stamp.serial) != stamp.releases {
+            return Ok(false);
+        }
+        let Some(device) = &target.device else {
+            return Ok(true);
+        };
         // SAFETY: the guard keeps the device alive; only this locked native operation is
         // exposed here. Native callbacks never acquire this guard.
-        let result =
-            self.with_device(|d| unsafe { ffi::ohmd_cv1touch_retire_sensor(d, serial.as_ptr()) });
-        match result {
-            None | Some(0) => Ok(()),
-            Some(_) => Err("the engine could not retire a sensor".into()),
+        match unsafe { ffi::ohmd_cv1touch_retire_sensor(device.0, serial.as_ptr()) } {
+            0 => Ok(true),
+            _ => Err("the engine could not retire a sensor".into()),
         }
+    }
+}
+
+#[cfg(feature = "engine")]
+impl RetirementTarget {
+    fn releases_of(&self, serial: &str) -> u64 {
+        self.releases
+            .get(&sensor_identity(serial))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -512,7 +662,8 @@ impl Engine {
                 ));
             }
             engine.last_io_errors = ffi::ohmd_cv1touch_get_io_errors(engine.hands[HAND_RIGHT]);
-            *engine.retirement.0.lock().unwrap() = Some(RetirementDevice(engine.hands[HAND_RIGHT]));
+            engine.retirement.0.lock().unwrap().device =
+                Some(RetirementDevice(engine.hands[HAND_RIGHT]));
             Ok(engine)
         }
     }
@@ -623,6 +774,22 @@ impl Engine {
             .collect()
     }
 
+    /// The lifetime the callbacks of this serial's open, unretired sensor object carry. Call on
+    /// the engine thread.
+    pub fn sensor_lifetime(&self, serial: &str) -> Option<u64> {
+        let serial_c = self::serial(serial).ok()?;
+        let mut lifetime = 0;
+        // SAFETY: this engine owns the device; serial is NUL-terminated and the output valid.
+        (unsafe {
+            ffi::ohmd_cv1touch_get_sensor_lifetime(
+                self.hands[HAND_RIGHT],
+                serial_c.as_ptr(),
+                &mut lifetime,
+            )
+        } == 0)
+            .then_some(lifetime)
+    }
+
     /// Drop a detached serial's diagnostic without freeing its native sensor object.
     /// Repeated detach notifications are harmless. Call on the engine thread.
     pub fn forget_sensor_stream(&self, serial: &str) -> Result<(), String> {
@@ -643,6 +810,85 @@ impl Engine {
     /// A retirement-only handle; safe to call from a watcher while an update is blocked.
     pub fn sensor_retirement(&self) -> SensorRetirement {
         self.retirement.clone()
+    }
+
+    /// Asks the engine's own worker to open and start sensor `serial` at the watcher's
+    /// `attachment`, with `pose` (camera -> world) from its first frame; never blocks on USB.
+    /// Ok(true) when queued, Ok(false) when that serial is already open or on its way.
+    /// Engine thread only.
+    pub fn add_sensor(
+        &self,
+        serial: &str,
+        attachment: &str,
+        pose: Option<&SensorPose>,
+    ) -> Result<bool, String> {
+        let serial_c = self::serial(serial)?;
+        let key = attachment_key(attachment)
+            .ok_or_else(|| format!("sensor {serial} has no attachment the engine can open"))?;
+        let pose = pose
+            .map(|p| {
+                Ok::<_, String>(ffi::ohmd_cv1touch_sensor_pose {
+                    serial: self::serial(&p.serial)?,
+                    orient: p.orient,
+                    pos: p.pos,
+                })
+            })
+            .transpose()?;
+        // SAFETY: this engine owns the device; every pointer is valid for the call, and the
+        // engine copies what it keeps.
+        match unsafe {
+            ffi::ohmd_cv1touch_add_sensor(
+                self.hands[HAND_RIGHT],
+                serial_c.as_ptr(),
+                &key,
+                pose.as_ref().map_or(ptr::null(), |p| p as *const _),
+            )
+        } {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(format!(
+                "the engine could not queue sensor {serial} to be opened"
+            )),
+        }
+    }
+
+    /// The live adds that finished since the last call, in the order they finished. A started
+    /// sensor is in the engine's roster now. Engine thread only.
+    pub fn poll_sensor_adds(&self) -> Vec<SensorAdded> {
+        let mut out = Vec::new();
+        let mut batch = [ffi::ohmd_cv1touch_sensor_added::default(); 8];
+        loop {
+            // SAFETY: this engine owns the device; the buffer holds `batch.len()` records.
+            let n = unsafe {
+                ffi::ohmd_cv1touch_poll_sensor_adds(
+                    self.hands[HAND_RIGHT],
+                    batch.as_mut_ptr(),
+                    batch.len() as c_int,
+                )
+            };
+            let n = n.clamp(0, batch.len() as c_int) as usize;
+            out.extend(batch[..n].iter().filter_map(SensorAdded::from_native));
+            if n < batch.len() {
+                return out;
+            }
+        }
+    }
+
+    /// Retires sensor `serial`, takes it out of the engine's roster and has the engine's worker
+    /// free it; its last-start record stays until `forget_sensor_stream`. A retirement decided
+    /// before reaches none of the serial's later sensors (`SensorRetirement::retire`). Engine
+    /// thread only.
+    pub fn release_sensor(&self, serial: &str) -> Result<(), String> {
+        let serial_c = self::serial(serial)?;
+        // SAFETY: valid device and a NUL-terminated serial.
+        if unsafe { ffi::ohmd_cv1touch_release_sensor(self.hands[HAND_RIGHT], serial_c.as_ptr()) }
+            == 0
+        {
+            self.retirement.released(serial);
+            Ok(())
+        } else {
+            Err(format!("the engine could not release sensor {serial}"))
+        }
     }
 
     /// Gives the open sensor `serial` the camera -> world pose it tracks with from its next frame
@@ -853,6 +1099,85 @@ mod tests {
         assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_stream>(), 64);
     }
 
+    /// A live add hands the engine the key the watcher's attachment names: the exact inverse of
+    /// how the engine reports a start's attachment, on both platforms.
+    #[test]
+    fn a_watcher_attachment_round_trips_to_the_engines_key() {
+        use crate::ffi;
+        for attachment in [
+            "sysfs:1:7@123456789abcdef0",
+            "sysfs:255:127@0000000000000001",
+            r"USB\VID_2833&PID_0211\SENSORALPHA@123456789abcdef0",
+        ] {
+            let key = super::attachment_key(attachment).expect(attachment);
+            assert_eq!(
+                super::sensor_attachment("SensorAlpha", key).as_deref(),
+                Some(attachment)
+            );
+        }
+        let key = super::attachment_key("sysfs:3:20@00000000deadbeef").unwrap();
+        assert_eq!(key.kind, ffi::OHMD_CV1TOUCH_ATTACHMENT_SYSFS);
+        assert_eq!(key.data, [3 | (20 << 8), 0xdeadbeef, 0]);
+        // lower-case Windows instance IDs are the same device
+        let key = super::attachment_key(r"usb\vid_2833&pid_0211\SENSORALPHA@0000000000000002");
+        assert_eq!(
+            key.map(|k| (k.kind, k.data)),
+            Some((ffi::OHMD_CV1TOUCH_ATTACHMENT_WINDOWS, [2, 0, 0]))
+        );
+        for unusable in [
+            "",
+            "sysfs:1:7@unknown",
+            "sysfs:1:7@0000000000000000",
+            "sysfs:0:7@0000000000000001",
+            "sysfs:1:0@0000000000000001",
+            "sysfs:1:256@0000000000000001",
+            "sysfs:1@0000000000000001",
+            "port-a-1",
+            r"USB\VID_2833&PID_0201\SENSORALPHA@0000000000000002",
+            r"USB\VID_2833&PID_0211\SENSORALPHA",
+        ] {
+            assert!(super::attachment_key(unusable).is_none(), "{unusable}");
+        }
+    }
+
+    #[test]
+    fn a_finished_add_keeps_its_outcome_record_and_times() {
+        use crate::ffi;
+        let mut native = ffi::ohmd_cv1touch_sensor_added {
+            outcome: ffi::OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED,
+            error_code: -1,
+            open_ms: 65,
+            start_ms: 1130,
+            lifetime: 41,
+            ..Default::default()
+        };
+        for (out, byte) in native.stream.serial.iter_mut().zip(b"SENSORALPHA") {
+            *out = *byte as std::ffi::c_char;
+        }
+        native.stream.error_kind = ffi::OHMD_CV1TOUCH_STREAM_ERROR_LIKELY_USB_BANDWIDTH;
+        native.stream.attachment = super::attachment_key("sysfs:1:7@0000000000000009").unwrap();
+        let added = super::SensorAdded::from_native(&native).unwrap();
+        assert_eq!(added.outcome, super::AddOutcome::StartFailed);
+        assert_eq!(
+            (
+                added.error_code,
+                added.open_ms,
+                added.start_ms,
+                added.lifetime
+            ),
+            (-1, 65, 1130, 41)
+        );
+        assert_eq!(added.start.serial, "SENSORALPHA");
+        assert_eq!(added.start.error_kind, "likely_usb_bandwidth");
+        assert_eq!(
+            added.start.attachment.as_deref(),
+            Some("sysfs:1:7@0000000000000009")
+        );
+        native.outcome = 99;
+        assert!(super::SensorAdded::from_native(&native).is_none());
+        assert_eq!(std::mem::size_of::<ffi::ohmd_cv1touch_sensor_added>(), 88);
+    }
+
     #[cfg(feature = "engine")]
     #[test]
     fn windows_discovery_callback_uses_only_its_pre_enumeration_snapshot() {
@@ -891,13 +1216,39 @@ mod tests {
 
     use super::*;
 
+    /// A retirement decided before the engine released the serial's sensors reaches none it
+    /// added since: decided with the sensor watch held, it was about the released ones.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn hotplug_a_retirement_reaches_no_sensor_added_after_a_release() {
+        // no native device: a retirement that goes ahead calls nothing
+        let retirement = SensorRetirement::default();
+        let before = retirement.stamp("SensorAlpha");
+        assert_eq!(retirement.retire(&before), Ok(true));
+        retirement.released("SENSORALPHA");
+        assert_eq!(
+            retirement.retire(&before),
+            Ok(false),
+            "decided before the release"
+        );
+        assert_eq!(
+            retirement.retire(&retirement.stamp("sensoralpha")),
+            Ok(true)
+        );
+        assert_eq!(
+            retirement.retire(&retirement.stamp("SENSORBETA")),
+            Ok(true),
+            "another serial"
+        );
+    }
+
     #[cfg(feature = "engine")]
     #[test]
     fn hotplug_retirement_cannot_outlive_its_native_device() {
         use std::sync::mpsc;
         use std::time::Duration;
         let retirement = SensorRetirement::default();
-        *retirement.0.lock().unwrap() =
+        retirement.0.lock().unwrap().device =
             Some(RetirementDevice(std::ptr::NonNull::dangling().as_ptr()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -905,10 +1256,10 @@ mod tests {
         std::thread::scope(|scope| {
             let r = &retirement;
             scope.spawn(move || {
-                r.with_device(|_| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                });
+                // a retirement in flight holds the target
+                let _target = r.0.lock().unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             });
             entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             scope.spawn(move || {
@@ -926,7 +1277,7 @@ mod tests {
             );
         });
         assert!(
-            retirement.with_device(|_| ()).is_none(),
+            retirement.0.lock().unwrap().device.is_none(),
             "a retained handle must never touch a closed device"
         );
     }

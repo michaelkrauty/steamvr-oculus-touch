@@ -883,13 +883,23 @@ static void release_serial(rift_tracker_ctx *ctx, const char *serial)
 	}
 }
 
-static bool sensor_open(rift_tracker_ctx *ctx, const char *serial)
+/* Engine thread: this serial's open sensor that is not retired, or NULL. */
+static rift_sensor_ctx *sensor_open(rift_tracker_ctx *ctx, const char *serial)
 {
 	for (size_t i = 0; i < ctx->n_sensors; i++)
 		if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(ctx->sensors[i]), serial) &&
 		    !rift_sensor_retired(ctx->sensors[i]))
-			return true;
-	return false;
+			return ctx->sensors[i];
+	return NULL;
+}
+
+int rift_tracker_get_sensor_lifetime(rift_tracker_ctx *ctx, const char *serial, uint64_t *out)
+{
+	rift_sensor_ctx *sensor = sensor_open(ctx, serial);
+	if (!sensor)
+		return -1;
+	*out = rift_sensor_lifetime(sensor);
+	return 0;
 }
 
 int rift_tracker_add_sensor(rift_tracker_ctx *ctx, const char *serial,
@@ -997,6 +1007,7 @@ static void adopt_sensor(rift_tracker_ctx *ctx, struct sensor_add_result *res)
 		LOGE("Could not retain sensor stream diagnostics");
 	/* Its earlier frames were exposed before its radio followed the headset */
 	rift_sensor_accept_frames_from(sensor, res->start_done_ns);
+	res->added.lifetime = rift_sensor_lifetime(sensor);
 }
 
 int rift_tracker_poll_sensor_adds(rift_tracker_ctx *ctx, ohmd_cv1touch_sensor_added *out, int max)

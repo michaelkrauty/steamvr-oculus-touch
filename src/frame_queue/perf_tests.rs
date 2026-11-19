@@ -7,14 +7,14 @@ use crate::track::tracker::stillness_tests::counted;
 #[test]
 fn bounded_insertion_matches_sorted_reference() {
     let mut q = FrameQueue::default();
-    q.register(["camera".into()]);
+    q.register([("camera".into(), 1)]);
     let mut reference = Vec::new();
     let mut seed = 42u64;
     let mut dropped = 0;
     for value in 0..20_000 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let time = (seed >> 32) % 100;
-        q.push_frame("camera", time, value);
+        q.push_frame("camera", 1, time, value);
         if let Some(i) = reference.iter().position(|&(t, _)| t == time) {
             reference.remove(i);
             dropped += 1;
@@ -27,7 +27,7 @@ fn bounded_insertion_matches_sorted_reference() {
         }
         assert_eq!(q.stats().dropped_frames, dropped);
         assert_eq!(
-            q.frames["camera"].iter().copied().collect::<Vec<_>>(),
+            q.frames["camera"].1.iter().copied().collect::<Vec<_>>(),
             reference
         );
         if value % 7 == 0 {
@@ -44,16 +44,16 @@ fn bounded_insertion_matches_sorted_reference() {
 fn selection_visits_once_in_order_and_retains_storage() {
     for mask in 0..4 {
         let mut q = FrameQueue::default();
-        q.register(["a".into(), "b".into()]);
+        q.register([("a".into(), 1), ("b".into(), 1)]);
         // Move the deque head so removal is also tested across its wrap.
         for time in 0..3 {
-            q.push_frame("a", time, time);
-            q.frames.get_mut("a").unwrap().pop_front();
+            q.push_frame("a", 1, time, time);
+            q.frames.get_mut("a").unwrap().1.pop_front();
         }
-        q.push_frame("a", 20, 1);
-        q.push_frame("a", 10, 0);
-        q.push_frame("b", 15, 2);
-        let capacity = q.frames["a"].capacity();
+        q.push_frame("a", 1, 20, 1);
+        q.push_frame("a", 1, 10, 0);
+        q.push_frame("b", 1, 15, 2);
+        let capacity = q.frames["a"].1.capacity();
         let mut visited = Vec::new();
         let taken = q.take_sensor_frames("a", |&value| {
             visited.push(value);
@@ -64,7 +64,7 @@ fn selection_visits_once_in_order_and_retains_storage() {
             taken,
             (0..2).filter(|i| mask & (1 << i) != 0).collect::<Vec<_>>()
         );
-        assert_eq!(q.frames["a"].capacity(), capacity);
+        assert_eq!(q.frames["a"].1.capacity(), capacity);
         assert_eq!(q.stats().dropped_frames, 0);
         let kept: Vec<_> = (0..2).filter(|i| mask & (1 << i) == 0).collect();
         let mut expected = kept.clone();
@@ -77,12 +77,12 @@ fn selection_visits_once_in_order_and_retains_storage() {
 #[test]
 fn registered_frames_and_empty_selections_do_not_allocate() {
     let mut q = FrameQueue::default();
-    q.register(["camera".into()]);
+    q.register([("camera".into(), 1)]);
     let (_, counts) = counted(|| {
         for time in 0..1000 {
-            q.push_frame("camera", time, time);
-            q.push_frame("camera", time, time); // replacement
-            q.push_frame("camera", 0, 0); // old exposure when full
+            q.push_frame("camera", 1, time, time);
+            q.push_frame("camera", 1, time, time); // replacement
+            q.push_frame("camera", 1, 0, 0); // old exposure when full
             assert!(q.take_sensor_frames("camera", |_| false).is_empty());
             if time % 5 == 0 {
                 q.pop_frame();
@@ -92,7 +92,7 @@ fn registered_frames_and_empty_selections_do_not_allocate() {
     assert_eq!(counts, (0, 0, 0));
     assert!(!q.take_sensor_frames("camera", |_| true).is_empty());
     // Taking every frame must not discard the ingress queue's allocation.
-    let (_, counts) = counted(|| q.push_frame("camera", 2000, 2000));
+    let (_, counts) = counted(|| q.push_frame("camera", 1, 2000, 2000));
     assert_eq!(counts, (0, 0, 0));
 }
 
