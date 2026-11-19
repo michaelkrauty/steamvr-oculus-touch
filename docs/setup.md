@@ -7,13 +7,13 @@ The supported build target is Linux x86-64. Rust 1.85 or newer, Cargo, Meson 1.3
 On Debian/Ubuntu with a suitable Rust toolchain:
 
 ```sh
-sudo apt install build-essential pkg-config meson ninja-build clang libclang-dev libhidapi-dev libusb-1.0-0-dev libopencv-dev libjpeg-dev libpipewire-0.3-dev libspa-0.2-dev python3 procps
+sudo apt install build-essential pkg-config meson ninja-build clang libclang-dev libhidapi-dev libusb-1.0-0-dev libjpeg-dev libpipewire-0.3-dev libspa-0.2-dev python3 procps
 ```
 
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel rust meson ninja clang hidapi libusb opencv libjpeg-turbo pipewire glib2 gstreamer gst-plugins-base python procps-ng
+sudo pacman -S --needed base-devel rust meson ninja clang hidapi libusb libjpeg-turbo pipewire glib2 gstreamer gst-plugins-base python procps-ng
 ```
 
 Hosted CI builds on Ubuntu 24.04; this identifies the build environment, not a SteamVR runtime compatibility guarantee. Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.

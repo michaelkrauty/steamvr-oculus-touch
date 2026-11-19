@@ -64,13 +64,13 @@ Take (Join-Path $root 'driver\cv1touch\driver.vrdrivermanifest') (Join-Path $Out
 foreach ($file in 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md') {
     Take (Join-Path $root $file) (Join-Path $Out $file)
 }
-foreach ($file in 'openhmd\LICENSE', 'licenses\nxjson-MIT.txt', 'licenses\miniz-Unlicense.txt', 'openvr\LICENSE', 'openvr\PROVENANCE.md') {
+foreach ($file in 'openhmd\LICENSE', 'openhmd\LICENSE-OpenCV', 'openhmd\src\drv_oculus_rift\rift-sensor-camera.c', 'openhmd\src\drv_oculus_rift\rift-sensor-pose.c', 'licenses\nxjson-MIT.txt', 'licenses\miniz-Unlicense.txt', 'openvr\LICENSE', 'openvr\PROVENANCE.md') {
     Take (Join-Path $root "third_party\$file") (Join-Path $Out "third_party\$file")
 }
 
 # The libraries the engine's DLLs carry (libusb as its own DLL, the others inside openhmd-0.dll),
 # with the version vcpkg built: the status file lists "Package: <port>" and "Version: <version>".
-$ports = 'libusb', 'opencv4', 'libjpeg-turbo', 'hidapi', 'zlib'
+$ports = 'libusb', 'libjpeg-turbo', 'hidapi'
 $versions = @{}
 $package = ''
 foreach ($line in Get-Content $status) {

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.1)
 
-project(openhmd C CXX)
+project(openhmd C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -70,7 +70,6 @@ option(OPENHMD_EXAMPLE_SDL "SDL OpenGL test (outdated)" OFF)
 
 if(OPENHMD_DRIVER_OCULUS_RIFT)
   pkg_check_modules(libusb-1.0 REQUIRED libusb-1.0)
-  find_package( OpenCV REQUIRED )
 
 	set(openhmd_source_files ${openhmd_source_files}
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/correspondence_search.c
@@ -100,8 +99,8 @@ if(OPENHMD_DRIVER_OCULUS_RIFT)
 	add_definitions(-DDRIVER_OCULUS_RIFT)
 
 	find_package(HIDAPI REQUIRED)
-  include_directories(${HIDAPI_INCLUDE_DIRS} ${libusb-1.0_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
-	set(LIBS ${LIBS} ${HIDAPI_LIBRARIES} ${libusb-1.0_LIBRARIES} ${OpenCV_LIBS})
+  include_directories(${HIDAPI_INCLUDE_DIRS} ${libusb-1.0_INCLUDE_DIRS})
+	set(LIBS ${LIBS} ${HIDAPI_LIBRARIES} ${libusb-1.0_LIBRARIES})
 endif(OPENHMD_DRIVER_OCULUS_RIFT)
 
 if(OPENHMD_DRIVER_OCULUS_RIFT_S)

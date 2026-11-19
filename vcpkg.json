@@ -6,11 +6,6 @@
   "dependencies": [
     "hidapi",
     "libjpeg-turbo",
-    "libusb",
-    {
-      "name": "opencv4",
-      "default-features": false,
-      "features": ["calib3d", "intrinsics", "thread"]
-    }
+    "libusb"
   ]
 }

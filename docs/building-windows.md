@@ -35,7 +35,7 @@ cargo run --no-default-features --example driver_contract -- build-driver\driver
 
 ## Engine
 
-`vcpkg.json` pins the dependencies: hidapi, libusb, OpenCV (calib3d) and libjpeg-turbo. The `x64-windows-cv1touch` triplet in `windows\triplets` builds them as static libraries on the static C runtime. The exception is libusb, which is LGPL-2.1 and ships as its own DLL.
+`vcpkg.json` pins the dependencies: hidapi, libusb and libjpeg-turbo. The `x64-windows-cv1touch` triplet in `windows\triplets` builds them as static libraries on the static C runtime. The exception is libusb, which is LGPL-2.1 and ships as its own DLL.
 
 ```powershell
 vcpkg install --x-manifest-root=. --overlay-triplets=windows\triplets --triplet x64-windows-cv1touch --x-install-root=vcpkg_installed
@@ -43,7 +43,7 @@ $env:CV1TOUCH_DEPS = "$PWD\vcpkg_installed\x64-windows-cv1touch"
 cargo test --lib --bins
 ```
 
-The first `vcpkg install` compiles OpenCV, which takes a long time. `build.rs` builds the engine with meson, links `openhmd`, and copies `openhmd-0.dll` and `libusb-1.0.dll` into the profile directory, `deps` and `examples` for directly run binaries and release bundles. It also puts libusb beside the engine in the native link-search directory inside `OUT_DIR`, which Cargo adds to the DLL search path for `cargo test` and `cargo run`; test executable locations differ between Cargo versions.
+`build.rs` builds the engine with meson, links `openhmd`, and copies `openhmd-0.dll` and `libusb-1.0.dll` into the profile directory, `deps` and `examples` for directly run binaries and release bundles. It also puts libusb beside the engine in the native link-search directory inside `OUT_DIR`, which Cargo adds to the DLL search path for `cargo test` and `cargo run`; test executable locations differ between Cargo versions.
 
 The repository's Cargo configuration statically links the MSVC runtime into the Rust executables, just as the native libraries do. Do not override it with a dynamic CRT build: the installer does not require or ship the Visual C++ Redistributable. `python windows/check_bundle.py target/bundle` uses `llvm-readobj` to reject unshipped DLL dependencies, including dependencies a CI runner happens to have installed.
 

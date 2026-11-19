@@ -1,5 +1,5 @@
 project(
-	'openhmd', 'c', 'cpp',
+	'openhmd', 'c',
 	default_options: 'c_std=c99',
 	version: '0.3.0',
 	meson_version: '>= 0.44',
@@ -30,16 +30,6 @@ dep_libm = meson.get_compiler('c').find_library('m', required: false)
 dep_hidapi = dependency(hidapi, required: true)
 dep_threads = dependency('threads')
 dep_libusb = dependency('libusb-1.0', required: true)
-dep_opencv = dependency('opencv4', required: false)
-if not dep_opencv.found()
-    dep_opencv = dependency('OpenCV', method: 'cmake', modules: ['opencv_core', 'opencv_calib'], required: false)
-endif
-if not dep_opencv.found()
-    dep_opencv = dependency('OpenCV', method: 'cmake', modules: ['opencv_core', 'opencv_calib3d'], required: false)
-endif
-if not dep_opencv.found()
-    error('OpenCV development files are required (Ubuntu: libopencv-dev)')
-endif
 
 dep_jpeg = dependency('libjpeg', required: false)
 
@@ -154,7 +144,6 @@ if _drivers.contains('rift')
 	]
 	c_args += '-DDRIVER_OCULUS_RIFT'
 	deps += dep_hidapi
-	deps += dep_opencv
 	if dep_jpeg.found()
 		deps += dep_jpeg
 	endif
@@ -259,7 +248,6 @@ openhmd_lib = library(
 	sources,
 	include_directories: include_directories('./include'),
 	c_args: c_args,
-	cpp_args: c_args,
 	dependencies: deps,
 	install: true,
 	version: library_version,

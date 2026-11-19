@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-LICENSE_FILES = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "third_party/openhmd/LICENSE", "third_party/licenses/nxjson-MIT.txt", "third_party/licenses/miniz-Unlicense.txt", "third_party/openvr/LICENSE", "third_party/openvr/PROVENANCE.md")
+LICENSE_FILES = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "third_party/openhmd/LICENSE", "third_party/openhmd/LICENSE-OpenCV", "third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c", "third_party/openhmd/src/drv_oculus_rift/rift-sensor-pose.c", "third_party/licenses/nxjson-MIT.txt", "third_party/licenses/miniz-Unlicense.txt", "third_party/openvr/LICENSE", "third_party/openvr/PROVENANCE.md")
 
 
 def run(args, **kwargs):
@@ -102,12 +102,10 @@ def artifacts(args, staging):
         shutil.copy2(library, staging / library.name)
     shutil.copy2(native / "driver/driver_cv1touch.so", staging / "driver_cv1touch.so")
     shutil.copy2(ROOT / "driver/cv1touch/driver.vrdrivermanifest", staging / "driver.vrdrivermanifest")
-    for name in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
-        shutil.copy2(ROOT / name, staging / name)
-    for name in ("openhmd/LICENSE", "licenses/nxjson-MIT.txt", "licenses/miniz-Unlicense.txt", "openvr/LICENSE", "openvr/PROVENANCE.md"):
-        destination = staging / "third_party" / name
+    for name in LICENSE_FILES:
+        destination = staging / name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / "third_party" / name, destination)
+        shutil.copy2(ROOT / name, destination)
     return staging
 
 

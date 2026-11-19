@@ -79,6 +79,20 @@ print(matches.pop())
 PY
 )
 native=$(cat "$(dirname "$daemon")/cv1touch-native-dir")
+if [ "$(uname -s)" = Linux ]; then
+  library="$native/third_party/openhmd/libopenhmd.so"
+  test -f "$library" || { echo "Missing OpenHMD library: $library" >&2; exit 1; }
+  dynamic=$(readelf -d "$library")
+  printf '%s\n' "$dynamic"
+  printf '%s\n' "$dynamic" | grep -q '(NEEDED)' || { echo 'OpenHMD has no dynamic dependencies' >&2; exit 1; }
+  closure=$(ldd "$library")
+  printf '%s\n' "$closure"
+  if printf '%s\n%s\n' "$dynamic" "$closure" | grep -Ei 'not found|libopencv|libstdc\+\+|libc\+\+'; then
+    echo 'OpenHMD has missing or forbidden dependencies' >&2
+    exit 1
+  fi
+  echo 'OpenHMD dependency check passed'
+fi
 meson test -C "$native" --no-rebuild --print-errorlogs
 # The SteamVR driver against the daemon's own shared-memory and control code.
 cargo run --locked --release --example driver_contract -- "$native/driver/test_daemon_contract"

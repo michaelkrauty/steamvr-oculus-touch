@@ -194,6 +194,34 @@ class InstallTests(unittest.TestCase):
         self.prefix = self.root / "prefix with spaces"
         self.env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"))
 
+    def test_opencv_notices_are_staged_and_installed(self):
+        target = self.root / "target"
+        release = target / "release"
+        native = self.root / "native"
+        (native / "third_party/openhmd").mkdir(parents=True)
+        (native / "driver").mkdir()
+        release.mkdir(parents=True)
+        (release / "cv1touch-native-dir").write_text(str(native))
+        for name in ("cv1touch", "cv1touchd"):
+            (release / name).write_bytes(b"binary")
+        (native / "third_party/openhmd/libopenhmd.so.0").write_bytes(b"library")
+        (native / "driver/driver_cv1touch.so").write_bytes(b"driver")
+        staging = self.root / "staging"
+        staging.mkdir()
+        args = mock.Mock(artifacts=None, no_build=True, target_dir=target)
+        with mock.patch.object(INSTALLER.subprocess, "check_output", return_value=json.dumps({"target_directory": str(target)})):
+            INSTALLER.artifacts(args, staging)
+        names = ("third_party/openhmd/LICENSE-OpenCV",
+                 "third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c",
+                 "third_party/openhmd/src/drv_oculus_rift/rift-sensor-pose.c")
+        for name in names:
+            self.assertEqual((staging / name).read_bytes(), (INSTALLER.ROOT / name).read_bytes())
+        self.bundle = staging
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in names:
+            self.assertEqual((self.prefix / "share/cv1touch" / name).read_bytes(), (staging / name).read_bytes())
+
     def invoke(self, *args, service=False, steamvr=False):
         command = [sys.executable, str(SCRIPT), "--prefix", str(self.prefix), "--artifacts", str(self.bundle)]
         if not steamvr:

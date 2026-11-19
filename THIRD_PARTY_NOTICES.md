@@ -7,6 +7,7 @@ The root Apache 2.0 license covers original SteamVR Oculus Touch code and local 
 | Component | Origin and revision | Applicable terms |
 | --- | --- | --- |
 | OpenHMD acquisition engine | [thaytan/OpenHMD](https://github.com/thaytan/OpenHMD), `a4ebf094e8be5c53c43c5f68d92e87afa5bdf0c8`, modified | [Boost 1.0](third_party/openhmd/LICENSE), including the Boost option in dual-license files; exceptions below |
+| OpenCV adapted code | [opencv/opencv](https://github.com/opencv/opencv): camera formulas from 5.1.0, pose solver from 4.12.0, modified; authorship and original notices retained in the source headers | [Apache-2.0](third_party/openhmd/LICENSE-OpenCV); the [pose source header](third_party/openhmd/src/drv_oculus_rift/rift-sensor-pose.c) also retains the original BSD 3-Clause conditions and disclaimer |
 | LambdaTwist headers | Bundled by that OpenHMD revision; retained authorship in each header | Boost option of GPL-2.0-or-later/Boost dual license |
 | nxjson | Bundled by OpenHMD; Copyright 2018 Yaroslav Stavnichiy | [MIT](third_party/licenses/nxjson-MIT.txt); small UTF-8 encoder independently replaced |
 | miniz | Bundled by OpenHMD; authors and history in source | [Unlicense](third_party/licenses/miniz-Unlicense.txt); original dedication retained in source |
@@ -32,9 +33,9 @@ Local OpenHMD cache writes use a consistent negative-error convention, publish a
 
 ## Build and runtime dependencies
 
-The camera model in `third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c` adapts projection and undistortion formulas from OpenCV 5.1.0 (cross-checked against 4.12.0), under Apache-2.0. Its upstream license and retained source notices are in `third_party/openhmd/LICENSE-OpenCV`. This code is modified to use plain C, normalised quaternions and the engine's float boundaries without OpenCV containers or allocations. The pose solver in `rift-sensor-pose.c` adapts OpenCV 4.12's `solvePnPRansac` with its EPnP and P3P solvers, singular value decomposition and iterative refinement, and retains the relevant source notices in that file. OpenCV is still linked during this transition.
+The camera model in `third_party/openhmd/src/drv_oculus_rift/rift-sensor-camera.c` adapts projection and undistortion formulas from OpenCV 5.1.0 (cross-checked against 4.12.0), under Apache-2.0. Its upstream license is in `third_party/openhmd/LICENSE-OpenCV` and its retained notices are in the source header. This code is modified to use plain C, normalised quaternions and the engine's float boundaries without OpenCV containers or allocations. The pose solver in `rift-sensor-pose.c` adapts OpenCV 4.12's `solvePnPRansac` with its EPnP and P3P solvers, singular value decomposition and iterative refinement, and retains the relevant source notices in that file.
 
-Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, OpenCV, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.
+Rust dependency versions and checksums are pinned in `Cargo.lock`. Their license metadata is available from Cargo/their package sources: libc (MIT/Apache-2.0), miniz_oxide (MIT/Zlib/Apache-2.0), nalgebra (BSD-3-Clause), serde/serde_json (MIT/Apache-2.0), bindgen (BSD-3-Clause), sha2 (MIT/Apache-2.0), and their transitive dependencies. These packages are not vendored here. Native system dependencies include hidapi, libusb, JPEG, and optionally PipeWire/SPA; their upstream licenses continue to apply. Distributing a prebuilt bundle requires reviewing the licenses of every included library, not merely this source repository.
 
 ## Windows bundle
 
@@ -43,10 +44,8 @@ The Windows installer ships binaries, which Linux leaves to the distribution's p
 | Component | How it ships | Applicable terms |
 | --- | --- | --- |
 | libusb | `libusb-1.0.dll`, its own DLL, so that it can be replaced by any compatible build; its source is at [libusb/libusb](https://github.com/libusb/libusb) under the version `windows-bundle.txt` names | LGPL-2.1-or-later (`libusb-copyright.txt`) |
-| OpenCV (calib3d and what it needs) | statically linked into `openhmd-0.dll` | Apache-2.0 (`opencv4-copyright.txt`) |
 | libjpeg-turbo | statically linked into `openhmd-0.dll` | IJG, BSD-3-Clause and zlib (`libjpeg-turbo-copyright.txt`) |
 | hidapi | statically linked into `openhmd-0.dll` | BSD-3-Clause option (`hidapi-copyright.txt`) |
-| zlib | statically linked, through the above | Zlib (`zlib-copyright.txt`) |
 | Rust crates | statically linked into `cv1touchd.exe`, `cv1touch.exe` and `cv1touchd-quiet.exe`, or used to build them | each crate's own, listed in `rust-crates.txt` with the texts in `rust\` (MIT, Apache-2.0, BSD-3-Clause and the like) |
 
 SteamVR is installed separately. Its Oculus input profiles and controller meshes are referenced from that installation; no Oculus firmware, proprietary runtime, mesh, texture, input-profile asset, or SteamVR binary is redistributed here. Oculus, Touch, Meta, Steam, SteamVR, and OpenVR names are used to identify interoperability targets and do not imply endorsement.
