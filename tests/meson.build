@@ -135,7 +135,8 @@ foreach scenario : ['stale-tail', 'nearly-complete', 'header-only', 'fid-sequenc
                     'packet-error', 'timestamp', 'jpeg', 'missing-pts', 'missing-header-end',
                     'same-fid-after-stall', 'gap-damage', 'discard-summary', 'starvation-log',
                     'opening-error-raw', 'opening-error-jpeg', 'bad-traffic-start', 'bad-traffic-rejected',
-                    'raw-overrun-report', 'quality-counts', 'latency']
+                    'raw-overrun-report', 'quality-counts', 'latency',
+                    'idle-resume', 'idle-discards', 'idle-jpeg']
   test('uvc_frames_' + scenario, test_uvc_frames, args: [scenario])
 endforeach
 test_jpeg_dep = dependency('libjpeg', required: false)

@@ -53,6 +53,11 @@ struct rift_sensor_uvc_stream {
 	int frame_collected;
 	/* true if we're skipping the current frame */
 	bool skip_frame;
+	/* cv1touch: the current raw image is wanted by nothing: checked and counted, never
+	 * copied or delivered. Latched at its boundary from wanted_cb. */
+	bool idle;
+	/* An idle image came since the last delivery. */
+	bool idle_gap;
 	/* An image starts only at an observed FID/PTS boundary. */
 	bool have_frame_id;
 	/* A boundary has been accepted since this stream started. */
@@ -74,6 +79,11 @@ struct rift_sensor_uvc_stream {
 	uint64_t discard_window_start;
 	/* Optional device-owned lifetime counter; outlives all streaming callbacks. */
 	uint64_t *frames_dropped;
+	/* cv1touch: asked at each raw image boundary whether anything needs the image (NULL:
+	 * everything is needed). Complete idle images are counted in *frames_received. */
+	bool (*wanted_cb)(void *data);
+	void *wanted_data;
+	uint64_t *frames_received;
 
 	/* USB streaming alt_setting */
 	int alt_setting;

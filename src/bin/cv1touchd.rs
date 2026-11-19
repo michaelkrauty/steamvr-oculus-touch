@@ -18,7 +18,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -171,6 +171,8 @@ struct Daemon {
     /// The radio's recent traffic, recorded around a controller's dropout.
     flight: FlightRecorder,
     quit: AtomicBool,
+    /// Wakes every `sleep_until` to look at `quit` and its condition (`wake_sleepers`).
+    naps: (Mutex<()>, Condvar),
     /// The first critical worker that stopped unexpectedly; read without any worker locks.
     failed_worker: AtomicU8,
     /// A client asked the daemon to stop (control `stop`).
@@ -304,6 +306,13 @@ impl Daemon {
 
     fn wake_radio(&self) {
         self.radio_wake.wake();
+    }
+
+    /// After `quit` or a sleeper's condition is set: taking the lock orders this after any
+    /// sleeper's check, so none misses it.
+    fn wake_sleepers(&self) {
+        drop(self.naps.0.lock().unwrap_or_else(PoisonError::into_inner));
+        self.naps.1.notify_all();
     }
 }
 
@@ -600,12 +609,22 @@ impl EngineSink for Daemon {
         gyro_squared: f32,
     ) {
         if let Some(h) = pipeline::device_hand(device) {
-            self.radio_activity[reader as usize][h].push(cv1touch::hand::RadioActivity {
+            let activity = &self.radio_activity[reader as usize][h];
+            let engine_wake = reader as usize == engine::RadioReader::Engine as usize
+                && !asleep
+                && activity.latest_activity().is_none_or(|(at, was_asleep)| {
+                    was_asleep
+                        || host_ns.saturating_sub(at) >= HandConfig::default().connect_timeout_ns
+                });
+            activity.push(cv1touch::hand::RadioActivity {
                 device_time_ns: device_ns,
                 received_host_ns: host_ns,
                 asleep,
                 moving: cv1touch::hand::in_use_motion(gyro_squared),
             });
+            if engine_wake {
+                self.wake_radio();
+            }
         }
     }
 
@@ -711,7 +730,10 @@ impl EngineSink for Daemon {
         }
         if self.tracker == TrackerKind::Rust && source == 0 {
             if let Some(us) = pipeline::hmd_report_timestamp(data) {
-                self.track_in.lock().unwrap().push_clock(ts, us);
+                let ready = self.track_in.lock().unwrap().push_clock(ts, us);
+                if ready {
+                    self.wake_radio();
+                }
             }
         }
     }
@@ -839,6 +861,7 @@ fn shutdown_and_drain<T>(d: &Daemon, drain: impl FnOnce() -> T) -> T {
 
 fn begin_shutdown(d: &Daemon) {
     d.quit.store(true, Ordering::Release);
+    d.wake_sleepers();
     publish_disconnected(d);
 }
 
@@ -1605,13 +1628,21 @@ fn sleep_interruptible(d: &Daemon, ms: u64) {
     sleep_until(d, ms, || false);
 }
 
-/// Sleeps `ms`, or until quitting or `wake` says so.
+/// Sleeps `ms`, or until quitting or `wake` says so (`Daemon::wake_sleepers`).
 fn sleep_until(d: &Daemon, ms: u64, wake: impl Fn() -> bool) {
-    for _ in 0..ms / 50 {
-        if d.quit.load(Ordering::Acquire) || wake() {
+    let end = std::time::Instant::now() + Duration::from_millis(ms);
+    let mut nap = d.naps.0.lock().unwrap_or_else(PoisonError::into_inner);
+    while !d.quit.load(Ordering::Acquire) && !wake() {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
             return;
         }
-        thread::sleep(Duration::from_millis(50));
+        nap = d
+            .naps
+            .1
+            .wait_timeout(nap, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -3769,9 +3800,8 @@ impl BodyFinder {
     }
 }
 
-/// How long the radio thread sleeps with nothing to do, ms: it keeps the hands' published state
-/// current (a controller set down stops sending) about this often.
-const RADIO_IDLE_WAKE_MS: u64 = 20;
+/// How often the radio thread republishes a hand it publishes without a new report, keeping its
+/// published state current (a controller set down stops sending).
 const RADIO_REFRESH_NS: u64 = 20_000_000;
 
 /// The radio thread's own newest sample of each hand, and when it last published each.
@@ -3786,6 +3816,114 @@ struct RadioSensors<'a> {
     reposing: Reposing,
     /// Borrowed. The caller's resources join the landmark worker after WorkerExit.
     watch: &'a mut Option<LandmarkWatch>,
+}
+
+fn all_sensor_images_wanted(d: &Daemon, started: u64, now: u64) -> bool {
+    let timeout = HandConfig::default().connect_timeout_ns;
+    d.rec.active()
+        || *d.mode.lock().unwrap() != "calibrated"
+        || (0..2).any(|h| {
+            d.radio_activity
+                .iter()
+                .filter_map(|reader| reader[h].latest_activity())
+                // Ties are conservatively awake.
+                .max_by_key(|&(at, asleep)| (at, !asleep))
+                .map_or(now.saturating_sub(started) < timeout, |(at, asleep)| {
+                    !asleep && now.saturating_sub(at) < timeout
+                })
+        })
+}
+
+/// `None` means every sensor; otherwise only the listed serials are wanted.
+#[derive(PartialEq, Eq)]
+struct ImageDemand {
+    revision: u64,
+    wanted: Option<std::collections::BTreeSet<String>>,
+    admitted: std::collections::BTreeMap<String, u64>,
+}
+
+impl ImageDemand {
+    fn new(
+        all: bool,
+        sensors: &RadioSensors<'_>,
+        admitted: std::collections::BTreeMap<String, u64>,
+    ) -> Self {
+        let wanted = (!all).then(|| {
+            let reposing = &sensors.reposing;
+            reposing
+                .probed_since
+                .keys()
+                .map(String::as_str)
+                .chain(reposing.monitor.inspecting())
+                .chain(reposing.monitor.restoring().iter().map(String::as_str))
+                .chain(
+                    sensors
+                        .watch
+                        .iter()
+                        .flat_map(|w| w.monitor.watched_serials()),
+                )
+                .map(str::to_ascii_uppercase)
+                .collect()
+        });
+        Self {
+            revision: sensors.revision,
+            wanted,
+            admitted,
+        }
+    }
+
+    fn wants_lifetime(&self, serial: &str, lifetime: u64) -> bool {
+        self.admitted
+            .get(&cv1touch::status::sensor_identity(serial))
+            != Some(&lifetime)
+            || self.wants(serial)
+    }
+
+    fn wants(&self, serial: &str) -> bool {
+        self.wanted.as_ref().is_none_or(|wanted| {
+            wanted
+                .iter()
+                .any(|s| cv1touch::status::same_sensor(s, serial))
+        })
+    }
+}
+
+/// Drain the HID reports in arrival order. The decoder publishes activity even
+/// when it cannot return a calibrated controller sample.
+fn drain_radio_reports(
+    d: &Daemon,
+    mut read: impl FnMut(&mut [u8; 64]) -> std::io::Result<Option<usize>>,
+    mut decode: impl FnMut(&[u8], u64),
+) -> std::io::Result<()> {
+    let mut buf = [0; 64];
+    while let Some(n) = read(&mut buf)? {
+        let report = &buf[..n];
+        decode(report, d.radio_report(report));
+    }
+    Ok(())
+}
+
+/// Decode reports (which publish activity) and service sensor work before sending demand.
+fn radio_image_pass<D>(
+    d: &Daemon,
+    decoder: &mut D,
+    sensors: &mut RadioSensors<'_>,
+    previous: &mut Option<ImageDemand>,
+    started: u64,
+    work: impl FnOnce(&mut D, &mut RadioSensors<'_>) -> u64,
+    set_wanted: impl FnOnce(&mut D, &ImageDemand),
+) -> u64 {
+    let now = work(decoder, sensors);
+    let demand = ImageDemand::new(
+        all_sensor_images_wanted(d, started, now),
+        sensors,
+        d.track_in.lock().unwrap().admitted_lifetimes(),
+    );
+    if previous.as_ref() != Some(&demand) {
+        set_wanted(decoder, &demand);
+        *previous = Some(demand);
+    }
+    now
 }
 
 /// The radio thread's exit marker and its borrowed landmark watch.
@@ -3992,135 +4130,150 @@ fn radio_main(
     let mut holds = HoldStats::default();
     let mut own = RadioHands::default();
     let mut search_skip = SearchSkip::default();
+    let mut image_demand = None;
     let mut next_stats = 0u64;
-    let mut buf = [0u8; 64];
     let mut clocks = Vec::new();
     let mut radio_failed = false;
     let mut rest = Rest::new();
+    let started = shm::now_ns();
     while !link.stop.load(Ordering::Acquire) && !radio_failed {
-        let idle_ms = if d.track_in.lock().unwrap().is_empty() {
-            RADIO_IDLE_WAKE_MS
+        // Queued frames need immediate service; clock samples wake us in batches.
+        let idle_ms = if !d.track_in.lock().unwrap().has_frames() {
+            let now = shm::now_ns();
+            let timers = [next_stats, sensors.reposing.next_tick, biases.next_save];
+            radio_deadline(&link.hands, &own, now, timers)
+                .saturating_sub(now)
+                .div_ceil(1_000_000)
         } else {
             0
         };
         // an interrupted wait just reads what is in
         let _ = radio.wait(&d.radio_wake, Some(Duration::from_millis(idle_ms)));
-        // every report that is in
-        let mut arrived = [None; 2];
-        let mut published = false;
-        while !radio_failed {
-            let n = match radio.try_read(&mut buf) {
-                Ok(Some(n)) => n,
-                Ok(None) => break,
-                Err(err) => {
-                    // the headset gone (waiting on a dead device returns at once, which would
-                    // spin this thread): the engine reopens, with a new radio thread
+        let now = radio_image_pass(
+            d,
+            dec,
+            sensors,
+            &mut image_demand,
+            started,
+            |dec, sensors| {
+                // every report that is in
+                let mut arrived = [None; 2];
+                let mut published = false;
+                if let Err(err) = drain_radio_reports(
+                    d,
+                    |buf| radio.try_read(buf),
+                    |report, at| {
+                        let (samples, k) = dec.decode(report, at);
+                        for s in &samples[..k] {
+                            let Some(h) = pipeline::device_hand(s.device_id) else {
+                                continue;
+                            };
+                            if !link.hands.radio_publishes(h) || !pipe.has_body(h) {
+                                continue;
+                            }
+                            let Some(view) = link.engine_view.lock().unwrap()[h] else {
+                                continue;
+                            };
+                            let c = radio_sample(&view, s);
+                            let now = shm::now_ns();
+                            publish_radio_state(d, sensors, pipe, h, &c, shm::now_ns, log);
+                            own.newest[h] = Some(*s);
+                            own.last_publish[h] = now;
+                            arrived[h] = Some(HoldParts {
+                                held_ns: at,
+                                ..Default::default()
+                            });
+                            published = true;
+                        }
+                    },
+                ) {
+                    // A dead device would spin in wait; reopen with a new radio thread.
                     log!("radio read failed ({err}); reopening the engine");
                     radio_failed = true;
-                    break;
                 }
-            };
-            let report = &buf[..n];
-            let at = d.radio_report(report);
-            let (samples, k) = dec.decode(report, at);
-            for s in &samples[..k] {
-                let Some(h) = pipeline::device_hand(s.device_id) else {
-                    continue;
-                };
-                if !link.hands.radio_publishes(h) || !pipe.has_body(h) {
-                    continue;
+                if published {
+                    d.shm.signal();
+                    holds.note(arrived, shm::now_ns());
                 }
-                let Some(view) = link.engine_view.lock().unwrap()[h] else {
-                    continue;
-                };
-                let c = radio_sample(&view, s);
-                let now = shm::now_ns();
-                publish_radio_state(d, sensors, pipe, h, &c, shm::now_ns, log);
-                own.newest[h] = Some(*s);
-                own.last_publish[h] = now;
-                arrived[h] = Some(HoldParts {
-                    held_ns: at,
-                    ..Default::default()
+                deliver_new_bodies(&link.bodies, |b| {
+                    pipe.body(b.device_id, b.leds.clone(), b.imu);
+                    log!(
+                        "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
+                        ["left", "right"][b.hand],
+                        b.leds.len(),
+                        b.imu.x * 1e3,
+                        b.imu.y * 1e3,
+                        b.imu.z * 1e3
+                    );
+                    biases.seed(pipe, b.hand, &b.leds);
+                    link.hands.request(b.hand);
                 });
-                published = true;
-            }
-        }
-        if published {
-            d.shm.signal();
-            holds.note(arrived, shm::now_ns());
-        }
-        deliver_new_bodies(&link.bodies, |b| {
-            pipe.body(b.device_id, b.leds.clone(), b.imu);
-            log!(
-                "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
-                ["left", "right"][b.hand],
-                b.leds.len(),
-                b.imu.x * 1e3,
-                b.imu.y * 1e3,
-                b.imu.z * 1e3
-            );
-            biases.seed(pipe, b.hand, &b.leds);
-            link.hands.request(b.hand);
-        });
-        with_radio_sensors(
-            d,
-            &mut sensors.revision,
-            pipe,
-            &mut sensors.reposing,
-            sensors.watch,
-            |_, _| (),
-        );
-        let identities = d.track_identities.lock().unwrap().take();
-        for (serial, evidence) in identities {
-            pipe.inspection_lifecycle(&serial, &evidence);
-        }
-        d.track_in.lock().unwrap().take_clocks_into(&mut clocks);
-        for &(host, us) in &clocks {
-            pipe.hmd_clock_sample(host, us);
-        }
-        let search = d.track_searches.lock().unwrap().pop_frame();
-        if let Some((info, remaining_ns)) = search {
-            pipe.hold_inspection(&info, remaining_ns);
-        }
-        consume_camera_frame(d, sensors, pipe);
-        // A handoff can happen after the radio's last report. Persistent publication still
-        // refreshes and expires that hand even before this worker has a sample of its own.
-        let now = shm::now_ns();
-        // a removed sensor's landmark results are forgotten before they are taken
-        with_radio_sensors(
-            d,
-            &mut sensors.revision,
-            pipe,
-            &mut sensors.reposing,
-            sensors.watch,
-            |_, watch| {
-                if let Some(w) = watch.as_mut() {
-                    w.poll(d, now);
+                with_radio_sensors(
+                    d,
+                    &mut sensors.revision,
+                    pipe,
+                    &mut sensors.reposing,
+                    sensors.watch,
+                    |_, _| (),
+                );
+                let identities = d.track_identities.lock().unwrap().take();
+                for (serial, evidence) in identities {
+                    pipe.inspection_lifecycle(&serial, &evidence);
                 }
+                d.track_in.lock().unwrap().take_clocks_into(&mut clocks);
+                for &(host, us) in &clocks {
+                    pipe.hmd_clock_sample(host, us);
+                }
+                let search = d.track_searches.lock().unwrap().pop_frame();
+                if let Some((info, remaining_ns)) = search {
+                    pipe.hold_inspection(&info, remaining_ns);
+                }
+                consume_camera_frame(d, sensors, pipe);
+                // A handoff can happen after the radio's last report. Persistent publication still
+                // refreshes and expires that hand even before this worker has a sample of its own.
+                let now = shm::now_ns();
+                // a removed sensor's landmark results are forgotten before they are taken
+                with_radio_sensors(
+                    d,
+                    &mut sensors.revision,
+                    pipe,
+                    &mut sensors.reposing,
+                    sensors.watch,
+                    |_, watch| {
+                        if let Some(w) = watch.as_mut() {
+                            w.poll(d, now);
+                        }
+                    },
+                );
+                if refresh_radio_hands(d, link, &mut own, pipe, sensors, shm::now_ns, log) {
+                    d.shm.signal();
+                }
+                for h in [HAND_LEFT, HAND_RIGHT] {
+                    // only hands our tracker publishes, and only while fits keep coming: a track no second
+                    // sensor has confirmed yet may be wrong, and the engine keeps searching meanwhile
+                    let since_fix = pipe
+                        .tracker(h)
+                        .filter(|t| t.tracking())
+                        .and_then(|t| Some(t.newest_imu()?.saturating_sub(t.last_fix())));
+                    let since_sample =
+                        own.newest[h].map(|s| now.saturating_sub(s.received_host_ns));
+                    search_skip.hands[h] = link.hands.radio_publishes(h)
+                        && pipe.has_body(h)
+                        && search_needless(since_fix, since_sample);
+                }
+                if let Some(hands) = search_skip.changed() {
+                    dec.set_search_skip(hands);
+                }
+                if let Some(f) = biases.update(pipe, now) {
+                    *link.biases.lock().unwrap() = Some(f);
+                }
+                sensors.reposing.tick(d, link, pipe, sensors.watch, now);
+                now
+            },
+            |dec, demand| {
+                dec.set_images_wanted(|serial, lifetime| demand.wants_lifetime(serial, lifetime))
             },
         );
-        if refresh_radio_hands(d, link, &mut own, pipe, sensors, shm::now_ns, log) {
-            d.shm.signal();
-        }
-        for h in [HAND_LEFT, HAND_RIGHT] {
-            // only hands our tracker publishes, and only while fits keep coming: a track no second
-            // sensor has confirmed yet may be wrong, and the engine keeps searching meanwhile
-            let since_fix = pipe
-                .tracker(h)
-                .filter(|t| t.tracking())
-                .and_then(|t| Some(t.newest_imu()?.saturating_sub(t.last_fix())));
-            let since_sample = own.newest[h].map(|s| now.saturating_sub(s.received_host_ns));
-            search_skip.hands[h] = link.hands.radio_publishes(h)
-                && pipe.has_body(h)
-                && search_needless(since_fix, since_sample);
-        }
-        if let Some(hands) = search_skip.changed() {
-            dec.set_search_skip(hands);
-        }
-        if let Some(f) = biases.update(pipe, now) {
-            *link.biases.lock().unwrap() = Some(f);
-        }
-        sensors.reposing.tick(d, link, pipe, sensors.watch, now);
         rest.if_due(now);
         if now >= next_stats {
             d.pending_frames_dropped
@@ -4137,6 +4290,28 @@ fn radio_main(
     if let Some(f) = biases.take_changed() {
         *link.biases.lock().unwrap() = Some(f);
     }
+}
+
+/// When the radio thread next has timed work with no report or frame to wake it: each hand it
+/// publishes is republished, or expired, `RADIO_REFRESH_NS` after its last publish, and a hand
+/// it asked for is looked at as often until the engine lets go; then the earliest of `timers`
+/// (statistics, repose tick, bias save). The landmark watch closes its windows and takes its
+/// results on the pass the repose tick (`REPOSE_TICK_NS`) brings at the latest.
+fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u64; 3]) -> u64 {
+    [HAND_LEFT, HAND_RIGHT]
+        .into_iter()
+        .filter_map(|h| {
+            if hands.radio_publishes(h) {
+                Some(own.last_publish[h] + RADIO_REFRESH_NS)
+            } else {
+                hands.wanted[h]
+                    .load(Ordering::Acquire)
+                    .then_some(now + RADIO_REFRESH_NS)
+            }
+        })
+        .chain(timers)
+        .min()
+        .unwrap_or(u64::MAX)
 }
 
 fn refresh_radio_hands(
@@ -4180,11 +4355,12 @@ fn refresh_radio_hands(
             // The engine can let go of the hand just before this pass ends, its controller still
             // reporting. Only once nothing has published the hand for the connect timeout have
             // its samples stopped, a radio gap like any other. Meanwhile this thread looks after
-            // the hand, which keeps the heartbeat off it, and tries again on its next pass.
+            // the hand, which keeps the heartbeat off it, and tries again on its next refresh.
             if now.saturating_sub(publisher.worker_publish_ns)
                 < HandConfig::default().connect_timeout_ns
             {
                 d.hand_workers[h].store(now, Ordering::Release);
+                own.last_publish[h] = now;
                 continue;
             }
             let mut gaps = GapNotices::default();
@@ -5517,6 +5693,7 @@ fn status_json(d: &Daemon) -> String {
 fn recording_started(d: &Daemon, started: Result<(), String>) -> String {
     match started {
         Ok(()) => {
+            d.wake_radio();
             d.session.lock().unwrap().reset();
             "ok".into()
         }
@@ -5744,6 +5921,7 @@ fn handle(d: &Daemon, line: &str) -> String {
                 .filter(|p| Some(p.0) == created)
                 .map(|p| p.1);
             d.universe_recheck.store(true, Ordering::Release);
+            d.wake_sleepers();
             let (alignment, notes) = align::load_with(shift.as_ref());
             publish_alignment(d, alignment);
             format!("ok {}", notes.join("; "))
@@ -6301,6 +6479,7 @@ fn wait_for_recording_start(
         };
         if let Some(result) = pending.poll() {
             if result.is_ok() && !d.stop_requested.load(Ordering::Acquire) {
+                d.wake_radio();
                 *starting = None;
                 return Ok(true);
             }
@@ -6365,6 +6544,7 @@ fn finish_recording_startup(
 ) -> i32 {
     let _no_more_requests = control.stop();
     d.quit.store(true, Ordering::Release);
+    d.wake_sleepers();
     let status = d
         .rec
         .stop_timeout(None, RECORD_SHUTDOWN_WAIT)
@@ -6634,6 +6814,7 @@ fn main() {
         record_command: Mutex::new(()),
         flight: FlightRecorder::new(),
         quit: AtomicBool::new(false),
+        naps: Default::default(),
         failed_worker: AtomicU8::new(0),
         stop_requested: AtomicBool::new(false),
         haptics: Mutex::new([None; 2]),
@@ -8427,6 +8608,37 @@ mod tests {
         assert!(events[0].1[HAND_RIGHT].epochs.is_empty());
     }
 
+    #[test]
+    fn a_sleeping_watcher_wakes_at_once_for_shutdown_or_its_condition() {
+        let d = status_daemon();
+        let recheck = AtomicBool::new(false);
+        let woke = |set: &dyn Fn()| {
+            thread::scope(|scope| {
+                let sleeper = scope.spawn(|| {
+                    let start = std::time::Instant::now();
+                    sleep_until(&d, 60_000, || recheck.swap(false, Ordering::AcqRel));
+                    start.elapsed()
+                });
+                thread::sleep(Duration::from_millis(20));
+                set();
+                sleeper.join().unwrap()
+            })
+        };
+        let rechecked = woke(&|| {
+            recheck.store(true, Ordering::Release);
+            d.wake_sleepers();
+        });
+        assert!(rechecked < Duration::from_secs(1), "{rechecked:?}");
+        let quit = woke(&|| begin_shutdown(&d));
+        assert!(quit < Duration::from_secs(1), "{quit:?}");
+        let start = std::time::Instant::now();
+        sleep_until(&d, 60_000, || false);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "already quitting"
+        );
+    }
+
     pub(crate) fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
@@ -8440,6 +8652,7 @@ mod tests {
             record_command: Mutex::new(()),
             flight: FlightRecorder::new(),
             quit: AtomicBool::new(false),
+            naps: Default::default(),
             failed_worker: AtomicU8::new(0),
             stop_requested: AtomicBool::new(false),
             haptics: Mutex::new([None; 2]),
@@ -10636,6 +10849,201 @@ mod tests {
             "retirement must precede IMU drain"
         );
         assert!(pipe.camera(&a.serial).is_none());
+    }
+
+    #[test]
+    fn image_demand_follows_latest_radio_activity() {
+        let d = status_daemon();
+        let timeout = HandConfig::default().connect_timeout_ns;
+        let start = 100;
+        let report = |reader, device, at, asleep| d.activity(reader, device, at, at, asleep, 0.0);
+        use engine::RadioReader::{Engine, Radio};
+        report(Engine, 1, start, true);
+        assert!(all_sensor_images_wanted(&d, start, start + timeout - 1));
+        assert!(!all_sensor_images_wanted(&d, start, start + timeout));
+        report(Engine, 2, start + 1, true);
+        assert!(!all_sensor_images_wanted(&d, start, start + 1));
+        let awake = start + 2;
+        report(Radio, 1, awake, false);
+        assert!(all_sensor_images_wanted(&d, start, awake));
+        assert!(all_sensor_images_wanted(&d, start, awake + timeout - 1));
+        assert!(!all_sensor_images_wanted(&d, start, awake + timeout));
+        report(Radio, 1, awake + 1, true);
+        assert!(!all_sensor_images_wanted(&d, start, awake + 1));
+        *d.mode.lock().unwrap() = "capture".into();
+        assert!(all_sensor_images_wanted(&d, start, awake + 1));
+        *d.mode.lock().unwrap() = "calibrated".into();
+        let dir = socket_dir::SocketDir::new();
+        d.rec.start(&dir.path().join("demand.rec"), awake).unwrap();
+        assert!(all_sensor_images_wanted(&d, start, awake + 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_hmd_reports_wake_the_radio_in_batches_without_losing_clocks() {
+        let d = status_daemon();
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("report-source");
+        std::fs::write(&path, []).unwrap();
+        let mut radio = hid::Device::open(&path).unwrap();
+        let mut data = [0; 64];
+        data[0] = pipeline::HMD_SENSORS_REPORT;
+        let mut clocks = Vec::new();
+        let mut passes = 0;
+        let mut samples = 0;
+        // Twelve seconds at 500 Hz with no frames or radio reports. Model the 250 ms
+        // stats deadline and up to 18 ms of delay in servicing the real waker.
+        for i in 1..=6_000u32 {
+            let us = i * 2_000;
+            data[8..12].copy_from_slice(&us.to_le_bytes());
+            d.report(0, u64::from(us) * 1_000, &data);
+            let timer = i % 125 == 0;
+            let woken = (timer || i % 10 == 0)
+                && radio
+                    .wait(&d.radio_wake, Some(Duration::ZERO))
+                    .unwrap()
+                    .waker;
+            if timer || woken {
+                let mut ingress = d.track_in.lock().unwrap();
+                assert!(!ingress.has_frames());
+                ingress.take_clocks_into(&mut clocks);
+                samples += clocks.len();
+                passes += 1;
+            }
+        }
+        assert_eq!(d.track_in.lock().unwrap().stats().dropped_clocks, 0);
+        assert_eq!(samples, 6_000);
+        assert!(passes <= 12 * 36, "{passes} passes in twelve seconds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_recording_wakes_the_radio() {
+        let d = status_daemon();
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("report-source");
+        std::fs::write(&path, []).unwrap();
+        let mut radio = hid::Device::open(&path).unwrap();
+        let woke = |radio: &mut hid::Device| {
+            radio
+                .wait(&d.radio_wake, Some(Duration::ZERO))
+                .unwrap()
+                .waker
+        };
+        assert!(!woke(&mut radio));
+        let command = format!(
+            "record start {} frames",
+            dir.path().join("wake.rec").display()
+        );
+        assert_eq!(handle(&d, &command), "ok");
+        assert!(woke(&mut radio));
+    }
+
+    #[test]
+    fn an_awake_report_raises_image_demand_in_the_same_radio_pass() {
+        let d = status_daemon();
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        let mut previous = None;
+        let mut pushes = Vec::new();
+        let mut pass = |now, report: Option<bool>, sensors: &mut RadioSensors<'_>| {
+            radio_image_pass(
+                &d,
+                &mut pushes,
+                sensors,
+                &mut previous,
+                100,
+                |_, _| {
+                    let mut pending = report;
+                    drain_radio_reports(
+                        &d,
+                        |buf| {
+                            Ok(pending.take().map(|asleep| {
+                                buf[0] = u8::from(asleep);
+                                1
+                            }))
+                        },
+                        |report, _| {
+                            d.activity(
+                                engine::RadioReader::Radio,
+                                1,
+                                now,
+                                now,
+                                report[0] != 0,
+                                0.0,
+                            );
+                        },
+                    )
+                    .unwrap();
+                    now
+                },
+                |pushes, demand| pushes.push(demand.wants("A")),
+            );
+            pushes.clone()
+        };
+        d.activity(engine::RadioReader::Radio, 2, 100, 100, true, 0.0);
+        assert_eq!(pass(100, Some(true), &mut sensors), [false]);
+        assert_eq!(pass(101, Some(false), &mut sensors), [false, true]);
+        assert_eq!(pass(102, None, &mut sensors), [false, true]);
+        sensors.revision = 1;
+        assert_eq!(pass(103, None, &mut sensors), [false, true, true]);
+    }
+
+    #[test]
+    fn image_demand_does_not_gate_a_native_lifetime_before_admission() {
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        let mut admitted = std::collections::BTreeMap::new();
+        admitted.insert("A".to_string(), 1);
+        let stale = ImageDemand::new(false, &sensors, admitted.clone());
+        assert!(!stale.wants_lifetime("a", 1));
+        // Native insertion can precede the radio's Added event, including a replacement.
+        assert!(stale.wants_lifetime("a", 2));
+        assert!(stale.wants_lifetime("B", 3));
+        admitted.insert("A".to_string(), 2);
+        admitted.insert("B".to_string(), 3);
+        sensors.revision = 1;
+        let fresh = ImageDemand::new(false, &sensors, admitted);
+        assert!(!fresh.wants_lifetime("a", 2));
+        assert!(!fresh.wants_lifetime("b", 3));
+    }
+
+    #[test]
+    fn image_demand_is_per_sensor_for_reposing_and_landmarks() {
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        let check = |sensors: &RadioSensors<'_>, a| {
+            assert_eq!(
+                ImageDemand::new(false, sensors, Default::default()).wants("A"),
+                a
+            );
+            assert!(!ImageDemand::new(false, sensors, Default::default()).wants("B"));
+            assert!(ImageDemand::new(true, sensors, Default::default()).wants("B"));
+        };
+        check(&sensors, false);
+        sensors.reposing.probed_since.insert("A".into(), 1);
+        check(&sensors, true);
+        sensors.reposing.probed_since.clear();
+        sensors.reposing.monitor.search_finished("A");
+        check(&sensors, true);
+        sensors.reposing.monitor.engine_restored("A");
+        check(&sensors, false);
+        *sensors.watch = Some(LandmarkWatch {
+            monitor: track::landmarks::BackgroundMonitor::new(
+                vec![track::landmarks::Landmark {
+                    serial: "A".into(),
+                    x: 100.0,
+                    y: 100.0,
+                    seen: 0.5,
+                }],
+                LANDMARK_WINDOW_NS,
+                20,
+            )
+            .unwrap(),
+            alerts: Default::default(),
+            missing: Default::default(),
+        });
+        check(&sensors, true);
     }
 
     fn radio_sensors(watch: &mut Option<LandmarkWatch>) -> RadioSensors<'_> {
@@ -16743,6 +17151,11 @@ mod tests {
                 d.shm.hand(HAND_RIGHT).unwrap().flags & ffi::CV1T_FLAG_RADIO_GAP,
                 0
             );
+            // waiting for the engine's sample, the radio thread sleeps until its next refresh
+            assert_eq!(
+                radio_deadline(&link.hands, &own, now + at, [u64::MAX; 3]),
+                now + at + RADIO_REFRESH_NS
+            );
         }
         publish_unavailable_with_log(&d, now + 101_000_000, |n| notices.push(n));
         assert!(refresh_radio_hands(
@@ -16751,7 +17164,7 @@ mod tests {
             &mut own,
             &mut pipe,
             &mut sensors,
-            || now + 102_000_000,
+            || now + 106_000_000,
             |n| notices.push(n),
         ));
         assert_ne!(
@@ -17666,6 +18079,39 @@ mod tests {
     /// OpenHMD's brute-force search leaves out a controller our tracker fitted within the last
     /// SEARCH_SKIP_FIX_NS, or one silent on the radio for SEARCH_SKIP_ASLEEP_NS, and searches for
     /// any other: never fitted, fits stopped, or a short radio dropout.
+    #[test]
+    fn the_radio_sleeps_until_its_next_timed_duty() {
+        let ms = 1_000_000;
+        let (now, timers) = (1000 * ms, [1250 * ms, 2000 * ms, 31_000 * ms]);
+        let hands = HandOwnership::default();
+        let own = RadioHands {
+            last_publish: [995 * ms, 990 * ms],
+            ..Default::default()
+        };
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1250 * ms,
+            "idle: statistics"
+        );
+        hands.request(HAND_RIGHT);
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1020 * ms,
+            "a hand the engine has yet to let go"
+        );
+        assert!(!hands.engine_publishes(HAND_RIGHT));
+        assert_eq!(
+            radio_deadline(&hands, &own, now, timers),
+            1010 * ms,
+            "a published hand's refresh"
+        );
+        assert_eq!(
+            radio_deadline(&hands, &own, now, [999 * ms, 2000 * ms, 31_000 * ms]),
+            999 * ms,
+            "an overdue timer"
+        );
+    }
+
     #[test]
     fn the_search_skips_freshly_fitted_and_sleeping_controllers_only() {
         let ms = 1_000_000;

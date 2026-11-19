@@ -245,6 +245,9 @@ static bool rift_sensor_usb_start(rift_sensor_device *base_dev, uint8_t min_fram
 
 	dev->frame_cb = frame_cb;
 	dev->frame_cb_data = cb_data;
+	dev->uvc_stream.wanted_cb = base_dev->cv1touch_wanted;
+	dev->uvc_stream.wanted_data = base_dev->cv1touch_wanted_data;
+	dev->uvc_stream.frames_received = base_dev->cv1touch_frames_received;
 	base_dev->stream_status = (ohmd_cv1touch_sensor_stream){
 		.error_kind = OHMD_CV1TOUCH_STREAM_ERROR_OTHER,
 	};

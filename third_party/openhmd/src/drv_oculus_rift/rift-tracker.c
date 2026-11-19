@@ -1912,6 +1912,17 @@ void rift_tracked_device_get_export(rift_tracked_device *dev_base, rift_tracked_
 	ohmd_unlock_mutex (dev->device_lock);
 }
 
+void rift_tracker_set_images_wanted(rift_tracker_ctx *ctx,
+		int (*wanted)(const char *serial, uint64_t lifetime, void *data), void *data)
+{
+	ohmd_lock_mutex(ctx->roster_lock);
+	for (size_t i = 0; i < ctx->n_sensors; i++) {
+		rift_sensor_ctx *sensor = ctx->sensors[i];
+		rift_sensor_set_images_wanted(sensor, !wanted || wanted(rift_sensor_serial_no(sensor), rift_sensor_lifetime(sensor), data));
+	}
+	ohmd_unlock_mutex(ctx->roster_lock);
+}
+
 void rift_tracker_set_search_skip(rift_tracker_ctx *ctx, uint32_t device_mask)
 {
 	__atomic_store_n(&ctx->cv1touch_search_skip, device_mask, __ATOMIC_RELAXED);

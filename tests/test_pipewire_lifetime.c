@@ -104,6 +104,28 @@ static void a_second_user_waits_for_the_connection(void) {
   CHECK(live == 0 && ohmd_pw_global_data_ptr == NULL);
 }
 
+/* State callbacks and USB boundary reads run on different threads. */
+static void *toggle_connection(void *arg) {
+  ohmd_pw_video_stream *v = arg;
+  for (int i = 0; i < 10000; i++) {
+    on_stream_state_changed(&v->base, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    on_stream_state_changed(&v->base, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+  }
+  return NULL;
+}
+
+static void connection_is_safe_to_read_concurrently(void) {
+  ohmd_pw_video_stream v = {0};
+  pthread_t thread;
+  CHECK(pthread_create(&thread, NULL, toggle_connection, &v) == 0);
+  for (int i = 0; i < 10000; i++)
+    (void)ohmd_pw_video_stream_connected(&v);
+  CHECK(pthread_join(thread, NULL) == 0);
+  CHECK(!ohmd_pw_video_stream_connected(&v));
+  on_stream_state_changed(&v.base, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+  CHECK(ohmd_pw_video_stream_connected(&v));
+}
+
 int main(void) {
   for (int fail = 1; fail <= 6; fail++) {
     calls = live = 0;
@@ -136,6 +158,7 @@ int main(void) {
                                  64, 60, 1) == NULL);
   CHECK(live == 0 && ohmd_pw_global_data_ptr == NULL);
   a_second_user_waits_for_the_connection();
+  connection_is_safe_to_read_concurrently();
   puts("test_pipewire_lifetime: ok");
   return 0;
 }

@@ -46,6 +46,8 @@ typedef struct rift_tracked_device_export {
 
 void rift_tracked_device_get_export(rift_tracked_device *dev, rift_tracked_device_export *out);
 int rift_tracker_get_sensor_count(rift_tracker_ctx *ctx);
+void rift_tracker_set_images_wanted(rift_tracker_ctx *ctx,
+		int (*wanted)(const char *serial, uint64_t lifetime, void *data), void *data);
 /* cv1touch: the devices (bit 1 << device id) the brute-force search leaves out, because the
  * daemon's own tracker holds them or they are asleep (rift_pose_finder_process_blobs_fast).
  * Any thread. */

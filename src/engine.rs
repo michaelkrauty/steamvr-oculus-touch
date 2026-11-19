@@ -1024,6 +1024,39 @@ impl RadioDecoder {
         (out, n.clamp(0, 2) as usize)
     }
 
+    /// Update every live sensor by serial while the native roster is stable.
+    pub fn set_images_wanted(&mut self, wanted: impl Fn(&str, u64) -> bool) {
+        fn set<F: Fn(&str, u64) -> bool>(decoder: &mut RadioDecoder, wanted: &F) {
+            unsafe extern "C" fn visit<F: Fn(&str, u64) -> bool>(
+                serial: *const std::ffi::c_char,
+                lifetime: u64,
+                data: *mut std::ffi::c_void,
+            ) -> c_int {
+                // SAFETY: the synchronous call supplies a native C string and our live closure.
+                let serial = unsafe { std::ffi::CStr::from_ptr(serial) };
+                let wanted = unsafe { &*data.cast::<F>() };
+                // Fail open, including on panic: never unwind across the native roster lock.
+                i32::from(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        serial
+                            .to_str()
+                            .map_or(true, |serial| wanted(serial, lifetime))
+                    }))
+                    .unwrap_or(true),
+                )
+            }
+            // SAFETY: native code does not retain the callback or its data.
+            unsafe {
+                ffi::ohmd_cv1touch_radio_decoder_set_images_wanted(
+                    decoder.0,
+                    Some(visit::<F>),
+                    std::ptr::from_ref(wanted).cast_mut().cast(),
+                );
+            }
+        }
+        set(self, &wanted);
+    }
+
     /// Leaves the controllers of `hands` (by hand index) out of the engine's brute-force pose
     /// search until the next call or the decoder's drop: the caller's tracker holds them, or they
     /// are asleep. The engine still matches them against its own priors.

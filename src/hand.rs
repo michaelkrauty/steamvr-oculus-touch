@@ -86,6 +86,7 @@ const ACTIVITY_SLOTS: usize = 256;
 /// before an older entry the next drain retains; this daemon has no such producer.
 pub struct RadioActivityQueue {
     slots: [ActivitySlot; ACTIVITY_SLOTS],
+    latest: std::sync::atomic::AtomicU64,
     head: std::sync::atomic::AtomicUsize,
     tail: std::sync::atomic::AtomicUsize,
     lost: std::sync::atomic::AtomicBool,
@@ -108,6 +109,7 @@ impl Default for RadioActivityQueue {
     fn default() -> Self {
         Self {
             slots: std::array::from_fn(|_| ActivitySlot::default()),
+            latest: Default::default(),
             head: Default::default(),
             tail: Default::default(),
             lost: Default::default(),
@@ -124,8 +126,19 @@ impl Default for RadioActivityQueue {
 }
 
 impl RadioActivityQueue {
+    /// Independent of the queue consumer and overflow: newest host time and explicit sleep bit.
+    pub fn latest_activity(&self) -> Option<(u64, bool)> {
+        let packed = self.latest.load(std::sync::atomic::Ordering::Relaxed);
+        (packed != 0).then(|| ((packed >> 1) - 1, packed & 1 != 0))
+    }
+
     pub fn push(&self, activity: RadioActivity) {
         use std::sync::atomic::Ordering;
+        // Monotonic nanoseconds fit in 63 bits for over 290 years.
+        self.latest.store(
+            ((activity.received_host_ns + 1) << 1) | u64::from(activity.asleep),
+            Ordering::Relaxed,
+        );
         let head = self.head.load(Ordering::Relaxed);
         if head.wrapping_sub(self.tail.load(Ordering::Acquire)) == ACTIVITY_SLOTS {
             if activity.moving {

@@ -823,6 +823,80 @@ static void latency(void)
     finish();
 }
 
+static bool test_wanted(void *data) { return *(bool *)data; }
+
+static void idle_resume(void)
+{
+    start();
+    bool wanted = false;
+    uint64_t received = 0;
+    stream.wanted_cb = test_wanted;
+    stream.wanted_data = &wanted;
+    stream.frames_received = &received;
+    memset(image, 42, sizeof image);
+    feed(1, 100, 0, image, FRAME_BYTES / 2);
+    CHECK(callbacks == 0 && received == 0);
+    CHECK(stream.n_free_frames == 1 && stream.cur_frame == NULL);
+    wanted = true;
+    feed(1, 100, 2, image, FRAME_BYTES / 2);
+    feed(1, 100, 2, NULL, 0);
+    CHECK(callbacks == 0 && received == 1 && stream.n_free_frames == 1);
+    retain_frame = true;
+    feed(0, 200, 0, image, FRAME_BYTES / 2);
+    CHECK(stream.cur_frame && callbacks == 0);
+    uint64_t first = stream.cur_frame->start_ts;
+    CHECK(first >= submitted_ns);
+    feed(0, 200, 2, image, FRAME_BYTES / 2);
+    CHECK(callbacks == 1 && received == 1 && held_frame->cv1touch_after_idle);
+    CHECK(held_frame->start_ts == first && held_frame->data_size == FRAME_BYTES);
+    CHECK(memcmp(held_frame->data, image, FRAME_BYTES) == 0);
+    rift_sensor_uvc_stream_release_frame(held_frame, &stream);
+    retain_frame = false;
+    full(1, 300);
+    CHECK(!stream.free_frames[0]->cv1touch_after_idle);
+    finish();
+}
+
+static void idle_discards(void)
+{
+    unsigned char expected[sizeof stream.discards];
+    for (int pass = 0; pass < 2; ++pass) {
+        start();
+        bool wanted = pass == 0;
+        uint64_t received = 0, dropped = 0;
+        stream.wanted_cb = test_wanted;
+        stream.wanted_data = &wanted;
+        stream.frames_received = &received;
+        stream.frames_dropped = &dropped;
+        feed(1, 100, 0, image, 16);
+        feed(1, 100, 0, image, FRAME_BYTES); /* too long */
+        feed(0, 200, 0, image, 16);
+        feed(1, 200, 0, image, 16); /* sequence */
+        feed(1, 300, 0x40, image, 16); /* camera */
+        feed(0, 400, 2, image, 16); /* incomplete */
+        feed(1, 500, 0, image, FRAME_BYTES);
+        feed(1, 500, 0, image, 16); /* trailing */
+        feed(0, 600, 2, image, FRAME_BYTES); /* rejected next image */
+        CHECK(dropped == 5);
+        CHECK(callbacks == wanted && received == !wanted);
+        if (wanted) memcpy(expected, stream.discards, sizeof expected);
+        else CHECK(memcmp(expected, stream.discards, sizeof expected) == 0);
+        finish();
+    }
+}
+
+static void idle_jpeg(void)
+{
+    start();
+    bool wanted = false;
+    stream.format = OHMD_VIDEO_FRAME_FORMAT_JPEG;
+    stream.wanted_cb = test_wanted;
+    stream.wanted_data = &wanted;
+    feed(1, 100, 2, image, 16);
+    CHECK(callbacks == 1 && last_bytes == 16);
+    finish();
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -859,6 +933,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "raw-overrun-report")) raw_overrun_report();
     else if (!strcmp(argv[1], "quality-counts")) quality_counts();
     else if (!strcmp(argv[1], "latency")) latency();
+    else if (!strcmp(argv[1], "idle-resume")) idle_resume();
+    else if (!strcmp(argv[1], "idle-discards")) idle_discards();
+    else if (!strcmp(argv[1], "idle-jpeg")) idle_jpeg();
     else CHECK(false);
     return 0;
 }
