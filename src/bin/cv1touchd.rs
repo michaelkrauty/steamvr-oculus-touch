@@ -3839,10 +3839,15 @@ fn all_sensor_images_wanted(d: &Daemon, started: u64, now: u64) -> bool {
 struct ImageDemand {
     revision: u64,
     wanted: Option<std::collections::BTreeSet<String>>,
+    admitted: std::collections::BTreeMap<String, u64>,
 }
 
 impl ImageDemand {
-    fn new(all: bool, sensors: &RadioSensors<'_>) -> Self {
+    fn new(
+        all: bool,
+        sensors: &RadioSensors<'_>,
+        admitted: std::collections::BTreeMap<String, u64>,
+    ) -> Self {
         let wanted = (!all).then(|| {
             let reposing = &sensors.reposing;
             reposing
@@ -3863,7 +3868,15 @@ impl ImageDemand {
         Self {
             revision: sensors.revision,
             wanted,
+            admitted,
         }
+    }
+
+    fn wants_lifetime(&self, serial: &str, lifetime: u64) -> bool {
+        self.admitted
+            .get(&cv1touch::status::sensor_identity(serial))
+            != Some(&lifetime)
+            || self.wants(serial)
     }
 
     fn wants(&self, serial: &str) -> bool {
@@ -3901,7 +3914,11 @@ fn radio_image_pass<D>(
     set_wanted: impl FnOnce(&mut D, &ImageDemand),
 ) -> u64 {
     let now = work(decoder, sensors);
-    let demand = ImageDemand::new(all_sensor_images_wanted(d, started, now), sensors);
+    let demand = ImageDemand::new(
+        all_sensor_images_wanted(d, started, now),
+        sensors,
+        d.track_in.lock().unwrap().admitted_lifetimes(),
+    );
     if previous.as_ref() != Some(&demand) {
         set_wanted(decoder, &demand);
         *previous = Some(demand);
@@ -4253,7 +4270,9 @@ fn radio_main(
                 sensors.reposing.tick(d, link, pipe, sensors.watch, now);
                 now
             },
-            |dec, demand| dec.set_images_wanted(|serial| demand.wants(serial)),
+            |dec, demand| {
+                dec.set_images_wanted(|serial, lifetime| demand.wants_lifetime(serial, lifetime))
+            },
         );
         rest.if_due(now);
         if now >= next_stats {
@@ -10971,13 +10990,35 @@ mod tests {
     }
 
     #[test]
+    fn image_demand_does_not_gate_a_native_lifetime_before_admission() {
+        let mut watch = None;
+        let mut sensors = radio_sensors(&mut watch);
+        let mut admitted = std::collections::BTreeMap::new();
+        admitted.insert("A".to_string(), 1);
+        let stale = ImageDemand::new(false, &sensors, admitted.clone());
+        assert!(!stale.wants_lifetime("a", 1));
+        // Native insertion can precede the radio's Added event, including a replacement.
+        assert!(stale.wants_lifetime("a", 2));
+        assert!(stale.wants_lifetime("B", 3));
+        admitted.insert("A".to_string(), 2);
+        admitted.insert("B".to_string(), 3);
+        sensors.revision = 1;
+        let fresh = ImageDemand::new(false, &sensors, admitted);
+        assert!(!fresh.wants_lifetime("a", 2));
+        assert!(!fresh.wants_lifetime("b", 3));
+    }
+
+    #[test]
     fn image_demand_is_per_sensor_for_reposing_and_landmarks() {
         let mut watch = None;
         let mut sensors = radio_sensors(&mut watch);
         let check = |sensors: &RadioSensors<'_>, a| {
-            assert_eq!(ImageDemand::new(false, sensors).wants("A"), a);
-            assert!(!ImageDemand::new(false, sensors).wants("B"));
-            assert!(ImageDemand::new(true, sensors).wants("B"));
+            assert_eq!(
+                ImageDemand::new(false, sensors, Default::default()).wants("A"),
+                a
+            );
+            assert!(!ImageDemand::new(false, sensors, Default::default()).wants("B"));
+            assert!(ImageDemand::new(true, sensors, Default::default()).wants("B"));
         };
         check(&sensors, false);
         sensors.reposing.probed_since.insert("A".into(), 1);

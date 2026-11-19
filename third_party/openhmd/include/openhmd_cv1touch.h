@@ -293,7 +293,7 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_search_skip(
 /* Synchronously set image demand by serial. The callback must not reenter the engine;
  * NULL restores demand for every sensor. New streams start wanted. */
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_images_wanted(ohmd_cv1touch_radio_decoder *dec,
-		int (*wanted)(const char *serial, void *data), void *data);
+		int (*wanted)(const char *serial, uint64_t lifetime, void *data), void *data);
 /* Stable factory-calibration identity, 32 lowercase hex bytes + NUL. Returns -1 until
  * calibrated or on invalid arguments. Engine thread only. Does not change sample ABI. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller_identity(ohmd_device *device, char *out, int size);

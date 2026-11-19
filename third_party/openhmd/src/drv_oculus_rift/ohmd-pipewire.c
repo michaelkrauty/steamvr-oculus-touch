@@ -81,13 +81,13 @@ static void on_stream_state_changed(void *_data, enum pw_stream_state old, enum 
 	switch (state) {
 	case PW_STREAM_STATE_STREAMING:
 	{
-		s->connected = true;
+		__atomic_store_n(&s->connected, true, __ATOMIC_RELEASE);
 		break;
 	}
 	case PW_STREAM_STATE_ERROR:
 	case PW_STREAM_STATE_UNCONNECTED:
 	default:
-		s->connected = false;
+		__atomic_store_n(&s->connected, false, __ATOMIC_RELEASE);
 		break;
 	}
 }
@@ -360,7 +360,7 @@ done:
 bool ohmd_pw_video_stream_connected (ohmd_pw_video_stream *v)
 {
 	ohmd_pw_base_stream *base = (ohmd_pw_base_stream *)(v);
-	return base != NULL && base->connected;
+	return base != NULL && __atomic_load_n(&base->connected, __ATOMIC_ACQUIRE);
 }
 
 void ohmd_pw_video_stream_push (ohmd_pw_video_stream *v, int64_t pts, const uint8_t *pixels)
@@ -469,7 +469,7 @@ fail:
 bool ohmd_pw_debug_stream_connected (ohmd_pw_debug_stream *s)
 {
 	ohmd_pw_base_stream *base = (ohmd_pw_base_stream *)(s);
-	return base != NULL && base->connected;
+	return base != NULL && __atomic_load_n(&base->connected, __ATOMIC_ACQUIRE);
 }
 
 void ohmd_pw_debug_stream_push (ohmd_pw_debug_stream *s, int64_t pts, const char *debug_str)

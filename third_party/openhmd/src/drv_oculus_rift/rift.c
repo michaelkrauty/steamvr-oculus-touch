@@ -1668,7 +1668,7 @@ OHMD_APIENTRYDLL ohmd_cv1touch_radio_decoder *OHMD_APIENTRY ohmd_cv1touch_radio_
 }
 
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_images_wanted(ohmd_cv1touch_radio_decoder *dec,
-		int (*wanted)(const char *serial, void *data), void *data)
+		int (*wanted)(const char *serial, uint64_t lifetime, void *data), void *data)
 {
 	if (dec != NULL && dec->hmd->tracker_ctx != NULL)
 		rift_tracker_set_images_wanted(dec->hmd->tracker_ctx, wanted, data);

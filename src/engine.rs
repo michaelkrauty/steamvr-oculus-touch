@@ -1025,10 +1025,11 @@ impl RadioDecoder {
     }
 
     /// Update every live sensor by serial while the native roster is stable.
-    pub fn set_images_wanted(&mut self, wanted: impl Fn(&str) -> bool) {
-        fn set<F: Fn(&str) -> bool>(decoder: &mut RadioDecoder, wanted: &F) {
-            unsafe extern "C" fn visit<F: Fn(&str) -> bool>(
+    pub fn set_images_wanted(&mut self, wanted: impl Fn(&str, u64) -> bool) {
+        fn set<F: Fn(&str, u64) -> bool>(decoder: &mut RadioDecoder, wanted: &F) {
+            unsafe extern "C" fn visit<F: Fn(&str, u64) -> bool>(
                 serial: *const std::ffi::c_char,
+                lifetime: u64,
                 data: *mut std::ffi::c_void,
             ) -> c_int {
                 // SAFETY: the synchronous call supplies a native C string and our live closure.
@@ -1037,7 +1038,9 @@ impl RadioDecoder {
                 // Fail open, including on panic: never unwind across the native roster lock.
                 i32::from(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        serial.to_str().map_or(true, wanted)
+                        serial
+                            .to_str()
+                            .map_or(true, |serial| wanted(serial, lifetime))
                     }))
                     .unwrap_or(true),
                 )

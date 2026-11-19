@@ -61,6 +61,14 @@ impl<F> FrameQueue<F> {
         }
     }
 
+    /// Snapshot the admitted native lifetimes for a synchronous demand update.
+    pub fn admitted_lifetimes(&self) -> BTreeMap<String, u64> {
+        self.frames
+            .iter()
+            .map(|(serial, (lifetime, _))| (crate::status::sensor_identity(serial), *lifetime))
+            .collect()
+    }
+
     /// Admit the native object `lifetime` a running engine added, without disturbing other
     /// queues: its frames are queued from now on. It replaces another object of its serial and
     /// discards that one's frames; adding the object already admitted changes nothing.
