@@ -111,6 +111,10 @@ int main(void) {
                                                  .area = 9};
                     struct result a = run(&model, &cal, blobs, count, scenario == 2, 1);
                     struct result b = run(&model, &cal, blobs, count, scenario == 2, 0);
+                    for (int i = 0; i < 3; i++) {
+                        CHECK(a.score.orient_error.arr[i] == 0 && a.score.pos_error.arr[i] == 0);
+                        CHECK(b.score.orient_error.arr[i] == 0 && b.score.pos_error.arr[i] == 0);
+                    }
                     CHECK(a.accepted == b.accepted && a.trials == b.trials && a.checks == b.checks);
                     CHECK(memcmp(&a.pose, &b.pose, sizeof(a.pose)) == 0);
                     CHECK(memcmp(&a.score, &b.score, sizeof(a.score)) == 0);

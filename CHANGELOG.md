@@ -6,6 +6,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- Cold correspondence searches initialize pose error metrics before returning them, avoiding undefined values when no prior pose is available.
 - The Windows source build instructions now note the LLVM version required by newer MSVC standard libraries.
 - Building from source with Rust 1.100 works again on Linux and Windows, including tests and release bundles. Rust 1.85 remains supported.
 
