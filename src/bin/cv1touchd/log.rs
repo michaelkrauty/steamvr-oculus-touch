@@ -13,7 +13,8 @@ const CAPACITY: usize = 256;
 const LINE_BYTES: usize = 2048;
 const TRUNCATED: &str = " [truncated]";
 const EXIT_FLUSH: Duration = Duration::from_millis(200);
-const POLL: Duration = Duration::from_millis(2);
+/// Retry interval for a drop report the writer could not write; never used while output works.
+const RETRY: Duration = Duration::from_millis(2);
 
 struct Line {
     bytes: [u8; LINE_BYTES],
@@ -129,11 +130,15 @@ struct Shared {
     pending: AtomicUsize,
     writing: AtomicBool,
     closed: AtomicBool,
+    #[cfg(test)]
+    passes: AtomicUsize,
 }
 
 #[derive(Clone)]
 struct Logger {
     shared: Arc<Shared>,
+    /// Parked while there is nothing to write; woken on every enqueue, drop and close.
+    writer: thread::Thread,
 }
 
 impl Logger {
@@ -144,14 +149,18 @@ impl Logger {
             pending: AtomicUsize::new(0),
             writing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            passes: AtomicUsize::new(0),
         });
         let worker = shared.clone();
-        thread::Builder::new()
+        let writer = thread::Builder::new()
             .name("cv1t-log".into())
             .spawn(move || {
                 write_loop(worker, writer);
-            })?;
-        Ok(Self { shared })
+            })?
+            .thread()
+            .clone();
+        Ok(Self { shared, writer })
     }
 
     fn enqueue(&self, line: Line) {
@@ -163,6 +172,7 @@ impl Logger {
             self.shared.dropped.fetch_add(1, Ordering::Relaxed);
             self.shared.pending.fetch_sub(1, Ordering::Release);
         }
+        self.writer.unpark();
     }
 
     fn line(&self, args: fmt::Arguments<'_>) {
@@ -197,12 +207,15 @@ impl Logger {
 
     fn close(&self, within: Duration) -> bool {
         self.shared.closed.store(true, Ordering::Release);
+        self.writer.unpark();
         self.flush(within)
     }
 }
 
 fn write_loop(shared: Arc<Shared>, mut writer: impl io::Write) {
     loop {
+        #[cfg(test)]
+        shared.passes.fetch_add(1, Ordering::Relaxed);
         shared.writing.store(true, Ordering::Release);
         while let Some(line) = shared.queue.pop() {
             let written = writer
@@ -226,7 +239,13 @@ fn write_loop(shared: Arc<Shared>, mut writer: impl io::Write) {
         {
             return;
         }
-        thread::sleep(POLL);
+        // Every enqueue, drop and close unparks after updating these, so a line that arrived since
+        // the queue was found empty leaves the park token set and this returns at once.
+        if shared.dropped.load(Ordering::Acquire) != 0 {
+            thread::park_timeout(RETRY);
+        } else {
+            thread::park();
+        }
     }
 }
 
@@ -644,6 +663,32 @@ mod rate_tests {
             }
         }
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn an_idle_writer_waits_for_a_line_and_still_writes_everything_on_close() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let logger = Logger::new(Collect(bytes.clone())).unwrap();
+        logger.line(format_args!("before"));
+        let start = Instant::now();
+        while !bytes.lock().unwrap().ends_with(b"before\n") {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(5));
+        let idle = logger.shared.passes.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(100));
+        let woke = logger.shared.passes.load(Ordering::Relaxed) - idle;
+        assert_eq!(
+            woke, 0,
+            "the writer woke {woke} times with nothing to write"
+        );
+        logger.line(format_args!("after"));
+        assert!(logger.close(Duration::from_secs(2)));
+        assert_eq!(
+            &*bytes.lock().unwrap(),
+            b"cv1touchd: before\ncv1touchd: after\n"
+        );
     }
 
     #[test]

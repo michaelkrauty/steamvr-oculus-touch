@@ -13,6 +13,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - When the controllers are asleep or disconnected, the daemon stops copying and analysing unneeded raw camera images. The streams stay open and doctor still checks that video is arriving. USB 2 cameras and cameras being repositioned, inspected or watched for landmark movement keep processing images.
 
+- The daemon wakes less often while idle. Its log writer waits for a line instead of checking about 480 times a second.
+
 ## [0.4.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.0) - 2026-11-19
 
 ### Changed
