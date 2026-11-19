@@ -6,6 +6,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "../log-output.h"
+#include <pthread.h>
 #include <strings.h>
 
 #include <spa/param/video/format-utils.h>
@@ -60,9 +61,14 @@ struct ohmd_pw_debug_stream_s {
 };
 
 static ohmd_pw_global_data *ohmd_pw_global_data_ptr = NULL;
+/* cv1touch: sensors are created and freed on the engine's live-sensor worker too, while the
+ * engine thread can create a controller's debug stream: the shared connection is counted under
+ * this lock */
+static pthread_mutex_t ohmd_pw_global_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void ohmd_pipewire_global_deinit();
 static ohmd_pw_global_data *ohmd_pipewire_global_init();
+static void ohmd_pipewire_global_deinit_locked();
 
 static void on_stream_state_changed(void *_data, enum pw_stream_state old, enum pw_stream_state state,
 				const char *error)
@@ -124,7 +130,7 @@ static const struct pw_stream_events video_stream_events = {
 	.param_changed = on_video_stream_param_changed,
 };
 
-static ohmd_pw_global_data *ohmd_pipewire_global_init()
+static ohmd_pw_global_data *ohmd_pipewire_global_init_locked()
 {
 	ohmd_pw_global_data *gdata;
 
@@ -153,11 +159,26 @@ static ohmd_pw_global_data *ohmd_pipewire_global_init()
     gdata->thread_started = true;
     return gdata;
 fail:
-    ohmd_pipewire_global_deinit();
+    ohmd_pipewire_global_deinit_locked();
     return NULL;
 }
 
+static ohmd_pw_global_data *ohmd_pipewire_global_init()
+{
+	pthread_mutex_lock(&ohmd_pw_global_lock);
+	ohmd_pw_global_data *gdata = ohmd_pipewire_global_init_locked();
+	pthread_mutex_unlock(&ohmd_pw_global_lock);
+	return gdata;
+}
+
 static void ohmd_pipewire_global_deinit()
+{
+	pthread_mutex_lock(&ohmd_pw_global_lock);
+	ohmd_pipewire_global_deinit_locked();
+	pthread_mutex_unlock(&ohmd_pw_global_lock);
+}
+
+static void ohmd_pipewire_global_deinit_locked()
 {
 	ohmd_pw_global_data *gdata = ohmd_pw_global_data_ptr;
 

@@ -153,6 +153,45 @@ struct sensor_stream_record {
     int pin_fd; /* one O_PATH|O_DIRECTORY|O_CLOEXEC metadata pin, closed on forget/replacement/close */
 };
 
+/* cv1touch: a sensor the engine thread asked the hot-plug worker to open and start */
+struct sensor_add_request {
+	char serial[32];
+	ohmd_cv1touch_sensor_attachment key;
+	bool have_pose;
+	ohmd_cv1touch_sensor_pose pose;
+};
+
+/* cv1touch: a finished add, waiting for the engine thread to poll it */
+struct sensor_add_result {
+	ohmd_cv1touch_sensor_added added;
+	rift_sensor_ctx *sensor;  /* STARTED: started, frames held back; in done or adopting until the roster */
+	int pin_fd;               /* STARTED, START_FAILED: the start record's attachment pin */
+	uint64_t start_done_ns;   /* when its start returned (host clock) */
+};
+
+/* cv1touch: the live sensor lifecycle's worker (cv1t-sensors). Every blocking USB step of an
+ * add or a release runs there, never on the engine thread. It frees released sensors before it
+ * opens the next one: on Windows a sensor's old handle must close before its new arrival opens.
+ * `lock` is a leaf: nothing else is locked while it is held. The worker starts with the first
+ * add or release, from the engine thread, whose scheduling, affinity and signal mask it keeps. */
+struct sensor_hotplug {
+	ohmd_thread *thread;
+	ohmd_mutex *lock;
+	ohmd_cond *cond;
+	bool quit;
+	struct sensor_add_request *requests;
+	size_t n_requests, request_capacity;
+	bool busy;                         /* the worker is adding `current` */
+	struct sensor_add_request current;
+	struct sensor_add_result *done;    /* capacity covers every request queued or running */
+	size_t n_done, done_capacity;
+	/* STARTED, taken out of done, not yet on the roster or in frees. The Windows search
+	 * treats its device as held; cleared once the roster has it, or as it is queued to free. */
+	rift_sensor_ctx *adopting;
+	rift_sensor_ctx **frees;
+	size_t n_frees, free_capacity;
+};
+
 struct rift_tracker_ctx_s
 {
 	ohmd_context* ohmd_ctx;
@@ -166,10 +205,21 @@ struct rift_tracker_ctx_s
 	int exposure_history_size;
 	rift_tracker_exposure_info exposure_history[NUM_EXPOSURE_HISTORY];
 
+	/* cv1touch: only the engine thread changes the roster, and once the tracker is open it does
+	 * so holding roster_lock; its own reads take no lock. Other threads (retirement, the hot-plug
+	 * worker) read it holding roster_lock. Lock order: roster_lock -> sensor_lock ->
+	 * tracker_lock -> device_lock; no sensor_lock holder takes roster_lock. */
+	ohmd_mutex *roster_lock;
 	rift_sensor_ctx **sensors;
 	size_t n_sensors, sensor_capacity;
 	struct sensor_stream_record *sensor_streams;
 	size_t n_sensor_streams, sensor_stream_capacity;
+
+	/* cv1touch: what a sensor added later needs: the headset's radio address, and a sensor id
+	 * (logs, thread names) not used before */
+	uint8_t radio_id[5];
+	uint32_t next_sensor_id;
+	struct sensor_hotplug hotplug;
 
 	rift_tracked_device_priv devices[RIFT_MAX_TRACKED_DEVICES];
 	uint8_t n_devices;
@@ -203,7 +253,8 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	next_dev = ctx->devices + ctx->n_devices;
 
 	next_dev->base.id = device_id;
-	next_dev->n_delay_slots = ctx->n_sensors != 0 ? NUM_POSE_DELAY_SLOTS : 0;
+	/* cv1touch: always, so a sensor plugged in after this device came online can feed its fusion */
+	next_dev->n_delay_slots = NUM_POSE_DELAY_SLOTS;
 	rift_kalman_6dof_init(&next_dev->ukf_fusion, &init_pose, next_dev->n_delay_slots);
 	next_dev->last_acquired_pose_lock_ts = next_dev->last_reported_pose = next_dev->last_observed_orient_ts = next_dev->last_observed_pose_ts = next_dev->device_time_ns = 0;
 
@@ -340,6 +391,114 @@ static int pin_sensor_attachment(libusb_device *device,
 }
 #endif
 
+/* cv1touch: a Rift Sensor (CV1 or DK2 camera), and its descriptor */
+static bool is_rift_sensor(libusb_device *dev, struct libusb_device_descriptor *desc)
+{
+	return libusb_get_device_descriptor(dev, desc) >= 0 && desc->idVendor == 0x2833 &&
+		(desc->idProduct == CV1_PID || desc->idProduct == DK2_PID);
+}
+
+/* Room for one more roster entry. Pointer-array growth never moves sensor objects. Once the
+ * tracker is open, the caller holds roster_lock: other threads read the array under it. */
+static bool reserve_sensor(rift_tracker_ctx *ctx)
+{
+	if (ctx->n_sensors >= INT_MAX) return false;
+	if (ctx->n_sensors < ctx->sensor_capacity) return true;
+	size_t capacity = ctx->sensor_capacity ? ctx->sensor_capacity * 2 : 4;
+	if (capacity > INT_MAX) capacity = INT_MAX;
+	if (capacity > SIZE_MAX / sizeof(*ctx->sensors)) return false;
+	void *next = realloc(ctx->sensors, capacity * sizeof(*ctx->sensors));
+	if (!next) return false;
+	ctx->sensors = next; ctx->sensor_capacity = capacity;
+	return true;
+}
+
+/* cv1touch: how opening a sensor ended (try_open_sensor) */
+enum sensor_open {
+	SENSOR_OPENED,
+	SENSOR_OPEN_FAILED, /* libusb_open, or setting up the USB device or the analyser */
+	SENSOR_REJECTED,    /* unreadable serial, not the one asked for, already open, or ignored */
+	SENSOR_NO_MEMORY,   /* the roster could not grow */
+};
+
+/* cv1touch: opens the Rift Sensor dev and creates its analyser, both at engine open and for a
+ * sensor added later. A duplicate is an open sensor of the same serial that is not retired.
+ * expected: the serial asked for, or NULL. reserve: make room in the roster first (engine open;
+ * a sensor added later joins the roster on the engine thread). Closes pin_fd unless it returns
+ * SENSOR_OPENED; *error_code is libusb's code (or a negative errno) of a failed open or setup. */
+static enum sensor_open try_open_sensor(rift_tracker_ctx *ctx, libusb_device *dev,
+	const struct libusb_device_descriptor *desc, int pin_fd, int id, const char *expected,
+	const ohmd_cv1touch_sensor_pose *pose, bool reserve, rift_sensor_ctx **out, int *error_code)
+{
+	ohmd_context *ohmd_ctx = ctx->ohmd_ctx;
+	libusb_device_handle *usb_devh;
+	unsigned char serial[33];
+	int ret;
+
+	*out = NULL;
+	*error_code = 0;
+	ret = libusb_open(dev, &usb_devh);
+	if (ret) {
+		ohmd_log_fprintf (stderr, "Failed to open Rift Sensor device. Check permissions\n");
+		rift_sensor_close_attachment_pin(pin_fd);
+		*error_code = ret;
+		return SENSOR_OPEN_FAILED;
+	}
+
+	memset(serial, 0, sizeof serial);
+	ret = desc->iSerialNumber ? libusb_get_string_descriptor_ascii(
+		usb_devh, desc->iSerialNumber, serial, 32) : -1;
+	if (ret <= 0 || ret >= 32 || !cv1touch_sensor_serial_valid((const char *)serial)) {
+		LOGW("Ignoring Rift Sensor with unreadable or invalid serial");
+		libusb_close(usb_devh); rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_REJECTED;
+	}
+	if (expected && !cv1touch_sensor_serial_equal(expected, (const char *)serial)) {
+		LOGW("Ignoring Rift Sensor %s: sensor %s was asked for", serial, expected);
+		libusb_close(usb_devh); rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_REJECTED;
+	}
+	bool duplicate = false;
+	ohmd_lock_mutex(ctx->roster_lock);
+	for (size_t k = 0; k < ctx->n_sensors; k++)
+		if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(ctx->sensors[k]), (const char *)serial) &&
+		    !rift_sensor_retired(ctx->sensors[k]))
+			duplicate = true;
+	ohmd_unlock_mutex(ctx->roster_lock);
+	if (duplicate) {
+		LOGW("Ignoring duplicate Rift Sensor identity");
+		libusb_close(usb_devh); rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_REJECTED;
+	}
+	if (cv1touch_sensor_ignored(&ohmd_ctx->cv1touch_sensors,
+			&ohmd_ctx->cv1touch_config, (const char *)serial)) {
+		LOGI("Ignoring Rift Sensor %s (configured ignore list)", serial);
+		libusb_close(usb_devh); rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_REJECTED;
+	}
+	/* Reserve before creating workers. */
+	if (reserve && !reserve_sensor(ctx)) {
+		libusb_close(usb_devh); rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_NO_MEMORY;
+	}
+	rift_sensor_device *sensor_device = rift_sensor_usb_new (ohmd_ctx, id, (char *) serial,
+		ctx->usb_ctx, usb_devh, ctx->radio_id, error_code);
+	if (sensor_device == NULL) {
+		LOGW("Failed to open Rift Sensor USB device %s\n", serial);
+		rift_sensor_close_attachment_pin(pin_fd);
+		return SENSOR_OPEN_FAILED;
+	}
+
+	*out = rift_sensor_new (ohmd_ctx, id, (char *) serial, sensor_device, ctx, pose);
+	if (*out == NULL) {
+		LOGW("Failed to open Rift Sensor analyser for %s\n", serial);
+		rift_sensor_close_attachment_pin(pin_fd);
+		*error_code = LIBUSB_ERROR_NO_MEM;
+		return SENSOR_OPEN_FAILED;
+	}
+	return SENSOR_OPENED;
+}
+
 rift_tracker_ctx *
 rift_tracker_new (ohmd_context* ohmd_ctx,
 		const uint8_t radio_id[5])
@@ -351,8 +510,11 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	tracker_ctx = ohmd_alloc(ohmd_ctx, sizeof (rift_tracker_ctx));
 	if (!tracker_ctx) return NULL;
 	tracker_ctx->ohmd_ctx = ohmd_ctx;
+	memcpy(tracker_ctx->radio_id, radio_id, sizeof tracker_ctx->radio_id);
 	tracker_ctx->tracker_lock = ohmd_create_mutex(ohmd_ctx);
 	if (!tracker_ctx->tracker_lock) goto fail;
+	tracker_ctx->roster_lock = ohmd_create_mutex(ohmd_ctx);
+	if (!tracker_ctx->roster_lock) goto fail;
 
 	for (i = 0; i < RIFT_MAX_TRACKED_DEVICES; i++) {
 		rift_tracked_device_priv *dev = tracker_ctx->devices + i;
@@ -375,16 +537,14 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	tracker_ctx->usb_thread = ohmd_create_thread (ohmd_ctx, uvc_handle_events, tracker_ctx);
 	if (!tracker_ctx->usb_thread) goto fail;
 
+	/* Until this returns, no other thread can reach the tracker or its roster. */
 	for (i = 0; devs[i]; ++i) {
 		struct libusb_device_descriptor desc;
-		libusb_device_handle *usb_devh;
-		unsigned char serial[33];
+		rift_sensor_ctx *sensor_ctx;
+		int error_code;
 
-		ret = libusb_get_device_descriptor(devs[i], &desc);
-		if (ret < 0)
-			continue; /* Can't access this device */
-		if (desc.idVendor != 0x2833 || (desc.idProduct != CV1_PID && desc.idProduct != DK2_PID))
-			continue;
+		if (!is_rift_sensor(devs[i], &desc))
+			continue; /* Can't access this device, or it is something else */
 
         ohmd_cv1touch_sensor_attachment attachment = {0};
         int attachment_pin = -1;
@@ -392,64 +552,16 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
         if (!ohmd_ctx->cv1touch_sensor_attachment_cb)
             attachment_pin = pin_sensor_attachment(devs[i], &attachment);
 #endif
-		ret = libusb_open(devs[i], &usb_devh);
-		if (ret) {
-			ohmd_log_fprintf (stderr, "Failed to open Rift Sensor device. Check permissions\n");
-            rift_sensor_close_attachment_pin(attachment_pin);
+		enum sensor_open opened = try_open_sensor(tracker_ctx, devs[i], &desc, attachment_pin,
+			(int)tracker_ctx->n_sensors, NULL, NULL, true, &sensor_ctx, &error_code);
+		if (opened == SENSOR_NO_MEMORY)
+			goto fail;
+		if (opened != SENSOR_OPENED)
 			continue;
-		}
-
-        memset(serial, 0, sizeof serial);
-        ret = desc.iSerialNumber ? libusb_get_string_descriptor_ascii(
-            usb_devh, desc.iSerialNumber, serial, 32) : -1;
-        if (ret <= 0 || ret >= 32 || !cv1touch_sensor_serial_valid((const char *)serial)) {
-            LOGW("Ignoring Rift Sensor with unreadable or invalid serial");
-            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
-            continue;
-        }
-        bool duplicate = false;
-        for (size_t k = 0; k < tracker_ctx->n_sensors; k++)
-            if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(tracker_ctx->sensors[k]), (const char *)serial))
-                duplicate = true;
-        if (duplicate) {
-            LOGW("Ignoring duplicate Rift Sensor identity");
-            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
-            continue;
-        }
-        if (cv1touch_sensor_ignored(&ohmd_ctx->cv1touch_sensors,
-                &ohmd_ctx->cv1touch_config, (const char *)serial)) {
-            LOGI("Ignoring Rift Sensor %s (configured ignore list)", serial);
-            libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin);
-            continue;
-        }
-        /* Reserve before creating workers. Pointer-array growth never moves sensor objects. */
-        if (tracker_ctx->n_sensors >= INT_MAX) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
-        if (tracker_ctx->n_sensors == tracker_ctx->sensor_capacity) {
-            size_t capacity = tracker_ctx->sensor_capacity ? tracker_ctx->sensor_capacity * 2 : 4;
-            if (capacity > INT_MAX) capacity = INT_MAX;
-            if (capacity > SIZE_MAX / sizeof(*tracker_ctx->sensors)) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
-            void *next = realloc(tracker_ctx->sensors, capacity * sizeof(*tracker_ctx->sensors));
-            if (!next) { libusb_close(usb_devh); rift_sensor_close_attachment_pin(attachment_pin); goto fail; }
-            tracker_ctx->sensors=next; tracker_ctx->sensor_capacity=capacity;
-        }
-		rift_sensor_device *sensor_device = rift_sensor_usb_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, tracker_ctx->usb_ctx, usb_devh, radio_id);
-
-		if (sensor_device == NULL) {
-			LOGW("Failed to open Rift Sensor USB device %s\n", serial);
-            rift_sensor_close_attachment_pin(attachment_pin);
-			continue;
-		}
-
-		rift_sensor_ctx *sensor_ctx = rift_sensor_new (ohmd_ctx, (int)tracker_ctx->n_sensors, (char *) serial, sensor_device, tracker_ctx);
-		if (sensor_ctx == NULL) {
-			LOGW("Failed to open Rift Sensor analyser for %s\n", serial);
-            rift_sensor_close_attachment_pin(attachment_pin);
-			continue;
-		}
 
         if (ohmd_ctx->cv1touch_sensor_attachment_cb)
             ohmd_ctx->cv1touch_sensor_attachment_cb(ohmd_ctx->cv1touch_sensor_attachment_user,
-                (const char *)serial, &attachment);
+                rift_sensor_serial_no(sensor_ctx), &attachment);
         rift_sensor_set_attachment(sensor_ctx, &attachment, attachment_pin);
 		tracker_ctx->sensors[tracker_ctx->n_sensors] = sensor_ctx;
 		tracker_ctx->n_sensors++;
@@ -457,6 +569,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	}
 	libusb_free_device_list(devs, 1);
 	devs = NULL;
+	tracker_ctx->next_sensor_id = (uint32_t)tracker_ctx->n_sensors;
 
 	/* Loop over the sensors we found and start the video flowing */
     for (i = 0; i < (int)tracker_ctx->n_sensors;) {
@@ -487,6 +600,463 @@ fail:
 	if (tracker_ctx)
 		rift_tracker_free (tracker_ctx);
 	return NULL;
+}
+
+/* cv1touch: the live sensor lifecycle (openhmd_cv1touch.h, "Live sensor lifecycle"). The engine
+ * thread queues adds and releases and adopts started sensors; the hot-plug worker opens, starts
+ * and frees them. Neither holds roster, sensor or tracker lock across a USB start, stop or
+ * retry, nor any lock while it waits for the other. */
+
+static uint32_t elapsed_ms(rift_tracker_ctx *ctx, uint64_t since)
+{
+	uint64_t ms = ohmd_monotonic_conv(ohmd_monotonic_get(ctx->ohmd_ctx) - since,
+		ohmd_monotonic_per_sec(ctx->ohmd_ctx), 1000);
+	return ms > UINT32_MAX ? UINT32_MAX : (uint32_t)ms;
+}
+
+/* items (capacity entries of size bytes) with room for needed entries, or NULL when it cannot
+ * grow, which leaves items as it was. */
+static void *reserve_entries(void *items, size_t *capacity, size_t needed, size_t size)
+{
+	if (needed <= *capacity)
+		return items;
+	size_t next = *capacity ? *capacity : 4;
+	while (next < needed) {
+		if (next > SIZE_MAX / 2)
+			return NULL;
+		next *= 2;
+	}
+	if (next > SIZE_MAX / size)
+		return NULL;
+	void *grown = realloc(items, next * size);
+	if (grown)
+		*capacity = next;
+	return grown;
+}
+
+#ifndef _WIN32
+/* The device at the key's bus/address, pinned and still the incarnation the key names. */
+static uint32_t find_pinned_sensor(libusb_device **list, const ohmd_cv1touch_sensor_attachment *key,
+	libusb_device **out, struct libusb_device_descriptor *desc, int *pin_fd,
+	ohmd_cv1touch_sensor_attachment *pinned)
+{
+	for (size_t i = 0; list[i]; i++) {
+		uint32_t place = (uint32_t)libusb_get_bus_number(list[i]) |
+			((uint32_t)libusb_get_device_address(list[i]) << 8);
+		if (place != key->data[0] || !is_rift_sensor(list[i], desc))
+			continue;
+		*pin_fd = pin_sensor_attachment(list[i], pinned);
+		if (*pin_fd < 0)
+			return OHMD_CV1TOUCH_SENSOR_ADD_NOT_FOUND;
+		if (memcmp(pinned, key, sizeof *key) != 0) {
+			/* Another connection took that place: never open it for this one */
+			rift_sensor_close_attachment_pin(*pin_fd);
+			*pin_fd = -1;
+			return OHMD_CV1TOUCH_SENSOR_ADD_STALE;
+		}
+		*out = list[i];
+		return 0;
+	}
+	return OHMD_CV1TOUCH_SENSOR_ADD_NOT_FOUND;
+}
+#endif
+
+/* WinUSB lets one handle at a time open a device, and libusb keeps the libusb_device of a device
+ * a handle holds open: a device a sensor of this engine holds is never a candidate for another.
+ * That includes one the engine thread has taken out of `done` and is adopting onto the roster. */
+static bool sensor_device_held(rift_tracker_ctx *ctx, const libusb_device *dev)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+	bool held = false;
+
+	ohmd_lock_mutex(ctx->roster_lock);
+	for (size_t i = 0; i < ctx->n_sensors && !held; i++)
+		held = rift_sensor_get_usb_device(ctx->sensors[i]) == dev;
+	ohmd_unlock_mutex(ctx->roster_lock);
+	ohmd_lock_mutex(h->lock);
+	for (size_t i = 0; i < h->n_done && !held; i++)
+		held = h->done[i].sensor && rift_sensor_get_usb_device(h->done[i].sensor) == dev;
+	for (size_t i = 0; i < h->n_frees && !held; i++)
+		held = rift_sensor_get_usb_device(h->frees[i]) == dev;
+	if (!held && h->adopting)
+		held = rift_sensor_get_usb_device(h->adopting) == dev;
+	ohmd_unlock_mutex(h->lock);
+	return held;
+}
+
+/* A Windows key cannot be verified natively: the sensor is the unheld Rift Sensor of that
+ * serial. Unverified on Windows hardware. */
+static uint32_t find_unheld_sensor(rift_tracker_ctx *ctx, libusb_device **list, const char *serial,
+	libusb_device **out, struct libusb_device_descriptor *desc, int *error_code)
+{
+	int open_error = 0;
+	for (size_t i = 0; list[i]; i++) {
+		libusb_device_handle *devh;
+		unsigned char found[33] = {0};
+		if (!is_rift_sensor(list[i], desc) || sensor_device_held(ctx, list[i]))
+			continue;
+		int ret = libusb_open(list[i], &devh);
+		if (ret) {
+			open_error = ret;
+			continue;
+		}
+		ret = desc->iSerialNumber ? libusb_get_string_descriptor_ascii(
+			devh, desc->iSerialNumber, found, 32) : -1;
+		libusb_close(devh);
+		if (ret > 0 && ret < 32 && cv1touch_sensor_serial_equal((const char *)found, serial)) {
+			*out = list[i];
+			return 0;
+		}
+	}
+	/* one it could not open may well have been it */
+	*error_code = open_error;
+	return open_error ? OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED : OHMD_CV1TOUCH_SENSOR_ADD_NOT_FOUND;
+}
+
+/* Worker: opens and starts one sensor. Nothing else can reach it until the engine thread adopts
+ * it, and its frames are held back until then. */
+static void add_one_sensor(rift_tracker_ctx *ctx, const struct sensor_add_request *req,
+	struct sensor_add_result *res)
+{
+	ohmd_cv1touch_sensor_added *added = &res->added;
+	uint64_t began = ohmd_monotonic_get(ctx->ohmd_ctx);
+	ohmd_cv1touch_sensor_attachment attachment = req->key;
+	struct libusb_device_descriptor desc;
+	libusb_device **list = NULL, *dev = NULL;
+	rift_sensor_ctx *sensor = NULL;
+	int pin_fd = -1, error_code = 0;
+
+	*res = (struct sensor_add_result){.pin_fd = -1};
+	memcpy(added->stream.serial, req->serial, sizeof added->stream.serial);
+	added->stream.attachment = req->key;
+
+	ssize_t listed = libusb_get_device_list(ctx->usb_ctx, &list);
+	if (listed < 0) {
+		added->outcome = OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED;
+		added->error_code = (int32_t)listed;
+		return;
+	}
+#ifndef _WIN32
+	if (req->key.kind == OHMD_CV1TOUCH_ATTACHMENT_SYSFS)
+		added->outcome = find_pinned_sensor(list, &req->key, &dev, &desc, &pin_fd, &attachment);
+	else
+#endif
+		added->outcome = find_unheld_sensor(ctx, list, req->serial, &dev, &desc, &error_code);
+	if (added->outcome == 0) {
+		enum sensor_open opened = try_open_sensor(ctx, dev, &desc, pin_fd, (int)ctx->next_sensor_id++,
+			req->serial, req->have_pose ? &req->pose : NULL, false, &sensor, &error_code);
+		if (opened != SENSOR_OPENED)
+			added->outcome = opened == SENSOR_REJECTED ? OHMD_CV1TOUCH_SENSOR_ADD_REJECTED :
+				OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED;
+	}
+	libusb_free_device_list(list, 1);
+	added->open_ms = elapsed_ms(ctx, began);
+	added->error_code = error_code;
+	if (sensor == NULL)
+		return;
+
+	rift_sensor_set_attachment(sensor, &attachment, pin_fd);
+	rift_sensor_accept_frames_from(sensor, UINT64_MAX);
+	if (__atomic_load_n(&ctx->hotplug.quit, __ATOMIC_ACQUIRE)) {
+		/* the engine is closing: not worth a second of start */
+		rift_sensor_free(sensor);
+		added->outcome = OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED;
+		added->error_code = LIBUSB_ERROR_INTERRUPTED;
+		return;
+	}
+	uint64_t starting = ohmd_monotonic_get(ctx->ohmd_ctx);
+	bool started = rift_sensor_start(sensor);
+	res->start_done_ns = ohmd_monotonic_get(ctx->ohmd_ctx);
+	added->start_ms = elapsed_ms(ctx, starting);
+	rift_sensor_get_stream_info(sensor, &added->stream);
+	res->pin_fd = rift_sensor_take_attachment_pin(sensor);
+	if (!started) {
+		LOGW("Failed to start video stream for sensor %s\n", rift_sensor_serial_no(sensor));
+		rift_sensor_free(sensor);
+		added->outcome = OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED;
+		added->error_code = added->stream.error_code;
+		return;
+	}
+	added->outcome = OHMD_CV1TOUCH_SENSOR_ADD_STARTED;
+	res->sensor = sensor;
+}
+
+static unsigned int sensor_hotplug_thread(void *arg)
+{
+	rift_tracker_ctx *ctx = arg;
+	struct sensor_hotplug *h = &ctx->hotplug;
+
+	/* cv1touch: findable in profiles and the daemon's thread list */
+	ohmd_set_thread_name("cv1t-sensors");
+	ohmd_lock_mutex(h->lock);
+	while (!h->quit) {
+		if (h->n_frees > 0) {
+			/* frees first: a sensor's new arrival may need its old handle closed */
+			rift_sensor_ctx *sensor = h->frees[0];
+			h->n_frees--;
+			memmove(h->frees, h->frees + 1, h->n_frees * sizeof *h->frees);
+			ohmd_unlock_mutex(h->lock);
+			rift_sensor_free(sensor);
+			ohmd_lock_mutex(h->lock);
+		} else if (h->n_requests > 0) {
+			struct sensor_add_request req = h->requests[0];
+			struct sensor_add_result res;
+			h->n_requests--;
+			memmove(h->requests, h->requests + 1, h->n_requests * sizeof *h->requests);
+			h->current = req;
+			h->busy = true;
+			ohmd_unlock_mutex(h->lock);
+			add_one_sensor(ctx, &req, &res);
+			ohmd_lock_mutex(h->lock);
+			h->done[h->n_done++] = res; /* room was made when it was queued */
+			h->busy = false;
+		} else {
+			ohmd_cond_wait(h->cond, h->lock);
+		}
+	}
+	ohmd_unlock_mutex(h->lock);
+	return 0;
+}
+
+/* Engine thread. */
+static bool start_hotplug_worker(rift_tracker_ctx *ctx)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+
+	if (h->thread)
+		return true;
+	if (!h->lock)
+		h->lock = ohmd_create_mutex(ctx->ohmd_ctx);
+	if (h->lock && !h->cond)
+		h->cond = ohmd_create_cond(ctx->ohmd_ctx);
+	if (h->cond)
+		h->thread = ohmd_create_thread(ctx->ohmd_ctx, sensor_hotplug_thread, ctx);
+	if (!h->thread)
+		LOGE("Could not start the sensor hot-plug worker");
+	return h->thread != NULL;
+}
+
+/* Engine thread: the worker frees the sensor, or this thread does when it cannot. */
+static void free_on_worker(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+	rift_sensor_ctx **frees = NULL;
+
+	if (start_hotplug_worker(ctx)) {
+		ohmd_lock_mutex(h->lock);
+		/* Same critical section as the frees insert: the worker cannot free it while the
+		 * Windows search could still see it, and it is not in both places. */
+		if (h->adopting == sensor)
+			h->adopting = NULL;
+		frees = reserve_entries(h->frees, &h->free_capacity, h->n_frees + 1, sizeof *h->frees);
+		if (frees) {
+			h->frees = frees;
+			h->frees[h->n_frees++] = sensor;
+			ohmd_cond_signal(h->cond);
+		}
+		ohmd_unlock_mutex(h->lock);
+	} else if (h->adopting == sensor) {
+		h->adopting = NULL;
+	}
+	if (!frees) {
+		LOGW("Freeing Rift Sensor %s on the engine thread", rift_sensor_serial_no(sensor));
+		rift_sensor_free(sensor);
+	}
+}
+
+/* Engine thread: retires every roster sensor of this serial, takes it out of the roster under
+ * roster_lock (so retirement elsewhere never reaches a freed sensor) and has it freed. */
+static void release_serial(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (size_t i = 0; i < ctx->n_sensors;) {
+		rift_sensor_ctx *sensor = ctx->sensors[i];
+		if (!cv1touch_sensor_serial_equal(rift_sensor_serial_no(sensor), serial)) {
+			i++;
+			continue;
+		}
+		rift_sensor_retire(sensor);
+		ohmd_lock_mutex(ctx->roster_lock);
+		ctx->n_sensors--;
+		memmove(ctx->sensors + i, ctx->sensors + i + 1, (ctx->n_sensors - i) * sizeof *ctx->sensors);
+		ohmd_unlock_mutex(ctx->roster_lock);
+		free_on_worker(ctx, sensor);
+	}
+}
+
+static bool sensor_open(rift_tracker_ctx *ctx, const char *serial)
+{
+	for (size_t i = 0; i < ctx->n_sensors; i++)
+		if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(ctx->sensors[i]), serial) &&
+		    !rift_sensor_retired(ctx->sensors[i]))
+			return true;
+	return false;
+}
+
+int rift_tracker_add_sensor(rift_tracker_ctx *ctx, const char *serial,
+	const ohmd_cv1touch_sensor_attachment *key, const ohmd_cv1touch_sensor_pose *pose)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+	struct sensor_add_request req = {0};
+	size_t length = strnlen(serial, sizeof req.serial);
+
+	if (length == 0 || length >= sizeof req.serial)
+		return -1;
+	memcpy(req.serial, serial, length);
+	if (!cv1touch_sensor_serial_valid(req.serial))
+		return -1;
+	switch (key->kind) {
+#ifndef _WIN32
+	case OHMD_CV1TOUCH_ATTACHMENT_SYSFS:
+		if ((key->data[0] & 0xff) == 0 || (key->data[0] & 0xff00) == 0 || (key->data[1] | key->data[2]) == 0)
+			return -1;
+		break;
+#endif
+	case OHMD_CV1TOUCH_ATTACHMENT_WINDOWS:
+		if ((key->data[0] | key->data[1]) == 0)
+			return -1;
+		break;
+	default:
+		return -1;
+	}
+	req.key = *key;
+	if (pose) {
+		if (!cv1touch_sensor_serial_equal(pose->serial, req.serial))
+			return -1;
+		req.have_pose = true;
+		req.pose = *pose;
+	}
+	if (sensor_open(ctx, req.serial))
+		return 1;
+	if (!start_hotplug_worker(ctx))
+		return -1;
+
+	ohmd_lock_mutex(h->lock);
+	bool queued = h->busy && cv1touch_sensor_serial_equal(h->current.serial, req.serial);
+	for (size_t i = 0; i < h->n_requests; i++)
+		queued |= cv1touch_sensor_serial_equal(h->requests[i].serial, req.serial);
+	for (size_t i = 0; i < h->n_done; i++)
+		queued |= cv1touch_sensor_serial_equal(h->done[i].added.stream.serial, req.serial);
+	int ret = 1;
+	if (!queued) {
+		struct sensor_add_request *requests = reserve_entries(h->requests, &h->request_capacity,
+			h->n_requests + 1, sizeof *h->requests);
+		if (requests)
+			h->requests = requests;
+		/* the worker never waits for room for a result */
+		struct sensor_add_result *done = requests ? reserve_entries(h->done, &h->done_capacity,
+			h->n_done + h->n_requests + (h->busy ? 1 : 0) + 1, sizeof *h->done) : NULL;
+		if (done)
+			h->done = done;
+		ret = -1;
+		if (requests && done) {
+			h->requests[h->n_requests++] = req;
+			ohmd_cond_signal(h->cond);
+			ret = 0;
+		}
+	}
+	ohmd_unlock_mutex(h->lock);
+	return ret;
+}
+
+/* Engine thread: a started sensor joins the roster, unless it duplicates an open one. */
+static void adopt_sensor(rift_tracker_ctx *ctx, struct sensor_add_result *res)
+{
+	rift_sensor_ctx *sensor = res->sensor;
+	const char *serial = rift_sensor_serial_no(sensor);
+	bool joined = false;
+
+	if (sensor_open(ctx, serial)) {
+		LOGW("Ignoring duplicate Rift Sensor identity");
+		res->added.outcome = OHMD_CV1TOUCH_SENSOR_ADD_REJECTED;
+		res->added.error_code = 0;
+	} else {
+		/* An earlier connection's retired object goes first, if its release has not come yet */
+		release_serial(ctx, serial);
+		/* Every device the tracker has, before any other thread can see the sensor; this thread
+		 * is the only one that adds devices */
+		for (int i = 0; i < ctx->n_devices; i++) {
+			if (!rift_sensor_add_device(sensor, &ctx->devices[i].base))
+				LOGE("Failed to configure object tracking for device %d\n", ctx->devices[i].base.id);
+		}
+		ohmd_lock_mutex(ctx->roster_lock);
+		joined = reserve_sensor(ctx);
+		if (joined)
+			ctx->sensors[ctx->n_sensors++] = sensor;
+		ohmd_unlock_mutex(ctx->roster_lock);
+		if (!joined) {
+			res->added.outcome = OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED;
+			res->added.error_code = LIBUSB_ERROR_NO_MEM;
+		}
+	}
+	if (!joined) {
+		rift_sensor_close_attachment_pin(res->pin_fd);
+		free_on_worker(ctx, sensor);
+		return;
+	}
+	if (!record_sensor_stream(ctx, &res->added.stream, res->pin_fd))
+		LOGE("Could not retain sensor stream diagnostics");
+	/* Its earlier frames were exposed before its radio followed the headset */
+	rift_sensor_accept_frames_from(sensor, res->start_done_ns);
+}
+
+int rift_tracker_poll_sensor_adds(rift_tracker_ctx *ctx, ohmd_cv1touch_sensor_added *out, int max)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+	int n = 0;
+
+	if (!h->lock)
+		return 0;
+	while (n < max) {
+		struct sensor_add_result res;
+		ohmd_lock_mutex(h->lock);
+		bool finished = h->n_done > 0;
+		if (finished) {
+			res = h->done[0];
+			h->n_done--;
+			memmove(h->done, h->done + 1, h->n_done * sizeof *h->done);
+			/* Visible to sensor_device_held until adopt joins the roster or frees it.
+			 * h->lock stays a leaf: the roster lock is taken only after this unlock. */
+			if (res.sensor && res.added.outcome == OHMD_CV1TOUCH_SENSOR_ADD_STARTED)
+				h->adopting = res.sensor;
+		}
+		ohmd_unlock_mutex(h->lock);
+		if (!finished)
+			break;
+		if (res.added.outcome == OHMD_CV1TOUCH_SENSOR_ADD_STARTED)
+			adopt_sensor(ctx, &res);
+		else if (res.added.outcome == OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED &&
+		         !record_sensor_stream(ctx, &res.added.stream, res.pin_fd))
+			LOGE("Could not retain sensor stream diagnostics");
+		if (res.sensor) {
+			ohmd_lock_mutex(h->lock);
+			if (h->adopting == res.sensor)
+				h->adopting = NULL;
+			ohmd_unlock_mutex(h->lock);
+		}
+		out[n++] = res.added;
+	}
+	return n;
+}
+
+int rift_tracker_release_sensor(rift_tracker_ctx *ctx, const char *serial)
+{
+	release_serial(ctx, serial);
+	return 0;
+}
+
+/* Engine thread, at close: the worker can be in a sensor's start or free. */
+static void stop_hotplug_worker(rift_tracker_ctx *ctx)
+{
+	struct sensor_hotplug *h = &ctx->hotplug;
+
+	if (!h->thread)
+		return;
+	ohmd_lock_mutex(h->lock);
+	__atomic_store_n(&h->quit, true, __ATOMIC_RELEASE);
+	ohmd_cond_broadcast(h->cond);
+	ohmd_unlock_mutex(h->lock);
+	ohmd_destroy_thread(h->thread);
+	h->thread = NULL;
 }
 
 /* Called from the rift IMU / packet handling loop
@@ -676,15 +1246,42 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 	if (!tracker_ctx)
 		return;
 
+	/* cv1touch: first the hot-plug worker, then the sensors it started or was to free */
+	stop_hotplug_worker(tracker_ctx);
+	struct sensor_hotplug *h = &tracker_ctx->hotplug;
+
 	/* Signal every stream before the first blocking drain. Sensor workers keep
 	 * their frame storage until each sensor's normal stop/join/free completes. */
+	for (size_t s = 0; s < h->n_done; s++)
+		if (h->done[s].sensor)
+			rift_sensor_request_stop(h->done[s].sensor);
+	for (size_t s = 0; s < h->n_frees; s++)
+		rift_sensor_request_stop(h->frees[s]);
+	if (h->adopting)
+		rift_sensor_request_stop(h->adopting);
 	for (i = 0; i < tracker_ctx->n_sensors; i++)
 		rift_sensor_request_stop(tracker_ctx->sensors[i]);
 
+	for (size_t s = 0; s < h->n_done; s++) {
+		if (h->done[s].sensor)
+			rift_sensor_free(h->done[s].sensor);
+		rift_sensor_close_attachment_pin(h->done[s].pin_fd);
+	}
+	for (size_t s = 0; s < h->n_frees; s++)
+		rift_sensor_free(h->frees[s]);
+	if (h->adopting) {
+		rift_sensor_free(h->adopting);
+		h->adopting = NULL;
+	}
 	for (i = 0; i < tracker_ctx->n_sensors; i++) {
 		rift_sensor_ctx *sensor_ctx = tracker_ctx->sensors[i];
 		rift_sensor_free (sensor_ctx);
 	}
+	free(h->requests);
+	free(h->done);
+	free(h->frees);
+	if (h->cond) ohmd_destroy_cond(h->cond);
+	if (h->lock) ohmd_destroy_mutex(h->lock);
 
 	for (i = 0; i < RIFT_MAX_TRACKED_DEVICES; i++) {
 		rift_tracked_device_priv *dev = tracker_ctx->devices + i;
@@ -705,6 +1302,7 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 		libusb_exit (tracker_ctx->usb_ctx);
 
 	if (tracker_ctx->tracker_lock) ohmd_destroy_mutex (tracker_ctx->tracker_lock);
+	if (tracker_ctx->roster_lock) ohmd_destroy_mutex (tracker_ctx->roster_lock);
 	free(tracker_ctx->sensors);
     for (size_t s = 0; s < tracker_ctx->n_sensor_streams; s++)
         rift_sensor_close_attachment_pin(tracker_ctx->sensor_streams[s].pin_fd);
@@ -1427,11 +2025,15 @@ int rift_tracker_sensor_pose_applied(rift_tracker_ctx *ctx, const char *serial)
 	return -1;
 }
 
+/* Any thread. roster_lock is held through rift_sensor_retire: the engine thread takes a sensor
+ * out of the roster under it before the sensor can be freed. */
 int rift_tracker_retire_sensor(rift_tracker_ctx *ctx, const char *serial)
 {
-	for (int i = 0; i < ctx->n_sensors; i++) {
+	ohmd_lock_mutex(ctx->roster_lock);
+	for (size_t i = 0; i < ctx->n_sensors; i++) {
 		if (cv1touch_sensor_serial_equal(rift_sensor_serial_no(ctx->sensors[i]), serial))
 			rift_sensor_retire(ctx->sensors[i]);
 	}
+	ohmd_unlock_mutex(ctx->roster_lock);
 	return 0;
 }

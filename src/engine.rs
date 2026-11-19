@@ -309,9 +309,10 @@ pub trait EngineSink: Send + Sync {
     }
 }
 
-/// The only native operation allowed away from the engine thread. The sensor roster is
-/// immutable after open, and retirement takes each sensor's lock. Drop invalidates this
-/// target before closing any native device and waits for an in-flight retirement first.
+/// The only native operation allowed away from the engine thread. Only the engine thread
+/// changes the native sensor roster, under the roster lock that retirement holds while it takes
+/// each sensor's lock. Drop invalidates this target before closing any native device and waits
+/// for an in-flight retirement first.
 #[cfg(feature = "engine")]
 struct RetirementDevice(*mut ffi::ohmd_device);
 #[cfg(feature = "engine")]
@@ -335,8 +336,8 @@ impl SensorRetirement {
 
     pub fn retire(&self, serial: &str) -> Result<(), String> {
         let serial = self::serial(serial)?;
-        // SAFETY: the guard keeps the device alive; only this immutable-roster, locked
-        // native operation is exposed here. Native callbacks never acquire this guard.
+        // SAFETY: the guard keeps the device alive; only this locked native operation is
+        // exposed here. Native callbacks never acquire this guard.
         let result =
             self.with_device(|d| unsafe { ffi::ohmd_cv1touch_retire_sensor(d, serial.as_ptr()) });
         match result {

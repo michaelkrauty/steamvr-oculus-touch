@@ -61,7 +61,14 @@ int rift_tracker_get_sensor_stream(rift_tracker_ctx *ctx, int index, ohmd_cv1tou
 bool rift_tracker_record_sensor_stream(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_stream *stream);
 void rift_tracker_forget_sensor_stream(rift_tracker_ctx *ctx, const char *serial);
 int rift_tracker_set_sensor_pose(rift_tracker_ctx *ctx, const ohmd_cv1touch_sensor_pose *pose);
+/* Any thread while the tracker lives. */
 int rift_tracker_retire_sensor(rift_tracker_ctx *ctx, const char *serial);
+/* cv1touch live sensor lifecycle (ohmd_cv1touch_add_sensor and the rest). Engine thread only;
+ * arguments are checked by the callers in rift.c. */
+int rift_tracker_add_sensor(rift_tracker_ctx *ctx, const char *serial,
+	const ohmd_cv1touch_sensor_attachment *key, const ohmd_cv1touch_sensor_pose *pose);
+int rift_tracker_poll_sensor_adds(rift_tracker_ctx *ctx, ohmd_cv1touch_sensor_added *out, int max);
+int rift_tracker_release_sensor(rift_tracker_ctx *ctx, const char *serial);
 int rift_tracker_clear_sensor_pose(rift_tracker_ctx *ctx, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask);
 int rift_tracker_sensor_pose_applied(rift_tracker_ctx *ctx, const char *serial);
 

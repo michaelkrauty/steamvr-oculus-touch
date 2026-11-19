@@ -100,6 +100,10 @@ struct rift_sensor_ctx_s
 
 	int shutdown;
 	bool retired; /* sensor_lock fences retirement against an in-flight pose commit */
+	/* cv1touch: frames that start before this neither move a device, place the sensor nor reach
+	 * the frame callback. 0 for a sensor opened with the engine; one added to a running engine
+	 * stays closed until it is adopted (rift_sensor_accept_frames_from). */
+	uint64_t accept_from_ns;
 
 	bool long_analysis_busy;
 
@@ -185,6 +189,13 @@ rift_sensor_add_device(rift_sensor_ctx *sensor, rift_tracked_device *device)
 	bool ret;
 
 	ohmd_lock_mutex(sensor->sensor_lock);
+	/* cv1touch: a sensor a running engine adopts is given every device the tracker has */
+	for (int d = 0; d < sensor->n_devices; d++) {
+		if (sensor->devices[d] == device) {
+			ohmd_unlock_mutex(sensor->sensor_lock);
+			return true;
+		}
+	}
 	OHMD_ASSERT(sensor->n_devices < RIFT_MAX_TRACKED_DEVICES);
 
 	ret	= correspondence_search_set_model (sensor->pf.cs, device->id, device->led_search);
@@ -197,6 +208,12 @@ rift_sensor_add_device(rift_sensor_ctx *sensor, rift_tracked_device *device)
 	ohmd_unlock_mutex(sensor->sensor_lock);
 
 	return ret;
+}
+
+/* Called with sensor_lock held. */
+static bool frame_accepted(const rift_sensor_ctx *sensor, const rift_sensor_analysis_frame *frame)
+{
+	return frame->vframe->start_ts >= sensor->accept_from_ns;
 }
 
 /* Called with sensor_lock held. Releases a frame back to the capture thread */
@@ -221,7 +238,7 @@ release_capture_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame
 			sensor->serial_no);
 
 	__atomic_fetch_add(&sensor->cv1touch_frames, 1, __ATOMIC_RELAXED);
-	if (!sensor->retired && frame->bwobs && sensor->ohmd_ctx->cv1touch_frame_cb) {
+	if (!sensor->retired && frame_accepted(sensor, frame) && frame->bwobs && sensor->ohmd_ctx->cv1touch_frame_cb) {
 		ohmd_cv1touch_frame_info info;
 		ohmd_cv1touch_blob blobs[MAX_BLOBS_PER_FRAME];
 		int n = frame->bwobs->num_blobs;
@@ -363,7 +380,9 @@ no_frame:
 	ohmd_unlock_mutex(sensor->sensor_lock);
 }
 
-static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
+/* accepted: the frame starts at or after the sensor's accept_from_ns. Earlier frames' blobs are
+ * still tracked, so their LED patterns are known by then, but no pose is searched for in them. */
+static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame, bool accepted)
 {
 	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
 	ohmd_video_frame *vframe = frame->vframe;
@@ -379,7 +398,7 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 
 	frame->blob_extract_finish_ts = ohmd_monotonic_get(sensor->ohmd_ctx);
 
-	if (frame->bwobs) {
+	if (accepted && frame->bwobs) {
 		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices,
 			rift_tracker_get_search_skip(sensor->tracker));
 #if 0
@@ -581,7 +600,7 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 
 rift_sensor_ctx *
 rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
-	rift_sensor_device *dev, rift_tracker_ctx *tracker)
+	rift_sensor_device *dev, rift_tracker_ctx *tracker, const ohmd_cv1touch_sensor_pose *pose)
 {
 	rift_sensor_ctx *sensor_ctx = NULL;
 	char stream_id[64];
@@ -638,11 +657,13 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	sensor_ctx->pf.cs->stop_data = sensor_ctx;
 
 	/* cv1touch: a calibrated sensor starts with its fixed pose; with fixed_poses_only, the others
-	 * never place themselves and only observe (calibration capture). */
+	 * never place themselves and only observe (calibration capture). A sensor a running engine
+	 * adds is given its current pose, which may have moved since the engine opened. */
 	{
 		posef fixed;
 		sensor_ctx->pf.cv1touch_allow_placement = !ohmd_ctx->cv1touch_config.fixed_poses_only;
-		if (cv1touch_fixed_pose_lookup_list(ohmd_ctx->cv1touch_sensors.configured ? ohmd_ctx->cv1touch_sensors.poses : ohmd_ctx->cv1touch_config.fixed_poses,
+		if (pose ? cv1touch_fixed_pose_lookup_list(pose, 1, sensor_ctx->serial_no, &fixed) :
+		    cv1touch_fixed_pose_lookup_list(ohmd_ctx->cv1touch_sensors.configured ? ohmd_ctx->cv1touch_sensors.poses : ohmd_ctx->cv1touch_config.fixed_poses,
                 ohmd_ctx->cv1touch_sensors.configured ? ohmd_ctx->cv1touch_sensors.pose_count : 8, sensor_ctx->serial_no, &fixed)) {
 			rift_pose_finder_set_camera_pose(&sensor_ctx->pf, &fixed);
 			LOGI("Sensor %d (%s) uses its calibrated pose", sensor_ctx->id, sensor_ctx->serial_no);
@@ -702,6 +723,13 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 		return;
 
 	__atomic_store_n(&sensor_ctx->search_stopping, true, __ATOMIC_RELAXED);
+	/* cv1touch: frames still in flight neither move a device nor reach the frame callback */
+	if (sensor_ctx->sensor_lock) {
+		ohmd_lock_mutex(sensor_ctx->sensor_lock);
+		sensor_ctx->retired = true;
+		ohmd_unlock_mutex(sensor_ctx->sensor_lock);
+	}
+
 	if (sensor_ctx->dev)
 		rift_sensor_device_stop_video(sensor_ctx->dev);
 
@@ -719,6 +747,19 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 
 	if (sensor_ctx->long_analysis_thread)
 		ohmd_destroy_thread(sensor_ctx->long_analysis_thread);
+
+	/* cv1touch: each frame left queued for analysis holds a delay slot of every device it was
+	 * captured for. A sensor freed while the engine runs gives them back, or replugging it again
+	 * and again would leave the devices without free slots. */
+	if (sensor_ctx->sensor_lock) {
+		rift_sensor_analysis_frame *frame;
+		ohmd_lock_mutex(sensor_ctx->sensor_lock);
+		while ((frame = POP_QUEUE(&sensor_ctx->fast_analysis_q)) != NULL)
+			release_capture_frame(sensor_ctx, frame);
+		while ((frame = POP_QUEUE(&sensor_ctx->long_analysis_q)) != NULL)
+			release_capture_frame(sensor_ctx, frame);
+		ohmd_unlock_mutex(sensor_ctx->sensor_lock);
+	}
 
 	if (sensor_ctx->sensor_lock)
 		ohmd_destroy_mutex(sensor_ctx->sensor_lock);
@@ -745,6 +786,7 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 	if (sensor_ctx->dev)
 		rift_sensor_device_free(sensor_ctx->dev);
 
+	/* Both analysis threads have joined, so no placement can race this release. */
 	rift_pose_finder_clear (&sensor_ctx->pf);
 
 	rift_sensor_close_attachment_pin(sensor_ctx->attachment_pin);
@@ -804,6 +846,9 @@ static unsigned int long_analysis_thread(void *arg)
 				ohmd_cond_wait(ctx->long_analysis_q_cond, ctx->sensor_lock);
 			}
 	}
+	/* cv1touch: a frame taken as shutdown began goes back with the queued ones */
+	if (frame != NULL)
+		release_capture_frame(ctx, frame);
 	ohmd_unlock_mutex (ctx->sensor_lock);
 
 	return 0;
@@ -869,7 +914,9 @@ bool decode_frame(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
 }
 #endif
 
-static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
+/* attached: the sensor's device count when the frame was taken for analysis. A device the tracker
+ * added since, which the frame's exposure info already has, is left out of this frame's search. */
+static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame, uint8_t attached)
 {
 
 	/* Do initial prep of the frame before we start analysis */
@@ -896,7 +943,7 @@ static bool init_frame_analyse(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 
 		rift_pose_finder_exp_info_to_dev_state (&sensor->pf, exp_dev_info, dev_state);
 	}
-	frame->n_devices = exposure_info->n_devices;
+	frame->n_devices = OHMD_MIN(exposure_info->n_devices, attached);
 
 	bool jpeg = frame->vframe->format == OHMD_VIDEO_FRAME_FORMAT_JPEG;
 #if HAVE_LIBJPEG
@@ -965,12 +1012,14 @@ static unsigned int fast_analysis_thread(void *arg)
 	rift_sensor_analysis_frame *frame = POP_QUEUE(&sensor->fast_analysis_q);
 	while (!sensor->shutdown) {
 			if (frame != NULL) {
+				uint8_t attached = sensor->n_devices;
+				bool accepted = frame_accepted(sensor, frame);
 				/* cv1touch: a pose given at runtime, taken between frames while the long
 				 * analysis is not reading the pose finder */
 				apply_pending_pose(sensor);
 				ohmd_unlock_mutex (sensor->sensor_lock);
-				if (init_frame_analyse(sensor, frame))
-					analyse_frame_fast(sensor, frame);
+				if (init_frame_analyse(sensor, frame, attached))
+					analyse_frame_fast(sensor, frame, accepted);
 				ohmd_lock_mutex (sensor->sensor_lock);
 				finish_fast_frame(sensor, frame);
 				frame = NULL;
@@ -983,6 +1032,9 @@ static unsigned int fast_analysis_thread(void *arg)
 				ohmd_cond_wait(sensor->fast_analysis_q_cond, sensor->sensor_lock);
 			}
 	}
+	/* cv1touch: a frame taken as shutdown began goes back with the queued ones */
+	if (frame != NULL)
+		release_capture_frame(sensor, frame);
 	ohmd_unlock_mutex (sensor->sensor_lock);
 
 	return 0;
@@ -1002,7 +1054,7 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	/* Analysis runs without sensor_lock. Retirement and the final pose commit share it,
 	 * so a frame that was already being fitted cannot move a hand after retirement. */
 	ohmd_lock_mutex(sensor_ctx->sensor_lock);
-	bool ret = !inspected && !sensor_ctx->retired &&
+	bool ret = !inspected && !sensor_ctx->retired && frame_accepted(sensor_ctx, frame) &&
 		!__atomic_load_n(&sensor_ctx->dev->usb_gone, __ATOMIC_RELAXED) &&
 		rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
 			score, obj_world_pose, sensor_ctx->serial_no);
@@ -1124,6 +1176,26 @@ void rift_sensor_retire(rift_sensor_ctx *sensor)
 	 * without waiting for a restoration acknowledgement. */
 	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
 	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
+bool rift_sensor_retired(rift_sensor_ctx *sensor)
+{
+	ohmd_lock_mutex(sensor->sensor_lock);
+	bool retired = sensor->retired;
+	ohmd_unlock_mutex(sensor->sensor_lock);
+	return retired;
+}
+
+void rift_sensor_accept_frames_from(rift_sensor_ctx *sensor, uint64_t start_ns)
+{
+	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->accept_from_ns = start_ns;
+	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
+const struct libusb_device *rift_sensor_get_usb_device(rift_sensor_ctx *sensor)
+{
+	return sensor->dev->usb_device;
 }
 
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor)
@@ -1250,7 +1322,8 @@ int rift_sensor_take_attachment_pin(rift_sensor_ctx *sensor)
 
 void rift_sensor_get_stream_info(rift_sensor_ctx *sensor, ohmd_cv1touch_sensor_stream *out)
 {
-	/* Starts and diagnostic reads both run on the engine thread. */
+	/* Read by the thread that started the sensor, before any other thread can reach it: the
+	 * engine thread at open, the hot-plug worker for a sensor added later. */
 	*out = sensor->dev->stream_status;
 	out->attachment = sensor->attachment;
 	snprintf(out->serial, sizeof out->serial, "%s", sensor->serial_no);

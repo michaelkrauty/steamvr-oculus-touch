@@ -242,7 +242,7 @@ test_pw_dep = dependency('libpipewire-0.3', required: false)
 if test_pw_dep.found()
   test_pipewire_lifetime = executable('test_pipewire_lifetime', 'test_pipewire_lifetime.c',
     c_args: ['-DHAVE_PIPEWIRE=1', '-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
-    dependencies: [test_pw_dep], link_args: ['-Wl,--gc-sections'])
+    dependencies: [test_pw_dep, threads_dep], link_args: ['-Wl,--gc-sections'])
   test('pipewire_lifetime', test_pipewire_lifetime)
 endif
 
@@ -299,3 +299,14 @@ test_sensor_retirement = executable('test_sensor_retirement', 'test_sensor_retir
   c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
   dependencies: [openhmd_dep, dependency('libusb-1.0'), threads_dep], link_args: ['-Wl,--gc-sections', '-lm'])
 test('sensor_retirement', test_sensor_retirement, timeout: 10)
+# Live sensor adds and releases on the actual tracker and its hot-plug worker thread.
+test_sensor_hotplug = executable('test_sensor_hotplug', 'test_sensor_hotplug.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections'],
+  dependencies: [openhmd_dep, dependency('libusb-1.0'), threads_dep], link_args: ['-Wl,--gc-sections', '-lm'])
+test('sensor_hotplug', test_sensor_hotplug, timeout: 30)
+
+# Provisional placement ownership across sensor lifetimes.
+test_placement_lifecycle = executable('test_placement_lifecycle', 'test_placement_lifecycle.c',
+  c_args: ['-I' + (rift_dir / 'src' / 'drv_oculus_rift'), '-I' + (rift_dir / 'src'), '-I' + (rift_dir / 'include'), '-ffunction-sections', '-fdata-sections', '-Wno-sign-compare'],
+  link_args: ['-Wl,--gc-sections', '-lm'])
+test('placement_lifecycle', test_placement_lifecycle)

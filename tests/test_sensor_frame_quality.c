@@ -56,26 +56,26 @@ static void raw_layout(void)
 		.width = 128, .height = 128, .stride = 128, .data = pixels,
 		.data_size = sizeof pixels, .data_block_size = sizeof pixels };
 	rift_sensor_analysis_frame frame = { .vframe = &video };
-	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	video.data_size--;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	video.data_size = sizeof pixels;
 	video.data_block_size--;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	video.data_block_size = sizeof pixels;
 	video.stride++;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	/* Packed and complete for its own size, but not the camera's. */
 	video.stride = video.width = 127;
 	video.data_size = 127 * 128;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	video.stride = video.width = 128;
 	video.height = 127;
 	video.data_size = 128 * 127;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	video.height = 128;
 	video.data_size = sizeof pixels;
-	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	CHECK(dev.cv1touch_frames_dropped == 5 && dev.cv1touch_frames_decoded == 0);
 }
 
@@ -176,9 +176,9 @@ static void jpeg_quality(bool corrupt)
 		if (decoded) {
 			CHECK(output != NULL && output->pts == 123 && output->start_ts == 456);
 			rift_sensor_analysis_frame frame = { .vframe = output };
-			CHECK(init_frame_analyse(&sensor, &frame));
+			CHECK(init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 			output->data_size--;
-			CHECK(!init_frame_analyse(&sensor, &frame));
+			CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 			output->data_size++;
 			ohmd_video_frame_release(output);
 		} else {
@@ -432,11 +432,11 @@ static void jpeg_counters(void)
 		.width = 128, .height = 128, .stride = 128, .data = data,
 		.data_size = size / 2, .data_block_size = size, .releasefn = count_release };
 	rift_sensor_analysis_frame frame = { .vframe = &input };
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	CHECK(dev.cv1touch_frames_dropped == 1 && dev.cv1touch_frames_decoded == 0);
 	CHECK(frame.vframe == &input && releases == 0);
 	input.data_size = size;
-	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	CHECK(dev.cv1touch_frames_dropped == 1 && dev.cv1touch_frames_decoded == 1);
 	CHECK(frame.vframe->format == OHMD_VIDEO_FRAME_FORMAT_GRAY8 && releases == 1);
 	CHECK(dev.cv1touch_video_format == OHMD_CV1TOUCH_VIDEO_JPEG);
@@ -444,13 +444,13 @@ static void jpeg_counters(void)
 	/* Decodable pixels with the wrong camera layout must not count as decoded. */
 	dev.calib.width = 127;
 	frame.vframe = &input;
-	CHECK(!init_frame_analyse(&sensor, &frame));
+	CHECK(!init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	CHECK(dev.cv1touch_frames_dropped == 2 && dev.cv1touch_frames_decoded == 1);
 	CHECK(frame.vframe != &input && releases == 2);
 	ohmd_video_frame_release(frame.vframe);
 	dev.calib.width = 128;
 	frame.vframe = &input;
-	CHECK(init_frame_analyse(&sensor, &frame));
+	CHECK(init_frame_analyse(&sensor, &frame, RIFT_MAX_TRACKED_DEVICES));
 	CHECK(dev.cv1touch_frames_dropped == 2 && dev.cv1touch_frames_decoded == 2 && releases == 3);
 	ohmd_video_frame_release(frame.vframe);
 	CHECK(sensor.cv1touch_frames_received == 0); /* Analysis is not acquisition. */

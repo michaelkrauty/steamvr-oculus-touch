@@ -71,6 +71,7 @@ struct rift_pose_finder {
 	uint64_t inspection_frame_ns, inspection_epoch; /* fast worker only */
 	blobservation inspection_previous_raw;
 	uint64_t inspection_tracks[MAX_BLOBS_PER_FRAME], inspection_next_track;
+	bool cv1touch_owns_placement; /* released after the analysis threads join */
 	bool cv1touch_allow_placement; /* provisional runtime placement allowed (cv1touch) */
 
 	/* Brute force search */

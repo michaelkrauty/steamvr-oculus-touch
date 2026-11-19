@@ -96,6 +96,21 @@ void ohmd_pw_video_stream_free(ohmd_pw_video_stream *p) { CHECK(!p); }
 #if HAVE_LIBJPEG
 void ohmd_jpeg_decoder_free(ohmd_jpeg_decoder *p) { CHECK(!p); }
 #endif
+/* A freed sensor gives back what its queued frames hold. */
+static unsigned slot_releases, video_releases, callbacks;
+void rift_tracker_frame_release(rift_tracker_ctx *t, uint64_t now, uint64_t start,
+                                rift_tracker_exposure_info *info, const char *source) {
+  (void)t; (void)now; (void)start; (void)source;
+  CHECK(info != NULL);
+  slot_releases++;
+}
+void blobwatch_release_observation(blobwatch *bw, blobservation *ob) { (void)bw; (void)ob; }
+void ohmd_video_frame_release(ohmd_video_frame *f) { CHECK(f); video_releases++; }
+static void count_frame(void *user, const ohmd_cv1touch_frame_info *info, int n,
+                        const ohmd_cv1touch_blob *blobs) {
+  (void)user; (void)info; (void)n; (void)blobs;
+  callbacks++;
+}
 static void stop(rift_sensor_device *d) { CHECK(d); }
 static void close_device(rift_sensor_device *d) {
   closed++;
@@ -145,7 +160,7 @@ static void pin_ownership_survives_sensor_free(bool transfer) {
   device->funcs = &funcs;
   device->calib.width = 1280;
   device->calib.height = 960;
-  rift_sensor_ctx *sensor = rift_sensor_new(&ctx, 0, "TEST000001", device, NULL);
+  rift_sensor_ctx *sensor = rift_sensor_new(&ctx, 0, "TEST000001", device, NULL, NULL);
   CHECK(sensor && sensor->attachment_pin == -1);
   int pin = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
   CHECK(pin >= 0);
@@ -165,7 +180,38 @@ static void pin_ownership_survives_sensor_free(bool transfer) {
   CHECK(fcntl(pin, F_GETFD) == -1 && errno == EBADF);
 }
 
+/* Each frame left queued for analysis holds a delay slot of every device it was captured for:
+ * a sensor freed while the engine runs gives them back, and no frame reaches the callback. */
+static void free_releases_frames_queued_for_analysis(void) {
+  calls = owned = closed = fail_at = 0;
+  slot_releases = video_releases = callbacks = 0;
+  ohmd_context ctx = {0};
+  ctx.cv1touch_frame_cb = count_frame;
+  rift_sensor_device_funcs funcs = {.stop = stop, .free = close_device};
+  rift_sensor_device *device = calloc(1, sizeof *device);
+  CHECK(device);
+  device->funcs = &funcs;
+  device->calib.width = 1280;
+  device->calib.height = 960;
+  rift_sensor_ctx *sensor = rift_sensor_new(&ctx, 0, "TEST000001", device, NULL, NULL);
+  CHECK(sensor);
+  ohmd_video_frame video[3] = {0};
+  blobservation obs = {0};
+  for (int i = 0; i < 3; i++) {
+    rift_sensor_analysis_frame *frame = POP_QUEUE(&sensor->capture_frame_q);
+    CHECK(frame);
+    frame->vframe = &video[i];
+    frame->bwobs = &obs;
+    frame->exposure_info_valid = true;
+    PUSH_QUEUE(i < 2 ? &sensor->fast_analysis_q : &sensor->long_analysis_q, frame);
+  }
+  rift_sensor_free(sensor);
+  CHECK(slot_releases == 3 && video_releases == 3 && callbacks == 0);
+  CHECK(closed == 1);
+}
+
 int main(void) {
+  free_releases_frames_queued_for_analysis();
   pin_ownership_survives_sensor_free(false);
   pin_ownership_survives_sensor_free(true);
   serial_case_matches();
@@ -182,7 +228,7 @@ int main(void) {
     d->funcs = &funcs;
     d->calib.width = 1280;
     d->calib.height = 960;
-    rift_sensor_ctx *s = rift_sensor_new(&ctx, 64, "TEST000064", d, NULL);
+    rift_sensor_ctx *s = rift_sensor_new(&ctx, 64, "TEST000064", d, NULL, NULL);
     if (s)
       rift_sensor_free(s);
     CHECK(closed == 1);

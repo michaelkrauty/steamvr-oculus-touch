@@ -43,6 +43,7 @@ static void *test_realloc(void *p, size_t n) {
 #define rift_sensor_take_attachment_pin fake_sensor_take_attachment_pin
 #define rift_sensor_serial_no fake_sensor_serial
 #define rift_sensor_retire fake_sensor_retire
+#define rift_sensor_retired fake_sensor_retired
 #include "rift-tracker.c"
 #include "test_util.h"
 
@@ -162,12 +163,13 @@ void fake_join(ohmd_thread *thread) { (void)thread; }
 rift_sensor_device *fake_sensor_device(ohmd_context *ctx, int id,
                                        const char *serial, libusb_context *usb,
                                        libusb_device_handle *handle,
-                                       const uint8_t radio[5]) {
+                                       const uint8_t radio[5], int *error_code) {
   (void)ctx;
   (void)id;
   (void)serial;
   (void)usb;
   (void)radio;
+  (void)error_code;
   if ((int)(uintptr_t)handle == fail_device) {
     fake_close(handle);
     return NULL;
@@ -176,9 +178,11 @@ rift_sensor_device *fake_sensor_device(ohmd_context *ctx, int id,
 }
 rift_sensor_ctx *fake_sensor_new(ohmd_context *ctx, int id, const char *serial,
                                  rift_sensor_device *device,
-                                 rift_tracker_ctx *tracker) {
+                                 rift_tracker_ctx *tracker,
+                                 const ohmd_cv1touch_sensor_pose *pose) {
   (void)ctx;
   (void)tracker;
+  CHECK(pose == NULL);
   if ((int)(uintptr_t)device == fail_analyser) {
     fake_close((void *)device);
     return NULL;
@@ -199,6 +203,9 @@ bool fake_sensor_start(rift_sensor_ctx *sensor) {
 }
 void fake_sensor_retire(rift_sensor_ctx *sensor) {
   ((struct fake_sensor *)sensor)->retired = true;
+}
+bool fake_sensor_retired(rift_sensor_ctx *sensor) {
+  return ((struct fake_sensor *)sensor)->retired;
 }
 void fake_sensor_request_stop(rift_sensor_ctx *sensor) {
   struct fake_sensor *s = (void *)sensor;
@@ -251,6 +258,12 @@ ohmd_mutex *ohmd_create_mutex(ohmd_context *ctx) {
   return ++mutex_calls == fail_mutex ? NULL : (void *)1;
 }
 void ohmd_destroy_mutex(ohmd_mutex *mutex) { (void)mutex; }
+/* One thread: the roster lock is only taken and given back. */
+void ohmd_lock_mutex(ohmd_mutex *mutex) { CHECK(mutex); }
+void ohmd_unlock_mutex(ohmd_mutex *mutex) { CHECK(mutex); }
+/* Discovery never starts the hot-plug worker. */
+void ohmd_cond_broadcast(ohmd_cond *cond) { (void)cond; abort(); }
+void ohmd_destroy_cond(ohmd_cond *cond) { (void)cond; abort(); }
 void led_search_model_free(led_search_model_t *model) { (void)model; }
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state) { (void)state; }
 void rift_pose_finder_cv1touch_reset(void) {}
@@ -451,7 +464,7 @@ int main(void) {
   fail_alloc = 1;
   CHECK(rift_tracker_new(ctx, radio) == NULL);
   fail_alloc = 0;
-  for (int k = 1; k <= 4; k++) {
+  for (int k = 1; k <= 5; k++) {
     mutex_calls = 0;
     fail_mutex = k;
     CHECK(rift_tracker_new(ctx, radio) == NULL);

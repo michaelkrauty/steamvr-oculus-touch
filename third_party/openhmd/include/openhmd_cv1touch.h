@@ -292,21 +292,68 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_controller(ohmd_device *dev
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_led_model(ohmd_device *device, ohmd_cv1touch_led *out, int max);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_count(ohmd_device *device);
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor(ohmd_device *device, int index, ohmd_cv1touch_sensor *out);
-/* Current sensor acquisition counters; indices can change after discovery.
+/* Current sensor acquisition counters; indices change as sensors are added or released.
  * Returns -1 past the last record. Engine thread only; counters are atomic. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video(ohmd_device *device, int index, ohmd_cv1touch_sensor_video *out);
 /* Current quality counters and negotiated input format. Same enumeration and
  * engine-thread-only rules as acquisition; no locks or device I/O. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_video_quality(ohmd_device *device, int index, ohmd_cv1touch_sensor_video_quality *out);
 /* Last start-attempt results, keyed by serial, including failed starts. Indices
- * may change after device discovery; returns -1 past the last record. Engine thread only. */
+ * change as sensors are added or forgotten; returns -1 past the last record. Engine thread only. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_get_sensor_stream(ohmd_device *device, int index, ohmd_cv1touch_sensor_stream *out);
-/* Forget a detached serial without freeing its native sensor object. Idempotent;
- * returns 0, or -1 on invalid arguments/context. Engine thread only. */
+/* Forget a detached serial's last-start record and its attachment pin. A sensor object of that
+ * serial is freed by ohmd_cv1touch_release_sensor, not here. Idempotent; returns 0, or -1 on
+ * invalid arguments/context. Engine thread only. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_forget_sensor_stream(ohmd_device *device, const char *serial);
-/* Retires this serial until engine replacement, fencing in-flight native pose commits.
- * Idempotent, including when the serial is not open. Thread-safe while the device lives. */
+/* Retires this serial's open sensors, fencing in-flight native pose commits and frame callbacks,
+ * until ohmd_cv1touch_release_sensor frees them (or the engine closes). Idempotent, including
+ * when the serial is not open. Thread-safe while the device lives: the only call allowed away
+ * from the engine thread. */
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_retire_sensor(ohmd_device *device, const char *serial);
+
+/* Live sensor lifecycle. A sensor plugged in while the engine runs is opened and started by the
+ * engine's own worker thread (cv1t-sensors), never on the engine thread, and joins the roster
+ * when the engine thread polls for it. Its frames neither move a controller nor reach the frame
+ * callback before it joins, and from then on only frames that started after its start returned
+ * do: earlier ones were exposed before the sensor's radio followed the headset. */
+#define OHMD_CV1TOUCH_SENSOR_ADD_STARTED 1u      /* in the roster now, with its last-start record */
+#define OHMD_CV1TOUCH_SENSOR_ADD_START_FAILED 2u /* opened, but its video did not start; recorded */
+#define OHMD_CV1TOUCH_SENSOR_ADD_NOT_FOUND 3u    /* no such USB device (yet, or any more) */
+#define OHMD_CV1TOUCH_SENSOR_ADD_STALE 4u        /* another connection is at that place now */
+#define OHMD_CV1TOUCH_SENSOR_ADD_OPEN_FAILED 5u  /* opening or setting up the device failed */
+#define OHMD_CV1TOUCH_SENSOR_ADD_REJECTED 6u     /* ignored, unreadable, another serial or already open */
+
+/* One finished add. stream: serial and attachment as requested (as pinned, for SYSFS); for
+ * STARTED and START_FAILED, the start attempt as recorded. error_code: libusb's (or a negative
+ * errno) for OPEN_FAILED and START_FAILED, else 0. open_ms: finding, opening and setting up the
+ * device, calibration read included; start_ms: starting its video, through the radio setup. */
+typedef struct ohmd_cv1touch_sensor_added {
+	ohmd_cv1touch_sensor_stream stream;
+	uint32_t outcome;                  /* OHMD_CV1TOUCH_SENSOR_ADD_* */
+	int32_t error_code;
+	uint32_t open_ms;
+	uint32_t start_ms;
+} ohmd_cv1touch_sensor_added;          /* 80 bytes */
+
+/* Asks the worker to open and start the sensor serial at attachment `key`. SYSFS keys (Linux) must
+ * match the device's pinned directory inode, or the add is STALE without opening it. WINDOWS keys
+ * are matched by serial among Rift Sensors no open sensor holds, and recorded as given. pose: the
+ * camera -> world pose it starts with (NULL: as at open); it must name serial. Never blocks on
+ * USB. Returns 0 when queued, 1 when that serial is already open (and not retired), queued or
+ * starting, -1 on invalid arguments or when the worker cannot start. Engine thread only. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_add_sensor(ohmd_device *device, const char *serial,
+	const ohmd_cv1touch_sensor_attachment *key, const ohmd_cv1touch_sensor_pose *pose);
+/* Takes up to max finished adds, in the order they finished. A STARTED sensor joins the roster
+ * here, given every controller the engine tracks; a duplicate of an open serial is freed instead
+ * and returned REJECTED. Retired sensors of that serial still in the roster are released first.
+ * Returns the count, or -1 on invalid arguments. Engine thread only. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_poll_sensor_adds(ohmd_device *device,
+	ohmd_cv1touch_sensor_added *out, int max);
+/* Retires every roster sensor of this serial, takes it out of the roster and has the worker free
+ * it (the engine thread does, if the worker cannot start). The stream record stays until
+ * ohmd_cv1touch_forget_sensor_stream. Idempotent. Returns 0, or -1 on invalid arguments. Engine
+ * thread only. */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_release_sensor(ohmd_device *device, const char *serial);
 /* Gives the sensor pose->serial names the camera -> world pose it tracks with from now on, as its
  * fixed pose at start did; applied by the sensor's own analysis thread before its next frame.
  * Returns 0, or -1 when no such sensor is open. */

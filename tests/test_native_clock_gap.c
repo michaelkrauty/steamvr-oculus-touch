@@ -97,6 +97,8 @@ ohmd_mutex *ohmd_create_mutex(ohmd_context *ctx)
 	CHECK(m && pthread_mutex_init(m, NULL) == 0);
 	return (ohmd_mutex *)m;
 }
+void ohmd_destroy_cond(ohmd_cond *c) { CHECK(pthread_cond_destroy((pthread_cond_t *)c) == 0); free(c); }
+void ohmd_cond_broadcast(ohmd_cond *c) { CHECK(pthread_cond_broadcast((pthread_cond_t *)c) == 0); }
 void ohmd_destroy_mutex(ohmd_mutex *m) { CHECK(pthread_mutex_destroy((pthread_mutex_t *)m) == 0); free(m); }
 void ohmd_lock_mutex(ohmd_mutex *m) { CHECK(locks_held == 0); CHECK(pthread_mutex_lock((pthread_mutex_t *)m) == 0); locks_held++; }
 void ohmd_unlock_mutex(ohmd_mutex *m) { CHECK(locks_held == 1); locks_held--; CHECK(pthread_mutex_unlock((pthread_mutex_t *)m) == 0); }
@@ -134,7 +136,7 @@ static struct fixture *create_fixture(int slots, uint32_t first_message)
 	posef model_pose = {.pos = {{.04f, .05f, .06f}}, .orient = {.w = 1}};
 	f->dev = (rift_tracked_device_priv *)rift_tracker_add_device(&f->ctx, 2,
 		&imu_pose, &model_pose, &f->leds, &f->calibration);
-	CHECK(f->dev->n_delay_slots == slots && f->dev->index == 0);
+	CHECK(f->dev->n_delay_slots == 3 && f->dev->index == 0);
 	f->touch.have_calibration = true;
 	for (int i = 0; i < 3; i++) {
 		f->touch.calibration.accel_matrix[i][i] = 1;
@@ -534,7 +536,7 @@ void led_search_model_free(led_search_model_t *s) { (void)s; abort(); }
 void ohmd_destroy_thread(ohmd_thread *t) { (void)t; abort(); }
 
 /* Exercise the production owner, including unused slots and construction cleanup.
- * Sensor presence selects delay slots only; no sensor resources are created. */
+ * Both sensorless and sensor-present engines reserve delay slots; no sensor resources are created. */
 static int ownership_regression(void)
 {
 	rift_tracker_free(NULL);
@@ -558,7 +560,7 @@ static int ownership_regression(void)
 				ctx->devices[i].device_lock = ohmd_create_mutex(NULL);
 				rift_tracked_device_priv *dev = (void *)rift_tracker_add_device(ctx,
 					i, &pose, &pose, &leds, &cal);
-				CHECK(dev->n_delay_slots == slots);
+				CHECK(dev->n_delay_slots == NUM_POSE_DELAY_SLOTS);
 			}
 			ctx->n_sensors = 0; /* No actual sensor ownership to drain. */
 			rift_tracker_free(ctx);

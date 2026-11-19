@@ -996,7 +996,8 @@ static void pending_fast_match(rift_sensor_ctx *sensor, rift_tracked_device *dev
     rift_tracked_device *devices[] = {&inspected};
     blobservation obs = *latest;
     for (int i = 0; i < 6; i++) obs.blobs[i].led_id = LED_MAKE_ID(dev->id, i);
-    rift_sensor_analysis_frame fast = {.bwobs = &obs, .n_devices = 1};
+    ohmd_video_frame video = {0}; /* a pose commit reads when its frame started */
+    rift_sensor_analysis_frame fast = {.bwobs = &obs, .vframe = &video, .n_devices = 1};
     fast.exposure_info.devices[0].capture_pose.orient.w = 1;
     fast.exposure_info.devices[0].device_time_ns = 300000000000ULL;
     rift_pose_finder_process_blobs_fast(&sensor->pf, &fast, devices, 0x6);
@@ -1045,7 +1046,8 @@ static void check_other_hand(rift_sensor_ctx *sensor, blobservation *latest, int
     rift_tracked_device dev = {.id = other_id, .leds = &model};
     rift_tracked_device *devices[] = {&dev};
     blobservation obs = *latest;
-    rift_sensor_analysis_frame fast = {.bwobs = &obs, .n_devices = 1};
+    ohmd_video_frame video = {0}; /* a pose commit reads when its frame started */
+    rift_sensor_analysis_frame fast = {.bwobs = &obs, .vframe = &video, .n_devices = 1};
     fast.exposure_info.devices[0].capture_pose.orient.w = 1;
     rift_pose_finder_process_blobs_fast(&sensor->pf, &fast, devices, 0x6);
     CHECK(fast.capture_state[0].found_device_pose);
