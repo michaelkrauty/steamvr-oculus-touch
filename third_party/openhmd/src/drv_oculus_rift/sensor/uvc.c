@@ -221,6 +221,8 @@ static void deliver_frame(struct rift_sensor_uvc_stream *stream)
 	uint64_t start_ts = stream->cur_frame->start_ts;
 
 	stream->cur_frame->data_size = stream->frame_collected;
+	stream->cur_frame->cv1touch_after_idle = stream->idle_gap;
+	stream->idle_gap = false;
 	if (stream->frame_cb) {
 		stream->frame_cb(stream, stream->cur_frame, stream->frame_cb_data);
 		stream->cur_frame = NULL;
@@ -232,6 +234,20 @@ static void deliver_frame(struct rift_sensor_uvc_stream *stream)
 	if ((stream->n_discards != 0 || stream->bad_packets != 0) &&
 			start_ts >= stream->discard_window_start + UVC_DISCARD_REPORT_NS)
 		report_discards(stream, start_ts);
+}
+
+/* A complete image nothing wanted: counted as received, as if it had been delivered. */
+static void count_idle_frame(struct rift_sensor_uvc_stream *stream)
+{
+	if (stream->frames_received)
+		__atomic_fetch_add(stream->frames_received, 1, __ATOMIC_RELAXED);
+	stream->frame_collected = 0;
+	stream->frame_delivered = true;
+	if (stream->n_discards != 0 || stream->bad_packets != 0) {
+		uint64_t now = uvc_now(stream);
+		if (now >= stream->discard_window_start + UVC_DISCARD_REPORT_NS)
+			report_discards(stream, now);
+	}
 }
 
 /* An APP segment can contain a thumbnail's EOI. Skip marker payloads by their
@@ -339,6 +355,15 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 		stream->have_boundary = true;
 		stream->frame_collected = 0;
 		stream->skip_frame = skip;
+		/* Decided once per image, so a change never splits one. JPEG decoding is the
+		 * proof of a USB 2 stream's video, so those images are always wanted. */
+		stream->idle = !skip && stream->wanted_cb && stream->format != OHMD_VIDEO_FRAME_FORMAT_JPEG &&
+			!stream->wanted_cb(stream->wanted_data);
+		if (stream->idle && stream->cur_frame) {
+			rift_sensor_uvc_stream_release_frame(stream->cur_frame, stream);
+			stream->cur_frame = NULL;
+		}
+		stream->idle_gap |= stream->idle;
 		stream->frame_delivered = false;
 		stream->jpeg_header_offset = 0;
 		stream->jpeg_scan_started = false;
@@ -368,6 +393,20 @@ void process_payload(struct rift_sensor_uvc_stream *stream, unsigned char *paylo
 	}
 	if (stream->skip_frame)
 		return;
+
+	if (stream->idle) {
+		/* The same length checks as for a delivered image, on the lengths alone. */
+		if (len > (size_t)(stream->frame_size - stream->frame_collected)) {
+			reject_frame(stream, UVC_DISCARD_TOO_LONG);
+			return;
+		}
+		stream->frame_collected += (int)len;
+		if (stream->frame_collected == stream->frame_size)
+			count_idle_frame(stream);
+		else if (is_eof)
+			reject_frame(stream, UVC_DISCARD_INCOMPLETE);
+		return;
+	}
 
 	if (len != 0) {
 		if (stream->cur_frame == NULL) {
@@ -737,6 +776,7 @@ int rift_sensor_uvc_stream_start(rift_sensor_uvc_stream *stream, uint8_t min_fra
 	stream->have_boundary = false;
 	stream->skip_frame = true;
 	stream->frame_delivered = stream->reject_next_frame = false;
+	stream->idle = stream->idle_gap = false;
 	stream->frame_collected = 0;
 	stream->jpeg_header_offset = 0;
 	stream->jpeg_scan_started = false;

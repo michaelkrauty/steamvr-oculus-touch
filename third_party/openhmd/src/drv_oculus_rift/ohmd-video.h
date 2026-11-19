@@ -6,6 +6,7 @@
 
 /* Oculus Rift driver - video frame handling */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifndef __OHMD_VIDEO_H__
@@ -38,6 +39,10 @@ struct ohmd_video_frame {
 	int stride;
 	int width;
 	int height;
+
+	/* cv1touch: the images before this one were counted but not analysed, so no analysis
+	 * history continues into it */
+	bool cv1touch_after_idle;
 
 	void *owner;
 	ohmd_video_frame_release_func releasefn;

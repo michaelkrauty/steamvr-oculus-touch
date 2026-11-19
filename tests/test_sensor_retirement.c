@@ -23,7 +23,8 @@
 #include "test_util.h"
 #include <pthread.h>
 #include <errno.h>
-static unsigned poses, releases;
+static unsigned poses, releases, history_resets;
+static bool expect_history_reset;
 static bool check_commit_lock;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 uint64_t test_now(ohmd_context *ctx) { (void)ctx; return 1; }
@@ -58,6 +59,7 @@ void rift_pose_finder_set_inspection_pose(rift_pose_finder *pf, int id, const po
 void blobwatch_update_labels(blobwatch *bw, blobservation *ob, int id) {
   (void)bw; (void)ob; (void)id; abort();
 }
+void blobwatch_reset_history(blobwatch *bw) { (void)bw; history_resets++; }
 void blobwatch_clear_labels(blobwatch *bw, int id) { (void)bw; (void)id; abort(); }
 void rift_pose_finder_set_inspection_candidate(rift_pose_finder *pf, int id,
     const blobservation *ob, uint64_t epoch, const uint64_t *tracks, const posef *world,
@@ -84,6 +86,7 @@ void test_set_camera_pose(rift_pose_finder *pf, const posef *pose) { (void)pf; (
 void test_blobwatch_process(blobwatch *bw, uint8_t *frame, int w, int h, uint8_t phase,
     rift_led *leds, uint8_t n, blobservation **out) {
   (void)bw; (void)frame; (void)w; (void)h; (void)phase; (void)leds; (void)n;
+  CHECK(history_resets == (unsigned)expect_history_reset);
   *out = &observed;
   inline_sensor->shutdown = true;
 }
@@ -140,6 +143,8 @@ static void analysis_sensor(rift_sensor_ctx *sensor) {
     PUSH_QUEUE(&sensor->capture_frame_q, &analysis_frames[i]);
   }
   models_set = searches = long_searches = slot_releases = video_releases = callbacks = 0;
+  history_resets = 0;
+  expect_history_reset = false;
   inline_sensor = sensor;
 }
 /* A captured frame that started at start_ns, queued as the capture callback queues it. */
@@ -157,6 +162,40 @@ static rift_sensor_analysis_frame *captured(rift_sensor_ctx *sensor, rift_sensor
   frame->exposure_info.n_devices = exposed_devices;
   PUSH_QUEUE(q, frame);
   return frame;
+}
+
+bool rift_tracker_frame_captured(rift_tracker_ctx *t, uint64_t now, uint64_t start,
+    rift_tracker_exposure_info *info, const char *source) {
+  (void)t; (void)now; (void)start; (void)source;
+  *info = (rift_tracker_exposure_info){0};
+  return true;
+}
+
+/* Exercise the real capture callback and run the real fast thread through the
+ * first surviving frame, checking that history is reset before it extracts blobs. */
+static void idle_mark_survives_lost_frame(bool invalid, bool reclaim) {
+  rift_sensor_ctx sensor;
+  analysis_sensor(&sensor);
+  ohmd_video_frame next = {.format = OHMD_VIDEO_FRAME_FORMAT_GRAY8, .data = pixels,
+    .width = 4, .height = 2, .stride = 4, .data_size = 8, .data_block_size = 8};
+  ohmd_video_frame marked = next;
+  marked.cv1touch_after_idle = true;
+  if (invalid)
+    marked.data_size--;
+  if (!invalid && !reclaim)
+    while (POP_QUEUE(&sensor.capture_frame_q)) {}
+  frame_captured_cb(sensor.dev, &marked, &sensor);
+  if (reclaim) {
+    while (POP_QUEUE(&sensor.capture_frame_q)) {}
+  } else if (!invalid) {
+    PUSH_QUEUE(&sensor.capture_frame_q, &analysis_frames[0]);
+  }
+  CHECK(video_releases == (unsigned)!reclaim);
+  frame_captured_cb(sensor.dev, &next, &sensor);
+  CHECK(video_releases == 1 && next.cv1touch_after_idle && !sensor.idle_gap);
+  expect_history_reset = true;
+  fast_analysis_thread(&sensor);
+  CHECK(history_resets == 1);
 }
 
 /* A device the tracker adds after the sensor took a frame: the frame carries its exposure
@@ -250,6 +289,9 @@ static void a_frame_taken_at_shutdown_is_released(void) {
 }
 
 int main(void) {
+  idle_mark_survives_lost_frame(true, false);  /* rejected raw image */
+  idle_mark_survives_lost_frame(false, true);  /* reclaimed from fast queue */
+  idle_mark_survives_lost_frame(false, false); /* no buffer or queued work */
   rift_sensor_device usb = {0};
   rift_sensor_ctx sensor = {.dev = &usb, .sensor_lock = (void *)&lock};
   ohmd_cv1touch_sensor_attachment discovered = {.kind = OHMD_CV1TOUCH_ATTACHMENT_USB,

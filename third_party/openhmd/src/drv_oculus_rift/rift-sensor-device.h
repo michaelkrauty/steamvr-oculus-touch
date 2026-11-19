@@ -52,6 +52,10 @@ struct rift_sensor_device {
 	uint32_t cv1touch_video_format;
 	uint64_t cv1touch_frames_decoded;
 	uint64_t cv1touch_frames_dropped;
+	/* Set before capture starts; valid until streaming callbacks have stopped. */
+	bool (*cv1touch_wanted)(void *data);
+	void *cv1touch_wanted_data;
+	uint64_t *cv1touch_frames_received;
 	/* Retained after NO_DEVICE, read by the engine without taking the USB event lock. */
 	uint32_t usb_gone;
 	/* cv1touch: the USB device this one has open, for as long as it is open; compared, never

@@ -237,8 +237,34 @@ static void native_lifetimes_are_unique_and_set_before_threads(void) {
   CHECK(closed == 3);
 }
 
+static void sensor_demand(void)
+{
+  rift_sensor_ctx sensor = {.sensor_lock = (void *)1};
+  CHECK(sensor_images_wanted(&sensor));
+  rift_sensor_set_images_wanted(&sensor, false);
+  CHECK(!sensor_images_wanted(&sensor));
+#define DEMAND(field) do { \
+  sensor.field = 1; \
+  CHECK(sensor_images_wanted(&sensor)); \
+  sensor.field = 0; \
+  CHECK(!sensor_images_wanted(&sensor)); \
+} while (0)
+  DEMAND(have_pending_pose);
+  DEMAND(pending_clear);
+  DEMAND(pending_candidate);
+  DEMAND(pending_label_updates);
+  DEMAND(pending_label_revoke);
+  DEMAND(pf.inspection_mask);
+  DEMAND(long_analysis_busy);
+  DEMAND(accept_from_ns);
+#undef DEMAND
+  rift_sensor_set_images_wanted(&sensor, true);
+  CHECK(sensor_images_wanted(&sensor));
+}
+
 int main(void) {
   native_lifetimes_are_unique_and_set_before_threads();
+  sensor_demand();
   free_releases_frames_queued_for_analysis();
   pin_ownership_survives_sensor_free(false);
   pin_ownership_survives_sensor_free(true);

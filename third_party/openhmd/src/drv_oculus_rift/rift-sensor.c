@@ -78,6 +78,8 @@ struct rift_sensor_ctx_s
 	uint32_t cv1touch_frames;
 	uint64_t cv1touch_frames_received;
 	uint32_t cv1touch_pose_fixes[3];
+	bool images_unwanted; /* atomic, defaults to wanted */
+	bool idle_gap; /* sensor_lock: carry the mark past any rejected or reclaimed frame */
 
 	ohmd_mutex *sensor_lock;
 
@@ -328,6 +330,11 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	 * using a different capture backend before taking ownership or queueing work. */
 	if (vframe->format != OHMD_VIDEO_FRAME_FORMAT_JPEG && !valid_raw_frame(dev, vframe)) {
 		__atomic_fetch_add(&dev->cv1touch_frames_dropped, 1, __ATOMIC_RELAXED);
+		if (vframe->cv1touch_after_idle) {
+			ohmd_lock_mutex(sensor->sensor_lock);
+			sensor->idle_gap = true;
+			ohmd_unlock_mutex(sensor->sensor_lock);
+		}
 		ohmd_video_frame_release(vframe);
 		return;
 	}
@@ -348,6 +355,7 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	 * one pending things are quite blocked */
 	if (frame == NULL) {
 		if ((frame = REWIND_QUEUE(&sensor->fast_analysis_q)) != NULL) {
+			sensor->idle_gap |= frame->vframe->cv1touch_after_idle;
 			release_capture_frame(sensor, frame);
 			frame = POP_QUEUE(&sensor->capture_frame_q);
 		}
@@ -368,6 +376,8 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	frame->frame_delivered_ts = now;
 	frame->vframe = vframe;
 	frame->bwobs = NULL;
+	vframe->cv1touch_after_idle |= sensor->idle_gap;
+	sensor->idle_gap = false;
 
 	frame->exposure_info_valid = rift_tracker_frame_captured (sensor->tracker, now,
 		vframe->start_ts, &frame->exposure_info, sensor->serial_no);
@@ -378,6 +388,7 @@ static void frame_captured_cb(rift_sensor_device *dev, ohmd_video_frame *vframe,
 	return;
 
 no_frame:
+	sensor->idle_gap |= vframe->cv1touch_after_idle;
 	ohmd_video_frame_release(vframe);
 	ohmd_unlock_mutex(sensor->sensor_lock);
 }
@@ -589,10 +600,35 @@ static rift_sensor_analysis_frame *next_fast_frame(rift_sensor_ctx *sensor)
 	return POP_QUEUE(&sensor->fast_analysis_q);
 }
 
+static bool pending_image_work(const rift_sensor_ctx *sensor)
+{
+	return sensor->have_pending_pose || sensor->pending_clear || sensor->pending_candidate ||
+		sensor->pending_label_updates || sensor->pending_label_revoke;
+}
+
+static bool sensor_images_wanted(void *data)
+{
+	rift_sensor_ctx *sensor = data;
+	if (!__atomic_load_n(&sensor->images_unwanted, __ATOMIC_RELAXED))
+		return true;
+
+	ohmd_lock_mutex(sensor->sensor_lock);
+	bool wanted = pending_image_work(sensor) || sensor->pf.inspection_mask ||
+		sensor->long_analysis_busy || (sensor->accept_from_ns != 0 &&
+			sensor->accept_from_ns > ohmd_monotonic_get(sensor->ohmd_ctx));
+	ohmd_unlock_mutex(sensor->sensor_lock);
+	return wanted;
+}
+
+void rift_sensor_set_images_wanted(rift_sensor_ctx *sensor, bool wanted)
+{
+	__atomic_store_n(&sensor->images_unwanted, !wanted, __ATOMIC_RELAXED);
+}
+
 static void long_analysis_finished(rift_sensor_ctx *sensor)
 {
 	sensor->long_analysis_busy = false;
-	if ((sensor->have_pending_pose || sensor->pending_clear || sensor->pending_candidate || sensor->pending_label_updates || sensor->pending_label_revoke) && sensor->fast_analysis_q_cond)
+	if (pending_image_work(sensor) && sensor->fast_analysis_q_cond)
 		ohmd_cond_signal(sensor->fast_analysis_q_cond);
 }
 
@@ -618,6 +654,9 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	/* libopenhmd is loaded once per process, so no two objects ever share a lifetime */
 	static uint64_t next_lifetime;
 	sensor_ctx->lifetime = __atomic_add_fetch(&next_lifetime, 1, __ATOMIC_SEQ_CST);
+	dev->cv1touch_wanted = sensor_images_wanted;
+	dev->cv1touch_wanted_data = sensor_ctx;
+	dev->cv1touch_frames_received = &sensor_ctx->cv1touch_frames_received;
 
 	sensor_ctx->pf.sensor_id = sensor_ctx->id = id;
 	strcpy ((char *) sensor_ctx->serial_no, (char *) serial_no);
@@ -1024,6 +1063,8 @@ static unsigned int fast_analysis_thread(void *arg)
 				 * analysis is not reading the pose finder */
 				apply_pending_pose(sensor);
 				ohmd_unlock_mutex (sensor->sensor_lock);
+				if (frame->vframe->cv1touch_after_idle)
+					blobwatch_reset_history(sensor->bw);
 				if (init_frame_analyse(sensor, frame, attached))
 					analyse_frame_fast(sensor, frame, accepted);
 				ohmd_lock_mutex (sensor->sensor_lock);

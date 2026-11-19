@@ -106,6 +106,7 @@ static inline int rift_sensor_frame_blob_label(const rift_sensor_analysis_frame 
  * names this sensor; NULL takes the context's configured pose, if any. */
 rift_sensor_ctx * rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	rift_sensor_device *dev, rift_tracker_ctx *tracker, const ohmd_cv1touch_sensor_pose *pose);
+void rift_sensor_set_images_wanted(rift_sensor_ctx *sensor, bool wanted);
 void rift_sensor_request_stop(rift_sensor_ctx *sensor_ctx);
 void rift_sensor_retire(rift_sensor_ctx *sensor);
 bool rift_sensor_retired(rift_sensor_ctx *sensor);

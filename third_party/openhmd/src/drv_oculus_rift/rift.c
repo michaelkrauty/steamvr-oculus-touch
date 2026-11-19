@@ -1667,6 +1667,13 @@ OHMD_APIENTRYDLL ohmd_cv1touch_radio_decoder *OHMD_APIENTRY ohmd_cv1touch_radio_
 	return dec;
 }
 
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_images_wanted(ohmd_cv1touch_radio_decoder *dec,
+		int (*wanted)(const char *serial, void *data), void *data)
+{
+	if (dec != NULL && dec->hmd->tracker_ctx != NULL)
+		rift_tracker_set_images_wanted(dec->hmd->tracker_ctx, wanted, data);
+}
+
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_search_skip(ohmd_cv1touch_radio_decoder *dec,
 		uint32_t device_mask)
 {
@@ -1677,6 +1684,7 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_set_search_skip(
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_radio_decoder_free(ohmd_cv1touch_radio_decoder *dec)
 {
 	ohmd_cv1touch_radio_decoder_set_search_skip(dec, 0);
+	ohmd_cv1touch_radio_decoder_set_images_wanted(dec, NULL, NULL);
 	free(dec);
 }
 

@@ -22,7 +22,10 @@ static void check_frames(bool simd, bool lit_first_line)
 	skip_simd = simd;
 	blobwatch *bw = blobwatch_new(BLOB_THRESHOLD_CV1);
 	CHECK(bw != NULL);
+	uint32_t before_gap = 0;
 	for (int frame_index = 0; frame_index < 4; frame_index++) {
+		if (frame_index == 2)
+			blobwatch_reset_history(bw);
 		blobservation *ob = NULL;
 		blobwatch_process(bw, frame, W, H, 0, NULL, 0, &ob);
 		CHECK(ob != NULL);
@@ -35,8 +38,15 @@ static void check_frames(bool simd, bool lit_first_line)
 		CHECK(ob->blobs[1].width == 4 && ob->blobs[1].area == 8);
 		CHECK_NEAR(ob->blobs[1].x, 42.0, 0.000001);
 		CHECK_NEAR(ob->blobs[1].y, 15.0, 0.000001);
-		CHECK(ob->blobs[0].age == (uint32_t)frame_index);
-		CHECK(ob->blobs[1].age == (uint32_t)frame_index);
+		CHECK(ob->blobs[0].age == (uint32_t)(frame_index % 2));
+		CHECK(ob->blobs[1].age == (uint32_t)(frame_index % 2));
+		if (frame_index == 1) {
+			before_gap = ob->blobs[0].blob_id;
+			ob->blobs[0].led_id = LED_MAKE_ID(1, 2);
+		} else if (frame_index == 2) {
+			CHECK(ob->blobs[0].blob_id != before_gap);
+			CHECK(ob->blobs[0].led_id == LED_INVALID_ID);
+		}
 		blobwatch_release_observation(bw, ob);
 	}
 	blobwatch_free(bw);

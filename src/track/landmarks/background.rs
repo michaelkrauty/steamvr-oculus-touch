@@ -366,6 +366,13 @@ impl BackgroundMonitor {
         }
     }
 
+    pub fn watched_serials(&self) -> impl Iterator<Item = &str> {
+        self.sensors
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.serial.as_ref())
+    }
+
     /// Whether `serial`'s landmarks are watched now.
     pub fn watches(&self, serial: &str) -> bool {
         self.sensors

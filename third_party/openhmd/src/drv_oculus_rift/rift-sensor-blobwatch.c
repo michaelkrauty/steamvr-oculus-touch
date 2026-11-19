@@ -110,6 +110,12 @@ struct blobwatch {
 	blobservation *last_observation;
 };
 
+void blobwatch_reset_history(blobwatch *bw)
+{
+	/* Observation buffers still belong to their consumers. Only forget the association. */
+	bw->last_observation = NULL;
+}
+
 void blobwatch_set_flicker(blobwatch *bw, bool enable)
 {
 	bw->flicker_enable = enable;
