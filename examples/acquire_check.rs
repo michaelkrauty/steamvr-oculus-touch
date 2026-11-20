@@ -140,7 +140,7 @@ fn main() {
                 let imu = factory::imu_position(&dir, &leds).expect("factory IMU position");
                 p.body(device, leds.clone(), imu);
                 if let Some(e) = bias_file.controllers.get(&biases::key(hand, &leds)) {
-                    p.seed_biases(hand, e.gyro(), e.accel());
+                    p.seed_biases(hand, e.gyro());
                 }
             }
             recorder::RAW_REPORT => {

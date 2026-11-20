@@ -65,9 +65,7 @@ pub struct Params {
     /// tracker's own (shift-search) association to re-lock without the engine.
     pub relock_ns: u64,
     /// A wrong lock (a pose that fits the LEDs but is turned from the truth) leaks gravity into the
-    /// filter, which drives the accelerometer bias off: beyond this from a remembered bias, or
-    /// beyond `max_accel_bias` without one (m/s^2), the track is dropped.
-    pub max_accel_bias_change: f64,
+    /// filter, which drives the accelerometer bias off: beyond this (m/s^2) the track is dropped.
     pub max_accel_bias: f64,
     /// After a wrong lock, engine poses within `wrong_lock_turn_rad` of the dropped orientation
     /// (carried on by the gyro) are refused for this long: the engine tends to offer it again.
@@ -122,7 +120,6 @@ impl Default for Params {
             max_refusing_ns: 500_000_000,
             foreign_px: 2.0,
             relock_ns: 3_000_000_000,
-            max_accel_bias_change: 0.5,
             max_accel_bias: 1.0,
             wrong_lock_memory_ns: 2_000_000_000,
             wrong_lock_turn_rad: 10f64.to_radians(),
@@ -333,8 +330,6 @@ pub struct Tracker {
     provisional: Option<u64>,
     /// The model origin where it was last tracked (held while the position is lost).
     held: Option<Vector3<f64>>,
-    /// The accelerometer bias remembered from an earlier run (`seed_biases`).
-    bias_ref: Option<Vector3<f64>>,
     /// The biases the current track started from, restored when it turns out a wrong lock.
     acquired_bias: Option<Filter>,
     /// A dropped wrong lock's orientation, carried on by the gyro: (controller time, orientation,
@@ -390,7 +385,6 @@ impl Tracker {
             last_fix: 0,
             last_track: 0,
             saved_bias: None,
-            bias_ref: None,
             acquired_bias: None,
             wrong_lock: None,
             aliases,
@@ -639,18 +633,14 @@ impl Tracker {
             cov[(BA + i, BA + i)] = sd_accel * sd_accel;
         }
         self.saved_bias = Some(Filter { x, cov });
-        self.bias_ref = Some(accel);
     }
 
-    /// Whether the newest state's accelerometer bias ran off (see `Params::max_accel_bias_change`).
+    /// Whether the newest state's accelerometer bias ran off (see `Params::max_accel_bias`).
     fn bias_ran_off(&self) -> bool {
         let Some(&(_, f)) = self.history.back() else {
             return false;
         };
-        match self.bias_ref {
-            Some(r) => (f.x.ba - r).norm() > self.params.max_accel_bias_change,
-            None => f.x.ba.norm() > self.params.max_accel_bias,
-        }
+        f.x.ba.norm() > self.params.max_accel_bias
     }
 
     /// Drops the track as a wrong lock: the biases go back to what it started from, the
@@ -2765,6 +2755,23 @@ mod tests {
             "kept the runaway bias {:?}",
             tr.saved_bias.map(|f| f.x.ba)
         );
+    }
+
+    /// An accelerometer bias the filter was started from is corrected by the fixes, however far
+    /// off it was: moving away from it is not taken for a wrong lock (the track dropped and the
+    /// stale bias restored for the next one to run off from again).
+    #[test]
+    fn a_stale_starting_accelerometer_bias_is_corrected_not_taken_for_a_wrong_lock() {
+        let w = world(5);
+        let stale = Run {
+            seed: Some((w.bg, w.ba + Vector3::new(0.5, -0.4, 0.0))),
+            ..Run::default()
+        };
+        let (tr, _) = run_with(&w, 6.0, 0.3, &stale);
+        assert_eq!(tr.stats.wrong_locks, 0, "{:?}", tr.stats);
+        assert!(tr.tracking());
+        let ba = tr.history.back().unwrap().1.x.ba;
+        assert!((ba - w.ba).norm() < 0.1, "ba {ba:?}, true {:?}", w.ba);
     }
 
     /// After a wrong lock the engine tends to offer the same wrong pose again: poses agreeing with

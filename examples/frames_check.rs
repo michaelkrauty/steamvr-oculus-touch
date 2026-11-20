@@ -119,10 +119,7 @@ fn main() {
     for (h, var) in ["SEED_L", "SEED_R"].iter().enumerate() {
         if let Ok(v) = std::env::var(var) {
             let x: Vec<f64> = v.split(',').map(|t| t.parse().unwrap()).collect();
-            o.seed_biases[h] = Some((
-                nalgebra::Vector3::new(x[0], x[1], x[2]),
-                nalgebra::Vector3::new(x[3], x[4], x[5]),
-            ));
+            o.seed_biases[h] = Some(nalgebra::Vector3::new(x[0], x[1], x[2]));
         }
     }
     let r = replay::replay(&rec, &cal, &|l| factory::imu_position(&dir, l), &o).unwrap();

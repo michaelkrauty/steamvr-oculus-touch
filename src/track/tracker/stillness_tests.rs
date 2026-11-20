@@ -408,7 +408,6 @@ pub(super) fn assert_state(a: &Tracker, b: &Tracker) {
         assert_eq!(fa.map(filter_bits), fb.map(filter_bits));
     }
     assert_eq!(a.held.map(vector_bits), b.held.map(vector_bits));
-    assert_eq!(a.bias_ref.map(vector_bits), b.bias_ref.map(vector_bits));
     assert_eq!(
         (a.last_fix, a.last_track, a.last_confirmed),
         (b.last_fix, b.last_track, b.last_confirmed)

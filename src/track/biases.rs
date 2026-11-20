@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! Each controller's IMU biases, remembered across daemon restarts. The accelerometer's take tens
-//! of seconds of varied orientation to learn from scratch (Touch R's reads 0.45 m/s^2 high on one
-//! axis), with up to a degree of tilt until then; a remembered estimate holds from the first fix.
+//! Each controller's IMU biases, remembered across daemon restarts. Only the gyro's seeds a new
+//! run. The accelerometer's is saved too but learned afresh each run: an estimate saved before it
+//! settled (or while the controller slept) was found up to 0.5 m/s^2 off the next run, and the
+//! fixes correcting it then looked like wrong locks to every new track, so a controller lost its
+//! position for minutes. Learning it takes tens of seconds of varied orientation (Touch R's reads
+//! 0.45 m/s^2 high on one axis), with up to a degree of tilt until then.
 //! Controllers are told apart by hand and LED model, so a replaced controller starts fresh.
 
 use std::collections::BTreeMap;
@@ -16,10 +19,8 @@ use crate::calib::capture::Led;
 
 pub const FORMAT: &str = "cv1touch-imu-biases";
 
-/// How far a remembered bias is trusted when seeding a new run: the gyro's turn-on spread and the
-/// accelerometer's drift with temperature.
+/// How far a remembered gyro bias is trusted when seeding a new run: its turn-on spread.
 pub const SEED_SD_GYRO: f64 = 0.005;
-pub const SEED_SD_ACCEL: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -33,10 +34,6 @@ pub struct Entry {
 impl Entry {
     pub fn gyro(&self) -> Vector3<f64> {
         Vector3::from(self.gyro)
-    }
-
-    pub fn accel(&self) -> Vector3<f64> {
-        Vector3::from(self.accel)
     }
 }
 

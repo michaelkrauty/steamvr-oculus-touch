@@ -88,9 +88,9 @@ pub struct Options {
     /// Replay only: also keep each output's pose this long before, as the filter holds it once
     /// the frames that arrive in the meantime are in (`Replay::delayed`).
     pub delayed_ns: Option<u64>,
-    /// Per hand, biases (gyro, accel) to start each new tracker from, as the daemon does with the
-    /// remembered ones (see `track::biases`).
-    pub seed_biases: [Option<(Vector3<f64>, Vector3<f64>)>; 2],
+    /// Per hand, a gyro bias to start each new tracker from, as the daemon does with the
+    /// remembered one (see `track::biases`).
+    pub seed_biases: [Option<Vector3<f64>>; 2],
 }
 
 impl Default for Options {
@@ -104,6 +104,19 @@ impl Default for Options {
             seed_biases: [None, None],
         }
     }
+}
+
+/// A remembered gyro bias, with the accelerometer's as unknown as at a cold start: a remembered
+/// one can be stale by more than the tracker's wrong-lock margin, and fixes correcting it then
+/// look like a wrong lock to every new track (see `track::biases`).
+fn seed_gyro_bias(tr: &mut Tracker, gyro: Vector3<f64>) {
+    let sd_accel = tr.params.acquire_sd[4];
+    tr.seed_biases(
+        gyro,
+        Vector3::zeros(),
+        super::biases::SEED_SD_GYRO,
+        sd_accel,
+    );
 }
 
 /// One frame's outcome for one controller.
@@ -465,27 +478,17 @@ impl Pipeline {
                 self.camera_slots,
             );
             tr.debug = self.opts.trace;
-            if let Some((g, a)) = self.opts.seed_biases[hand] {
-                tr.seed_biases(
-                    g,
-                    a,
-                    super::biases::SEED_SD_GYRO,
-                    super::biases::SEED_SD_ACCEL,
-                );
+            if let Some(g) = self.opts.seed_biases[hand] {
+                seed_gyro_bias(&mut tr, g);
             }
             self.trackers[hand] = Some(tr);
         }
     }
 
-    /// Starts a hand's biases from an earlier run's (see `Tracker::seed_biases`, `track::biases`).
-    pub fn seed_biases(&mut self, hand: usize, gyro: Vector3<f64>, accel: Vector3<f64>) {
+    /// Starts a hand's gyro bias from an earlier run's (see `track::biases`).
+    pub fn seed_biases(&mut self, hand: usize, gyro: Vector3<f64>) {
         if let Some(tr) = self.trackers[hand].as_mut() {
-            tr.seed_biases(
-                gyro,
-                accel,
-                super::biases::SEED_SD_GYRO,
-                super::biases::SEED_SD_ACCEL,
-            );
+            seed_gyro_bias(tr, gyro);
         }
     }
 

@@ -346,14 +346,14 @@ impl BiasMemory {
     fn seed(&mut self, p: &mut Pipeline, hand: usize, leds: &[calib::capture::Led]) {
         let key = track::biases::key(hand, leds);
         if let Some(e) = self.file.controllers.get(&key) {
-            p.seed_biases(hand, e.gyro(), e.accel());
-            let a = e.accel();
+            p.seed_biases(hand, e.gyro());
+            let g = e.gyro();
             log!(
-                "{}: IMU biases from the last run (accelerometer {:+.3} {:+.3} {:+.3} m/s^2)",
+                "{}: gyro bias from the last run ({:+.4} {:+.4} {:+.4} rad/s)",
                 ["left", "right"][hand],
-                a.x,
-                a.y,
-                a.z
+                g.x,
+                g.y,
+                g.z
             );
         }
         self.keys[hand] = Some(key);
