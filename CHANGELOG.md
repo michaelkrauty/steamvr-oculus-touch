@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- A controller without a position fix (after it wakes, after a dropout, or while a new track waits for a second sensor) is now stamped with the time its motion sensor measured it, as a tracked controller already was. It had been stamped about 4 ms later, at radio delivery, so SteamVR drew it that much behind.
+
 ## [0.4.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.3) - 2026-11-20
 
 ### Fixed

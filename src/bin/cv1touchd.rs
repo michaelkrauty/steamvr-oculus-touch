@@ -1287,6 +1287,22 @@ fn apply_tracked(
     }
 }
 
+/// Stamps a fresh sample, and its fix, when the controller measured them rather than at the
+/// radio's fastest arrival, as the tracker's poses are (`Pipeline::imu`, `apply_tracked`), so
+/// SteamVR carries a controller without a tracked pose forward over the same time. `extra_ns` is
+/// the owner's latency adjustment. Zero stays unknown.
+fn measured_at(state: &mut ControllerState, extra_ns: i64) {
+    let earlier = pipeline::DEFAULT_EXPOSURE_OFFSET_NS + extra_ns;
+    for t in [
+        &mut state.sample_host_ns,
+        &mut state.last_position_fix_host_ns,
+    ] {
+        if *t != 0 {
+            *t = (*t as i64).saturating_sub(earlier).max(0) as u64;
+        }
+    }
+}
+
 const UNIVERSE_CHECK_MS: u64 = 60_000;
 const UNIVERSE_RETRY_MAX_MS: u64 = 15 * 60_000;
 const UNIVERSE_PROCESS_CHECK_MS: u64 = 10_000;
@@ -5280,7 +5296,9 @@ fn publish_hand_state_for_reader(
         // Keep the last live sample's deadline and the gap the heartbeat already began.
         hand.unavailable(now, cause)
     } else {
-        hand.update(c, now)
+        let mut state = hand.update(c, now);
+        measured_at(&mut state, d.extra_latency_ns.load(Ordering::Relaxed));
+        state
     };
     if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
         state.battery_percent = d.battery[h].load(Ordering::Relaxed);
@@ -13059,7 +13077,7 @@ mod tests {
     /// A connected controller the tracker has no state for (it woke, or a wrong lock was dropped)
     /// is published where the tracker last had it, not at the engine's own position, without a
     /// position and not moving but turning at the gyro's rate; with the engine tracking, the
-    /// engine's pose is published as before.
+    /// engine's pose is published as before. Both are stamped when the controller measured them.
     #[test]
     fn an_unfixed_controller_is_published_where_the_tracker_last_had_it() {
         let d = status_daemon();
@@ -13103,9 +13121,15 @@ mod tests {
             (c.imu_gyro, c.gyro_bias),
             "the gyro's body rate for SteamVR to extrapolate"
         );
+        let measured = now - pipeline::DEFAULT_EXPOSURE_OFFSET_NS as u64;
+        assert_eq!(
+            st.sample_host_ns, measured,
+            "stamped when the controller measured it, as a tracked pose is"
+        );
 
         publish_hand_state(&d, HAND_LEFT, &c, || now, None);
-        assert_eq!(d.shm.hand(HAND_LEFT).unwrap().pos, c.view_pos);
+        let st = d.shm.hand(HAND_LEFT).unwrap();
+        assert_eq!((st.pos, st.sample_host_ns), (c.view_pos, measured));
     }
 
     /// A controller that goes silent while in use has the radio's traffic around its dropout
