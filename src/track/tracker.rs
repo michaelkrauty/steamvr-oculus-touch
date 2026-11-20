@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use nalgebra::{Isometry3, UnitQuaternion, Vector2, Vector3};
+use nalgebra::{Isometry3, Matrix3, UnitQuaternion, Vector2, Vector3};
 
 use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
 use super::search::{self, SearchParams};
@@ -589,8 +589,18 @@ impl Tracker {
     }
 
     /// The zero-velocity update for the step from `t0` to `t1` (see `Params::zupt_sigma`).
+    /// The IMU cannot tell a steady glide from rest, so a zero that the filter's own velocity and
+    /// its covariance rule out (past the chi-square 99.9 % point for three degrees of freedom) is
+    /// not applied: otherwise a slow pure translation out of sight is braked to a stop.
     fn zupt(&self, f: &mut Filter, t0: u64, t1: u64, still: bool) {
-        if still && t1 / self.params.zupt_every_ns != t0 / self.params.zupt_every_ns {
+        if !still || t1 / self.params.zupt_every_ns == t0 / self.params.zupt_every_ns {
+            return;
+        }
+        let s = f.cov.fixed_view::<3, 3>(VEL, VEL)
+            + Matrix3::identity() * self.params.zupt_sigma.powi(2);
+        if s.try_inverse()
+            .is_some_and(|s_inv| f.x.v.dot(&(s_inv * f.x.v)) < 16.27)
+        {
             f.update_velocity(&Vector3::zeros(), self.params.zupt_sigma);
         }
     }
@@ -2822,6 +2832,52 @@ mod tests {
             drift < 0.005,
             "drifted {:.1} mm in 1.5 s out of sight",
             drift * 1e3
+        );
+    }
+
+    /// A steady glide without a turn feels like rest to the IMU. Out of sight for 0.3 s, it keeps
+    /// gliding instead of being braked by the zero-velocity update.
+    #[test]
+    fn a_steady_glide_out_of_sight_is_not_braked() {
+        let mut w = world(5);
+        w.motion = Motion::glide(
+            Vector3::new(0.1, 1.0, -0.2),
+            Vector3::new(0.1, 0.0, 0.0),
+            [0.3, -0.5, 0.2],
+        );
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr.seed_biases(w.bg, w.ba, 1e-4, 1e-3);
+        let mut rng = Rng::new(3);
+        let (dt, frame) = (0.002, 1.0 / 52.0);
+        let (mut t, mut next) = (0.0, 0.01);
+        while t < 2.3 {
+            t += dt;
+            tr.imu(imu(&w, t));
+            // sensors see it for 2 s, then lose it
+            while next <= t && next < 2.0 {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs = sight(&w, cam, next, &mut rng, 0.3);
+                    tr.frame(
+                        (1e9 + next * 1e9) as u64,
+                        c,
+                        cam,
+                        &blobs,
+                        Some(EnginePose::strong(w.motion.pose(next))),
+                        &[],
+                    );
+                }
+                next += frame;
+            }
+        }
+        assert!(tr.tracking());
+        let f = tr.history.back().unwrap().1;
+        let error = (tr.body.world_from_model(&f.x).translation.vector
+            - w.motion.pose(t).translation.vector)
+            .norm();
+        assert!(
+            error < 0.005,
+            "{:.1} mm behind after 0.3 s out of sight",
+            error * 1e3
         );
     }
 

@@ -8,6 +8,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - A controller the tracker has no position for yet (after it wakes, after a radio dropout or a clock re-lock, or while its new track waits for a second sensor) now turns in SteamVR at the gyro's measured rate instead of being shown with no rotation to predict. SteamVR had drawn it as much behind as it turned during its prediction: about 9 degrees at 300 degrees a second with 30 ms of prediction. Replaying 15 recordings with a 150 ms IMU gap inserted at 140 points, the wait for the next confirmed fix was 12 ms at the median, under 75 ms for 90 percent and from 0.2 to 2.1 s for 10 of them; a wake can wait several seconds. The orientation is still the tracking engine's own until the fix, so it can still step by a few degrees when the fix arrives, and the position is still held without velocity.
 
+- A controller gliding slowly and steadily without turning, out of the sensors' sight for a moment, now keeps moving instead of being braked to a stop and snapping forward when it is seen again. The motion sensors cannot tell a steady glide from rest, so the tracker had applied its at-rest correction; it now skips that correction when its own velocity estimate rules rest out. In a simulated 0.3 s blackout during a reach without a turn, the snap when the controller was seen again fell from 54 mm to 1.6 mm. Replaying 11 recordings with ground truth, 10 gave identical results and one changed by at most 0.01 mm and 0.01 degrees. A track lost for longer than half a second still holds its last position until it is found again.
+
 ## [0.4.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.1) - 2026-11-19
 
 ### Added

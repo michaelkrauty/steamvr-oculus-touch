@@ -362,6 +362,17 @@ impl Motion {
         }
     }
 
+    /// Like `still`, but gliding at `vel` m/s from `centre` at t = 0: a sine so slow that its
+    /// acceleration stays under a micrometre per second squared for the first ten seconds.
+    pub fn glide(centre: Vector3<f64>, vel: Vector3<f64>, turn: [f64; 3]) -> Motion {
+        let w = 1e-4;
+        let term = |v: f64| [(v / w, w, 0.0), (0.0, 0.0, 0.0)];
+        Motion {
+            pos: [term(vel.x), term(vel.y), term(vel.z)],
+            ..Motion::still(centre, turn)
+        }
+    }
+
     pub fn pose(&self, t: f64) -> Isometry3<f64> {
         let p = Vector3::new(
             sines(&self.pos[0], t).0,
