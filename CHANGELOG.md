@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.4.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.3) - 2026-11-20
+
 ### Fixed
 
 - A controller could lose its position for minutes at a time, shown frozen in place while still turning, and tracked again only during fast moves. The accelerometer bias remembered from the last run could be saved before it had settled, up to half a m/s^2 off, and the tracker took every fix correcting it for a wrong lock, dropped the track and started the next one from the same stale bias. The remembered accelerometer bias is no longer used; it is learned afresh each run, as it is without a remembered one, while the remembered gyro bias still seeds the start. Replaying 19 recordings with the stale biases saved on the affected machine, wrong locks fell from 3,222 to 8 (10 with no remembered biases at all), and the poses compared with Lighthouse ground truth are the same as with none. Moving `imu-biases.json` aside is no longer needed. Until the accelerometer bias is learned, a controller can be tilted by up to a degree, as on a first run.
