@@ -55,28 +55,18 @@ static void connected_pose_and_timing()
 	assert(p.qWorldFromDriverRotation.w == 1 && p.qDriverFromHeadRotation.w == 1);
 }
 
-static void prediction_shares_scale_the_velocities()
+static void the_tracked_velocities_are_handed_over_whole()
 {
 	const cv1t_controller_state s = state();
 	cv1t_alignment al{};
-	// an alignment without the percents (from before they were published) gives all the motion
 	const auto all = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
 	assert(approx(all.vecVelocity[0], 0.5) && approx(all.vecAngularVelocity[2], 0.75));
-	al.valid = CV1T_ALIGN_PREDICTION;
-	al.prediction_position = 100;
-	al.prediction_rotation = 0;
-	const auto moves = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(approx(moves.vecVelocity[0], 0.5) && moves.vecAngularVelocity[2] == 0);
-	al.prediction_position = 0;
-	al.prediction_rotation = 100;
-	const auto turns = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(turns.vecVelocity[0] == 0 && approx(turns.vecAngularVelocity[2], 0.75));
-	al.prediction_position = 50;
-	al.prediction_rotation = 50;
-	const auto half = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
-	assert(approx(half.vecVelocity[0], 0.25) && approx(half.vecAngularVelocity[2], 0.375));
-	// the pose itself does not move with the shares
-	assert(half.vecPosition[1] == moves.vecPosition[1] && half.qRotation.w == moves.qRotation.w);
+	// percents an older daemon published (bit 3 and the two fields) scale nothing
+	al.valid = 1u << 3;
+	al.reserved_position = 0;
+	al.reserved_rotation = 50;
+	const auto old = make_pose(&s, &al, CV1T_HAND_RIGHT, 10'002'000'000);
+	assert(approx(old.vecVelocity[0], 0.5) && approx(old.vecAngularVelocity[2], 0.75));
 }
 
 static void coasting_then_out_of_range()
@@ -228,7 +218,7 @@ int main()
 {
 	no_data_is_disconnected();
 	connected_pose_and_timing();
-	prediction_shares_scale_the_velocities();
+	the_tracked_velocities_are_handed_over_whole();
 	coasting_then_out_of_range();
 	a_lost_position_is_not_extrapolated();
 	alignment_is_applied_per_hand();

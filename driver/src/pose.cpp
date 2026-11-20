@@ -64,19 +64,14 @@ vr::DriverPose_t make_pose(const cv1t_controller_state *st, const cv1t_alignment
 			p.vecDriverFromHeadTranslation[i] = al->render_pos[hand][i];
 	}
 	p.qRotation = quat(st->orient);
-	// SteamVR extrapolates with the share of the tracked motion `cv1touch prediction` set: all of
-	// it until the daemon has said
-	const bool set = al && (al->valid & CV1T_ALIGN_PREDICTION);
-	const double position_share = set ? al->prediction_position / 100.0 : 1.0;
-	const double rotation_share = set ? al->prediction_rotation / 100.0 : 1.0;
 	// SteamVR integrates the angular velocity in the frame of qRotation (measured with a synthetic
 	// pose; its documentation says driver world space), and neither the alignment nor the render
 	// offset changes that frame: it gets the body rate with the bias removed. The linear velocity
 	// is in driver world space, as documented.
 	for (int i = 0; i < 3; i++) {
 		p.vecPosition[i] = st->pos[i];
-		p.vecVelocity[i] = st->lin_vel[i] * position_share;
-		p.vecAngularVelocity[i] = ((double)st->ang_vel[i] - st->gyro_bias[i]) * rotation_share;
+		p.vecVelocity[i] = st->lin_vel[i];
+		p.vecAngularVelocity[i] = (double)st->ang_vel[i] - st->gyro_bias[i];
 	}
 	// a radio gap's pose is held, not placed in time: its sample can be seconds old
 	const bool gap = st->flags & CV1T_FLAG_RADIO_GAP;

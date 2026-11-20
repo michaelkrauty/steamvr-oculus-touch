@@ -25,9 +25,6 @@ fn regular_files_defaults_and_byte_limit() {
     let path = dir.0.join("settings.json");
     assert_eq!(load(&path), Ok(Settings::default()));
     let settings = Settings {
-        prediction_percent: 42,
-        rotation_prediction_percent: Some(13),
-        latency_adjustment_ms: Some(-3.0),
         tilt_deg: Some(7.5),
         ..Settings::default()
     };
@@ -70,7 +67,7 @@ fn symlinks_to_regular_files_still_load() {
     let path = dir.0.join("settings.json");
     let link = dir.0.join("link.json");
     let settings = Settings {
-        prediction_percent: 42,
+        tilt_deg: Some(-4.0),
         ..Settings::default()
     };
     save(&path, &settings).unwrap();

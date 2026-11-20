@@ -1381,6 +1381,21 @@ mod tests {
         assert_eq!(alignment(None, None).valid, 0);
     }
 
+    /// A driver from 0.4.2 or earlier scales the velocities by `reserved_*` / 100 when bit 3 of
+    /// `valid` is set, and passes them through whole when it is clear: the daemon never sets it.
+    #[test]
+    fn an_older_driver_gets_the_velocities_whole() {
+        for (reg, render) in [
+            (None, None),
+            (Some(registration()), None),
+            (Some(registration()), Some(render())),
+        ] {
+            let a = alignment(reg.as_ref(), render.as_ref());
+            assert_eq!(a.valid & (1 << 3), 0);
+            assert_eq!((a.reserved_position, a.reserved_rotation), (0, 0));
+        }
+    }
+
     #[test]
     fn station_quaternions_are_validated_without_requiring_unit_norm() {
         let dir = std::env::temp_dir().join(format!("cv1t-station-quats-{}", std::process::id()));

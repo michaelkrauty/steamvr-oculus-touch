@@ -167,8 +167,7 @@ class CliSocketPathTests(unittest.TestCase):
                 ["inject", "left", "x", "10"],
                 ["record", "start", str(self.root / "capture.rec")],
                 ["record", "start", str(self.root / "capture.rec"), "--frames"], ["record", "stop"],
-                ["shaping"], ["universe-watch"], ["latency"], ["prediction"],
-                ["prediction", "position", "100"], ["prediction", "rotation", "100"], ["tilt"],
+                ["universe-watch"], ["tilt"], ["tilt", "-4"],
                 ["calibrate"], ["calibrate", "--out", str(self.root / "calibration.json")],
                 ["calibrate", "inputs"], ["calibrate", "inputs", "--reset"],
                 ["calibrate", "inputs", "--out", str(self.root / "inputs.json")],
@@ -249,7 +248,7 @@ class CliControlErrorTests(unittest.TestCase):
         self.assertIn("os error", text)
 
     def test_a_missing_control_socket_explains_how_to_start_the_daemon(self):
-        for command in (["status", "--json"], ["inputs", "--json"], ["prediction"]):
+        for command in (["status", "--json"], ["inputs", "--json"], ["tilt"]):
             with self.subTest(command=command):
                 self.assert_start_advice(self.run_cli(*command))
 

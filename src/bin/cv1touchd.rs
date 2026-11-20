@@ -33,7 +33,6 @@ use cv1touch::recorder::{self, Recorder};
 use cv1touch::sensor_hotplug;
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
-use cv1touch::track::predict::{ShapeParams, VelocityShaper};
 use cv1touch::track::repose;
 use cv1touch::track::tracker::Stats;
 use cv1touch::{align, calib, ffi, input_calibration, modes, settings, setup, supervise, track};
@@ -239,24 +238,13 @@ struct Daemon {
     universe_watch_on: AtomicBool,
     /// What the watch follows the registration through now, for `universe-watch`.
     universe_following: Mutex<String>,
-    /// `shaping off` publishes the tracked velocities as they are (see `track::predict`).
-    shaping_on: AtomicBool,
-    /// Percent of the tracked linear velocity SteamVR extrapolates positions with
-    /// (`prediction position`), published in the alignment for the driver; saved in
-    /// `settings_path` on every change and read from it at start.
-    position_prediction: AtomicU32,
-    /// The same for the angular velocity and orientations (`prediction rotation`).
-    rotation_prediction: AtomicU32,
-    /// Held while the alignment is published, so that the prediction percents published are the
-    /// newest (see `publish_alignment`).
+    /// Held while the alignment is published, so that the tilt published is the newest (see
+    /// `publish_alignment`).
     alignment_publish: Mutex<()>,
     settings_path: PathBuf,
-    /// Extra stamp shift of published poses, ns (`latency` command); saved in `settings_path`
-    /// on every change and read from it at start.
-    extra_latency_ns: std::sync::atomic::AtomicI64,
     /// How far the controllers are shown pitched from their tracked pose, thousandths of a degree
-    /// (`tilt` command), turned into the render offsets published; saved and read like the
-    /// above.
+    /// (`tilt` command), turned into the render offsets published; saved in `settings_path` on
+    /// every change and read from it at start.
     tilt_mdeg: std::sync::atomic::AtomicI32,
     /// The render offsets as fitted (per hand, xyzw), before the tilt: what `tilt` turns, so that
     /// a republish does not turn them again.
@@ -1046,16 +1034,6 @@ fn calibrated_pipeline(opts: &EngineOptions, sensors: &[engine::Sensor]) -> Pipe
     p
 }
 
-/// The prediction percents a daemon starts with: (positions, orientations).
-fn start_prediction(settings: &settings::Settings) -> (u32, u32) {
-    (settings.prediction_percent, settings.rotation_percent())
-}
-
-/// The saved latency adjustment as the stamp shift it is, ns.
-fn start_latency_ns(settings: &settings::Settings) -> i64 {
-    (settings.latency_ms() * 1e6).round() as i64
-}
-
 /// The saved tilt in thousandths of a degree.
 fn start_tilt_mdeg(settings: &settings::Settings) -> i32 {
     (settings.tilt_deg() * 1000.0).round() as i32
@@ -1068,12 +1046,8 @@ fn tilt_deg(d: &Daemon) -> f64 {
 
 /// The settings as they are now: what every change saves, so that none drops another.
 fn current_settings(d: &Daemon) -> settings::Settings {
-    let extra_ns = d.extra_latency_ns.load(Ordering::Acquire);
     let tilt_mdeg = d.tilt_mdeg.load(Ordering::Acquire);
     settings::Settings {
-        prediction_percent: d.position_prediction.load(Ordering::Acquire),
-        rotation_prediction_percent: Some(d.rotation_prediction.load(Ordering::Acquire)),
-        latency_adjustment_ms: (extra_ns != 0).then(|| extra_ns as f64 / 1e6),
         tilt_deg: (tilt_mdeg != 0).then(|| tilt_mdeg as f64 / 1000.0),
         ..settings::Settings::default()
     }
@@ -1085,41 +1059,6 @@ fn save_settings(d: &Daemon) -> String {
         Ok(()) => String::new(),
         Err(e) => format!(" (not saved: {e})"),
     }
-}
-
-/// How published poses are stamped off their IMU samples' arrival time (the `latency` reply and
-/// the start-up note): the pipeline's measured offset and the adjustment on top of it.
-fn latency_text(extra_ns: i64) -> String {
-    let total_ms = (pipeline::DEFAULT_EXPOSURE_OFFSET_NS + extra_ns) as f64 / 1e6;
-    let adjustment = if extra_ns == 0 {
-        "no adjustment".to_string()
-    } else {
-        format!("{:+.1} ms adjustment", extra_ns as f64 / 1e6)
-    };
-    let measured = pipeline::DEFAULT_EXPOSURE_OFFSET_NS as f64 / 1e6;
-    if total_ms.abs() < 0.05 {
-        return format!(
-            "published poses stamped at their IMU samples' arrival time ({measured:.1} ms \
-             measured, {adjustment})"
-        );
-    }
-    format!(
-        "published poses stamped {:.1} ms {} than their IMU samples' arrival time ({measured:.1} \
-         ms measured, {adjustment})",
-        total_ms.abs(),
-        if total_ms < 0.0 { "later" } else { "earlier" },
-    )
-}
-
-/// `alignment` carrying the prediction percents (positions, orientations) the driver applies.
-fn with_prediction(
-    mut alignment: shm::Alignment,
-    (position, rotation): (u32, u32),
-) -> shm::Alignment {
-    alignment.prediction_position = position;
-    alignment.prediction_rotation = rotation;
-    alignment.valid |= ffi::CV1T_ALIGN_PREDICTION;
-    alignment
 }
 
 /// `alignment` with the controllers shown pitched `tilt_deg` from their tracked pose, positive
@@ -1188,98 +1127,45 @@ fn tilt_text(deg: f64) -> String {
     }
 }
 
-/// The daemon's prediction percents.
-fn prediction_percents(d: &Daemon) -> (u32, u32) {
-    (
-        d.position_prediction.load(Ordering::Acquire),
-        d.rotation_prediction.load(Ordering::Acquire),
-    )
-}
-
-/// Publishes `alignment` with the daemon's prediction percents. One at a time, the percents read
-/// while publishing: a reload or the universe watch cannot put back percents a `prediction`
-/// request has just changed.
+/// Publishes `alignment` with the daemon's tilt. One at a time, the tilt read while publishing: a
+/// reload or the universe watch cannot put back a tilt a `tilt` request has just changed.
 fn publish_alignment(d: &Daemon, alignment: shm::Alignment) {
     let _one = d.alignment_publish.lock().unwrap();
     // `alignment` carries the render offsets as fitted: what the tilt turns from now on
     *d.fitted_render_orient.lock().unwrap() = alignment.render_orient;
-    d.shm.publish_alignment(&with_prediction(
-        with_daemon_tilt(d, alignment),
-        prediction_percents(d),
-    ));
+    d.shm.publish_alignment(&with_daemon_tilt(d, alignment));
 }
 
 /// Publishes the alignment in place with the daemon's settings (the tilt on the fitted render
-/// offsets, the prediction percents). Read while holding the publishers' lock, it is the newest:
+/// offsets). Read while holding the publishers' lock, it is the newest:
 /// a registration the universe watch has just moved is not put back.
 fn republish_settings(d: &Daemon) {
     let _one = d.alignment_publish.lock().unwrap();
     if let Some(alignment) = d.shm.alignment() {
-        d.shm.publish_alignment(&with_prediction(
-            with_daemon_tilt(d, alignment),
-            prediction_percents(d),
-        ));
+        d.shm.publish_alignment(&with_daemon_tilt(d, alignment));
     }
 }
 
-/// What SteamVR extrapolates positions and orientations with, in words.
-fn prediction_text(position: u32, rotation: u32) -> String {
-    if position == rotation {
-        format!("SteamVR extrapolates with {position}% of the tracked velocities")
-    } else {
-        format!(
-            "SteamVR extrapolates positions with {position}% of the tracked velocity and \
-             orientations with {rotation}%"
-        )
-    }
-}
-
-/// Puts the tracker's pose into the published state, stamped `extra_ns` earlier than the
-/// pipeline's estimate of when the controller was there (the `latency` adjustment).
-/// `shaper` turns the velocities into the ones SteamVR's constant-velocity prediction should use
-/// (see `track::predict`). They are published as they are, for the tools that carry a pose
-/// forward too; the driver hands SteamVR the share of them the alignment's prediction percents
-/// say. The pose is published as tracked.
-fn apply_tracked(
-    state: &mut ControllerState,
-    s: &Stamped,
-    extra_ns: i64,
-    shaper: &mut VelocityShaper,
-    shaping: bool,
-) {
+/// Puts the tracker's pose into the published state as measured: the newest sample's pose,
+/// stamped when the controller was there, with the tracked velocities at the published point.
+/// SteamVR extrapolates with them; nothing here carries the pose forward.
+fn apply_tracked(state: &mut ControllerState, s: &Stamped) {
     let q = s.output.world_from_model.rotation;
     let t = s.output.world_from_model.translation.vector;
     state.orient = [q.i as f32, q.j as f32, q.k as f32, q.w as f32];
     state.pos = [t.x as f32, t.y as f32, t.z as f32];
-    let (w, v) = shaper.shape_body(
-        s.host_ns,
-        &q,
-        s.gyro - s.gyro_bias,
-        s.output.tracking.then_some(s.output.vel),
-    );
-    let (w, v) = if shaping {
-        (w, v)
-    } else {
-        (s.output.ang_vel_world, Some(s.output.vel))
-    };
-    let v = v.unwrap_or(s.output.vel);
+    let v = s.output.vel;
     state.lin_vel = [v.x as f32, v.y as f32, v.z as f32];
-    // the driver gives SteamVR ang_vel - gyro_bias as the body rate it integrates in: the shaped
-    // world rate, turned into the body
-    let body = q.inverse() * w + s.gyro_bias;
-    state.ang_vel = [body.x as f32, body.y as f32, body.z as f32];
+    // the driver gives SteamVR ang_vel - gyro_bias as the body rate it integrates in: the gyro
+    // sample less the filter's bias
+    state.ang_vel = [s.gyro.x as f32, s.gyro.y as f32, s.gyro.z as f32];
     state.gyro_bias = [
         s.gyro_bias.x as f32,
         s.gyro_bias.y as f32,
         s.gyro_bias.z as f32,
     ];
-    let shift = |t: u64| (t as i64).saturating_sub(extra_ns).max(0) as u64;
-    state.sample_host_ns = shift(s.host_ns);
-    state.last_position_fix_host_ns = if s.last_fix_host_ns == 0 {
-        0
-    } else {
-        shift(s.last_fix_host_ns)
-    };
+    state.sample_host_ns = s.host_ns;
+    state.last_position_fix_host_ns = s.last_fix_host_ns;
     if s.output.tracking {
         state.flags |= ffi::CV1T_FLAG_POSITION;
     } else {
@@ -1289,10 +1175,10 @@ fn apply_tracked(
 
 /// Stamps a fresh sample, and its fix, when the controller measured them rather than at the
 /// radio's fastest arrival, as the tracker's poses are (`Pipeline::imu`, `apply_tracked`), so
-/// SteamVR carries a controller without a tracked pose forward over the same time. `extra_ns` is
-/// the owner's latency adjustment. Zero stays unknown.
-fn measured_at(state: &mut ControllerState, extra_ns: i64) {
-    let earlier = pipeline::DEFAULT_EXPOSURE_OFFSET_NS + extra_ns;
+/// SteamVR carries a controller without a tracked pose forward over the same time. Zero stays
+/// unknown.
+fn measured_at(state: &mut ControllerState) {
+    let earlier = pipeline::DEFAULT_EXPOSURE_OFFSET_NS;
     for t in [
         &mut state.sample_host_ns,
         &mut state.last_position_fix_host_ns,
@@ -2223,7 +2109,7 @@ fn radio_resources<D, H>(
     Some((decoder, device))
 }
 
-/// What starts over with each open engine: each hand's wrong-lock count and velocity shaping,
+/// What starts over with each open engine: each hand's wrong-lock count,
 /// the sensors' status, and a recording's session info, with a mark where the engine's identity
 /// epochs number afresh.
 fn begin_engine_session(d: &Daemon) {
@@ -2231,7 +2117,6 @@ fn begin_engine_session(d: &Daemon) {
         let mut publisher = hand.lock().unwrap();
         // The tracker starts over; only publication and the gap outlive it.
         publisher.memory.wrong_locks = 0;
-        publisher.shaper = VelocityShaper::new(ShapeParams::default());
     }
     // The engine numbers its identities afresh, and only after an inspection request: frames
     // it delivered before this mark carry none.
@@ -5286,18 +5171,13 @@ fn publish_hand_state_for_reader(
             |e| notices.gaps.push(e),
         );
     }
-    let HandPublisher {
-        hand,
-        shaper,
-        memory,
-        ..
-    } = &mut *publisher;
+    let HandPublisher { hand, memory, .. } = &mut *publisher;
     let mut state = if let Some(cause) = missing {
         // Keep the last live sample's deadline and the gap the heartbeat already began.
         hand.unavailable(now, cause)
     } else {
         let mut state = hand.update(c, now);
-        measured_at(&mut state, d.extra_latency_ns.load(Ordering::Relaxed));
+        measured_at(&mut state);
         state
     };
     if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
@@ -5311,15 +5191,7 @@ fn publish_hand_state_for_reader(
                 ["left", "right"][h]
             ));
         }
-        apply_tracker(&mut state, latest.as_ref(), memory, |state, s| {
-            apply_tracked(
-                state,
-                s,
-                d.extra_latency_ns.load(Ordering::Relaxed),
-                shaper,
-                d.shaping_on.load(Ordering::Relaxed),
-            )
-        });
+        apply_tracker(&mut state, latest.as_ref(), memory, apply_tracked);
         let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
         let tracking = latest.is_some_and(|s| s.output.tracking);
         if let Some(change) = memory.observe(connected, tracking, now) {
@@ -5366,7 +5238,6 @@ struct HandPublisher {
     worker_publish_ns: u64,
     hand: Hand,
     memory: HandMemory,
-    shaper: VelocityShaper,
 }
 
 impl HandPublisher {
@@ -5375,7 +5246,6 @@ impl HandPublisher {
             worker_publish_ns: 0,
             hand: Hand::new(h, HandConfig::default()),
             memory: HandMemory::default(),
-            shaper: VelocityShaper::new(ShapeParams::default()),
         }
     }
 
@@ -5675,12 +5545,11 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"latency_adjustment_ms\":{},\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         mode,
-        d.extra_latency_ns.load(Ordering::Relaxed) as f64 / 1e6,
         tilt_deg(d),
         engine_ready,
         shared.input_calibration,
@@ -5835,41 +5704,6 @@ fn handle(d: &Daemon, line: &str) -> String {
                 Err(e) => format!("err {e}"),
             }
         }
-        Ok(Command::Shaping(on)) => {
-            if let Some(on) = on {
-                d.shaping_on.store(on, Ordering::Release);
-            }
-            format!(
-                "ok velocity shaping for SteamVR's prediction {}",
-                if d.shaping_on.load(Ordering::Acquire) {
-                    "on"
-                } else {
-                    "off"
-                }
-            )
-        }
-        Ok(Command::Prediction { position, rotation }) => {
-            let mut unsaved = String::new();
-            if position.is_some() || rotation.is_some() {
-                // one request at a time (serve_client): the pair saved is the pair set
-                if let Some(p) = position {
-                    d.position_prediction.store(p, Ordering::Release);
-                }
-                if let Some(p) = rotation {
-                    d.rotation_prediction.store(p, Ordering::Release);
-                }
-                unsaved = save_settings(d);
-                republish_settings(d);
-            }
-            // the driver applies the percents to whatever is published, OpenHMD's poses too
-            format!(
-                "ok prediction: {}{unsaved}",
-                prediction_text(
-                    d.position_prediction.load(Ordering::Acquire),
-                    d.rotation_prediction.load(Ordering::Acquire)
-                )
-            )
-        }
         Ok(Command::UniverseWatch(on)) => {
             if let Some(on) = on {
                 d.universe_watch_on.store(on, Ordering::Release);
@@ -5914,18 +5748,6 @@ fn handle(d: &Daemon, line: &str) -> String {
                 republish_settings(d);
             }
             format!("ok tilt: {}{unsaved}", tilt_text(tilt_deg(d)))
-        }
-        Ok(Command::Latency(v)) => {
-            let mut unsaved = String::new();
-            if let Some(ms) = v {
-                d.extra_latency_ns
-                    .store((ms * 1e6).round() as i64, Ordering::Release);
-                unsaved = save_settings(d);
-            }
-            format!(
-                "ok latency: {}{unsaved}",
-                latency_text(d.extra_latency_ns.load(Ordering::Acquire))
-            )
         }
         Ok(Command::AlignmentReload) => {
             // a shift measured against another registration does not apply to this one: until
@@ -6774,20 +6596,6 @@ fn main() {
         log!("settings: {e}; using the defaults");
         settings::Settings::default()
     });
-    if (settings.prediction_percent, settings.rotation_percent()) != (100, 100) {
-        log!(
-            "prediction: {} ({})",
-            prediction_text(settings.prediction_percent, settings.rotation_percent()),
-            settings_path.display()
-        );
-    }
-    if start_latency_ns(&settings) != 0 {
-        log!(
-            "latency: {} ({})",
-            latency_text(start_latency_ns(&settings)),
-            settings_path.display()
-        );
-    }
     let start_tilt_deg = start_tilt_mdeg(&settings) as f64 / 1000.0;
     if start_tilt_deg != 0.0 {
         log!(
@@ -6801,10 +6609,7 @@ fn main() {
         log(n);
     }
     let fitted_render_orient = alignment.render_orient;
-    shm.publish_alignment(&with_prediction(
-        with_tilt(alignment, &fitted_render_orient, start_tilt_deg),
-        start_prediction(&settings),
-    ));
+    shm.publish_alignment(&with_tilt(alignment, &fitted_render_orient, start_tilt_deg));
     let rec = Recorder::with_diagnostics(RECORDER_RING_BYTES, |message| log(message));
     // a stale socket goes (the lock guarantees no live owner); private to this user
     let listener = ipc::Listener::bind(&sock_path).unwrap_or_else(|e| {
@@ -6870,12 +6675,8 @@ fn main() {
         universe_connection: Mutex::new(UniverseConnection::default()),
         universe_watch_on: AtomicBool::new(true),
         universe_following: Mutex::new(String::new()),
-        shaping_on: AtomicBool::new(true),
-        position_prediction: AtomicU32::new(start_prediction(&settings).0),
-        rotation_prediction: AtomicU32::new(start_prediction(&settings).1),
         alignment_publish: Mutex::new(()),
         settings_path,
-        extra_latency_ns: std::sync::atomic::AtomicI64::new(start_latency_ns(&settings)),
         tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
         fitted_render_orient: Mutex::new(fitted_render_orient),
         radio_activity: Default::default(),
@@ -7014,8 +6815,7 @@ mod tests {
                     flags: ffi::CV1T_FLAG_CONNECTED,
                     ..Default::default()
                 };
-                let mut shaper = VelocityShaper::new(ShapeParams::default());
-                apply_tracked(&mut state, &s, 0, &mut shaper, false);
+                apply_tracked(&mut state, &s);
                 assert_eq!(state.sample_host_ns, s.host_ns);
                 assert_eq!(state.last_position_fix_host_ns, s.last_fix_host_ns);
                 assert_eq!(
@@ -7076,14 +6876,12 @@ mod tests {
         now: u64,
         hand: &mut Hand,
         pipe: Option<&mut Pipeline>,
-        shaper: &mut VelocityShaper,
         memory: &mut HandMemory,
     ) {
         {
             let mut publisher = d.hands[h].lock().unwrap();
             std::mem::swap(&mut publisher.hand, hand);
             std::mem::swap(&mut publisher.memory, memory);
-            std::mem::swap(&mut publisher.shaper, shaper);
         }
         let reader = d.hands[h].lock().unwrap().memory.reader;
         if matches!(reader, engine::RadioReader::Radio) {
@@ -7094,7 +6892,6 @@ mod tests {
         let mut publisher = d.hands[h].lock().unwrap();
         std::mem::swap(&mut publisher.hand, hand);
         std::mem::swap(&mut publisher.memory, memory);
-        std::mem::swap(&mut publisher.shaper, shaper);
     }
     use super::*;
     use cv1touch::flight;
@@ -8708,9 +8505,6 @@ mod tests {
             universe_connection: Mutex::new(UniverseConnection::default()),
             universe_watch_on: AtomicBool::new(true),
             universe_following: Mutex::new(String::new()),
-            shaping_on: AtomicBool::new(true),
-            position_prediction: AtomicU32::new(100),
-            rotation_prediction: AtomicU32::new(100),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
                 .join(format!(
@@ -8718,7 +8512,6 @@ mod tests {
                     name.trim_start_matches('/')
                 ))
                 .join("settings.json"),
-            extra_latency_ns: std::sync::atomic::AtomicI64::new(0),
             tilt_mdeg: std::sync::atomic::AtomicI32::new(0),
             fitted_render_orient: Mutex::new([[0.0, 0.0, 0.0, 1.0]; 2]),
             radio_activity: Default::default(),
@@ -12613,123 +12406,6 @@ mod tests {
         assert!(d.stop_requested.load(Ordering::Acquire));
     }
 
-    /// `prediction` is saved as it is set, for the next daemon to start from; showing it saves
-    /// nothing, and while OpenHMD's own poses are published the reply says the dial does nothing.
-    #[test]
-    fn the_prediction_setting_is_saved_as_it_is_set() {
-        let d = status_daemon();
-        d.opts.lock().unwrap().fixed_poses.push(engine::SensorPose {
-            serial: "WMTD000000001".into(),
-            orient: [0.0, 0.0, 0.0, 1.0],
-            pos: [0.0; 3],
-        });
-        assert_eq!(
-            handle(&d, "prediction"),
-            "ok prediction: SteamVR extrapolates with 100% of the tracked velocities"
-        );
-        assert!(!d.settings_path.exists());
-        assert_eq!(
-            handle(&d, "prediction 0"),
-            "ok prediction: SteamVR extrapolates with 0% of the tracked velocities"
-        );
-        assert_eq!(
-            settings::load(&d.settings_path).map(|s| s.prediction_percent),
-            Ok(0)
-        );
-        // positions and orientations each on their own, both kept
-        assert_eq!(
-            handle(&d, "prediction position 100"),
-            "ok prediction: SteamVR extrapolates positions with 100% of the tracked velocity and \
-             orientations with 0%"
-        );
-        assert_eq!(
-            (
-                d.position_prediction.load(Ordering::Acquire),
-                d.rotation_prediction.load(Ordering::Acquire)
-            ),
-            (100, 0)
-        );
-        assert_eq!(
-            settings::load(&d.settings_path).map(|s| (s.prediction_percent, s.rotation_percent())),
-            Ok((100, 0))
-        );
-        // the driver reads them from the alignment
-        let published = d.shm.alignment().unwrap();
-        assert_eq!(
-            (published.prediction_position, published.prediction_rotation),
-            (100, 0)
-        );
-        assert!(handle(&d, "prediction rotation 30").ends_with("orientations with 30%"));
-        assert_eq!(
-            settings::load(&d.settings_path).map(|s| (s.prediction_percent, s.rotation_percent())),
-            Ok((100, 30))
-        );
-        // republished in place: a registration published meanwhile stays
-        let mut moved = d.shm.alignment().unwrap();
-        moved.lighthouse_pos = [1.0, 2.0, 3.0];
-        d.shm.publish_alignment(&moved);
-        handle(&d, "prediction 0");
-        let published = d.shm.alignment().unwrap();
-        assert_eq!(published.lighthouse_pos, [1.0, 2.0, 3.0]);
-        assert_eq!(
-            (published.prediction_position, published.prediction_rotation),
-            (0, 0)
-        );
-        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
-    }
-
-    /// `latency` is saved as it is set, for the next daemon to start from, and `prediction`,
-    /// saved beside it, keeps it; the status says it, and the reply says which way the stamps
-    /// move. Showing it saves nothing, and none is left out of the file.
-    #[test]
-    fn the_latency_adjustment_is_saved_as_it_is_set() {
-        let d = status_daemon();
-        assert_eq!(
-            handle(&d, "latency"),
-            "ok latency: published poses stamped 4.0 ms earlier than their IMU samples' arrival \
-             time (4.0 ms measured, no adjustment)"
-        );
-        assert!(!d.settings_path.exists());
-        assert_eq!(
-            handle(&d, "latency -5.4"),
-            "ok latency: published poses stamped 1.4 ms later than their IMU samples' arrival \
-             time (4.0 ms measured, -5.4 ms adjustment)"
-        );
-        assert_eq!(d.extra_latency_ns.load(Ordering::Acquire), -5_400_000);
-        assert_eq!(
-            settings::load(&d.settings_path).map(|s| s.latency_ms()),
-            Ok(-5.4)
-        );
-        handle(&d, "prediction 0");
-        let s = settings::load(&d.settings_path).unwrap();
-        assert_eq!((s.prediction_percent, s.latency_ms()), (0, -5.4));
-        assert_eq!(start_latency_ns(&s), -5_400_000);
-        let status: serde_json::Value =
-            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
-        assert_eq!(status["latency_adjustment_ms"], -5.4);
-        assert_eq!(
-            handle(&d, "latency 2"),
-            "ok latency: published poses stamped 6.0 ms earlier than their IMU samples' arrival \
-             time (4.0 ms measured, +2.0 ms adjustment)"
-        );
-        assert_eq!(
-            handle(&d, "latency -4"),
-            "ok latency: published poses stamped at their IMU samples' arrival time (4.0 ms \
-             measured, -4.0 ms adjustment)"
-        );
-        handle(&d, "latency 0");
-        assert_eq!(
-            settings::load(&d.settings_path).map(|s| s.latency_adjustment_ms),
-            Ok(None)
-        );
-        assert_eq!(
-            handle(&d, "latency 40"),
-            "err latency adjustment must be within +-30 ms"
-        );
-        assert_eq!(d.extra_latency_ns.load(Ordering::Acquire), 0);
-        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
-    }
-
     /// `tilt` pitches the pose SteamVR and its applications see, through the render offset:
     /// applied once to the offsets as fitted (a republish for another setting does not add it
     /// again), saved as it is set, shown in the status, and 0 gives the fitted offsets back
@@ -12784,15 +12460,15 @@ mod tests {
             applied(0).axis_angle()
         );
         assert_eq!(published.render_orient[1], [0.0; 4]);
-        // another setting republishes: the tilt is not added again
-        handle(&d, "prediction 0");
+        // setting it again republishes: the tilt is not added again
+        handle(&d, "tilt 10");
         assert_eq!(
             d.shm.alignment().unwrap().render_orient,
             published.render_orient
         );
         assert_eq!(
-            settings::load(&d.settings_path).map(|s| (s.tilt_deg(), s.prediction_percent)),
-            Ok((10.0, 0))
+            settings::load(&d.settings_path).map(|s| s.tilt_deg()),
+            Ok(10.0)
         );
         let status: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
@@ -13214,7 +12890,6 @@ mod tests {
             for h in [HAND_LEFT, HAND_RIGHT] {
                 let d = status_daemon();
                 let mut hand = Hand::new(h, HandConfig::default());
-                let mut shaper = VelocityShaper::new(ShapeParams::default());
                 let mut memory = HandMemory::default();
                 let now = 1_000_000_000;
                 let mut c = engine::Controller {
@@ -13227,16 +12902,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut publish = |c: &engine::Controller, at| {
-                    publish_hand_state_legacy(
-                        &d,
-                        h,
-                        c,
-                        at,
-                        &mut hand,
-                        None,
-                        &mut shaper,
-                        &mut memory,
-                    )
+                    publish_hand_state_legacy(&d, h, c, at, &mut hand, None, &mut memory)
                 };
                 publish(&c, now);
                 let live = d.shm.hand(h).unwrap();
@@ -13352,7 +13018,6 @@ mod tests {
             let d = status_daemon();
             d.radio_on.store(radio_thread, Ordering::Release);
             let mut hand = Hand::new(HAND_LEFT, HandConfig::default());
-            let mut shaper = VelocityShaper::new(ShapeParams::default());
             let mut memory = HandMemory {
                 reader: if radio_thread {
                     engine::RadioReader::Radio
@@ -13368,18 +13033,8 @@ mod tests {
                 received_host_ns: now,
                 ..Default::default()
             };
-            let mut publish = |at| {
-                publish_hand_state_legacy(
-                    &d,
-                    HAND_LEFT,
-                    &c,
-                    at,
-                    &mut hand,
-                    None,
-                    &mut shaper,
-                    &mut memory,
-                )
-            };
+            let mut publish =
+                |at| publish_hand_state_legacy(&d, HAND_LEFT, &c, at, &mut hand, None, &mut memory);
             publish(now);
             publish(now + 150_000_000);
             assert_eq!(
@@ -13430,7 +13085,6 @@ mod tests {
                     let d = status_daemon();
                     d.radio_on.store(radio_thread, Ordering::Release);
                     let mut hand = Hand::new(h, HandConfig::default());
-                    let mut shaper = VelocityShaper::new(ShapeParams::default());
                     let mut memory = HandMemory {
                         reader: if radio_thread {
                             engine::RadioReader::Radio
@@ -13447,16 +13101,7 @@ mod tests {
                         ..Default::default()
                     };
                     let mut publish = |c: &engine::Controller, at| {
-                        publish_hand_state_legacy(
-                            &d,
-                            h,
-                            c,
-                            at,
-                            &mut hand,
-                            None,
-                            &mut shaper,
-                            &mut memory,
-                        )
+                        publish_hand_state_legacy(&d, h, c, at, &mut hand, None, &mut memory)
                     };
                     publish(&c, now);
                     publish(&c, now + 150_000_000);
@@ -13539,7 +13184,6 @@ mod tests {
             .store(radio_thread || other_reader, Ordering::Release);
         let h = HAND_LEFT;
         let mut hand = Hand::new(h, HandConfig::default());
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
         let mut memory = HandMemory {
             reader: if radio_thread {
                 engine::RadioReader::Radio
@@ -13556,7 +13200,7 @@ mod tests {
             ..Default::default()
         };
         let mut publish = |c: &engine::Controller, at| {
-            publish_hand_state_legacy(&d, h, c, at, &mut hand, None, &mut shaper, &mut memory)
+            publish_hand_state_legacy(&d, h, c, at, &mut hand, None, &mut memory)
         };
         publish(&c, start);
         publish(&c, start + 150_000_000);
@@ -15380,8 +15024,6 @@ mod tests {
                 reader: reader(!outgoing_radio),
                 ..Default::default()
             };
-            let mut old_shaper = VelocityShaper::new(ShapeParams::default());
-            let mut new_shaper = VelocityShaper::new(ShapeParams::default());
             if outgoing_radio {
                 // Engine fallback reuses its earlier Hand and HandMemory, not a fresh publisher.
                 let first = engine::Controller {
@@ -15397,7 +15039,6 @@ mod tests {
                     first.received_host_ns,
                     &mut incoming,
                     None,
-                    &mut new_shaper,
                     &mut new_memory,
                 );
                 ownership.request(h);
@@ -15428,7 +15069,6 @@ mod tests {
                 old.received_host_ns,
                 &mut outgoing,
                 None,
-                &mut old_shaper,
                 &mut old_memory,
             );
             if uncertain_gap {
@@ -15455,7 +15095,6 @@ mod tests {
                     old.received_host_ns + 150_000_000,
                     &mut outgoing,
                     None,
-                    &mut old_shaper,
                     &mut old_memory,
                 );
             }
@@ -15478,16 +15117,7 @@ mod tests {
                 ..Default::default()
             };
             takeover_at(&d, h, &mut incoming, &mut new_memory, takeover);
-            publish_hand_state_legacy(
-                &d,
-                h,
-                &c,
-                start,
-                &mut incoming,
-                None,
-                &mut new_shaper,
-                &mut new_memory,
-            );
+            publish_hand_state_legacy(&d, h, &c, start, &mut incoming, None, &mut new_memory);
             let device = if h == HAND_LEFT {
                 calib::DEVICE_LEFT
             } else {
@@ -15508,7 +15138,6 @@ mod tests {
                 start + 150_000_000,
                 &mut incoming,
                 None,
-                &mut new_shaper,
                 &mut new_memory,
             );
             c.device_time_ns += 2_000_000;
@@ -15520,7 +15149,6 @@ mod tests {
                 c.received_host_ns,
                 &mut incoming,
                 None,
-                &mut new_shaper,
                 &mut new_memory,
             );
             let anchor = if uncertain_gap {
@@ -15557,7 +15185,6 @@ mod tests {
                     c.received_host_ns + 150_000_000,
                     &mut incoming,
                     None,
-                    &mut new_shaper,
                     &mut new_memory,
                 );
                 assert_ne!(d.shm.hand(h).unwrap().flags & ffi::CV1T_FLAG_ASLEEP, 0);
@@ -15570,7 +15197,6 @@ mod tests {
                     c.received_host_ns,
                     &mut incoming,
                     None,
-                    &mut new_shaper,
                     &mut new_memory,
                 );
                 assert!(d
@@ -15611,7 +15237,6 @@ mod tests {
                 reader,
                 ..Default::default()
             };
-            let mut shaper = VelocityShaper::new(ShapeParams::default());
             let start = 5_000_000_000;
             let mut c = engine::Controller {
                 calibrated: true,
@@ -15619,16 +15244,7 @@ mod tests {
                 received_host_ns: start,
                 ..Default::default()
             };
-            publish_hand_state_legacy(
-                &d,
-                HAND_LEFT,
-                &c,
-                start,
-                &mut hand,
-                None,
-                &mut shaper,
-                &mut memory,
-            );
+            publish_hand_state_legacy(&d, HAND_LEFT, &c, start, &mut hand, None, &mut memory);
             d.activity(
                 reader,
                 calib::DEVICE_LEFT,
@@ -15654,7 +15270,6 @@ mod tests {
                 c.received_host_ns,
                 &mut hand,
                 None,
-                &mut shaper,
                 &mut memory,
             );
             d.activity(
@@ -15672,7 +15287,6 @@ mod tests {
                 c.received_host_ns + 150_000_000,
                 &mut hand,
                 None,
-                &mut shaper,
                 &mut memory,
             );
             assert_eq!(
@@ -15688,7 +15302,6 @@ mod tests {
                 c.received_host_ns,
                 &mut hand,
                 None,
-                &mut shaper,
                 &mut memory,
             );
             assert_eq!(d.flight.due(start + 4_000_000 + flight::AFTER_NS).len(), 1);
@@ -18019,8 +17632,9 @@ mod tests {
         }
     }
 
-    /// The tracked velocities are published as they are, shaped or not (the driver applies the
-    /// prediction percents): the tools that carry a pose forward see the real motion.
+    /// The newest sample is published as measured: its own time, the gyro's rate less the
+    /// filter's bias, and the tracked linear velocity at the published point. Nothing is carried
+    /// forward or reshaped for SteamVR's extrapolation.
     #[test]
     fn the_tracked_velocities_are_published_as_they_are() {
         use nalgebra::Vector3;
@@ -18029,34 +17643,13 @@ mod tests {
         let (q, rate) = (s.output.world_from_model.rotation, s.output.ang_vel_world);
         let v3 = |a: [f32; 3]| Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
         let mut st = ControllerState::default();
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
-        apply_tracked(&mut st, &s, 0, &mut shaper, false);
-        // the body rate the driver hands SteamVR (the shaped world rate, in the body), and the
-        // linear velocity
+        apply_tracked(&mut st, &s);
+        // the body rate the driver hands SteamVR (ang_vel - gyro_bias), and the linear velocity
         assert!((q * (v3(st.ang_vel) - v3(st.gyro_bias)) - rate).norm() < 1e-5);
+        assert!((v3(st.ang_vel) - s.gyro).norm() < 1e-6);
         assert!((v3(st.lin_vel) - s.output.vel).norm() < 1e-6);
-        let mut shaped = ControllerState::default();
-        apply_tracked(&mut shaped, &s, 0, &mut shaper, true);
-        assert!(v3(shaped.lin_vel).norm() > 0.5 && v3(shaped.ang_vel).norm() > 0.5);
-    }
-
-    /// The percents a daemon starts with come from the settings, orientations' own or else the
-    /// positions'.
-    #[test]
-    fn the_prediction_starts_as_saved() {
-        let saved = |position, rotation| settings::Settings {
-            prediction_percent: position,
-            rotation_prediction_percent: rotation,
-            ..settings::Settings::default()
-        };
-        assert_eq!(start_prediction(&saved(100, Some(0))), (100, 0));
-        assert_eq!(start_prediction(&saved(30, None)), (30, 30));
-        let alignment = with_prediction(shm::Alignment::default(), (100, 0));
-        assert_eq!(
-            (alignment.prediction_position, alignment.prediction_rotation),
-            (100, 0)
-        );
-        assert_ne!(alignment.valid & ffi::CV1T_ALIGN_PREDICTION, 0);
+        assert_eq!(st.sample_host_ns, s.host_ns);
+        assert_eq!(st.last_position_fix_host_ns, s.last_fix_host_ns);
     }
 
     /// While the controller is connected the tracker's pose is published and remembered, and once
@@ -18071,9 +17664,8 @@ mod tests {
             pos: [3.0, 0.5, 4.0],
             ..Default::default()
         };
-        let mut shaper = VelocityShaper::new(ShapeParams::default());
         apply_tracker(&mut state, Some(&s), &mut memory, |st, s| {
-            apply_tracked(st, s, 0, &mut shaper, false)
+            apply_tracked(st, s)
         });
         let seen = s.output.world_from_model.translation.vector.cast::<f32>();
         assert_eq!(state.pos, [seen.x, seen.y, seen.z]);
@@ -18084,7 +17676,7 @@ mod tests {
         untracked.output.world_from_model.translation.vector.x += 1.0;
         let mut st = state;
         apply_tracker(&mut st, Some(&untracked), &mut memory, |st, s| {
-            apply_tracked(st, s, 0, &mut shaper, false)
+            apply_tracked(st, s)
         });
         assert_eq!(memory.last_seen, Some(state.pos));
 

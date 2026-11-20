@@ -18,9 +18,6 @@ use crate::shm::{HAND_LEFT, HAND_RIGHT};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     AlignmentReload,
-    /// Extra milliseconds the published poses are stamped earlier (SteamVR predicts that much
-    /// further), on top of the measured radio and IMU delay; None shows the current value.
-    Latency(Option<f64>),
     Haptic {
         hand: usize,
         duration_s: f32,
@@ -45,15 +42,6 @@ pub enum Command {
     Stations(Vec<(String, [f64; 7])>),
     /// Turn the universe watch on or off (None shows it).
     UniverseWatch(Option<bool>),
-    /// Turn the velocity shaping for SteamVR's prediction on or off (None shows it).
-    Shaping(Option<bool>),
-    /// Percent of the tracked velocities SteamVR extrapolates positions (linear velocity) and
-    /// orientations (angular velocity) with: 100 as tracked (and shaped), 0 none, so SteamVR shows
-    /// each where it was measured. None leaves that one as it is; both None shows them.
-    Prediction {
-        position: Option<u32>,
-        rotation: Option<u32>,
-    },
     /// Degrees the controllers are shown pitched from their tracked pose, positive with the
     /// forward end up (None shows it).
     Tilt(Option<f64>),
@@ -246,40 +234,6 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 .collect::<Result<Vec<_>, String>>()
                 .map(Command::Stations)
         }
-        ["shaping"] => Ok(Command::Shaping(None)),
-        ["shaping", "on"] => Ok(Command::Shaping(Some(true))),
-        ["shaping", "off"] => Ok(Command::Shaping(Some(false))),
-        ["shaping", ..] => Err("usage: shaping [on|off]".into()),
-        ["prediction"] => Ok(Command::Prediction {
-            position: None,
-            rotation: None,
-        }),
-        ["prediction", rest @ ..] => {
-            let percent = |p: &str| {
-                p.parse::<u32>()
-                    .ok()
-                    .filter(|p| *p <= 100)
-                    .ok_or_else(|| "prediction must be a whole percent from 0 to 100".to_string())
-            };
-            match rest {
-                ["position" | "rotation"] => {
-                    Err("usage: prediction position|rotation PERCENT".into())
-                }
-                [p] => percent(p).map(|p| Command::Prediction {
-                    position: Some(p),
-                    rotation: Some(p),
-                }),
-                ["position", p] => percent(p).map(|p| Command::Prediction {
-                    position: Some(p),
-                    rotation: None,
-                }),
-                ["rotation", p] => percent(p).map(|p| Command::Prediction {
-                    position: None,
-                    rotation: Some(p),
-                }),
-                _ => Err("usage: prediction [PERCENT] | prediction position|rotation PERCENT".into()),
-            }
-        }
         ["tilt"] => Ok(Command::Tilt(None)),
         ["tilt", deg] => deg
             .parse::<f64>()
@@ -338,21 +292,6 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["calibration", "provisional"] => Ok(Command::CalibrationProvisional),
         ["calibration", ..] => Err("usage: calibration capture | calibration provisional | calibration load <absolute-path>".into()),
         ["alignment", "reload"] => Ok(Command::AlignmentReload),
-        ["latency"] => Ok(Command::Latency(None)),
-        ["latency", ms] => {
-            let v = ms
-                .parse::<f64>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| "latency adjustment must be a finite number of ms".to_string())?;
-            if v.abs() > crate::settings::MAX_LATENCY_ADJUSTMENT_MS {
-                return Err(format!(
-                    "latency adjustment must be within +-{} ms",
-                    crate::settings::MAX_LATENCY_ADJUSTMENT_MS
-                ));
-            }
-            Ok(Command::Latency(Some(v)))
-        }
         ["alignment", ..] => Err("usage: alignment reload".into()),
         [verb, ..] => Err(format!("unknown command '{verb}'")),
     }
@@ -873,43 +812,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_prediction() {
-        let set = |position, rotation| Ok(Command::Prediction { position, rotation });
-        assert_eq!(parse("prediction"), set(None, None));
-        assert_eq!(parse("prediction 0"), set(Some(0), Some(0)));
-        assert_eq!(parse("prediction 100"), set(Some(100), Some(100)));
-        assert_eq!(parse("prediction position 100"), set(Some(100), None));
-        assert_eq!(parse("prediction rotation 0"), set(None, Some(0)));
-        assert_eq!(
-            parse("prediction position"),
-            Err("usage: prediction position|rotation PERCENT".into())
-        );
-        for bad in [
-            "prediction 101",
-            "prediction -1",
-            "prediction 50.5",
-            "prediction half",
-            "prediction 50 50",
-            "prediction rotation 101",
-            "prediction both 50",
-        ] {
-            assert!(parse(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn parse_alignment_reload() {
         assert_eq!(parse("alignment reload"), Ok(Command::AlignmentReload));
-        assert_eq!(parse("latency"), Ok(Command::Latency(None)));
-        assert_eq!(parse("latency -2.5"), Ok(Command::Latency(Some(-2.5))));
-        assert_eq!(
-            parse("latency 40"),
-            Err("latency adjustment must be within +-30 ms".into())
-        );
-        assert_eq!(
-            parse("latency abc"),
-            Err("latency adjustment must be a finite number of ms".into())
-        );
         assert_eq!(parse("tilt"), Ok(Command::Tilt(None)));
         assert_eq!(parse("tilt 10"), Ok(Command::Tilt(Some(10.0))));
         assert_eq!(parse("tilt -7.5"), Ok(Command::Tilt(Some(-7.5))));
@@ -993,10 +897,18 @@ mod tests {
             Ok(Command::UniverseWatch(Some(true)))
         );
         assert!(parse("universe-watch maybe").is_err());
-        assert_eq!(parse("shaping"), Ok(Command::Shaping(None)));
-        assert_eq!(parse("shaping off"), Ok(Command::Shaping(Some(false))));
-        assert_eq!(parse("shaping on"), Ok(Command::Shaping(Some(true))));
-        assert!(parse("shaping 1").is_err());
+        // the published motion is the tracked one: nothing reshapes, scales or restamps it
+        for gone in [
+            "shaping off",
+            "prediction 0",
+            "prediction rotation 50",
+            "latency 4",
+        ] {
+            assert!(
+                parse(gone).unwrap_err().starts_with("unknown command"),
+                "{gone}"
+            );
+        }
     }
 
     #[test]

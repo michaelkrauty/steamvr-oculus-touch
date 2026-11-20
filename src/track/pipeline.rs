@@ -1911,6 +1911,35 @@ mod tests {
         (errors, stale)
     }
 
+    thread_local! {
+        /// Per published sample of the last simulation on this thread: |error| of the linear
+        /// velocity against the model origin's true velocity and against the IMU's, and of the
+        /// body rate the driver hands SteamVR (gyro less bias) against the true body rate.
+        static MOTION_ERRORS: std::cell::RefCell<Vec<[f64; 3]>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The published linear velocity is the reported point's (the model origin, which the pose
+    /// places), not the IMU's, and the gyro less the filter's bias is the true body rate.
+    #[test]
+    fn the_published_velocities_are_the_reported_points_and_the_body_rate() {
+        MOTION_ERRORS.with(|m| m.borrow_mut().clear());
+        let _ = run(5.0, None);
+        let m = MOTION_ERRORS.with(|m| m.take());
+        let late = &m[m.len() / 2..];
+        let median = |k: usize| {
+            let mut v: Vec<f64> = late.iter().map(|e| e[k]).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (origin, imu, rate) = (median(0), median(1), median(2));
+        assert!(late.len() > 1000, "{}", late.len());
+        assert!(
+            origin < 0.02 && origin < imu / 2.0,
+            "origin {origin} imu {imu} m/s"
+        );
+        assert!(rate < 0.02, "body rate {rate} rad/s");
+    }
+
     type Simulation = (
         Vec<(f64, f64)>,
         bool,
@@ -2220,7 +2249,23 @@ mod tests {
                         }
                     }
                     if let Some(s) = s {
-                        let truth = motion.pose((s.host_ns - HMD_DELAY - H0) as f64 * 1e-9);
+                        let tt = (s.host_ns - HMD_DELAY - H0) as f64 * 1e-9;
+                        let truth = motion.pose(tt);
+                        // the published motion against the truth's: see
+                        // `the_published_velocities_are_the_reported_points_and_the_body_rate`
+                        let h = 1e-4;
+                        let at = |lever: Vector3<f64>| {
+                            (motion.pose(tt + h) * nalgebra::Point3::from(lever)
+                                - motion.pose(tt - h) * nalgebra::Point3::from(lever))
+                                / (2.0 * h)
+                        };
+                        MOTION_ERRORS.with(|m| {
+                            m.borrow_mut().push([
+                                (s.output.vel - at(Vector3::zeros())).norm(),
+                                (s.output.vel - at(imu_pos)).norm(),
+                                (s.gyro - s.gyro_bias - motion.gyro(tt)).norm(),
+                            ])
+                        });
                         errors.push((
                             t,
                             (s.output.world_from_model.translation.vector

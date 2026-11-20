@@ -60,7 +60,7 @@ fn main() {
         )
         .unwrap();
         assert_eq!(
-            eval_report_with(&base, &[pubs.clone(), vec![]], &regpath, true),
+            eval_report_with(&base, &[pubs.clone(), vec![]], &regpath),
             0
         );
     }

@@ -12,7 +12,6 @@ pub mod eskf;
 pub mod factory;
 pub mod landmarks;
 pub mod pipeline;
-pub mod predict;
 pub mod refine;
 pub mod replay;
 pub mod repose;

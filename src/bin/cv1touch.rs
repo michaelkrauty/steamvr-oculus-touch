@@ -72,7 +72,7 @@ fn usage_code(code: i32) -> ! {
          cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
          cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
          cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
-         cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | shaping [on|off]\n  cv1touch latency [MS] | prediction [PERCENT] | prediction position|rotation PERCENT | tilt [DEGREES]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
+         cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | tilt [DEGREES]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
          cv1touch fit-render [REC]\n  cv1touch steamvr install [--legacy-assets SO MANIFEST] | steamvr check [--legacy-assets SO MANIFEST] [--install-script] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
          cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
          cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
@@ -919,11 +919,6 @@ fn daemon_status(
         .and_then(|json| serde_json::from_str(json).ok()))
 }
 
-/// The daemon's latency adjustment from its status, ms (none from a daemon that does not say).
-fn latency_adjustment(status: Option<&serde_json::Value>) -> Option<f64> {
-    status?["latency_adjustment_ms"].as_f64()
-}
-
 /// Waits until cv1touchd reports `mode` with every sensor's frame counter advancing.
 fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
     let start = Instant::now();
@@ -1706,7 +1701,6 @@ fn paced_truth_file(
     universe_id: u64,
     windows: Vec<(String, u64, u64)>,
     sampled: TruthSampler,
-    latency_adjustment_ms: Option<f64>,
     tracking_bases: BTreeMap<String, String>,
 ) -> eval::TruthFile {
     let (samples, others) = sampled.into_paced_tracks(&reference);
@@ -1718,7 +1712,6 @@ fn paced_truth_file(
         windows,
         samples,
         others,
-        latency_adjustment_ms,
         tracking_bases,
     }
 }
@@ -1747,7 +1740,6 @@ fn eval_capture() -> i32 {
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return 1;
     }
-    let latency_adjustment_ms = latency_adjustment(status.as_ref());
     let client = match vr::Client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -1826,7 +1818,6 @@ fn eval_capture() -> i32 {
         universe,
         windows,
         sampled,
-        latency_adjustment_ms,
         tracking_bases,
     );
     let truth_path = base.with_extension("truth.json");
@@ -3150,7 +3141,6 @@ fn capture_free_named_with_feedback(
         eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
         return Err(1);
     }
-    let latency_adjustment_ms = latency_adjustment(status.as_ref());
     let client = match vr::Client::connect() {
         Ok(c) => c,
         Err(e) => {
@@ -3347,7 +3337,6 @@ fn capture_free_named_with_feedback(
         windows: vec![("free".into(), start, end)],
         samples,
         others,
-        latency_adjustment_ms,
         tracking_bases,
     };
     let truth_path = base.with_extension("truth.json");
@@ -6066,7 +6055,7 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
                     Err(e) => eprintln!("cv1touch: no registration fitted: {e}"),
                 }
             }
-            eval_report_with(base, &r.hands, &registration, false)
+            eval_report_with(base, &r.hands, &registration)
         }
         Err(e) => {
             eprintln!("cv1touch: {e}");
@@ -6114,18 +6103,10 @@ fn fit_capture_registration(
 
 /// Accuracy and latency of published poses against the jig truth recorded beside them.
 fn eval_report(base: &Path, hands: &[Vec<eval::Published>; 2]) -> i32 {
-    eval_report_with(base, hands, &align::registration_path(), true)
+    eval_report_with(base, hands, &align::registration_path())
 }
 
-/// `published_by_daemon`: the poses are the daemon's own records, whose stamps carry the latency
-/// adjustment the capture recorded; a replay's stamps carry none, so its lag is the tracker's and
-/// gets no advice on the adjustment.
-fn eval_report_with(
-    base: &Path,
-    hands: &[Vec<eval::Published>; 2],
-    registration: &Path,
-    published_by_daemon: bool,
-) -> i32 {
+fn eval_report_with(base: &Path, hands: &[Vec<eval::Published>; 2], registration: &Path) -> i32 {
     let truth_path = base.with_extension("truth.json");
     let tf: eval::TruthFile = match std::fs::read_to_string(&truth_path)
         .map_err(|e| e.to_string())
@@ -6195,7 +6176,7 @@ fn eval_report_with(
             .collect()
     };
     let (still1, still2) = (truly_still(&still1), truly_still(&still2));
-    let report = |label: &str, x: &nalgebra::Isometry3<f64>, advise: bool| -> f64 {
+    let report = |label: &str, x: &nalgebra::Isometry3<f64>| -> f64 {
         let params = eval::SegmentParams::default();
         let first = eval::Truth {
             samples: &truth,
@@ -6239,11 +6220,6 @@ fn eval_report_with(
             "  lag: {lag:.1} ms (published pose vs truth, moving; negative: the Touch runs ahead \
              of the reference)"
         );
-        if let Some(advice) = eval::latency_advice(lag, tf.latency_adjustment_ms)
-            .filter(|_| advise && published_by_daemon)
-        {
-            println!("  {advice}");
-        }
         println!("  moving, as published: position median {:.1} p90 {:.1} p99 {:.1} max {:.1} mm (rms {:.1}); rotation median {:.2} p90 {:.2} deg ({} poses)", e0.pos_median_mm, e0.pos_p90_mm, e0.pos_p99_mm, e0.pos_max_mm, e0.pos_rms_mm, e0.rot_median_deg, e0.rot_p90_deg, e0.n);
         println!("  moving, lag removed:  position median {:.1} p90 {:.1} p99 {:.1} max {:.1} mm (rms {:.1}); rotation median {:.2} p90 {:.2} deg", el.pos_median_mm, el.pos_p90_mm, el.pos_p99_mm, el.pos_max_mm, el.pos_rms_mm, el.rot_median_deg, el.rot_p90_deg);
         println!(
@@ -6266,7 +6242,6 @@ fn eval_report_with(
     let lag = report(
         "with the installed registration (what SteamVR shows)",
         &installed,
-        true,
     );
     if !lag.is_finite() {
         println!("(no best-fit registration: moving lag unavailable)");
@@ -6309,7 +6284,6 @@ fn eval_report_with(
                 report(
                     "with a best-fit registration (tracking error alone)",
                     &sol.lighthouse_from_world,
-                    false,
                 );
             }
             Err(e) => println!("(no best-fit registration: {e})"),
@@ -6508,19 +6482,10 @@ fn main() {
         ["eval-rig", base, "--replay"] => eval_rig(Path::new(base), true),
         ["vr-devices"] => vr_devices(),
         ["universe"] => universe_cmd(),
-        ["shaping"] => send("shaping"),
-        ["shaping", on @ ("on" | "off")] => send(&format!("shaping {on}")),
         ["universe-watch"] => send("universe-watch"),
         ["universe-watch", on @ ("on" | "off")] => send(&format!("universe-watch {on}")),
         ["tilt"] => send("tilt"),
         ["tilt", deg] => send(&format!("tilt {deg}")),
-        ["latency"] => send("latency"),
-        ["latency", ms] => send(&format!("latency {ms}")),
-        ["prediction"] => send("prediction"),
-        ["prediction", percent] => send(&format!("prediction {percent}")),
-        ["prediction", which @ ("position" | "rotation"), percent] => {
-            send(&format!("prediction {which} {percent}"))
-        }
         ["vr-pulse", index] => vr_pulse(index, "300"),
         ["vr-pulse", index, ms] => vr_pulse(index, ms),
         ["fit-render"] => fit_render(None),
@@ -6973,7 +6938,6 @@ mod tests {
             42,
             windows.clone(),
             sampled,
-            Some(-2.5),
             bases.clone(),
         );
         let encoded = serde_json::to_vec(&file).unwrap();
@@ -6988,7 +6952,6 @@ mod tests {
             (eval::TRUTH_FORMAT, 1, 42)
         );
         assert_eq!(decoded.windows, windows);
-        assert_eq!(decoded.latency_adjustment_ms, Some(-2.5));
         assert_eq!(decoded.tracking_bases, bases);
         let (reference, poses) = truth_track(&decoded, None).unwrap();
         assert_eq!(reference, "INDEX-REFERENCE");

@@ -8,6 +8,14 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - A controller without a position fix (after it wakes, after a dropout, or while a new track waits for a second sensor) is now stamped with the time its motion sensor measured it, as a tracked controller already was. It had been stamped about 4 ms later, at radio delivery, so SteamVR drew it that much behind.
 
+### Changed
+
+- cv1touch no longer shapes controller velocities for SteamVR's prediction. SteamVR gets the measured pose and the true linear and angular velocities and does its own prediction, as for any controller. A hand that stops abruptly can overshoot slightly more than before.
+
+### Removed
+
+- `cv1touch shaping`, `cv1touch prediction` and `cv1touch latency`. Prediction percents and latency adjustments saved by an earlier version are ignored.
+
 ## [0.4.3](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.4.3) - 2026-11-20
 
 ### Fixed

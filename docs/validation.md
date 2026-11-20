@@ -18,7 +18,7 @@ A fifth physical sensor was added to the calibrated four-sensor room. All five r
 
 Development captures compared tracked controller poses to a rigidly attached SteamVR reference and checked cross-camera/Touch-to-Touch consistency. A reference's own errors, non-rigid attachment, changed room setup, clock alignment, and fit/test overlap can dominate the residual. Tracking is not established as more accurate than another controller merely because a fitted residual is small.
 
-Radio-arrival-to-publication measurements characterize added software delay. They exclude the radio's sampling/delivery interval, camera exposure, SteamVR prediction, application rendering, and display scan-out. No universal sub-millisecond end-to-end claim is made here. Timing knobs and prediction shaping are expert controls that need out-of-sample checks.
+Radio-arrival-to-publication measurements characterize added software delay. They exclude the radio's sampling/delivery interval, camera exposure, SteamVR prediction, application rendering, and display scan-out. No universal sub-millisecond end-to-end claim is made here.
 
 Raw development recordings and personal calibration are not included. Consequently, historical numerical measurements are not presented as reproducible public benchmarks. A publishable benchmark should specify hardware, software commit, sensor layout, capture/clock procedure, reference quality, held-out data, and uncertainty, and distribute appropriately sanitized data with permission.
 
