@@ -1105,7 +1105,10 @@ impl Tracker {
         }
         let (k, carried) = match self.state_at(t_e) {
             Some((k, f)) => (k, Some(f)),
-            None if self.history.is_empty() => (0, self.saved_bias),
+            // after an IMU reset only the samples since it can carry a state to the present
+            None if self.history.is_empty() && self.imu.front().is_some_and(|s| s.t <= t_e) => {
+                (0, self.saved_bias)
+            }
             None => {
                 self.stats.too_old += 1;
                 return Outcome::TooOld;
@@ -1858,6 +1861,51 @@ mod tests {
         let (tr, errors) = run(&w, 6.0, 0.3, Some((3.0, 3.3)));
         assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
         assert!(pct(&errors, 0.5) < 1e-3, "{:?}", tr.stats);
+    }
+
+    /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of
+    /// the gap wait for IMU, as the daemon's pending frames do, and arrive with the first sample
+    /// after it. None of them may start the new track: no IMU carries a state from their exposure
+    /// across the gap, so one would show the controller turned by the whole gap's motion.
+    #[test]
+    fn frames_exposed_before_an_imu_reset_do_not_start_the_new_track() {
+        let w = world(8);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let mut rng = Rng::new(7);
+        let (gap, dt_frame) = ((2.0, 2.4), 1.0 / 52.0);
+        let mut next_frame = 0.01;
+        let mut t = 0.0;
+        let mut worst: f64 = 0.0;
+        while t < 3.0 {
+            t += 0.002;
+            if t > gap.0 && t < gap.1 {
+                continue;
+            }
+            tr.imu(imu(&w, t));
+            while next_frame <= t {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    let blobs = sight(&w, cam, next_frame, &mut rng, 0.3);
+                    let engine = EnginePose::strong(w.motion.pose(next_frame));
+                    let t_e = (1e9 + next_frame * 1e9) as u64;
+                    tr.frame(t_e, c, cam, &blobs, Some(engine), &[]);
+                }
+                next_frame += dt_frame;
+            }
+            if t > 1.0 {
+                if let Some(o) = tr.output().filter(|o| o.tracking) {
+                    let truth = w.motion.pose(t).rotation;
+                    worst = worst.max(o.world_from_model.rotation.angle_to(&truth));
+                }
+            }
+        }
+        assert_eq!(tr.stats.imu_gaps, 1, "{:?}", tr.stats);
+        assert!(tr.tracking(), "{:?}", tr.stats);
+        assert!(
+            worst < 3f64.to_radians(),
+            "worst tracked rotation error {} deg {:?}",
+            worst.to_degrees(),
+            tr.stats
+        );
     }
 
     #[test]
