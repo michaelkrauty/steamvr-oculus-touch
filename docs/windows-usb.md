@@ -14,4 +14,4 @@ The individual control and video interfaces use `FF/01/00` and `FF/02/00`. Micro
 
 The readiness check accepts that specific CV1 function identity, not any lone interface. Without evidence of grouping it still requires the separate interface nodes. It also retains the started-state, problem-code, arrival-identity and active device-interface checks. Synthetic regressions cover grouped, separate, incomplete and failed layouts.
 
-These descriptors and documented Windows behavior explain the software fix; they do not establish that a physical Windows host can stream this camera. Actual WinUSB transfers, USB 2 layouts, hub bandwidth, replugging and sleep/resume still need hardware testing. The descriptor bytes above contain no serial number, room calibration or personal device path.
+These descriptors and documented Windows behavior explain the software fix. Streaming from a physical Windows host is untested. The descriptor bytes above contain no serial number, room calibration or personal device path.

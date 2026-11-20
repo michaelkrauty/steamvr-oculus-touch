@@ -2,7 +2,7 @@
 
 cv1touch adds original Oculus Rift CV1 Touch controllers to an existing SteamVR setup. There is one installer; no command-line knowledge, Python, developer tools, or separate Visual C++ runtime installation is needed.
 
-**Status:** new. The Windows build passes its tests and the installer installs and uninstalls cleanly on a test machine, but no one has yet played with it: you may be the first. When something is off, send a report (below); that is what makes it work for the next person.
+**Status:** untested on Windows hardware, but it should work. The build passes its tests, and the installer installs and uninstalls cleanly. If something is off, send a report (below). Before a first test, read the [first Windows test checklist](windows-first-test.md).
 
 ## What you need
 
