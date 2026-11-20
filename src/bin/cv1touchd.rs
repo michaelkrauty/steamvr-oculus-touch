@@ -4926,7 +4926,7 @@ fn held_through_gap(last: &ControllerState, now: u64) -> ControllerState {
 
 /// For a connected controller the tracker shows no position for (it woke, its track was dropped,
 /// or its new track awaits a second sensor's confirmation): SteamVR is shown it where the tracker
-/// last had it, turning with the engine's IMU orientation but neither moving nor extrapolated,
+/// last had it, turning with the engine's IMU orientation and the gyro's rate but not moving,
 /// without a position. Not at the engine's position: the engine's own searches leave out the
 /// controllers the tracker holds, so its position can be metres off by then. Before the tracker's
 /// first fix the engine's position is all there is.
@@ -4935,8 +4935,9 @@ fn hold_unfixed(state: &mut ControllerState, last_seen: Option<[f32; 3]>) {
         state.pos = pos;
     }
     state.lin_vel = [0.0; 3];
-    // a zero body rate for the driver (ang_vel - gyro_bias = 0): no turn to extrapolate
-    state.ang_vel = state.gyro_bias;
+    // the measured body rate for the driver (ang_vel - gyro_bias = gyro - bias): the engine's
+    // orientation turns the IMU frame (the model frame), so SteamVR extrapolates the turn in it
+    state.ang_vel = state.imu_gyro;
     state.flags &= !ffi::CV1T_FLAG_POSITION;
     state.last_position_fix_host_ns = 0;
 }
@@ -13057,7 +13058,8 @@ mod tests {
 
     /// A connected controller the tracker has no state for (it woke, or a wrong lock was dropped)
     /// is published where the tracker last had it, not at the engine's own position, without a
-    /// position and not moving; with the engine tracking, the engine's pose is published as before.
+    /// position and not moving but turning at the gyro's rate; with the engine tracking, the
+    /// engine's pose is published as before.
     #[test]
     fn an_unfixed_controller_is_published_where_the_tracker_last_had_it() {
         let d = status_daemon();
@@ -13084,6 +13086,8 @@ mod tests {
             view_orient: [0.0, 0.6, 0.0, 0.8],
             view_lin_vel: [1.0, 0.0, 0.0],
             view_ang_vel: [0.0, 2.0, 0.0],
+            imu_gyro: [0.5, 3.0, 0.0],
+            gyro_bias: [0.01, 0.0, 0.0],
             ..Default::default()
         };
         d.hands[HAND_LEFT].lock().unwrap().memory.last_seen = Some([0.1, 1.0, -0.2]);
@@ -13095,8 +13099,9 @@ mod tests {
         assert_eq!((st.pos, st.orient), ([0.1, 1.0, -0.2], c.view_orient));
         assert_eq!(st.lin_vel, [0.0; 3]);
         assert_eq!(
-            st.ang_vel, st.gyro_bias,
-            "no turn for SteamVR to extrapolate"
+            (st.ang_vel, st.gyro_bias),
+            (c.imu_gyro, c.gyro_bias),
+            "the gyro's body rate for SteamVR to extrapolate"
         );
 
         publish_hand_state(&d, HAND_LEFT, &c, || now, None);
