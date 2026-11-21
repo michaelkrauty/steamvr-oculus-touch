@@ -152,9 +152,86 @@ impl Filter {
         x.q *= UnitQuaternion::from_scaled_axis(w * dt);
         x.q.renormalize();
 
+        self.transition(&r, &f, &w, a.norm(), dt, n);
+    }
+
+    /// Advances `dt` seconds along the straight line from one IMU sample (`gyro0`, `accel0`) to
+    /// another (`gyro1`, `accel1`): a stretch whose samples were lost, bridged by the samples on
+    /// either side. The rotation turns by the mean rate; each specific force is turned with the
+    /// orientation at its own end; the transition is taken at the midpoint. `white` is what the
+    /// stretch hides, as densities of white acceleration and turn rate (see `add_white`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn propagate_line(
+        &mut self,
+        gyro0: &Vector3<f64>,
+        accel0: &Vector3<f64>,
+        gyro1: &Vector3<f64>,
+        accel1: &Vector3<f64>,
+        dt: f64,
+        gravity: &Vector3<f64>,
+        n: &Noise,
+        white: (f64, f64),
+    ) {
+        if dt <= 0.0 {
+            return;
+        }
+        let x = &mut self.x;
+        let w = ((gyro0 - x.bg) + (gyro1 - x.bg)) * 0.5;
+        let (f0, f1) = (accel0 - x.ba, accel1 - x.ba);
+        let r0 = x.q.to_rotation_matrix().into_inner();
+        let q1 = x.q * UnitQuaternion::from_scaled_axis(w * dt);
+        let r1 = q1.to_rotation_matrix().into_inner();
+        let (a0, a1) = (r0 * f0 + gravity, r1 * f1 + gravity);
+        x.p += x.v * dt + (a0 / 3.0 + a1 / 6.0) * (dt * dt);
+        x.v += (a0 + a1) * (0.5 * dt);
+        x.q = q1;
+        x.q.renormalize();
+        let rm = (self.x.q * UnitQuaternion::from_scaled_axis(-w * (0.5 * dt)))
+            .to_rotation_matrix()
+            .into_inner();
+        let f = (f0 + f1) * 0.5;
+        self.transition(&rm, &f, &w, ((a0 + a1) * 0.5).norm(), dt, n);
+        self.add_white(&(rm * skew(&f)), white.0, white.1, dt);
+    }
+
+    /// Adds white acceleration of density `accel` (m^2/s^3) and white turn rate of density
+    /// `rate` (rad^2/s) over `dt` seconds, integrated through the dynamics `transition` steps:
+    /// the rotation's error reaches the velocity through the turned specific force `rf` (R [f]x)
+    /// as it accumulates, and from there the position. For constant inputs this is exact, so a
+    /// stretch takes on the same whole or in pieces.
+    fn add_white(&mut self, rf: &Matrix3<f64>, accel: f64, rate: f64, dt: f64) {
+        let (t2, t3) = (dt * dt, dt * dt * dt);
+        let i3 = Matrix3::identity();
+        let leak = rf * rf.transpose() * rate;
+        for (r, c, block) in [
+            (ROT, ROT, i3 * (rate * dt)),
+            (VEL, ROT, -rf * (rate * t2 / 2.0)),
+            (POS, ROT, -rf * (rate * t3 / 6.0)),
+            (VEL, VEL, i3 * (accel * dt) + leak * (t3 / 3.0)),
+            (POS, VEL, i3 * (accel * t2 / 2.0) + leak * (t2 * t2 / 8.0)),
+            (POS, POS, i3 * (accel * t3 / 3.0) + leak * (t2 * t3 / 20.0)),
+        ] {
+            let mut at = self.cov.fixed_view_mut::<3, 3>(r, c);
+            at += block;
+            if r != c {
+                let mut at = self.cov.fixed_view_mut::<3, 3>(c, r);
+                at += block.transpose();
+            }
+        }
+    }
+
+    fn transition(
+        &mut self,
+        r: &Matrix3<f64>,
+        f: &Vector3<f64>,
+        w: &Vector3<f64>,
+        a_norm: f64,
+        dt: f64,
+        n: &Noise,
+    ) {
         let mut phi = Cov::identity();
         let i3 = Matrix3::identity();
-        let rf = r * skew(&f);
+        let rf = r * skew(f);
         phi.fixed_view_mut::<3, 3>(ROT, ROT).copy_from(
             &UnitQuaternion::from_scaled_axis(-w * dt)
                 .to_rotation_matrix()
@@ -169,7 +246,7 @@ impl Filter {
         phi.fixed_view_mut::<3, 3>(VEL, ROT).copy_from(&(-rf * dt));
         phi.fixed_view_mut::<3, 3>(VEL, BA).copy_from(&(-r * dt));
         let mut q = Cov::zeros();
-        let accel_density = n.accel + n.accel_per_accel * a.norm() + n.accel_per_rate * w.norm();
+        let accel_density = n.accel + n.accel_per_accel * a_norm + n.accel_per_rate * w.norm();
         for (block, density) in [
             (ROT, n.gyro),
             (VEL, accel_density),

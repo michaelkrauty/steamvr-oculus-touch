@@ -10,6 +10,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - A controller just woken or picked up could be shown turned about its LED ring for a few hundred milliseconds before the tracker corrected it. A first lock is now shown only once the sensors' frames tell it from the ring's turns.
 - A controller could be shown running off, still as tracked, for a moment once the tracker's own fits stopped matching the sensors' frames, after fast motion out of their view or a few poor fits. The tracker now starts the track afresh when two frames show the controller well away from it.
 - A controller picked up quickly soon after the daemon started could lose its position for about two seconds when the sensors' views of the same moment disagreed slightly. The tracker now checks the motion sensor's bias only once all the sensors' views of a moment are in.
+- A controller in fast motion could be shown running off, or lose its position, after its motion samples dropped out over the radio for a few tens of milliseconds. The tracker now bridges such a gap with the samples on either side of it and allows for what the gap may have hidden.
 
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 

@@ -402,6 +402,91 @@ struct InspectionFrame {
     peers: bool,
 }
 
+/// The controller's IMU sample period.
+const IMU_PERIOD_NS: u64 = 2_000_000;
+
+/// An interval this long or longer between consecutive IMU samples has at least one sample
+/// missing. A lone 3 ms step is stamp jitter, paired with a 1 ms one, not a loss.
+const HOLE_MIN_NS: u64 = 2 * IMU_PERIOD_NS - IMU_PERIOD_NS / 4;
+
+/// What a stretch of lost IMU samples hides once it is bridged by the straight line between the
+/// samples on either side: the measured p95 of the velocity (m/s) and rotation (rad) the lost
+/// samples would have added beyond that line, by the stretch's length T (s) and by the rate of
+/// change entering it, the jerk `ja` (m/s^3) and angular acceleration `jw` (rad/s^2) between the
+/// two samples before it:
+///   p95 |dv| = T^2 (HOLE_VEL[0] + HOLE_VEL[1] ja)
+///   p95 |dθ| = T^2 (HOLE_ROT[0] + HOLE_ROT[1] jw) + T^3 (HOLE_ROT[2] + HOLE_ROT[3] jw)
+/// The filter's per-axis sd for the stretch is that p95 over `P95_PER_AXIS`, the p95 of the
+/// magnitude of an isotropic 3-D Gaussian in units of its per-axis sd.
+const HOLE_VEL: [f64; 2] = [5.469, 0.1708];
+const HOLE_ROT: [f64; 4] = [0.4293, 0.09208, 6.832, 3.9];
+const P95_PER_AXIS: f64 = 2.795;
+
+/// Per-axis variances of velocity (m^2/s^2) and rotation (rad^2) that the stretch from `prev`
+/// to `s` hides (see `HOLE_VEL`), `before` being the sample before `prev`.
+fn hole_variance(before: Option<&ImuSample>, prev: &ImuSample, s: &ImuSample) -> (f64, f64) {
+    let span = (s.t - prev.t) as f64 * 1e-9;
+    let (ja, jw) = before.filter(|b| b.t < prev.t).map_or((0.0, 0.0), |b| {
+        let h = (prev.t - b.t) as f64 * 1e-9;
+        (
+            (prev.accel - b.accel).norm() / h,
+            (prev.gyro - b.gyro).norm() / h,
+        )
+    });
+    let t2 = span * span;
+    let vel = t2 * (HOLE_VEL[0] + HOLE_VEL[1] * ja) / P95_PER_AXIS;
+    let rot = (t2 * (HOLE_ROT[0] + HOLE_ROT[1] * jw)
+        + t2 * span * (HOLE_ROT[2] + HOLE_ROT[3] * jw))
+        / P95_PER_AXIS;
+    (vel * vel, rot * rot)
+}
+
+/// Advances `f` from `t0` to `t1`, inside the interval that sample `s` ends; `prev` is the sample
+/// before it and `before` the one before that. An interval of about one period holds `s` over
+/// it, as `Filter::propagate` does. One with samples missing runs along the straight line from
+/// `prev` to `s` over the missing part, then holds `s` over its own last period; and the filter
+/// takes on what the missing part hides (`HOLE_VEL`), spread over the missing part.
+#[allow(clippy::too_many_arguments)]
+fn advance(
+    f: &mut Filter,
+    before: Option<&ImuSample>,
+    prev: Option<&ImuSample>,
+    s: &ImuSample,
+    t0: u64,
+    t1: u64,
+    g: &Vector3<f64>,
+    n: &Noise,
+) {
+    let Some(p) = prev.filter(|p| s.t.saturating_sub(p.t) >= HOLE_MIN_NS) else {
+        f.propagate(&s.gyro, &s.accel, t1.saturating_sub(t0) as f64 * 1e-9, g, n);
+        return;
+    };
+    let split = s.t - IMU_PERIOD_NS;
+    if t0 < split {
+        let end = t1.min(split);
+        let missing = (split - p.t) as f64;
+        let at = |t: u64| (t.saturating_sub(p.t) as f64 / missing).clamp(0.0, 1.0);
+        let along = |a: &Vector3<f64>, b: &Vector3<f64>, u: f64| a + (b - a) * u;
+        let (u0, u1) = (at(t0), at(end));
+        let dt = (end - t0) as f64 * 1e-9;
+        // white noise over this piece, carried through it to its end
+        let (vel, rot) = hole_variance(before, p, s);
+        f.propagate_line(
+            &along(&p.gyro, &s.gyro, u0),
+            &along(&p.accel, &s.accel, u0),
+            &along(&p.gyro, &s.gyro, u1),
+            &along(&p.accel, &s.accel, u1),
+            dt,
+            g,
+            n,
+            (vel / (missing * 1e-9), rot / (missing * 1e-9)),
+        );
+    }
+    if t1 > split {
+        f.propagate(&s.gyro, &s.accel, (t1 - t0.max(split)) as f64 * 1e-9, g, n);
+    }
+}
+
 impl Tracker {
     pub fn new(device_id: i32, body: Body, params: Params, camera_count: usize) -> Tracker {
         let aliases = vision::ring_aliases(&body.leds);
@@ -536,10 +621,15 @@ impl Tracker {
         self.still.push_back(still);
         let g = self.gravity();
         if let Some(&(t, mut f)) = self.history.back() {
-            f.propagate(
-                &s.gyro,
-                &s.accel,
-                (s.t - t) as f64 * 1e-9,
+            let n = self.imu.len();
+            let earlier = |k: usize| n.checked_sub(k).and_then(|i| self.imu.get(i));
+            advance(
+                &mut f,
+                earlier(3),
+                earlier(2),
+                &s,
+                t,
+                s.t,
                 &g,
                 &self.params.noise,
             );
@@ -560,7 +650,9 @@ impl Tracker {
             self.history.pop_front();
         }
         let oldest = self.history.front().map_or(cutoff, |h| h.0.min(cutoff));
-        while self.imu.len() > 1 && self.imu[0].t <= oldest {
+        // keep the two samples at or before the oldest snapshot: the interval propagating from
+        // it ends at the next sample, and a hole there needs both (see `advance`)
+        while self.imu.len() > 2 && self.imu[2].t <= oldest {
             self.imu.pop_front();
             self.still.pop_front();
         }
@@ -783,10 +875,14 @@ impl Tracker {
         if t > tk {
             let next = self.imu.partition_point(|s| s.t <= tk);
             let s = self.imu.get(next)?;
-            f.propagate(
-                &s.gyro,
-                &s.accel,
-                (t - tk) as f64 * 1e-9,
+            let earlier = |k: usize| next.checked_sub(k).and_then(|i| self.imu.get(i));
+            advance(
+                &mut f,
+                earlier(2),
+                earlier(1),
+                s,
+                tk,
+                t,
                 &self.gravity(),
                 &self.params.noise,
             );
@@ -817,6 +913,10 @@ impl Tracker {
         self.history.push_back((t, f));
         self.applied.push_back(first);
         let from = t;
+        // the two samples before the first one replayed: the interval it ends, and the rate into it
+        let at = self.imu.partition_point(|s| s.t <= from);
+        let mut prev = at.checked_sub(1).and_then(|i| self.imu.get(i)).copied();
+        let mut before = at.checked_sub(2).and_then(|i| self.imu.get(i)).copied();
         let mut imu = self
             .imu
             .iter()
@@ -830,7 +930,7 @@ impl Tracker {
             match (next_m, next_s) {
                 (Some(tm), Some(ts)) if tm <= ts => {
                     let (s, _) = *imu.peek().unwrap();
-                    f.propagate(&s.gyro, &s.accel, (tm - t) as f64 * 1e-9, &g, &n);
+                    advance(&mut f, before.as_ref(), prev.as_ref(), s, t, tm, &g, &n);
                     t = tm;
                     let a = &later[m];
                     match vision::fit_pairs(
@@ -855,7 +955,8 @@ impl Tracker {
                 }
                 (_, Some(ts)) => {
                     let (s, still) = imu.next().unwrap();
-                    f.propagate(&s.gyro, &s.accel, (ts - t) as f64 * 1e-9, &g, &n);
+                    advance(&mut f, before.as_ref(), prev.as_ref(), s, t, ts, &g, &n);
+                    (before, prev) = (prev, Some(*s));
                     self.zupt(&mut f, t, ts, *still);
                     t = ts;
                     self.history.push_back((t, f));
@@ -1887,6 +1988,8 @@ mod tests {
         /// The first two sensors' first frames exposed at or after this time show the same
         /// phantom, and arrive this much later than usual: after the third sensor's newer fixes.
         phantom_late: Option<(f64, f64)>,
+        /// The IMU samples in this span are lost (the radio dropped them).
+        imu_lost: Option<(f64, f64)>,
         /// Position errors are kept from this time on (default 1 s).
         measure_after: Option<f64>,
         /// The track is dropped as a wrong lock at this time.
@@ -1974,7 +2077,9 @@ mod tests {
             if let Some((_, _, off)) = opts.accel_off.filter(|(a, b, _)| t >= *a && t < *b) {
                 s.accel += off;
             }
-            tr.imu(s);
+            if !opts.imu_lost.is_some_and(|(a, b)| t > a && t < b) {
+                tr.imu(s);
+            }
             if opts.drop_at.is_some_and(|d| t >= d) && !dropped {
                 dropped = true;
                 tr.drop_wrong_lock();
@@ -2340,6 +2445,411 @@ mod tests {
             tr.stats
         );
         assert!(pct(&errors, 1.0) < 0.01, "{:?}", tr.stats);
+    }
+
+    /// A sample stream state, its covariance as a converged track's.
+    fn moving_filter() -> Filter {
+        let x = Nominal {
+            q: UnitQuaternion::from_euler_angles(0.3, -0.2, 1.1),
+            p: Vector3::new(0.1, 1.0, -0.2),
+            v: Vector3::new(0.4, -0.3, 0.2),
+            bg: Vector3::new(0.01, -0.005, 0.003),
+            ba: Vector3::new(0.02, 0.4, -0.05),
+        };
+        let mut cov = Cov::identity() * 1e-6;
+        for k in 0..3 {
+            cov[(POS + k, POS + k)] = 1e-7;
+        }
+        Filter { x, cov }
+    }
+
+    fn sample(t_ms: f64, k: f64) -> ImuSample {
+        ImuSample {
+            t: (t_ms * 1e6) as u64,
+            gyro: Vector3::new(1.3 * k, -0.7, 2.1 * k),
+            accel: Vector3::new(3.0 * k, 9.0 + k, -2.0),
+        }
+    }
+
+    /// An interval of about one sample period (2 ms, or the 1 and 3 ms of stamp jitter) is the end
+    /// sample held over it, exactly as `Filter::propagate` integrates it, whole or in pieces.
+    #[test]
+    fn a_complete_interval_is_integrated_as_before() {
+        let (g, n) = (Vector3::new(0.0, -G, 0.0), Noise::default());
+        for (t_prev, t_s) in [(10.0, 12.0), (10.0, 13.0), (10.0, 11.0)] {
+            let (before, prev, s) = (sample(8.0, 0.9), sample(t_prev, 1.0), sample(t_s, 1.2));
+            let (mut a, mut b) = (moving_filter(), moving_filter());
+            advance(&mut a, Some(&before), Some(&prev), &s, prev.t, s.t, &g, &n);
+            b.propagate(&s.gyro, &s.accel, (s.t - prev.t) as f64 * 1e-9, &g, &n);
+            assert_eq!(a, b, "{t_prev} -> {t_s} ms");
+            let mid = prev.t + 700_000;
+            let (mut a, mut b) = (moving_filter(), moving_filter());
+            advance(&mut a, Some(&before), Some(&prev), &s, prev.t, mid, &g, &n);
+            advance(&mut a, Some(&before), Some(&prev), &s, mid, s.t, &g, &n);
+            b.propagate(&s.gyro, &s.accel, (mid - prev.t) as f64 * 1e-9, &g, &n);
+            b.propagate(&s.gyro, &s.accel, (s.t - mid) as f64 * 1e-9, &g, &n);
+            assert_eq!(a, b, "{t_prev} -> {t_s} ms in two pieces");
+        }
+    }
+
+    /// Through the tracker: a stream with no sample missing (stamp jitter included) leaves every
+    /// history state, and a state between samples, bit for bit as holding each sample does.
+    #[test]
+    fn a_stream_without_missing_samples_is_integrated_as_before() {
+        let w = world(4);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let start = moving_filter();
+        tr.history.push_back((10_000_000, start));
+        tr.imu.push_back(sample(10.0, 1.0));
+        tr.still.push_back(false);
+        let mut reference = vec![start];
+        let mut t = 10.0;
+        for (i, step) in [2.0, 2.0, 3.0, 1.0, 2.0, 2.0, 1.0, 3.0, 2.0]
+            .iter()
+            .enumerate()
+        {
+            t += step;
+            let s = sample(t, 1.0 + 0.05 * i as f64);
+            let mut f = *reference.last().unwrap();
+            f.propagate(
+                &s.gyro,
+                &s.accel,
+                step * 1e-3,
+                &tr.gravity(),
+                &tr.params.noise,
+            );
+            reference.push(f);
+            tr.imu(s);
+        }
+        let got: Vec<Filter> = tr.history.iter().map(|&(_, f)| f).collect();
+        assert_eq!(got, reference);
+        // between the last two samples
+        let s = tr.imu[tr.imu.len() - 1];
+        let mid = s.t - 1_200_000;
+        let mut f = reference[reference.len() - 2];
+        f.propagate(
+            &s.gyro,
+            &s.accel,
+            (mid - tr.imu[tr.imu.len() - 2].t) as f64 * 1e-9,
+            &tr.gravity(),
+            &tr.params.noise,
+        );
+        assert_eq!(tr.state_at(mid).map(|(_, f)| f), Some(f));
+    }
+
+    /// A track of a hard sway (4 Hz, up to 25 m/s^2) loses 60 ms of IMU samples where the
+    /// acceleration curves. The state carried across the hole lies within the uncertainty the
+    /// filter then claims: bridged by the straight line between the samples either side, which
+    /// holding the last sample is not, and owning what that line cannot know.
+    #[test]
+    fn a_lost_stretch_is_bridged_within_its_uncertainty() {
+        let mut w = world(4);
+        w.motion = Motion::sway(
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.04, 0.03, 0.04),
+            4.0,
+            [0.4, -0.3, 0.2],
+        );
+        w.ba = Vector3::zeros();
+        w.bg = Vector3::zeros();
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let state = |t: f64| {
+            let imu_at = |t: f64| (w.motion.pose(t) * Point3::from(w.body.imu_pos)).coords;
+            Nominal {
+                q: w.motion.pose(t).rotation,
+                p: imu_at(t),
+                v: (imu_at(t + 1e-4) - imu_at(t - 1e-4)) / 2e-4,
+                bg: Vector3::zeros(),
+                ba: Vector3::zeros(),
+            }
+        };
+        let t0 = 1.0;
+        let mut start = moving_filter();
+        start.x = state(t0);
+        let first = imu(&w, t0);
+        tr.history.push_back((first.t, start));
+        tr.imu.push_back(first);
+        tr.still.push_back(false);
+        // the acceleration's curvature is largest at its peaks: the hole straddles one
+        let (lost_from, lost_to) = (t0 + 0.040, t0 + 0.100);
+        let mut t = t0;
+        while t < lost_to + 0.0005 {
+            t += 0.002;
+            if t > lost_from + 1e-9 && t < lost_to - 1e-9 {
+                continue;
+            }
+            tr.imu(imu(&w, t));
+        }
+        let (te, f) = *tr.history.back().unwrap();
+        let truth = state((te as f64 * 1e-9) - 1.0);
+        let e = f.x.minus(&truth);
+        let ev = e.fixed_rows::<3>(VEL).into_owned();
+        let cv = f.cov.fixed_view::<3, 3>(VEL, VEL).into_owned();
+        let m2 = ev.dot(&(cv.try_inverse().unwrap() * ev));
+        // chi-square 99.9 % for three degrees of freedom
+        assert!(
+            m2 < 16.27,
+            "velocity off by {:.0} mm/s, {m2:.1} against chi-square 16.27",
+            ev.norm() * 1e3
+        );
+        assert!(
+            ev.norm() > 0.01,
+            "the hole should have cost something: {:.1} mm/s",
+            ev.norm() * 1e3
+        );
+    }
+
+    /// The same sway, tracked: after the 60 ms hole the first frames are accepted, the track is
+    /// neither rejected nor restarted, and it stays within a centimetre of the truth.
+    #[test]
+    fn the_first_fix_after_a_lost_stretch_is_accepted() {
+        let mut w = world(4);
+        w.motion = Motion::sway(
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.04, 0.03, 0.04),
+            4.0,
+            [0.4, -0.3, 0.2],
+        );
+        let run = |lost| {
+            run_with(
+                &w,
+                5.0,
+                0.3,
+                &Run {
+                    imu_lost: lost,
+                    // from the first frames after the hole on (the output stands still meanwhile)
+                    measure_after: Some(4.15),
+                    ..Run::default()
+                },
+            )
+        };
+        let (base, _) = run(None);
+        let (tr, errors) = run(Some((4.04, 4.10)));
+        assert_eq!(
+            (
+                tr.stats.acquisitions,
+                tr.stats.rejected,
+                tr.stats.wrong_locks
+            ),
+            (1, base.stats.rejected, 0),
+            "{:?}",
+            tr.stats
+        );
+        assert!(
+            pct(&errors, 1.0) < 0.01,
+            "{:.1} mm {:?}",
+            pct(&errors, 1.0) * 1e3,
+            tr.stats
+        );
+    }
+
+    /// The hole's uncertainty is white acceleration and turn rate over the missing part, as it
+    /// stands at its end: from no covariance and no other noise, velocity variance V, position
+    /// V Tm^2 / 3 and their covariance V Tm / 2, rotation R, per axis, with (V, R) from
+    /// `hole_variance` and Tm the missing part; the same in two pieces. (No specific force, so the
+    /// rotation's uncertainty does not reach the velocity.)
+    #[test]
+    fn a_holes_uncertainty_is_white_noise_over_its_missing_part() {
+        let (g, quiet) = (
+            Vector3::new(0.0, -G, 0.0),
+            Noise {
+                gyro: 0.0,
+                accel: 0.0,
+                gyro_bias: 0.0,
+                accel_bias: 0.0,
+                accel_per_accel: 0.0,
+                accel_per_rate: 0.0,
+            },
+        );
+        let at = |t_ms: f64, w: f64| ImuSample {
+            t: (t_ms * 1e6) as u64,
+            gyro: Vector3::new(w, -0.5 * w, 0.3),
+            accel: Vector3::zeros(),
+        };
+        let (before, prev, s) = (at(8.0, 1.0), at(10.0, 3.0), at(54.0, 2.0));
+        let mut start = moving_filter();
+        start.x.ba = Vector3::zeros();
+        start.cov = Cov::zeros();
+        let split = s.t - IMU_PERIOD_NS;
+        let tm = (split - prev.t) as f64 * 1e-9;
+        let (v, r) = hole_variance(Some(&before), &prev, &s);
+        let mut whole = start;
+        advance(
+            &mut whole,
+            Some(&before),
+            Some(&prev),
+            &s,
+            prev.t,
+            split,
+            &g,
+            &quiet,
+        );
+        let mut pieces = start;
+        let mid = prev.t + 17_000_000;
+        advance(
+            &mut pieces,
+            Some(&before),
+            Some(&prev),
+            &s,
+            prev.t,
+            mid,
+            &g,
+            &quiet,
+        );
+        advance(
+            &mut pieces,
+            Some(&before),
+            Some(&prev),
+            &s,
+            mid,
+            split,
+            &g,
+            &quiet,
+        );
+        for (name, f) in [("whole", whole), ("pieces", pieces)] {
+            for k in 0..3 {
+                let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs();
+                assert!(
+                    close(f.cov[(VEL + k, VEL + k)], v),
+                    "{name} velocity {:e} {v:e}",
+                    f.cov[(VEL + k, VEL + k)]
+                );
+                assert!(
+                    close(f.cov[(POS + k, POS + k)], v * tm * tm / 3.0),
+                    "{name} position {:e} {:e}",
+                    f.cov[(POS + k, POS + k)],
+                    v * tm * tm / 3.0
+                );
+                assert!(
+                    close(f.cov[(POS + k, VEL + k)], v * tm / 2.0),
+                    "{name} position-velocity {:e} {:e}",
+                    f.cov[(POS + k, VEL + k)],
+                    v * tm / 2.0
+                );
+                assert!(
+                    close(f.cov[(ROT + k, ROT + k)], r),
+                    "{name} rotation {:e} {r:e}",
+                    f.cov[(ROT + k, ROT + k)]
+                );
+            }
+        }
+    }
+
+    /// A controller pushed steadily (gravity and about 3 g) loses 46 ms of samples. The hole's turn
+    /// rate reaches the velocity and position through the specific force as it accumulates, so,
+    /// from no covariance and no other noise, the covariance is the same to rounding whether the
+    /// hole is integrated whole or in the pieces between frames.
+    #[test]
+    fn a_hole_is_integrated_alike_whole_or_in_pieces() {
+        let (g, quiet) = (
+            Vector3::new(0.0, -G, 0.0),
+            Noise {
+                gyro: 0.0,
+                accel: 0.0,
+                gyro_bias: 0.0,
+                accel_bias: 0.0,
+                accel_per_accel: 0.0,
+                accel_per_rate: 0.0,
+            },
+        );
+        let mut start = moving_filter();
+        start.cov = Cov::zeros();
+        let at = |t_ms: f64| ImuSample {
+            t: (t_ms * 1e6) as u64,
+            gyro: start.x.bg,
+            accel: start.x.q.inverse() * -g + Vector3::new(18.0, -21.0, 9.0) + start.x.ba,
+        };
+        let (before, prev, s) = (at(8.0), at(10.0), at(58.0));
+        let mut whole = start;
+        advance(
+            &mut whole,
+            Some(&before),
+            Some(&prev),
+            &s,
+            prev.t,
+            s.t,
+            &g,
+            &quiet,
+        );
+        let mut pieces = start;
+        let cuts = [prev.t, 13_100_000, 31_700_000, 32_000_000, 57_300_000, s.t];
+        for c in cuts.windows(2) {
+            advance(
+                &mut pieces,
+                Some(&before),
+                Some(&prev),
+                &s,
+                c[0],
+                c[1],
+                &g,
+                &quiet,
+            );
+        }
+        let largest = whole.cov.amax();
+        let worst = (whole.cov - pieces.cov).amax();
+        assert!(
+            worst <= 1e-12 * largest,
+            "differs by {worst:e} of {largest:e}: velocity-rotation {:e} {:e}",
+            whole.cov[(VEL, ROT + 2)],
+            pieces.cov[(VEL, ROT + 2)]
+        );
+    }
+
+    /// A hole that starts at the oldest snapshot the history keeps is still bridged as it was
+    /// once the history has moved on: pruning keeps the sample at that snapshot and the one before
+    /// it, so a late frame exposed inside the hole gets, bit for bit, the prior of a history that
+    /// never moved on, the hole's variance with it.
+    #[test]
+    fn a_hole_at_the_oldest_snapshot_keeps_its_samples() {
+        let w = world(4);
+        let (before, prev, s) = (sample(998.0, 0.8), sample(1000.0, 1.0), sample(1060.0, 1.4));
+        let fed = |history_ns: u64| {
+            let params = Params {
+                history_ns,
+                ..Params::default()
+            };
+            let mut tr = Tracker::new(1, w.body.clone(), params, w.cams.len());
+            tr.history.push_back((prev.t, moving_filter()));
+            tr.imu.extend([before, prev]);
+            tr.still.extend([false, false]);
+            tr.imu(s);
+            tr
+        };
+        let (kept, pruned) = (fed(400_000_000), fed(20_000_000));
+        // the cutoff (1.040 s) is past the 1.000 s snapshot, which stays as the oldest one
+        assert_eq!(pruned.history.front().map(|h| h.0), Some(prev.t));
+        let inside = 1_030_000_000;
+        let original = kept.state_at(inside).map(|(_, f)| f);
+        assert!(
+            original.is_some_and(|f| f.cov[(VEL, VEL)] > moving_filter().cov[(VEL, VEL)] * 10.0)
+        );
+        assert_eq!(pruned.state_at(inside).map(|(_, f)| f), original);
+    }
+
+    /// Holes past the fitted range (it was measured to 60 ms) up to the reset at `max_imu_gap_ns`
+    /// keep the covariance finite, whatever the rates entering them.
+    #[test]
+    fn a_long_hole_keeps_the_covariance_finite() {
+        let (g, n) = (Vector3::new(0.0, -G, 0.0), Noise::default());
+        let rail = ImuSample {
+            t: 8_000_000,
+            gyro: Vector3::repeat(-35.0),
+            accel: Vector3::repeat(-157.0),
+        };
+        let prev = ImuSample {
+            t: 10_000_000,
+            gyro: Vector3::repeat(35.0),
+            accel: Vector3::repeat(157.0),
+        };
+        let s = ImuSample {
+            t: 110_000_000,
+            ..prev
+        };
+        let mut f = moving_filter();
+        advance(&mut f, Some(&rail), Some(&prev), &s, prev.t, s.t, &g, &n);
+        assert!(f.cov.iter().all(|c| c.is_finite()) && f.x.p.iter().all(|c| c.is_finite()));
+        let (vel, rot) = hole_variance(Some(&rail), &prev, &s);
+        assert!(vel.is_finite() && rot.is_finite() && vel > 0.0 && rot > 0.0);
     }
 
     /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of
