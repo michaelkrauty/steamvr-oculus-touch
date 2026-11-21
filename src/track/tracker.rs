@@ -14,6 +14,17 @@ use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
 use super::search::{self, SearchParams};
 use super::vision::{self, Blob, Body, Camera, FitParams};
 
+/// A first lock not yet told from its ring turns (see `Tracker::undecided`).
+#[derive(Debug, Clone, PartialEq)]
+struct Undecided {
+    /// The exposure the track was first acquired from; replacing it keeps this.
+    since: u64,
+    /// The other hypotheses as turns of the track, in the model frame.
+    turns: Vec<Isometry3<f64>>,
+    /// Each one's cost less the track's, summed over the frames since `since`.
+    lead: Vec<f64>,
+}
+
 /// The two cheapest costs in total_cmp order, including signed zero and NaNs.
 fn retain_two_costs(costs: &mut [Option<f64>; 2], cost: f64) {
     if costs[0].is_none_or(|first| cost.total_cmp(&first).is_lt()) {
@@ -76,7 +87,9 @@ pub struct Params {
     /// matched LEDs' squared residuals in units of `alias_sigma_px`, plus `alias_miss_cost` per
     /// LED it predicts facing the sensor with no blob near, and per blob in its footprint it
     /// leaves unexplained. The cheapest is taken when it leads by `alias_margin`; else the
-    /// acquisition waits for a clearer frame (for up to `max_refusing_ns`).
+    /// acquisition waits for a clearer frame (for up to `max_refusing_ns`). The track taken is
+    /// not published until it also leads the others by `alias_margin` over its frames from every
+    /// sensor, each hypothesis matched from its own pose (see `Tracker::undecided`).
     pub alias_sigma_px: f64,
     pub alias_miss_cost: f64,
     pub alias_margin: f64,
@@ -328,6 +341,14 @@ pub struct Tracker {
     /// published; if none has within `SearchParams::confirm_within_ns`, the track is dropped, and
     /// with it the kept orientation.
     provisional: Option<u64>,
+    /// A track acquired with no orientation to check it against, while the engine's pose or one
+    /// of its ring turns still explains the frames about as well as the track: one frame can
+    /// favour an alias (the engine itself locks onto one), and gravity cannot settle it while the
+    /// controller is being picked up. Until the track leads every other hypothesis by
+    /// `alias_margin`, summed over the frames it takes, it takes updates but is not published; a
+    /// hypothesis that leads it by as much takes its place. `max_refusing_ns` after the first
+    /// acquisition it is published as it stands, as an ambiguous acquisition is taken.
+    undecided: Option<Undecided>,
     /// The model origin where it was last tracked (held while the position is lost).
     held: Option<Vector3<f64>>,
     /// The biases the current track started from, restored when it turns out a wrong lock.
@@ -395,6 +416,7 @@ impl Tracker {
             last_confirmed: 0,
             refusing_since: 0,
             provisional: None,
+            undecided: None,
             held: None,
             camera_updates: vec![VecDeque::new(); camera_count],
             inspection_frames: VecDeque::new(),
@@ -445,7 +467,17 @@ impl Tracker {
     /// The position is tracked, and published: a fix holds it, and no second sensor is still
     /// awaited (see `provisional`).
     pub fn tracking(&self) -> bool {
-        self.has_track() && self.provisional.is_none()
+        self.has_track() && self.provisional.is_none() && !self.undecided_now()
+    }
+
+    /// An undecided track (see `undecided`) is published at the latest `max_refusing_ns` after
+    /// its acquisition, whatever happened since.
+    fn undecided_now(&self) -> bool {
+        self.undecided.as_ref().is_some_and(|u| {
+            self.history
+                .back()
+                .is_some_and(|&(t, _)| t.saturating_sub(u.since) <= self.params.max_refusing_ns)
+        })
     }
 
     /// A fix holds the position, confirmed or not: the track takes updates.
@@ -536,6 +568,7 @@ impl Tracker {
         self.refusing_since = 0;
         self.ambiguous_since = 0;
         self.provisional = None;
+        self.undecided = None;
         self.held = None;
     }
 
@@ -661,6 +694,7 @@ impl Tracker {
         self.camera_updates.iter_mut().for_each(VecDeque::clear);
         self.inspection_frames.clear();
         self.provisional = None;
+        self.undecided = None;
         self.last_fix = 0;
         self.track_camera = None;
         self.track_confirmed = false;
@@ -682,6 +716,7 @@ impl Tracker {
         self.refusing_since = 0;
         self.ambiguous_since = 0;
         self.provisional = None;
+        self.undecided = None;
         self.held = None;
     }
 
@@ -1057,6 +1092,7 @@ impl Tracker {
                         self.provisional = None;
                     }
                     self.refusing_since = 0;
+                    self.decide(t_e, cam, blobs);
                     if self.bias_ran_off() {
                         self.drop_wrong_lock();
                         return Outcome::Missed;
@@ -1115,6 +1151,8 @@ impl Tracker {
             }
         };
         let memory = carried.filter(|_| remembered);
+        // the alias taken in place of the engine's pose, if one was
+        let mut turned_by = None;
         let fit_params = FitParams {
             min_leds: self.params.acquire_min_leds,
             ..self.params.fit
@@ -1162,8 +1200,8 @@ impl Tracker {
                 if memory.is_none() && !self.aliases.is_empty() {
                     let original_cost = self.acquisition_cost(cam, blobs, &chosen.1);
                     let mut costs = [Some(original_cost), None];
-                    let mut best: Option<(f64, (Filter, vision::Fit))> = None;
-                    for a in &self.aliases {
+                    let mut best: Option<(f64, (Filter, vision::Fit), usize)> = None;
+                    for (k, a) in self.aliases.iter().enumerate() {
                         let pairs: Vec<(usize, usize)> = labelled
                             .iter()
                             .filter_map(|&(i, b)| a.led_at[i].map(|j| (j, b)))
@@ -1178,7 +1216,7 @@ impl Tracker {
                         ) {
                             let c = self.acquisition_cost(cam, blobs, &h.1);
                             if c < original_cost && best.as_ref().is_none_or(|b| c < b.0) {
-                                best = Some((c, h));
+                                best = Some((c, h, k));
                             }
                             retain_two_costs(&mut costs, c);
                         }
@@ -1194,9 +1232,10 @@ impl Tracker {
                             return Outcome::Waiting;
                         }
                     }
-                    if let Some((_, h)) = best {
+                    if let Some((_, h, k)) = best {
                         chosen = h;
                         turned = true;
+                        turned_by = Some(k);
                     }
                 }
                 if !e.strong {
@@ -1276,9 +1315,92 @@ impl Tracker {
         self.last_track = self.last_track.max(t_e);
         self.track_camera = Some(camera);
         self.track_confirmed = false;
+        self.undecided = None;
+        if memory.is_none() && !self.aliases.is_empty() {
+            // the engine's pose and its ring turns, as turns of the track
+            let back = turned_by.map_or(Isometry3::identity(), |k| self.aliases[k].turn.inverse());
+            let turns: Vec<Isometry3<f64>> = turned_by
+                .map(|_| back)
+                .into_iter()
+                .chain(
+                    (0..self.aliases.len())
+                        .filter(|&k| turned_by != Some(k))
+                        .map(|k| back * self.aliases[k].turn),
+                )
+                .collect();
+            self.undecided = Some(Undecided {
+                since: t_e,
+                lead: vec![0.0; turns.len()],
+                turns,
+            });
+            self.decide(t_e, cam, blobs);
+        }
         self.note_held();
         self.stats.acquisitions += 1;
         Outcome::Acquired(n)
+    }
+
+    /// Adds a frame to an undecided track's count (see `undecided`).
+    fn decide(&mut self, t_e: u64, cam: &Camera, blobs: &[Blob]) {
+        let Some(mut u) = self.undecided.take() else {
+            return;
+        };
+        let Some((_, f)) = self.state_at(t_e) else {
+            self.undecided = Some(u);
+            return;
+        };
+        let pose = self.body.world_from_model(&f.x);
+        // each hypothesis matched afresh from its own pose; one that cannot be fitted at all
+        // leaves unexplained all but three of the blobs the other matched
+        let cost = |p: &Isometry3<f64>| {
+            let prior = self.acquisition_prior(p, None);
+            vision::fit_frame(cam, &self.body, &prior, blobs, &[], &self.params.fit)
+                .ok()
+                .map(|fit| (self.acquisition_cost(cam, blobs, &fit), fit.pairs.len()))
+        };
+        let unfit =
+            |(c, n): (f64, usize)| self.params.alias_miss_cost * n.saturating_sub(3) as f64 + c;
+        let own = cost(&pose);
+        for (lead, turn) in u.lead.iter_mut().zip(&u.turns) {
+            *lead += match (own, cost(&(pose * turn))) {
+                (Some(o), Some(t)) => t.0 - o.0,
+                (Some(o), None) => unfit(o) - o.0,
+                (None, Some(t)) => t.0 - unfit(t),
+                (None, None) => 0.0,
+            };
+        }
+        let m = self.params.alias_margin;
+        let expired = t_e.saturating_sub(u.since) > self.params.max_refusing_ns;
+        let Some(k) = (0..u.lead.len())
+            .filter(|&k| u.lead[k] <= -m)
+            .min_by(|&a, &b| u.lead[a].total_cmp(&u.lead[b]))
+        else {
+            if !expired && u.lead.iter().any(|&l| l < m) {
+                self.undecided = Some(u);
+            }
+            return;
+        };
+        // the frames favour another hypothesis: the track starts over from it, as acquired now,
+        // still to be published by the first acquisition's deadline
+        let Some(&(t, f)) = self.history.back() else {
+            return;
+        };
+        let mut x = self.acquisition_prior(
+            &(self.body.world_from_model(&f.x) * u.turns[k]),
+            self.acquired_bias.as_ref(),
+        );
+        x.x.v = f.x.v;
+        self.history.clear();
+        self.history.push_back((t, x));
+        self.applied.clear();
+        self.stats.alias_turns += 1;
+        if !expired {
+            self.undecided = Some(Undecided {
+                since: u.since,
+                lead: vec![0.0; self.aliases.len()],
+                turns: self.aliases.iter().map(|a| a.turn).collect(),
+            });
+        }
     }
 
     /// One acquisition hypothesis: a pose, and the pairs that seed it (the engine's labels as they
@@ -1861,6 +1983,144 @@ mod tests {
         let (tr, errors) = run(&w, 6.0, 0.3, Some((3.0, 3.3)));
         assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
         assert!(pct(&errors, 0.5) < 1e-3, "{:?}", tr.stats);
+    }
+
+    /// A controller woken and picked up while the engine locks onto one of its ring aliases: for
+    /// the first 0.3 s the engine reports the pose turned by the alias, with its labels to match,
+    /// and the right Touch's half-m/s^2 accelerometer bias is still to be learned. A single frame
+    /// can favour the alias over the truth; the track may not be published until the frames have
+    /// told them apart, and never shows the alias.
+    #[test]
+    fn a_first_lock_on_a_ring_alias_is_not_published() {
+        // the cases of 80 (40 motions, either alias) that published the alias as tracked
+        for (seed, k) in [(11, 0), (25, 0), (22, 1)] {
+            let mut w = touch_world(seed);
+            w.ba = Vector3::new(0.10, 0.44, -0.10);
+            let alias = vision::ring_aliases(&w.body.leds).swap_remove(k);
+            let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+            let mut rng = Rng::new(11);
+            let (dt_frame, delay) = (1.0 / 52.0, 0.025);
+            let mut pending: Vec<(f64, usize, Vec<Blob>)> = Vec::new();
+            let (mut next_frame, mut t) = (0.01, 0.0);
+            let (mut worst, mut published): (f64, usize) = (0.0, 0);
+            while t < 0.6 {
+                t += 0.002;
+                tr.imu(imu(&w, t));
+                while next_frame <= t {
+                    for (c, cam) in w.cams.iter().enumerate() {
+                        pending.push((next_frame, c, sight(&w, cam, next_frame, &mut rng, 0.3)));
+                    }
+                    next_frame += dt_frame;
+                }
+                let ready: Vec<_> = pending
+                    .iter()
+                    .filter(|p| p.0 + delay <= t)
+                    .cloned()
+                    .collect();
+                pending.retain(|p| p.0 + delay > t);
+                for (te, c, mut blobs) in ready {
+                    let mut pose = w.motion.pose(te);
+                    if te < 0.3 {
+                        pose *= alias.turn;
+                        for b in &mut blobs {
+                            let i = (b.led_id & 0xff) as usize;
+                            b.led_id = alias.led_at[i].map_or(-1, |j| (1 << 8) | j as i32);
+                        }
+                    }
+                    let t_e = (1e9 + te * 1e9) as u64;
+                    tr.frame(
+                        t_e,
+                        c,
+                        &w.cams[c],
+                        &blobs,
+                        Some(EnginePose::strong(pose)),
+                        &[],
+                    );
+                }
+                if let Some(o) = tr.output().filter(|o| o.tracking) {
+                    published += 1;
+                    let truth = w.motion.pose(t).rotation;
+                    worst = worst.max(o.world_from_model.rotation.angle_to(&truth));
+                }
+            }
+            assert!(
+                published > 0 && tr.tracking(),
+                "seed {seed}: {:?}",
+                tr.stats
+            );
+            assert!(
+                worst < 5f64.to_radians(),
+                "seed {seed}, alias {k}: published {:.1} deg off {:?}",
+                worst.to_degrees(),
+                tr.stats
+            );
+        }
+    }
+
+    /// An undecided first lock is shown at the latest `max_refusing_ns` after it was acquired,
+    /// even when another hypothesis has taken its place meanwhile: here no hypothesis can ever
+    /// lead by the margin but one forced past it 0.3 s in, so the track is replaced then and
+    /// still has to be shown by the first acquisition's deadline.
+    #[test]
+    fn an_undecided_first_lock_is_shown_by_its_deadline_even_when_replaced() {
+        let w = touch_world(5);
+        let params = Params {
+            alias_margin: 1e6,
+            ..Params::default()
+        };
+        let mut tr = Tracker::new(1, w.body.clone(), params, w.cams.len());
+        let mut rng = Rng::new(11);
+        let (dt_frame, delay) = (1.0 / 52.0, 0.025);
+        let mut pending: Vec<(f64, usize, Vec<Blob>)> = Vec::new();
+        let (mut next_frame, mut t) = (0.01, 0.0);
+        let (mut since, mut forced, mut shown) = (None, false, None);
+        while t < 1.2 && shown.is_none() {
+            t += 0.002;
+            tr.imu(imu(&w, t));
+            while next_frame <= t {
+                for (c, cam) in w.cams.iter().enumerate() {
+                    pending.push((next_frame, c, sight(&w, cam, next_frame, &mut rng, 0.3)));
+                }
+                next_frame += dt_frame;
+            }
+            let ready: Vec<_> = pending
+                .iter()
+                .filter(|p| p.0 + delay <= t)
+                .cloned()
+                .collect();
+            pending.retain(|p| p.0 + delay > t);
+            for (te, c, blobs) in ready {
+                let engine = EnginePose::strong(w.motion.pose(te));
+                tr.frame(
+                    (1e9 + te * 1e9) as u64,
+                    c,
+                    &w.cams[c],
+                    &blobs,
+                    Some(engine),
+                    &[],
+                );
+            }
+            since = since.or(tr.undecided.as_ref().map(|u| u.since));
+            if let (Some(s), Some(u)) = (since, tr.undecided.as_mut()) {
+                if !forced && tr.history.back().is_some_and(|h| h.0 > s + 300_000_000) {
+                    forced = true;
+                    u.turns = vec![Isometry3::identity()];
+                    u.lead = vec![-2e6];
+                }
+            }
+            if tr.output().is_some_and(|o| o.tracking) {
+                shown = tr.history.back().map(|h| h.0);
+            }
+        }
+        let (since, shown) = (since.expect("acquired"), shown.expect("shown"));
+        assert!(forced && tr.stats.alias_turns >= 1, "{:?}", tr.stats);
+        let after = shown - since;
+        assert!(
+            after > 400_000_000 && after <= tr.params.max_refusing_ns + 2_000_000,
+            "shown {} ms after acquisition {:?}",
+            after as f64 * 1e-6,
+            tr.stats
+        );
     }
 
     /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of
