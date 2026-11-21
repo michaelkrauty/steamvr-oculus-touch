@@ -77,6 +77,9 @@ pub struct Params {
     pub relock_ns: u64,
     /// A wrong lock (a pose that fits the LEDs but is turned from the truth) leaks gravity into the
     /// filter, which drives the accelerometer bias off: beyond this (m/s^2) the track is dropped.
+    /// Tested on the state that holds all of an exposure's fixes, once a later exposure's frame
+    /// comes (or the IMU passes the exposure's last possible frame): between two sensors' fixes
+    /// of one exposure the bias swings with the order they arrive in.
     pub max_accel_bias: f64,
     /// After a wrong lock, engine poses within `wrong_lock_turn_rad` of the dropped orientation
     /// (carried on by the gyro) are refused for this long: the engine tends to offer it again.
@@ -353,6 +356,8 @@ pub struct Tracker {
     undecided: Option<Undecided>,
     /// The model origin where it was last tracked (held while the position is lost).
     held: Option<Vector3<f64>>,
+    /// The newest exposure with fixes applied whose state the bias test has not yet seen.
+    bias_pending: Option<u64>,
     /// The biases the current track started from, restored when it turns out a wrong lock.
     acquired_bias: Option<Filter>,
     /// A dropped wrong lock's orientation, carried on by the gyro: (controller time, orientation,
@@ -424,6 +429,7 @@ impl Tracker {
             provisional: None,
             undecided: None,
             held: None,
+            bias_pending: None,
             camera_updates: vec![VecDeque::new(); camera_count],
             inspection_frames: VecDeque::new(),
             searched_at: vec![0; camera_count],
@@ -499,11 +505,18 @@ impl Tracker {
         if self.imu.back().is_some_and(|l| s.t <= l.t) {
             return;
         }
-        if self
+        let gap = self
             .imu
             .back()
-            .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
+            .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns);
+        // past `history_ns` no frame of the pending exposure can come any more
+        if self
+            .bias_pending
+            .is_some_and(|t| gap || s.t.saturating_sub(t) > self.params.history_ns)
         {
+            self.test_pending_bias();
+        }
+        if gap {
             self.reset_imu_history();
         }
         if let Some((t, q, until)) = self.wrong_lock {
@@ -576,6 +589,7 @@ impl Tracker {
         self.provisional = None;
         self.undecided = None;
         self.held = None;
+        self.bias_pending = None;
     }
 
     /// Host time exposed a discontinuity that the controller's elapsed time concealed.
@@ -674,12 +688,17 @@ impl Tracker {
         self.saved_bias = Some(Filter { x, cov });
     }
 
-    /// Whether the newest state's accelerometer bias ran off (see `Params::max_accel_bias`).
-    fn bias_ran_off(&self) -> bool {
-        let Some(&(_, f)) = self.history.back() else {
-            return false;
-        };
-        f.x.ba.norm() > self.params.max_accel_bias
+    /// Drops the track as a wrong lock when the accelerometer bias it was left with by the pending
+    /// exposure's fixes ran off (see `Params::max_accel_bias`).
+    fn test_pending_bias(&mut self) {
+        self.bias_pending = None;
+        if self
+            .history
+            .back()
+            .is_some_and(|&(_, f)| f.x.ba.norm() > self.params.max_accel_bias)
+        {
+            self.drop_wrong_lock();
+        }
     }
 
     /// Drops the track as a wrong lock: the biases go back to what it started from, the
@@ -724,6 +743,7 @@ impl Tracker {
         self.provisional = None;
         self.undecided = None;
         self.held = None;
+        self.bias_pending = None;
     }
 
     pub fn output(&self) -> Option<Output> {
@@ -922,6 +942,9 @@ impl Tracker {
         if self.newest_imu().is_none_or(|n| t_e > n) {
             return Outcome::Early;
         }
+        if self.bias_pending.is_some_and(|t| t_e > t) {
+            self.test_pending_bias();
+        }
         let held = self
             .inspection_frames
             .iter()
@@ -1099,10 +1122,7 @@ impl Tracker {
                     }
                     self.refusing_since = 0;
                     self.decide(t_e, cam, blobs);
-                    if self.bias_ran_off() {
-                        self.drop_wrong_lock();
-                        return Outcome::Missed;
-                    }
+                    self.bias_pending = Some(self.bias_pending.map_or(t_e, |t| t.max(t_e)));
                     self.note_held();
                     self.stats.updates += 1;
                     self.stats.leds_used += n as u64;
@@ -1882,6 +1902,9 @@ mod tests {
         cameras_after: Option<(f64, usize)>,
         /// From this time on every frame has this many stray blobs too.
         clutter_after: Option<(f64, usize)>,
+        /// The tracker sees this sensor this far from where it is (world from where it is
+        /// believed to be: a few mm and a fraction of a degree, as a knocked sensor).
+        misplaced: Option<(usize, Isometry3<f64>)>,
     }
 
     /// Motion: IMU at 500 Hz, three sensors at 52 Hz, frames arriving 25 ms after exposure.
@@ -1906,6 +1929,18 @@ mod tests {
     fn run_with(w: &World, seconds: f64, pixel_noise: f64, opts: &Run) -> (Tracker, Vec<f64>) {
         let drop_cams_between = opts.blackout;
         let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let seen: Vec<Camera> = w
+            .cams
+            .iter()
+            .enumerate()
+            .map(|(c, cam)| match opts.misplaced {
+                Some((m, off)) if m == c => Camera {
+                    world_from_cam: off * cam.world_from_cam,
+                    ..*cam
+                },
+                _ => *cam,
+            })
+            .collect();
         if let Some((bg, ba)) = opts.seed {
             tr.seed_biases(bg, ba, 0.002, 0.03);
         }
@@ -2008,7 +2043,7 @@ mod tests {
                 tr.frame(
                     (1e9 + te * 1e9) as u64,
                     c,
-                    &w.cams[c],
+                    &seen[c],
                     &blobs,
                     engine.map(|e| EnginePose {
                         world_from_model: e,
@@ -3247,6 +3282,61 @@ mod tests {
             "kept the runaway bias {:?}",
             tr.saved_bias.map(|f| f.x.ba)
         );
+    }
+
+    /// A bias run off by an exposure's fixes drops the track when the next exposure's first frame
+    /// comes, or once the IMU passes the last moment a frame of that exposure could still come.
+    #[test]
+    fn a_run_off_bias_is_tested_at_the_next_exposure() {
+        let w = world(5);
+        for by_frame in [true, false] {
+            let (mut tr, _) = run_with(&w, 1.0, 0.3, &Run::default());
+            assert!(tr.tracking() && tr.stats.wrong_locks == 0, "{:?}", tr.stats);
+            let last = tr.applied.back().unwrap().t;
+            tr.history.back_mut().unwrap().1.x.ba = Vector3::new(1.5, 0.0, 0.0);
+            tr.bias_pending = Some(last);
+            if by_frame {
+                let te = last + 1_000_000_000 / 52;
+                let pose = w.motion.pose((te - 1_000_000_000) as f64 * 1e-9);
+                let blobs = sight_posed(&w, &w.cams[0], &pose, &mut Rng::new(3), 0.3);
+                tr.frame(te, 0, &w.cams[0], &blobs, None, &[]);
+                assert_eq!(tr.stats.wrong_locks, 1, "at the next exposure's frame");
+            } else {
+                let mut t = 1.0;
+                while tr.stats.wrong_locks == 0 && t < 2.0 {
+                    t += 0.002;
+                    tr.imu(imu(&w, t));
+                }
+                let waited = (1e9 + t * 1e9) as u64 - last;
+                assert!(
+                    waited > tr.params.history_ns && waited <= tr.params.history_ns + 3_000_000,
+                    "dropped {waited} ns after the exposure"
+                );
+            }
+            assert!(!tr.tracking());
+        }
+    }
+
+    /// With a sensor a few mm off its calibrated pose, each sensor's frame of one exposure pulls
+    /// a cold track its own way while the controller moves fast, and the accelerometer bias swings
+    /// with them past the limit and back. Only the state that holds all of an exposure's fixes is
+    /// a wrong lock's evidence.
+    #[test]
+    fn a_bias_swing_between_the_frames_of_one_exposure_is_not_a_wrong_lock() {
+        for (seed, sensor) in [(21, 2), (25, 0)] {
+            let w = world(seed);
+            let off = Isometry3::from_parts(
+                Translation3::new(0.0048, 0.0064, 0.0),
+                UnitQuaternion::from_scaled_axis(Vector3::new(0.0, 0.25f64.to_radians(), 0.0)),
+            );
+            let opts = Run {
+                misplaced: Some((sensor, off)),
+                ..Run::default()
+            };
+            let (tr, _) = run_with(&w, 1.5, 0.3, &opts);
+            assert_eq!(tr.stats.wrong_locks, 0, "seed {seed}: {:?}", tr.stats);
+            assert!(tr.tracking(), "seed {seed}");
+        }
     }
 
     /// An accelerometer bias the filter was started from is corrected by the fixes, however far

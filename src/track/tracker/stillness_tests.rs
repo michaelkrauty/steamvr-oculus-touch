@@ -130,11 +130,18 @@ impl Tracker {
         if self.imu.back().is_some_and(|l| s.t <= l.t) {
             return;
         }
-        if self
+        let gap = self
             .imu
             .back()
-            .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns)
+            .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns);
+        // past `history_ns` no frame of the pending exposure can come any more
+        if self
+            .bias_pending
+            .is_some_and(|t| gap || s.t.saturating_sub(t) > self.params.history_ns)
         {
+            self.test_pending_bias();
+        }
+        if gap {
             self.reset_imu_history();
         }
         if let Some((t, q, until)) = self.wrong_lock {
