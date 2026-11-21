@@ -4,9 +4,9 @@ type: software
 title: "SteamVR Oculus Touch: Rift CV1 controllers for SteamVR"
 authors:
   - name: "michaelkrauty"
-version: "0.5.0"
-date-released: "2026-11-20"
-url: "https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0"
+version: "0.5.1"
+date-released: "2026-11-21"
+url: "https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1"
 repository-code: "https://github.com/michaelkrauty/steamvr-oculus-touch"
 license: Apache-2.0
 keywords:
