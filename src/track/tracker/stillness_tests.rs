@@ -161,10 +161,15 @@ impl Tracker {
         self.still.push_back(still);
         let g = self.gravity();
         if let Some(&(t, mut f)) = self.history.back() {
-            f.propagate(
-                &s.gyro,
-                &s.accel,
-                (s.t - t) as f64 * 1e-9,
+            let n = self.imu.len();
+            let earlier = |k: usize| n.checked_sub(k).and_then(|i| self.imu.get(i));
+            advance(
+                &mut f,
+                earlier(3),
+                earlier(2),
+                &s,
+                t,
+                s.t,
                 &g,
                 &self.params.noise,
             );
@@ -185,7 +190,9 @@ impl Tracker {
             self.history.pop_front();
         }
         let oldest = self.history.front().map_or(cutoff, |h| h.0.min(cutoff));
-        while self.imu.len() > 1 && self.imu[0].t <= oldest {
+        // keep the two samples at or before the oldest snapshot: the interval propagating from
+        // it ends at the next sample, and a hole there needs both (see `advance`)
+        while self.imu.len() > 2 && self.imu[2].t <= oldest {
             self.imu.pop_front();
             self.still.pop_front();
         }

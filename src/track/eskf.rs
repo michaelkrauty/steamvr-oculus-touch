@@ -152,9 +152,68 @@ impl Filter {
         x.q *= UnitQuaternion::from_scaled_axis(w * dt);
         x.q.renormalize();
 
+        self.transition(&r, &f, &w, a.norm(), dt, n);
+    }
+
+    /// Advances `dt` seconds along the straight line from one IMU sample (`gyro0`, `accel0`) to
+    /// another (`gyro1`, `accel1`): a stretch whose samples were lost, bridged by the samples on
+    /// either side. The rotation turns by the mean rate; each specific force is turned with the
+    /// orientation at its own end; the transition is taken at the midpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propagate_line(
+        &mut self,
+        gyro0: &Vector3<f64>,
+        accel0: &Vector3<f64>,
+        gyro1: &Vector3<f64>,
+        accel1: &Vector3<f64>,
+        dt: f64,
+        gravity: &Vector3<f64>,
+        n: &Noise,
+    ) {
+        if dt <= 0.0 {
+            return;
+        }
+        let x = &mut self.x;
+        let w = ((gyro0 - x.bg) + (gyro1 - x.bg)) * 0.5;
+        let (f0, f1) = (accel0 - x.ba, accel1 - x.ba);
+        let r0 = x.q.to_rotation_matrix().into_inner();
+        let q1 = x.q * UnitQuaternion::from_scaled_axis(w * dt);
+        let r1 = q1.to_rotation_matrix().into_inner();
+        let (a0, a1) = (r0 * f0 + gravity, r1 * f1 + gravity);
+        x.p += x.v * dt + (a0 / 3.0 + a1 / 6.0) * (dt * dt);
+        x.v += (a0 + a1) * (0.5 * dt);
+        x.q = q1;
+        x.q.renormalize();
+        let rm = (self.x.q * UnitQuaternion::from_scaled_axis(-w * (0.5 * dt)))
+            .to_rotation_matrix()
+            .into_inner();
+        self.transition(&rm, &((f0 + f1) * 0.5), &w, ((a0 + a1) * 0.5).norm(), dt, n);
+    }
+
+    /// Adds white acceleration of density `accel` (m^2/s^3) and white turn rate of density
+    /// `rate` (rad^2/s) over `dt` seconds: velocity, position and their correlation, and rotation.
+    pub fn add_white(&mut self, accel: f64, rate: f64, dt: f64) {
+        for k in 0..3 {
+            self.cov[(VEL + k, VEL + k)] += accel * dt;
+            self.cov[(POS + k, POS + k)] += accel * dt * dt * dt / 3.0;
+            self.cov[(POS + k, VEL + k)] += accel * dt * dt / 2.0;
+            self.cov[(VEL + k, POS + k)] += accel * dt * dt / 2.0;
+            self.cov[(ROT + k, ROT + k)] += rate * dt;
+        }
+    }
+
+    fn transition(
+        &mut self,
+        r: &Matrix3<f64>,
+        f: &Vector3<f64>,
+        w: &Vector3<f64>,
+        a_norm: f64,
+        dt: f64,
+        n: &Noise,
+    ) {
         let mut phi = Cov::identity();
         let i3 = Matrix3::identity();
-        let rf = r * skew(&f);
+        let rf = r * skew(f);
         phi.fixed_view_mut::<3, 3>(ROT, ROT).copy_from(
             &UnitQuaternion::from_scaled_axis(-w * dt)
                 .to_rotation_matrix()
@@ -169,7 +228,7 @@ impl Filter {
         phi.fixed_view_mut::<3, 3>(VEL, ROT).copy_from(&(-rf * dt));
         phi.fixed_view_mut::<3, 3>(VEL, BA).copy_from(&(-r * dt));
         let mut q = Cov::zeros();
-        let accel_density = n.accel + n.accel_per_accel * a.norm() + n.accel_per_rate * w.norm();
+        let accel_density = n.accel + n.accel_per_accel * a_norm + n.accel_per_rate * w.norm();
         for (block, density) in [
             (ROT, n.gyro),
             (VEL, accel_density),
