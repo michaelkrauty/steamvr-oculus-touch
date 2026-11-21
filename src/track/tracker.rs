@@ -183,6 +183,8 @@ pub struct Stats {
     pub relocks: u64,
     /// Tracks dropped for a runaway accelerometer bias.
     pub wrong_locks: u64,
+    /// Tracks refuted by the engine's strong poses (see `Tracker::refutes`) and acquired afresh.
+    pub refuted: u64,
     /// Acquisitions that took the engine's pose turned by a ring alias (see `vision::Alias`),
     /// which fitted the frame clearly better.
     pub alias_turns: u64,
@@ -358,6 +360,9 @@ pub struct Tracker {
     wrong_lock: Option<(u64, UnitQuaternion<f64>, u64)>,
     /// The LED constellation's ring aliases, tested at acquisition.
     aliases: Vec<vision::Alias>,
+    /// The last frame (sensor, exposure) that refuted the track (see `refutes`), and the fix it
+    /// refuted.
+    refuted: Option<(usize, u64, u64)>,
     /// When the current run of acquisitions put off as ambiguous began (0: none).
     ambiguous_since: u64,
     /// The engine's labels for this controller come from a pose that disagrees with the track
@@ -409,6 +414,7 @@ impl Tracker {
             acquired_bias: None,
             wrong_lock: None,
             aliases,
+            refuted: None,
             ambiguous_since: 0,
             engine_labels_off: false,
             track_camera: None,
@@ -1102,8 +1108,25 @@ impl Tracker {
                     self.stats.leds_used += n as u64;
                     return Outcome::Updated(n);
                 }
-                // a failed re-lock falls through to the engine's acquisition below
+                // a failed re-lock falls through to the engine's acquisition below, and so does a
+                // track the frames refute
                 Err(_) if relock => {}
+                // only a frame exposed after the newest fix can refute it: an older one, arriving
+                // late, has a prior that the newer fixes have corrected since
+                Err(_)
+                    if t_e > self.last_fix
+                        && self.refutes(cam, blobs, &prior, engine, &labelled) =>
+                {
+                    // one engine pose can be wrong: it takes a second frame refuting the same fix
+                    if !self.refuted.is_some_and(|(c, t, fix)| {
+                        (c != camera || t != t_e) && fix == self.last_fix
+                    }) {
+                        self.refuted = Some((camera, t_e, self.last_fix));
+                        self.stats.rejected += 1;
+                        return Outcome::Missed;
+                    }
+                    self.stats.refuted += 1;
+                }
                 Err(_)
                     if vision::visible_leds(cam, &self.body, &prior.x, &self.params.fit.assoc)
                         == 0 =>
@@ -1436,6 +1459,50 @@ impl Tracker {
         Some((prior, fit))
     }
 
+    /// Whether the frame refutes the track's prior, which it gave no fix: the engine's strong pose,
+    /// with labels enough to acquire from and turned from the track by no more than an
+    /// acquisition allows (the gyro vouches for the orientation), fits the frame farther from the
+    /// prior than both their covariances allow (`FitParams::max_correction`). The dead-reckoned
+    /// position then ran off, as it can without fixes in fast motion: our association, gated by
+    /// that prior, cannot find the controller, and without this the track would be shown where it
+    /// ran to, as tracked, until `lost_after_ns`.
+    fn refutes(
+        &self,
+        cam: &Camera,
+        blobs: &[Blob],
+        prior: &Filter,
+        engine: Option<EnginePose>,
+        labelled: &[(usize, usize)],
+    ) -> bool {
+        let Some(e) = engine.filter(|e| {
+            e.strong
+                && labelled.len() >= self.params.acquire_min_leds
+                && e.world_from_model.rotation.angle_to(&prior.x.q)
+                    <= self.params.acquire_max_turn_rad
+        }) else {
+            return false;
+        };
+        let fit_params = FitParams {
+            min_leds: self.params.acquire_min_leds,
+            ..self.params.fit
+        };
+        let Some((_, fit)) = self.attempt(
+            cam,
+            blobs,
+            &e.world_from_model,
+            labelled.to_vec(),
+            Some(prior),
+            &fit_params,
+        ) else {
+            return false;
+        };
+        let f = &fit.updated.filter;
+        let d = f.x.minus(&prior.x).fixed_rows::<6>(0).into_owned();
+        let s = prior.cov.fixed_view::<6, 6>(0, 0) + f.cov.fixed_view::<6, 6>(0, 0);
+        s.cholesky()
+            .is_some_and(|c| (d.transpose() * c.solve(&d))[0] > self.params.fit.max_correction)
+    }
+
     /// The controller in this frame from the kept orientation `kept` alone (see `search`): each
     /// position the frame supports is fitted, which corrects the orientation too. With nothing
     /// else to back it, a fit counts only if it explains the frame almost wholly
@@ -1746,7 +1813,16 @@ mod tests {
     }
 
     fn sight(w: &World, cam: &Camera, t: f64, rng: &mut Rng, noise: f64) -> Vec<Blob> {
-        let pose = w.motion.pose(t);
+        sight_posed(w, cam, &w.motion.pose(t), rng, noise)
+    }
+
+    fn sight_posed(
+        w: &World,
+        cam: &Camera,
+        pose: &Isometry3<f64>,
+        rng: &mut Rng,
+        noise: f64,
+    ) -> Vec<Blob> {
         (0..w.body.leds.len())
             .filter_map(|i| {
                 let pc = cam.world_from_cam.inverse() * (pose * Point3::from(w.body.leds[i].pos));
@@ -1781,6 +1857,18 @@ mod tests {
         /// From this time on the accelerometer reads this much more: the filter's bias runs off
         /// the way it does under a wrong lock.
         accel_jump: Option<(f64, Vector3<f64>)>,
+        /// The accelerometer reads this much more over this span: an error the IMU model does not
+        /// cover, as violent shaking can leave.
+        accel_off: Option<(f64, f64, Vector3<f64>)>,
+        /// The first sensor's first frame exposed at or after this time shows, with the engine's
+        /// strong pose, a controller 20 cm from ours (as when the engine takes the other
+        /// controller for this one).
+        phantom_at: Option<f64>,
+        /// The first two sensors' first frames exposed at or after this time show the same
+        /// phantom, and arrive this much later than usual: after the third sensor's newer fixes.
+        phantom_late: Option<(f64, f64)>,
+        /// Position errors are kept from this time on (default 1 s).
+        measure_after: Option<f64>,
         /// The track is dropped as a wrong lock at this time.
         drop_at: Option<f64>,
         /// At this time the kept state is turned by this rotation vector (rad), as a gyro gone
@@ -1829,12 +1917,27 @@ mod tests {
         let mut next_frame = 0.01;
         let mut t = 0.0;
         let (mut dropped, mut turned) = (false, false);
+        let phantom = |c: usize, te: f64| {
+            let at = |a: Option<f64>, cams: usize| {
+                a.is_some_and(|a| c < cams && te >= a && te < a + dt_frame)
+            };
+            let shown = at(opts.phantom_at, 1) || at(opts.phantom_late.map(|p| p.0), 2);
+            Translation3::new(if shown { 0.2 } else { 0.0 }, 0.0, 0.0)
+        };
+        let held_back = |c: usize, te: f64| {
+            opts.phantom_late
+                .filter(|&(a, _)| c < 2 && te >= a && te < a + dt_frame)
+                .map_or(0.0, |(_, extra)| extra)
+        };
         while t < seconds {
             t += dt_imu;
             let mut s = imu(w, t);
             if let Some((after, jump)) = opts.accel_jump.filter(|(after, _)| t >= *after) {
                 let _ = after;
                 s.accel += jump;
+            }
+            if let Some((_, _, off)) = opts.accel_off.filter(|(a, b, _)| t >= *a && t < *b) {
+                s.accel += off;
             }
             tr.imu(s);
             if opts.drop_at.is_some_and(|d| t >= d) && !dropped {
@@ -1860,12 +1963,18 @@ mod tests {
                             rng.range(-0.005, 0.02)
                         } else {
                             0.0
-                        };
+                        } + held_back(c, next_frame);
                         pending.push((
                             next_frame,
                             next_frame + delay + late,
                             c,
-                            sight(w, cam, next_frame, &mut rng, pixel_noise),
+                            sight_posed(
+                                w,
+                                cam,
+                                &(phantom(c, next_frame) * w.motion.pose(next_frame)),
+                                &mut rng,
+                                pixel_noise,
+                            ),
                         ));
                     }
                 }
@@ -1881,7 +1990,7 @@ mod tests {
                         blobs.push(Blob { xy, led_id: -1 });
                     }
                 }
-                let mut engine = Some(w.motion.pose(te));
+                let mut engine = Some(phantom(c, te) * w.motion.pose(te));
                 if opts.engine_flipped.is_some_and(|(a, b)| te >= a && te < b) {
                     engine = engine.map(|mut e| {
                         e.rotation *= UnitQuaternion::from_scaled_axis(Vector3::new(
@@ -1912,7 +2021,7 @@ mod tests {
                     &[],
                 );
             }
-            if t > 1.0 {
+            if t > opts.measure_after.unwrap_or(1.0) {
                 let Some(o) = tr.output() else { continue };
                 if o.tracking && !opts.engine_flipped.is_some_and(|(a, b)| t >= a && t < b) {
                     errors.push(
@@ -2121,6 +2230,81 @@ mod tests {
             after as f64 * 1e-6,
             tr.stats
         );
+    }
+
+    /// Out of sight, an error the IMU model does not cover carries the dead-reckoned position off
+    /// by decimetres. Once the sensors see the controller again, the engine's poses refute the
+    /// track and it is acquired afresh: it is not shown where it ran off to, as tracked, until
+    /// the position is lost.
+    #[test]
+    fn a_track_that_ran_off_out_of_sight_is_refuted() {
+        let w = world(4);
+        let (tr, errors) = run_with(
+            &w,
+            6.0,
+            0.3,
+            &Run {
+                blackout: Some((4.0, 4.25)),
+                accel_off: Some((4.0, 4.2, Vector3::new(15.0, 0.0, 0.0))),
+                // the first frames after the blackout arrive at 4.275 s; the fresh track's
+                // velocity then takes a few frames to settle
+                measure_after: Some(4.35),
+                ..Run::default()
+            },
+        );
+        assert!(
+            pct(&errors, 1.0) < 0.01,
+            "{:.3} {:?}",
+            pct(&errors, 1.0),
+            tr.stats
+        );
+        assert!(tr.stats.refuted >= 1, "{:?}", tr.stats);
+    }
+
+    /// One frame whose engine pose and blobs put the controller 20 cm from the track refutes
+    /// nothing: the other sensors' fixes hold the track.
+    #[test]
+    fn one_frame_alone_does_not_refute_a_track() {
+        let w = world(4);
+        let (tr, errors) = run_with(
+            &w,
+            6.0,
+            0.3,
+            &Run {
+                phantom_at: Some(4.0),
+                ..Run::default()
+            },
+        );
+        assert_eq!(
+            (tr.stats.acquisitions, tr.stats.refuted),
+            (1, 0),
+            "{:?}",
+            tr.stats
+        );
+        assert!(pct(&errors, 1.0) < 0.01, "{:?}", tr.stats);
+    }
+
+    /// Two sensors' frames showing the controller 20 cm away arrive late, after the third sensor's
+    /// newer fixes: those fixes have already placed the track, so the old frames refute nothing.
+    #[test]
+    fn frames_older_than_the_newest_fix_do_not_refute_it() {
+        let w = world(4);
+        let (tr, errors) = run_with(
+            &w,
+            6.0,
+            0.3,
+            &Run {
+                phantom_late: Some((4.0, 0.06)),
+                ..Run::default()
+            },
+        );
+        assert_eq!(
+            (tr.stats.acquisitions, tr.stats.refuted),
+            (1, 0),
+            "{:?}",
+            tr.stats
+        );
+        assert!(pct(&errors, 1.0) < 0.01, "{:?}", tr.stats);
     }
 
     /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of
