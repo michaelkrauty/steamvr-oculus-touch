@@ -373,6 +373,17 @@ impl Motion {
         }
     }
 
+    /// Swaying about `centre` by `amp` m along each axis, one sine of `hz` on all three, turned by
+    /// the fixed angles `turn`: a hard, steadily curving motion.
+    pub fn sway(centre: Vector3<f64>, amp: Vector3<f64>, hz: f64, turn: [f64; 3]) -> Motion {
+        let w = std::f64::consts::TAU * hz;
+        let term = |a: f64| [(a, w, 0.0), (0.0, 0.0, 0.0)];
+        Motion {
+            pos: [term(amp.x), term(amp.y), term(amp.z)],
+            ..Motion::still(centre, turn)
+        }
+    }
+
     pub fn pose(&self, t: f64) -> Isometry3<f64> {
         let p = Vector3::new(
             sines(&self.pos[0], t).0,
