@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- When a tracking thread fails and the daemon restarts, the log now always says why; on a busy machine the reason could be missing.
+
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
 ### Fixed

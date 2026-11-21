@@ -17014,8 +17014,10 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(finished, "the heartbeat prevented the failure check");
         assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("radio thread stopped unexpectedly")
+            stderr.contains("radio thread stopped unexpectedly"),
+            "{stderr}"
         );
     }
 
@@ -18969,7 +18971,6 @@ mod tests {
         const CHILD: &str = "CV1TOUCH_TEST_RECORD_CLEANUP";
         if let Some(kind) = std::env::var_os(CHILD) {
             let _logging = recording_test_logger();
-            daemon_log::wait_for_test_output_at_exit();
             let dir = PathBuf::from(std::env::var_os("CV1TOUCH_TEST_RECORD_CLEANUP_DIR").unwrap());
             let d = Arc::new(status_daemon());
             fs::write(dir.join("shm-name"), d.shm.name()).unwrap();
