@@ -454,13 +454,6 @@ pub fn save_with_fingerprint(
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cv1t-calfile-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("calibration.json")
-    }
-
     /// A recalibration that keeps the sensors where they are but turns and shifts the world:
     /// the change comes back exactly. One that also re-placed a bumped sensor: with three others
     /// that sensor is left out; with two, the change says how far off it leaves it. A sensor
@@ -537,7 +530,8 @@ mod tests {
 
     #[test]
     fn saved_fingerprint_matches_exact_bytes_and_survives_external_replacement() {
-        let path = tmp("saved-fingerprint");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         let a = CalibrationFile::example();
         let (backup, accepted) = save_with_fingerprint(&path, &a).unwrap();
         assert!(backup.is_none());
@@ -550,11 +544,11 @@ mod tests {
         save(&path, &b).unwrap();
         assert_ne!(accepted, crate::setup::fingerprint(&path).unwrap());
         assert_eq!(accepted, format!("{:x}", Sha256::digest(bytes)));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
     fn save_and_load_round_trip_with_backup() {
-        let path = tmp("roundtrip");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         let f = CalibrationFile::example();
         assert_eq!(save(&path, &f).unwrap(), None);
         let backup = save(&path, &f)
@@ -562,7 +556,6 @@ mod tests {
             .expect("second save backs up the first");
         assert!(backup.exists());
         assert_eq!(load(&path).unwrap(), f);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -609,14 +602,14 @@ mod tests {
         );
         f.sensors[1].serial = "CAMERA10".into();
         f.validate().unwrap();
-        let path = tmp("case-duplicates");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         f.sensors[1].serial = "CAMERA1".into();
         assert!(save(&path, &f).unwrap_err().contains("duplicate sensor"));
         std::fs::write(&path, serde_json::to_string(&f).unwrap()).unwrap();
         assert!(load(&path)
             .unwrap_err()
             .contains("duplicate sensor CAMERA1"));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// An entry is the sensor a device reports whatever the letter case of either; the file's
@@ -639,7 +632,8 @@ mod tests {
 
     #[test]
     fn missing_or_corrupt_files_name_the_path() {
-        let path = tmp("corrupt");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         assert!(load(&path)
             .unwrap_err()
             .contains(&path.display().to_string()));
@@ -647,7 +641,6 @@ mod tests {
         assert!(load(&path)
             .unwrap_err()
             .contains(&path.display().to_string()));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// Review fix 4: a sensor calibrated before but absent from a new solve (it never opened) is named.
@@ -678,7 +671,8 @@ mod tests {
     #[test]
     fn dynamic_sensors_round_trip_nine_and_sixty_five() {
         for count in [9, 65] {
-            let path = tmp(&format!("dynamic-{count}"));
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("calibration.json");
             let mut f = CalibrationFile::example();
             f.sensors = (0..count)
                 .map(|i| {
@@ -700,12 +694,12 @@ mod tests {
 
     #[test]
     fn dynamic_sensors_reject_oversized_file_before_parsing() {
-        let path = tmp("oversized");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(16 * 1024 * 1024 + 1).unwrap();
         let error = load(&path).unwrap_err();
         assert!(error.contains("byte limit"), "{error}");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
     #[cfg(unix)]
@@ -714,7 +708,8 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         use std::sync::mpsc;
         use std::time::Duration;
-        let path = tmp("fifo");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         let name = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and points inside this test's temporary directory.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
@@ -736,6 +731,5 @@ mod tests {
         }
         reader.join().unwrap();
         assert!(result.unwrap().unwrap_err().contains("regular file"));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

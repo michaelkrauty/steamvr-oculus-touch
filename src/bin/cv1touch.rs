@@ -6515,9 +6515,8 @@ mod tests {
     #[test]
     fn universe_reports_skipped_tracking_as_unknown_and_recovers() {
         use std::io::Write;
-        let dir =
-            std::env::temp_dir().join(format!("cv1t-universe-skipped-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         std::fs::write(
             &path,
@@ -6561,14 +6560,19 @@ mod tests {
         });
         assert!(universe_headset_status(&watch.bases, "LHR-REFERENCE")
             .starts_with("SteamVR has lost the headset's tracking;"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     use super::*;
 
-    fn serial_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, file::CalibrationFile) {
-        let dir = std::env::temp_dir().join(format!("cv1t-identity-{}-{tag}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn serial_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        file::CalibrationFile,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let rec = dir.join("capture.rec");
         let path = dir.join("calibration.json");
         let reg = dir.join("registration.json");
@@ -6626,12 +6630,12 @@ mod tests {
         }
         let stats = recorder.stop();
         assert_eq!((stats.dropped, stats.write_errors), (0, 0));
-        (rec, path, reg, cal)
+        (tmp, rec, path, reg, cal)
     }
 
     #[test]
     fn mixed_case_station_command_uses_recorded_models_and_frames() {
-        let (rec, path, reg, _) = serial_fixture("stations");
+        let (_dir, rec, path, reg, _) = serial_fixture();
         let stations = [(-0.5, -0.3, 2.0), (0.6, -0.2, 2.5), (0.0, 0.6, 3.0)]
             .into_iter()
             .enumerate()
@@ -6651,7 +6655,7 @@ mod tests {
 
     #[test]
     fn mixed_case_rig_command_gets_past_reference_and_intrinsics() {
-        let (rec, path, reg, mut cal) = serial_fixture("rig");
+        let (_dir, rec, path, reg, mut cal) = serial_fixture();
         cal.stats.reference = "CAMERA1".into();
         file::save(&path, &cal).unwrap();
         std::fs::write(rec.with_extension("truth.json"), serde_json::to_vec(&serde_json::json!({
@@ -6667,7 +6671,7 @@ mod tests {
 
     #[test]
     fn mixed_case_place_preserves_the_saved_spelling_and_reference() {
-        let (rec, path, _, mut cal) = serial_fixture("place");
+        let (_dir, rec, path, _, mut cal) = serial_fixture();
         let rf = track::refine::Refined {
             world_from_cam: nalgebra::Isometry3::translation(0.1, 0.2, 0.3),
             before_px: 1.0,
@@ -7406,8 +7410,8 @@ mod tests {
     /// A lock file is `locked` while a process holds it, and a missing one is not.
     #[test]
     fn a_lock_held_by_the_daemon_is_seen() {
-        let dir = std::env::temp_dir().join(format!("cv1t-stop-lock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("daemon.lock");
         assert!(!locked(&path));
         let held = control::lock_single_instance(&path).unwrap();
@@ -7415,7 +7419,6 @@ mod tests {
         drop(held);
         assert!(!locked(&path));
         assert!(!locked(&dir.join("no-such-dir").join("daemon.lock")));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn raw_hand(trigger: f32, grip: f32, stick: [f32; 2]) -> RawInput {
@@ -7669,8 +7672,8 @@ mod tests {
 
     #[test]
     fn gravity_files_are_unchanged_when_second_file_cannot_stage() {
-        let dir = std::env::temp_dir().join(format!("cv1t-gravity-stage-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let cal = dir.join("calibration.json");
         let blocker = dir.join("not-a-directory");
         std::fs::write(&cal, b"old calibration").unwrap();
@@ -7682,14 +7685,13 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read(&cal).unwrap(), b"old calibration");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
     }
 
     #[test]
     fn gravity_files_save_both_and_keep_previous_versions() {
-        let dir = std::env::temp_dir().join(format!("cv1t-gravity-pair-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let cal = dir.join("calibration.json");
         let reg = dir.join("registration.json");
         std::fs::write(&cal, b"old calibration").unwrap();
@@ -7697,7 +7699,7 @@ mod tests {
         save_gravity_files(&cal, b"new calibration", Some((&reg, b"new registration"))).unwrap();
         assert_eq!(std::fs::read(&cal).unwrap(), b"new calibration");
         assert_eq!(std::fs::read(&reg).unwrap(), b"new registration");
-        let backups: Vec<_> = std::fs::read_dir(&dir)
+        let backups: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
@@ -7707,7 +7709,6 @@ mod tests {
             backups.contains(&b"old calibration".to_vec())
                 && backups.contains(&b"old registration".to_vec())
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -7995,8 +7996,8 @@ mod tests {
 
     #[test]
     fn input_wizard_save_and_reset_restore_only_input_file_on_reload_failure() {
-        let dir = std::env::temp_dir().join(format!("cv1t-input-transaction-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("input-calibration.json");
         let unrelated = dir.join("calibration.json");
         std::fs::write(&unrelated, b"camera configuration").unwrap();
@@ -8011,7 +8012,7 @@ mod tests {
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"camera configuration");
         assert!(write_input_calibration(&path, None, Some(&mut reject_reload)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        assert!(std::fs::read_dir(&dir)
+        assert!(std::fs::read_dir(dir)
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| {
@@ -8041,13 +8042,12 @@ mod tests {
         )
         .is_err());
         assert!(!path.exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn input_wizard_restores_malformed_previous_bytes_after_post_write_save_error() {
-        let dir = std::env::temp_dir().join(format!("cv1t-input-post-write-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("input-calibration.json");
         let old = b"{ malformed old configuration";
         std::fs::write(&path, old).unwrap();
@@ -8075,15 +8075,14 @@ mod tests {
         )
         .is_err());
         assert!(!path.exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Unix only: a symlink takes privileges to make on Windows.
     #[cfg(unix)]
     #[test]
     fn input_wizard_never_follows_a_config_symlink_for_backup_or_reset() {
-        let dir = std::env::temp_dir().join(format!("cv1t-input-symlink-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("input-calibration.json");
         let target = dir.join("unrelated.json");
         std::fs::write(&target, b"unrelated configuration").unwrap();
@@ -8095,8 +8094,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
     }
 
     fn steam_input(axis: usize, x: f32, y: f32) -> vr::ControllerState {
@@ -8324,7 +8322,8 @@ mod tests {
 
     #[test]
     fn cancelled_fits_never_call_the_writer_or_replace_previous_files() {
-        let path = std::env::temp_dir().join(format!("cv1t-cancel-fit-{}", process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         std::fs::write(&path, b"previous configuration").unwrap();
         let result = commit_fit(true, || {
             std::fs::write(&path, b"new fit").map_err(|e| e.to_string())
@@ -8336,13 +8335,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"accepted fit");
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn stale_registration_does_not_seed_a_new_world_and_is_retained_until_fit() {
         use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
-        let path = std::env::temp_dir().join(format!("cv1t-new-world-seed-{}", process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("registration.json");
         std::fs::write(&path, b"malformed previous registration").unwrap();
         let (reuse, fresh) = registration_seed(&path, 42, false).unwrap();
         assert!(!reuse);
@@ -8389,7 +8388,6 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"malformed previous registration"
         );
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

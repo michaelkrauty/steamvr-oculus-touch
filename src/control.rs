@@ -943,14 +943,14 @@ mod tests {
     /// Review Focus 3: a second daemon must not get the lock.
     #[test]
     fn single_instance_lock() {
-        let path = std::env::temp_dir().join(format!("cv1t-lock-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lock");
         let first = lock_single_instance(&path).unwrap();
         let err = lock_single_instance(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(first);
         let again = lock_single_instance(&path).unwrap();
         drop(again);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

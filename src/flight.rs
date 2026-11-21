@@ -982,10 +982,8 @@ mod tests {
         let bytes = encode(&dropout);
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
-        let path = std::env::temp_dir().join(format!(
-            "cv1t-unknown-flight-skips-{}.rec",
-            std::process::id()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-unknown-flight-skips.rec");
         std::fs::write(&path, bytes).unwrap();
         let mut reader = recorder::Reader::open(&path).unwrap();
         assert_eq!(
@@ -994,7 +992,6 @@ mod tests {
         );
         assert_eq!(reader.next().unwrap().payload, dropout.records[0].2);
         assert!(reader.next().is_none() && reader.error().is_none());
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1014,8 +1011,8 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
         assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 7);
-        let path =
-            std::env::temp_dir().join(format!("cv1t-flight-header-{}.rec", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-flight-header.rec");
         std::fs::write(&path, &bytes).unwrap();
         let mut reader = recorder::Reader::open(&path).unwrap();
         assert_eq!(reader.flight_skipped_records, 7);
@@ -1035,7 +1032,6 @@ mod tests {
         assert_eq!(reader.flight_skipped_records, 0);
         assert_eq!(reader.by_ref().collect::<Vec<_>>(), records);
         assert!(reader.error().is_none());
-        std::fs::remove_file(path).unwrap();
     }
 
     /// A blip's cancel takes back its own dropout only, not an earlier one still waiting.
@@ -1106,8 +1102,8 @@ mod tests {
     /// A recording is what `recorder::Reader` reads back, and the directory keeps the newest ten.
     #[test]
     fn saved_recordings_read_back_and_the_newest_are_kept() {
-        let dir = std::env::temp_dir().join(format!("cv1t-flight-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let d = Dropout {
             hand: 1,
             last_report_ns: 5 * S,
@@ -1126,7 +1122,7 @@ mod tests {
                 ),
             ],
         };
-        let path = save(&dir, &d, 1_000).unwrap();
+        let path = save(dir, &d, 1_000).unwrap();
         assert_eq!(path.file_name().unwrap(), "dropout-1000-right.rec");
         let mut r = recorder::Reader::open(&path).unwrap();
         let first = r.next().unwrap();
@@ -1152,7 +1148,7 @@ mod tests {
         }
         for t in 1_001..1_012 {
             save(
-                &dir,
+                dir,
                 &Dropout {
                     hand: 0,
                     ..d.clone()
@@ -1161,7 +1157,7 @@ mod tests {
             )
             .unwrap();
         }
-        let left = recordings(&dir);
+        let left = recordings(dir);
         assert_eq!(left.len(), KEEP_FILES);
         assert_eq!(left[0].file_name().unwrap(), "dropout-1011-left.rec");
         assert_eq!(
@@ -1173,7 +1169,7 @@ mod tests {
         }
         // the clock stepped back: the recording just made is kept, the oldest other goes
         let earlier = save(
-            &dir,
+            dir,
             &Dropout {
                 hand: 0,
                 ..d.clone()
@@ -1183,12 +1179,12 @@ mod tests {
         .unwrap();
         assert!(earlier.exists());
         assert!(!dir.join("dropout-1002-left.rec").exists());
-        assert_eq!(recordings(&dir).len(), KEEP_FILES);
+        assert_eq!(recordings(dir).len(), KEEP_FILES);
         // a recording that cannot be put in place leaves nothing behind
         std::fs::create_dir(dir.join("dropout-2000-left.rec")).unwrap();
         std::fs::write(dir.join("dropout-2000-left.rec/x"), b"").unwrap();
         assert!(save(
-            &dir,
+            dir,
             &Dropout {
                 hand: 0,
                 ..d.clone()
@@ -1198,7 +1194,6 @@ mod tests {
         .is_err());
         assert!(!dir.join(".dropout-2000-left.rec.tmp").exists());
         // a directory of that name is no recording
-        assert!(!recordings(&dir).contains(&dir.join("dropout-2000-left.rec")));
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!recordings(dir).contains(&dir.join("dropout-2000-left.rec")));
     }
 }

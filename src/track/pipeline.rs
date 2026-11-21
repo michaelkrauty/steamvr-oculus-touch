@@ -2662,11 +2662,8 @@ mod tests {
 
     #[test]
     fn dynamic_sensors_fifth_camera_survives_recording_and_replay() {
-        let path = std::env::temp_dir().join(format!(
-            "cv1t-five-sensor-replay-{}.rec",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-five-sensor-replay.rec");
         let recorder = crate::recorder::Recorder::new(4 << 20);
         recorder.start(&path, H0).unwrap();
         let (_, _, p, calibration) = run_with_sensors(
@@ -2769,13 +2766,8 @@ mod tests {
             (Some(recorder::IDENTITIES_RETIRED), 1),
             (None, 0),
         ] {
-            let path = |name: &str| {
-                std::env::temp_dir().join(format!(
-                    "cv1t-replay-sessions-{name}-{marker:?}-{}.rec",
-                    std::process::id()
-                ))
-            };
-            let (first, second) = (path("first"), path("second"));
+            let tmp = tempfile::tempdir().unwrap();
+            let (first, second) = (tmp.path().join("first.rec"), tmp.path().join("second.rec"));
             let recording = Recorder::new(8 << 20);
             recording.start(&first, H0).unwrap();
             // Camera 2's labels of `epoch` are invalidated before they arrive.
@@ -2845,8 +2837,6 @@ mod tests {
                 probes,
                 "{marker:?}"
             );
-            std::fs::remove_file(first).unwrap();
-            std::fs::remove_file(second).unwrap();
         }
     }
 
@@ -2854,11 +2844,8 @@ mod tests {
     /// device's, and so does the replay of its recording, under the recording's spelling.
     #[test]
     fn replay_places_sensors_calibrated_in_another_letter_case() {
-        let path = std::env::temp_dir().join(format!(
-            "cv1t-letter-case-replay-{}.rec",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-letter-case-replay.rec");
         let recorder = crate::recorder::Recorder::new(4 << 20);
         recorder.start(&path, H0).unwrap();
         let (_, _, p, mut calibration) = run_with_sensors(
@@ -2885,13 +2872,12 @@ mod tests {
         registered.sort();
         assert_eq!(registered, ["SENSOR0", "SENSOR1", "SENSOR2"]);
         assert!(!replay.hands[HAND_RIGHT].is_empty());
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn mixed_case_probe_options_keep_recorded_frames_out_of_tracking() {
-        let path = std::env::temp_dir().join(format!("cv1t-probe-case-{}.rec", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-probe-case.rec");
         let recorder = crate::recorder::Recorder::new(4 << 20);
         recorder.start(&path, H0).unwrap();
         let (_, _, p, mut cal) = run_with_sensors(
@@ -2922,7 +2908,6 @@ mod tests {
             assert!(!replay.probes.is_empty(), "unposed={unposed}");
             assert!(replay.probes.iter().all(|p| p.camera == 0));
         }
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -392,9 +392,8 @@ mod tests {
     #[cfg(unix)]
     fn bounded_atomic_private_storage_and_bad_loads() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("cv1touch-input-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("calibration.json");
         let c = example();
         assert_eq!(load(&p).unwrap(), None);
@@ -420,6 +419,5 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         std::os::unix::fs::symlink("/dev/zero", &p).unwrap();
         assert!(load(&p).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

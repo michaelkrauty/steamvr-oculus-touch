@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn a_long_log_keeps_its_end_from_a_line_start() {
-        let dir = std::env::temp_dir().join(format!("cv1t-report-tail-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("log");
         std::fs::write(&path, "first line\nsecond line\nthird line\n").unwrap();
         assert_eq!(
@@ -490,15 +490,14 @@ mod tests {
             String::from_utf8(tail(&path, 11).unwrap()).unwrap(),
             "[the first 23 bytes are left out]\nthird line\n"
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A FIFO (or a link to a device) would never end: it is refused, not read.
     #[cfg(unix)]
     #[test]
     fn only_regular_files_are_read() {
-        let dir = std::env::temp_dir().join(format!("cv1t-report-fifo-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let fifo = dir.join("settings.json");
         let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: a NUL-terminated path.
@@ -506,7 +505,6 @@ mod tests {
         assert!(tail(&fifo, 1000).is_err());
         std::os::unix::fs::symlink("/dev/zero", dir.join("zero")).unwrap();
         assert!(tail(&dir.join("zero"), 1000).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A line longer than what is kept keeps its end, not nothing.
@@ -531,8 +529,8 @@ mod tests {
                 Ok(())
             }
         }
-        let dir = std::env::temp_dir().join(format!("cv1t-report-save-{}", process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("report.zip");
         // left by an earlier run that stopped half-way
         let _ = std::fs::remove_file(&path);
@@ -542,7 +540,6 @@ mod tests {
         std::fs::write(&path, b"someone else's").unwrap();
         assert!(save(&path, created, |mut out| out.write_all(b"zip")).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

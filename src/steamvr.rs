@@ -1013,16 +1013,10 @@ pub fn enable_multiple_drivers(path: &Path) -> Result<Option<PathBuf>, String> {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cv1t-steamvr-{}-{tag}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     #[test]
     fn uninstall_removes_owned_payload_and_retains_unknown_content() {
-        let d = tmp("remove-owned");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::write(d.join("lib.so"), b"ELF").unwrap();
         std::fs::write(d.join("manifest"), br#"{"name":"cv1touch"}"#).unwrap();
         let owned = d.join("driver");
@@ -1033,7 +1027,6 @@ mod tests {
         std::fs::remove_file(owned.join("personal-file")).unwrap();
         remove_owned_driver(&owned).unwrap();
         assert!(!owned.exists());
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1046,7 +1039,8 @@ mod tests {
 
     #[test]
     fn enables_multiple_drivers_keeping_everything_else() {
-        let d = tmp("settings");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("steamvr.vrsettings");
         std::fs::write(
             &p,
@@ -1068,7 +1062,8 @@ mod tests {
 
     #[test]
     fn creates_a_missing_settings_file() {
-        let d = tmp("missing");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("config").join("steamvr.vrsettings");
         assert!(enable_multiple_drivers(&p).unwrap().is_none());
         let v: serde_json::Value =
@@ -1078,7 +1073,8 @@ mod tests {
 
     #[test]
     fn refuses_a_broken_settings_file() {
-        let d = tmp("broken");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let p = d.join("steamvr.vrsettings");
         std::fs::write(&p, "{ not json").unwrap();
         assert!(enable_multiple_drivers(&p)
@@ -1089,7 +1085,8 @@ mod tests {
 
     #[test]
     fn assembles_the_driver_directory() {
-        let d = tmp("assemble");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         std::fs::write(d.join("lib.so"), b"ELF").unwrap();
         std::fs::write(d.join("driver.vrdrivermanifest"), b"{}").unwrap();
         let out = d.join("cv1touch");
@@ -1110,7 +1107,8 @@ mod tests {
     #[test]
     fn modified_driver_payload_is_preserved_before_upgrade_or_remove() {
         for name in [driver_library(), DRIVER_MANIFEST.into()] {
-            let d = tmp(&format!("modified-{}", name.replace('/', "-")));
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
             let so = d.join("source.so");
             let manifest = d.join("source.json");
             std::fs::write(&so, b"original driver").unwrap();
@@ -1131,11 +1129,8 @@ mod tests {
     fn unknown_content_and_symlinks_block_install_before_any_replacement() {
         use std::os::unix::fs::symlink;
         for symbolic in [false, true] {
-            let d = tmp(if symbolic {
-                "install-symlink"
-            } else {
-                "install-unknown"
-            });
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
             let so = d.join("source.so");
             let manifest = d.join("source.json");
             std::fs::write(&so, b"old").unwrap();
@@ -1163,7 +1158,8 @@ mod tests {
 
     #[test]
     fn legacy_package_requires_exact_trusted_payload() {
-        let d = tmp("legacy");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let so = d.join("source.so");
         let manifest = d.join("source.json");
         std::fs::write(&so, b"old").unwrap();
@@ -1183,11 +1179,11 @@ mod tests {
         assemble(&so, &manifest, &package).unwrap();
         remove_owned_driver(&package).unwrap();
         remove_owned_driver(&package).unwrap();
-        std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
     fn legacy_upgrade_can_validate_old_assets_and_install_new_assets() {
-        let d = tmp("legacy-upgrade");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let old = d.join("old.so");
         let new = d.join("new.so");
         let manifest = d.join("manifest");
@@ -1205,12 +1201,12 @@ mod tests {
             b"new"
         );
         check_driver(&package, None).unwrap();
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn failed_atomic_publish_keeps_existing_directory_and_stage() {
-        let d = tmp("publish-failure");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let package = d.join("package");
         let stage = d.join("stage");
         std::fs::create_dir(&package).unwrap();
@@ -1220,7 +1216,6 @@ mod tests {
         assert!(publish_directory(&stage, &package, false, None).is_err());
         assert_eq!(std::fs::read(package.join("original")).unwrap(), b"keep");
         assert!(stage.is_dir());
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// A made-up input profile laid out as SteamVR's are (not SteamVR's own), spaced unevenly so
@@ -1319,8 +1314,9 @@ mod tests {
 
     #[test]
     fn the_profile_becomes_the_controllers_own_and_keeps_every_other_byte() {
-        let d = tmp("derive");
-        let resources = derive_resources(&fixture_runtime(&d)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let resources = derive_resources(&fixture_runtime(d)).unwrap();
         let names: Vec<&str> = resources.iter().map(|(name, _)| name.as_str()).collect();
         // a binding named by an {driver} path is found from anywhere: nothing to copy
         assert_eq!(
@@ -1362,7 +1358,6 @@ mod tests {
             derived.matches('\n').count(),
             derived.matches("\r\n").count()
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1419,20 +1414,21 @@ mod tests {
 
     #[test]
     fn a_missing_steamvr_profile_says_what_to_do() {
-        let d = tmp("no-profile");
-        let runtime = installed_runtime(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = installed_runtime(d);
         let e = derive_resources(&runtime).unwrap_err();
         assert!(e.starts_with("SteamVR's Oculus Touch input profile is missing"));
         assert!(e.contains(&touch_profile(&runtime).display().to_string()));
         assert!(e.contains("verify SteamVR's files"), "{e}");
         assert!(!e.contains("was not found"), "{e}");
         assert!(e.ends_with(REINSTALL));
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn steamvr_that_is_not_installed_is_named() {
-        let d = tmp("no-steamvr");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let runtime = d.join("runtime");
         let e = derive_resources(&runtime).unwrap_err();
         assert!(
@@ -1458,13 +1454,13 @@ mod tests {
                 && !e.contains("verify SteamVR's files"),
             "{e}"
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_missing_default_binding_is_left_out() {
-        let d = tmp("dangling-binding");
-        let runtime = fixture_runtime(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = fixture_runtime(d);
         let binding = touch_profile(&runtime).with_file_name("example_bindings.json");
         std::fs::remove_file(&binding).unwrap();
         let resources = derive_resources(&runtime).unwrap();
@@ -1478,7 +1474,7 @@ mod tests {
         let profile = std::str::from_utf8(&resources[0].1).unwrap();
         assert!(profile.contains("example_bindings.json"), "{profile}");
         // The file showing up later is one the installed package does not have.
-        let (so, manifest) = fixture_payload(&d);
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         assemble_with_legacy(&so, &manifest, &resources, &package, None).unwrap();
         check_input_profile(&package, &runtime).unwrap();
@@ -1491,7 +1487,6 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains("not installed"), "{e}");
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1521,7 +1516,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn the_install_script_is_told_to_run_itself_again() {
-        let d = tmp("install-script");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let e = derive_resources_for_install_script(&d.join("runtime")).unwrap_err();
         assert!(e.starts_with("SteamVR was not found at"), "{e}");
         assert!(
@@ -1539,7 +1535,6 @@ mod tests {
                 && plain.contains("cv1touch steamvr install"),
             "{plain}"
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1585,8 +1580,9 @@ mod tests {
 
     #[test]
     fn a_right_home_button_already_in_the_profile_is_kept() {
-        let d = tmp("home-kept");
-        let runtime = fixture_runtime(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = fixture_runtime(d);
         let path = touch_profile(&runtime);
         let text = FIXTURE_PROFILE.replacen(
             "\"input_source\" :\n  {",
@@ -1627,14 +1623,14 @@ mod tests {
                 "{sources}: {e}"
             );
         }
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_package_owns_its_input_resources() {
-        let d = tmp("resources");
-        let resources = derive_resources(&fixture_runtime(&d)).unwrap();
-        let (so, manifest) = fixture_payload(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let resources = derive_resources(&fixture_runtime(d)).unwrap();
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         assemble_with_legacy(&so, &manifest, &resources, &package, None).unwrap();
         for (name, bytes) in &resources {
@@ -1678,14 +1674,14 @@ mod tests {
             assert!(assemble_with_legacy(&so, &manifest, &extra, &package, None).is_err());
             assert!(!package.exists());
         }
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_package_an_earlier_cv1touch_installed_upgrades() {
-        let d = tmp("version-1");
-        let resources = derive_resources(&fixture_runtime(&d)).unwrap();
-        let (so, manifest) = fixture_payload(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let resources = derive_resources(&fixture_runtime(d)).unwrap();
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         std::fs::create_dir_all(package.join(DRIVER_LIBRARY.0)).unwrap();
         std::fs::copy(&so, package.join(driver_library())).unwrap();
@@ -1712,14 +1708,14 @@ mod tests {
                 .unwrap_err()
                 .contains("unsupported ownership metadata"));
         }
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_doctor_check_compares_with_the_profile_steamvr_has_now() {
-        let d = tmp("doctor-profile");
-        let runtime = fixture_runtime(&d);
-        let (so, manifest) = fixture_payload(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = fixture_runtime(d);
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         let install = || {
             let resources = derive_resources(&runtime).unwrap();
@@ -1839,14 +1835,14 @@ mod tests {
         assert!(check_input_profile(&package, &runtime)
             .unwrap_err()
             .starts_with("SteamVR's Oculus Touch input profile is missing"));
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_doctor_checks_edits_before_a_stale_profile() {
-        let d = tmp("doctor-stale-profile-edit");
-        let runtime = fixture_runtime(&d);
-        let (so, manifest) = fixture_payload(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = fixture_runtime(d);
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         let resources = derive_resources(&runtime).unwrap();
         assemble_with_legacy(&so, &manifest, &resources, &package, None).unwrap();
@@ -1876,14 +1872,14 @@ mod tests {
             e.contains("is out of date") && e.ends_with(REINSTALL),
             "{e}"
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_doctor_checks_edits_to_a_binding_steamvr_no_longer_names() {
-        let d = tmp("doctor-old-binding-edit");
-        let runtime = fixture_runtime(&d);
-        let (so, manifest) = fixture_payload(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let runtime = fixture_runtime(d);
+        let (so, manifest) = fixture_payload(d);
         let package = d.join("package");
         let resources = derive_resources(&runtime).unwrap();
         assemble_with_legacy(&so, &manifest, &resources, &package, None).unwrap();
@@ -1921,7 +1917,6 @@ mod tests {
             e.contains("is out of date") && e.ends_with(REINSTALL),
             "{e}"
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

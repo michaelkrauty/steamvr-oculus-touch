@@ -9,8 +9,8 @@ use std::process::Command;
 
 #[test]
 fn mixed_case_refine_and_place_commands_find_the_recorded_camera() {
-    let dir = std::env::temp_dir().join(format!("cv1t-serial-command-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let calibration = dir.join("calibration.json");
     let rec = dir.join("capture.rec");
     std::fs::write(&calibration, serde_json::to_vec(&serde_json::json!({
@@ -43,10 +43,10 @@ fn mixed_case_refine_and_place_commands_find_the_recorded_camera() {
             .arg(&rec)
             .arg("--calibration")
             .arg(&calibration)
-            .env("HOME", &dir)
-            .env("LOCALAPPDATA", &dir)
-            .env("XDG_CONFIG_HOME", &dir)
-            .env("XDG_STATE_HOME", &dir)
+            .env("HOME", dir)
+            .env("LOCALAPPDATA", dir)
+            .env("XDG_CONFIG_HOME", dir)
+            .env("XDG_STATE_HOME", dir)
             .output()
             .unwrap()
     };
@@ -71,5 +71,4 @@ fn mixed_case_refine_and_place_commands_find_the_recorded_camera() {
         file::load(&calibration).unwrap().sensors[0].serial,
         "camera1"
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }

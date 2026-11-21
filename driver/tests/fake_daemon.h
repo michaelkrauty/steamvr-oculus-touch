@@ -12,6 +12,8 @@
 #include "cv1touch_shm.h"
 
 #ifndef _WIN32
+#include <csignal>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -45,6 +47,35 @@ static inline std::wstring fake_object(const char *kind, const std::string &name
 }
 #endif
 
+#ifndef _WIN32
+/* Names this process created, unlinked at exit and when a failed assert aborts. */
+static char fake_names[16][64];
+
+static inline void fake_unlink_all(int sig)
+{
+	for (const char *n : fake_names)
+		if (*n)
+			shm_unlink(n);
+	if (sig) {
+		signal(sig, SIG_DFL);
+		raise(sig);
+	}
+}
+
+static inline void fake_remember(const std::string &name)
+{
+	static const bool hooked = (signal(SIGABRT, fake_unlink_all), atexit([] { fake_unlink_all(0); }), true);
+	(void)hooked;
+	assert(name.size() < sizeof fake_names[0]);
+	for (char *n : fake_names)
+		if (!*n || name == n) {
+			std::strcpy(n, name.c_str());
+			return;
+		}
+	assert(!"too many fake daemons");
+}
+#endif
+
 static inline FakeDaemon fake_start(const std::string &name, uint32_t version, uint64_t generation, uint64_t heartbeat)
 {
 	FakeDaemon d;
@@ -61,6 +92,7 @@ static inline FakeDaemon fake_start(const std::string &name, uint32_t version, u
 	d.events[1] = CreateEventW(nullptr, TRUE, FALSE, fake_object("update1", name).c_str());
 	assert(d.events[0] && d.events[1]);
 #else
+	fake_remember(name);
 	shm_unlink(name.c_str());
 	int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
 	assert(fd >= 0);

@@ -87,8 +87,8 @@ mod tests {
 
     #[test]
     fn the_matching_controllers_imu_position_is_found() {
-        let dir = std::env::temp_dir().join(format!("cv1touch-factory-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let left = [[-0.03, -0.008, -0.011], [-0.02, 0.01, 0.0]];
         let right = [[0.03, -0.008, -0.011], [0.02, 0.01, 0.0]];
         std::fs::write(
@@ -112,14 +112,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            imu_position(&dir, &leds(&right)),
+            imu_position(dir, &leds(&right)),
             Some(Vector3::new(0.0154, -0.0126, 0.0082))
         );
-        assert_eq!(imu_position(&dir, &leds(&left)).map(|v| v.x), Some(-0.002));
+        assert_eq!(imu_position(dir, &leds(&left)).map(|v| v.x), Some(-0.002));
         assert_eq!(
-            imu_position(&dir, &leds(&[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])),
+            imu_position(dir, &leds(&[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])),
             None
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
