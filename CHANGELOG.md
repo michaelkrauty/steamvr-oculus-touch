@@ -7,6 +7,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 ### Fixed
 
 - After a radio dropout or a wake, the tracker no longer starts its new track from a sensor frame exposed before the motion data resumed.
+- A controller just woken or picked up could be shown turned about its LED ring for a few hundred milliseconds before the tracker corrected it. A first lock is now shown only once the sensors' frames tell it from the ring's turns.
 
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
