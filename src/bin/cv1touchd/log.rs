@@ -12,9 +12,13 @@ use std::time::{Duration, Instant};
 const CAPACITY: usize = 256;
 const LINE_BYTES: usize = 2048;
 const TRUNCATED: &str = " [truncated]";
+/// How long exit waits on output that has stopped taking writes. A writer that has not yet been
+/// scheduled is waited for: its last lines are often the reason for the exit.
 const EXIT_FLUSH: Duration = Duration::from_millis(200);
 /// Retry interval for a drop report the writer could not write; never used while output works.
 const RETRY: Duration = Duration::from_millis(2);
+/// `Shared::stalled_since` while the last write succeeded.
+const NOT_STALLED: u64 = u64::MAX;
 
 struct Line {
     bytes: [u8; LINE_BYTES],
@@ -130,8 +134,19 @@ struct Shared {
     pending: AtomicUsize,
     writing: AtomicBool,
     closed: AtomicBool,
+    /// The writer thread has returned or panicked: nothing more will be written.
+    ended: AtomicBool,
+    /// When, in nanoseconds after `epoch`, the current or last unsuccessful write began.
+    stalled_since: AtomicU64,
+    epoch: Instant,
     #[cfg(test)]
     passes: AtomicUsize,
+}
+
+impl Shared {
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +164,9 @@ impl Logger {
             pending: AtomicUsize::new(0),
             writing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            stalled_since: AtomicU64::new(NOT_STALLED),
+            epoch: Instant::now(),
             #[cfg(test)]
             passes: AtomicUsize::new(0),
         });
@@ -190,15 +208,20 @@ impl Logger {
     }
 
     fn flush(&self, within: Duration) -> bool {
-        let start = Instant::now();
         loop {
+            // Read first: a writer that drained everything and then ended has flushed.
+            let ended = self.shared.ended.load(Ordering::Acquire);
             if self.shared.pending.load(Ordering::Acquire) == 0
                 && self.shared.dropped.load(Ordering::Acquire) == 0
                 && !self.shared.writing.load(Ordering::Acquire)
             {
                 return true;
             }
-            if start.elapsed() >= within {
+            let since = self.shared.stalled_since.load(Ordering::Acquire);
+            if ended
+                || since != NOT_STALLED
+                    && Duration::from_nanos(self.shared.now().saturating_sub(since)) >= within
+            {
                 return false;
             }
             thread::sleep(Duration::from_millis(1));
@@ -213,15 +236,19 @@ impl Logger {
 }
 
 fn write_loop(shared: Arc<Shared>, mut writer: impl io::Write) {
+    struct Ended<'a>(&'a Shared);
+    impl Drop for Ended<'_> {
+        fn drop(&mut self) {
+            self.0.ended.store(true, Ordering::Release);
+        }
+    }
+    let _ended = Ended(&shared);
     loop {
         #[cfg(test)]
         shared.passes.fetch_add(1, Ordering::Relaxed);
         shared.writing.store(true, Ordering::Release);
         while let Some(line) = shared.queue.pop() {
-            let written = writer
-                .write_all(line.bytes())
-                .and_then(|()| writer.flush())
-                .is_ok();
+            let written = write(&shared, &mut writer, line.bytes());
             if !written {
                 shared.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -249,29 +276,35 @@ fn write_loop(shared: Arc<Shared>, mut writer: impl io::Write) {
     }
 }
 
+/// Writes one line, keeping in `stalled_since` when the output stopped taking writes.
+fn write(shared: &Shared, writer: &mut impl io::Write, bytes: &[u8]) -> bool {
+    let _ = shared.stalled_since.compare_exchange(
+        NOT_STALLED,
+        shared.now(),
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+    let written = writer
+        .write_all(bytes)
+        .and_then(|()| writer.flush())
+        .is_ok();
+    if written {
+        shared.stalled_since.store(NOT_STALLED, Ordering::Release);
+    }
+    written
+}
+
 fn report_drops(shared: &Shared, writer: &mut impl io::Write) {
     let count = shared.dropped.swap(0, Ordering::AcqRel);
     if count != 0 {
         let line = Line::formatted(format_args!("cv1touchd: {count} log lines dropped"));
-        if writer
-            .write_all(line.bytes())
-            .and_then(|()| writer.flush())
-            .is_err()
-        {
+        if !write(shared, writer, line.bytes()) {
             shared.dropped.fetch_add(count, Ordering::Relaxed);
         }
     }
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
-
-#[cfg(test)]
-static WAIT_FOR_TEST_OUTPUT: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-pub(super) fn wait_for_test_output_at_exit() {
-    WAIT_FOR_TEST_OUTPUT.store(true, Ordering::Release);
-}
 
 pub(super) struct Guard;
 
@@ -366,11 +399,6 @@ unsafe extern "C" fn native_fatal() {
 
 pub(super) fn exit(code: i32) -> ! {
     if let Some(logger) = LOGGER.get() {
-        // Outcome tests observe all enqueued lines independently of the production deadline.
-        #[cfg(test)]
-        if WAIT_FOR_TEST_OUTPUT.load(Ordering::Acquire) {
-            logger.flush(Duration::MAX);
-        }
         logger.close(EXIT_FLUSH);
     }
     std::process::exit(code);
@@ -617,6 +645,59 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "flush took {elapsed:?}"
         );
+    }
+
+    /// A writer held away from the queue, as a descheduled or frozen thread is, for longer than
+    /// the exit deadline: its output works, so the last line, the reason for the exit, arrives.
+    #[test]
+    fn exit_flush_waits_for_a_writer_that_has_not_run() {
+        let Blocked {
+            logger,
+            entered,
+            release,
+            bytes,
+        } = blocked();
+        logger.line(format_args!("first"));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        logger.line(format_args!("reason"));
+        let (locked, held) = mpsc::channel();
+        let holder = {
+            let logger = logger.clone();
+            thread::spawn(move || {
+                let _slot = logger.shared.queue.slots[1].lock().unwrap();
+                locked.send(()).unwrap();
+                thread::sleep(EXIT_FLUSH * 2);
+            })
+        };
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        let drained = logger.close(EXIT_FLUSH);
+        holder.join().unwrap();
+        assert!(drained);
+        assert_eq!(
+            &*bytes.lock().unwrap(),
+            b"cv1touchd: first\ncv1touchd: reason\n"
+        );
+    }
+
+    /// Exit must never hang on a writer thread that is gone. With no deadline at all, close
+    /// still returns once the writer has ended with a line unwritten.
+    #[test]
+    fn exit_flush_does_not_wait_for_a_writer_that_has_ended() {
+        struct Panics;
+        impl io::Write for Panics {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("test writer failed");
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let logger = Logger::new(Panics).unwrap();
+        logger.line(format_args!("lost"));
+        let (closed, done) = mpsc::channel();
+        thread::spawn(move || closed.send(logger.close(Duration::MAX)).unwrap());
+        assert_eq!(done.recv_timeout(Duration::from_secs(5)), Ok(false));
     }
 }
 

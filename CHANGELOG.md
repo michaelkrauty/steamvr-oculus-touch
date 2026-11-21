@@ -12,6 +12,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - A controller picked up quickly soon after the daemon started could lose its position for about two seconds when the sensors' views of the same moment disagreed slightly. The tracker now checks the motion sensor's bias only once all the sensors' views of a moment are in.
 - A controller in fast motion could be shown running off, or lose its position, after its motion samples dropped out over the radio for a few tens of milliseconds. The tracker now bridges such a gap with the samples on either side of it and allows for what the gap may have hidden.
 - A controller woken, picked up or held next to the other could be shown at the other's position, or running off from there; the tracker no longer takes LEDs that the other controller's own track accounts for.
+- When a tracking thread fails and the daemon restarts, the log now always says why; on a busy machine the reason could be missing.
 
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
