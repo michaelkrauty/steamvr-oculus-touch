@@ -84,7 +84,7 @@ if [ "$(uname -s)" = Linux ]; then
   test -f "$library" || { echo "Missing OpenHMD library: $library" >&2; exit 1; }
   dynamic=$(readelf -d "$library")
   printf '%s\n' "$dynamic"
-  printf '%s\n' "$dynamic" | grep -q '(NEEDED)' || { echo 'OpenHMD has no dynamic dependencies' >&2; exit 1; }
+  [[ $dynamic == *'(NEEDED)'* ]] || { echo 'OpenHMD has no dynamic dependencies' >&2; exit 1; }
   closure=$(ldd "$library")
   printf '%s\n' "$closure"
   if printf '%s\n%s\n' "$dynamic" "$closure" | grep -Ei 'not found|libopencv|libstdc\+\+|libc\+\+'; then
