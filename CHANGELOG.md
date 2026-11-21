@@ -12,6 +12,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - A controller picked up quickly soon after the daemon started could lose its position for about two seconds when the sensors' views of the same moment disagreed slightly. The tracker now checks the motion sensor's bias only once all the sensors' views of a moment are in.
 - A controller in fast motion could be shown running off, or lose its position, after its motion samples dropped out over the radio for a few tens of milliseconds. The tracker now bridges such a gap with the samples on either side of it and allows for what the gap may have hidden.
 
+### Changed
+
+- A controller not seen since the daemon started is republished every 20 ms until it sends new data, as an asleep controller already was, instead of about 440 times a second, and the SteamVR driver is woken that much less often.
+
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
 ### Fixed
