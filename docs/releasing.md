@@ -57,9 +57,9 @@ filenames (run `sha256sum` inside `target/dist`). Verify the sums and upload the
 source tarball and checksum file to the draft. Keep checksums in sync if an asset
 changes **before** publication; do not silently replace published assets.
 
-Write concise release notes with highlights, upgrade instructions, known
-limitations, and links to the tagged changelog and setup guide. Explain any need
-to update the daemon and SteamVR driver together. State Windows signing and
-hardware-validation limits. Publish the draft only after checking the assets,
+Write concise release notes that say what changed and what was verified, with
+upgrade instructions and links to the tagged changelog and setup guide. Explain
+any need to update the daemon and SteamVR driver together. State whether the
+Windows installer is signed. Publish the draft only after checking the assets,
 checksums, exact tagged revision's CI, and release notes; then verify the public
 release URL and downloadable files.
