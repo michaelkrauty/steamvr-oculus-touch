@@ -1793,6 +1793,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    /// Waits for a session that ends itself. Its writer syncs the file first, which can take
+    /// any time on loaded storage, so only the writer's own signal ends this wait.
+    fn wait_finished(r: &Recorder) {
+        let ring = r.shared.ring.lock().unwrap();
+        drop(r.shared.cond.wait_while(ring, |r| !r.finished).unwrap());
+    }
 
     #[test]
     fn size_limit_finishes_a_readable_recording_for_summary_and_replay() {
@@ -1817,7 +1823,7 @@ mod tests {
                 );
             }
             state_record(&r, 4);
-            wait_until(|| r.status().finished);
+            wait_finished(&r);
             assert!(!r.active());
             // A capped session retains its reason until stop acknowledges it.
             assert!(r.start(&tmp("capped-replacement"), 2).is_err());
@@ -1889,7 +1895,7 @@ mod tests {
         // Header and first record spent 312 bytes: one byte short of another whole record.
         assert_eq!(available.load(Ordering::Relaxed), (2 << 30) + 279);
         state_record(&r, 2);
-        wait_until(|| r.status().finished);
+        wait_finished(&r);
         let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
         assert_eq!(status.state, State::Complete);
         assert!(status.message().contains("GiB free; keeping 2.00 GiB free"));
