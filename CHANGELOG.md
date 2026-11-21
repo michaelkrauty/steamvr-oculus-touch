@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- After a radio dropout or a wake, the tracker no longer starts its new track from a sensor frame exposed before the motion data resumed.
+
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
 ### Fixed
