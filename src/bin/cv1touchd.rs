@@ -3498,6 +3498,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
     let mut live_sensors = LiveSensorState::default();
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
+    let mut refresh = EngineRefresh::default();
     let mut restoring = std::collections::BTreeSet::new();
     let (mut failures, mut next_sensors) = (0u32, 0u64);
     // A successful native open still initializes lazily in its first update.
@@ -3534,6 +3535,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
             }
             link.engine_view.lock().unwrap()[h] = Some(c);
             if !engine_publishes_hand_persistent(d, &link.hands, h, &c, shm::now_ns) {
+                refresh.forget(h);
                 continue;
             }
             if c.device_time_ns != holds.last_sample[h] {
@@ -3544,6 +3546,9 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
                     update_ns: now.saturating_sub(c.received_host_ns),
                     read_ns: shm::now_ns().saturating_sub(read_from),
                 });
+            }
+            if !refresh.due(h, &c, now) {
+                continue;
             }
             publish_hand_state(d, h, &c, shm::now_ns, None);
             published = true;
@@ -3698,6 +3703,38 @@ impl BodyFinder {
             }
         }
         found
+    }
+}
+
+/// What the engine thread last published of each hand it publishes, and when: a hand without a
+/// new sample is republished only every `RADIO_REFRESH_NS`, as the radio thread does, instead of
+/// on every engine pass.
+#[derive(Default)]
+struct EngineRefresh {
+    last: [Option<(u64, [u64; 5])>; 2],
+}
+
+impl EngineRefresh {
+    /// Whether the engine publishes `c` at `now`, recording it if so.
+    fn due(&mut self, h: usize, c: &engine::Controller, now: u64) -> bool {
+        let sample = [
+            c.calibrated as u64,
+            c.device_time_ns,
+            c.received_host_ns,
+            c.last_pose_fix_device_ns,
+            c.last_orient_fix_device_ns,
+        ];
+        let due = self.last[h]
+            .is_none_or(|(at, last)| last != sample || now.saturating_sub(at) >= RADIO_REFRESH_NS);
+        if due {
+            self.last[h] = Some((now, sample));
+        }
+        due
+    }
+
+    /// The engine does not publish the hand: it publishes it at once when it does again.
+    fn forget(&mut self, h: usize) {
+        self.last[h] = None;
     }
 }
 
@@ -16502,6 +16539,78 @@ mod tests {
             (expired.buttons, expired.trigger, expired.grip),
             (0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn the_engine_republishes_a_hand_without_a_new_sample_only_every_refresh() {
+        // `engine_loop`'s publication of a hand in one pass: whether it published.
+        fn pass(
+            d: &Daemon,
+            hands: &HandOwnership,
+            refresh: &mut EngineRefresh,
+            c: &engine::Controller,
+            now: u64,
+        ) -> bool {
+            if !engine_publishes_hand_persistent(d, hands, HAND_RIGHT, c, || now) {
+                refresh.forget(HAND_RIGHT);
+                return false;
+            }
+            let due = refresh.due(HAND_RIGHT, c, now);
+            if due {
+                publish_hand_state(d, HAND_RIGHT, c, || now, None);
+            }
+            due
+        }
+        // A pass every 2 ms for 1 s, as when no radio report ends the engine's radio wait sooner,
+        // counting changes of the hand's publish time.
+        fn publications(
+            d: &Daemon,
+            hands: &HandOwnership,
+            refresh: &mut EngineRefresh,
+            start: u64,
+            sample: impl Fn(u64) -> engine::Controller,
+        ) -> usize {
+            let mut last = d.shm.hand(HAND_RIGHT).unwrap().publish_host_ns;
+            let mut n = 0;
+            for i in 0..500 {
+                let now = start + i * 2_000_000;
+                pass(d, hands, refresh, &sample(now), now);
+                let at = d.shm.hand(HAND_RIGHT).unwrap().publish_host_ns;
+                n += usize::from(at != last);
+                last = at;
+            }
+            n
+        }
+        let d = status_daemon();
+        d.engine_offline.store(false, Ordering::Release);
+        let hands = HandOwnership::default();
+        let mut refresh = EngineRefresh::default();
+        let now = shm::now_ns();
+        let unseen = publications(&d, &hands, &mut refresh, now, |_| {
+            engine::Controller::default()
+        });
+        let asleep = reopen_controller(now + 1_000_000_000);
+        let asleep = publications(&d, &hands, &mut refresh, now + 1_000_000_000, |_| asleep);
+        let awake = |t: u64| engine::Controller {
+            device_time_ns: t - now,
+            ..reopen_controller(t)
+        };
+        let start = now + 2_000_000_000;
+        let moving = publications(&d, &hands, &mut refresh, start, awake);
+        assert_eq!((unseen, asleep, moving), (50, 50, 500));
+
+        // The radio thread takes the hand and exits: the engine publishes it on its next pass.
+        let last = awake(start + 998_000_000);
+        hands.request(HAND_RIGHT);
+        assert!(!pass(
+            &d,
+            &hands,
+            &mut refresh,
+            &last,
+            start + 1_000_000_000
+        ));
+        hands.radio_exit();
+        assert!(pass(&d, &hands, &mut refresh, &last, start + 1_002_000_000));
     }
 
     #[test]
