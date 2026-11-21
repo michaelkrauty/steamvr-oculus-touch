@@ -2066,8 +2066,8 @@ mod tests {
         use std::io::Write;
         const CHILD: &str = "CV1TOUCH_TEST_REDIRECT";
         let Some(path) = std::env::var_os(CHILD) else {
-            let dir = std::env::temp_dir().join(format!("cv1t-redirect-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
             let path = dir.join("log");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -2080,7 +2080,7 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "to the log\n");
-            std::fs::remove_dir_all(&dir).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
             return;
         };
         let log = super::fs::append_private(std::path::Path::new(&path)).unwrap();
@@ -2148,7 +2148,8 @@ mod tests {
         use super::process;
         const CHILD: &str = "CV1TOUCH_TEST_END_WITH";
         let Some(pids) = std::env::var_os(CHILD) else {
-            let pids = std::env::temp_dir().join(format!("cv1t-end-with-{}", std::process::id()));
+            let tmp = tempfile::tempdir().unwrap();
+            let pids = tmp.path().join("pids");
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -2689,16 +2690,10 @@ mod tests {
         );
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cv1t-platform-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn a_private_file_is_created_once_and_read_back() {
-        let dir = scratch("private");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("a/b/c.json");
         fs::create_private_dir_all(path.parent().unwrap()).unwrap();
         use std::io::{Read, Write};
@@ -2711,23 +2706,23 @@ mod tests {
             .unwrap();
         assert_eq!(s, "{}");
         fs::sync_dir(path.parent().unwrap()).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_rename_replaces_the_target() {
-        let dir = scratch("rename");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::write(dir.join("new"), "new").unwrap();
         std::fs::write(dir.join("old"), "old").unwrap();
         fs::rename_replacing(&dir.join("new"), &dir.join("old")).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("old")).unwrap(), "new");
         assert!(!dir.join("new").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_directory_swap_leaves_the_old_contents_in_the_stage() {
-        let dir = scratch("swap");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let (stage, live) = (dir.join("stage"), dir.join("live"));
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(stage.join("v"), "2").unwrap();
@@ -2742,7 +2737,6 @@ mod tests {
         std::fs::create_dir(dir.join("other")).unwrap();
         assert!(fs::swap_dir(&dir.join("other"), &live, false).is_err());
         assert_eq!(std::fs::read_to_string(live.join("v")).unwrap(), "3");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn usb_identity_read_failures_are_unknown_instead_of_absent() {

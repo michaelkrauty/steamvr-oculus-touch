@@ -344,8 +344,8 @@ mod tests {
 
     #[test]
     fn a_burst_of_events_is_bounded_without_leaving_the_bases_out_of_date() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-burst-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         let boot = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)\n";
         let later = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 8765DCBA (best)\nx lighthouse: LHR-CONTROLLER: ----- BOOTSTRAPPED base 11112222 (best)\nx lighthouse: LHR-CONTROLLER: Resetting tracking: no samples\nx lighthouse: LHR-EXAMPLE H: Resetting tracking: no samples\n";
@@ -363,15 +363,13 @@ mod tests {
             Some("LHB-11112222")
         );
         assert!(w.poll().unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_skipped_log_cannot_use_the_reference_before_identifying_the_headset() {
         use std::io::Write;
-        let dir =
-            std::env::temp_dir().join(format!("cv1t-vrlog-unidentified-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         for overflow in [false, true] {
             std::fs::write(
@@ -427,7 +425,6 @@ mod tests {
             );
             assert!(!watch.bases.tracking_unknown("LHR-REFERENCE"));
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -450,9 +447,8 @@ mod tests {
     #[test]
     fn skipped_bootstraps_forget_the_remembered_headset_base_until_named_again() {
         use std::io::Write;
-        let dir =
-            std::env::temp_dir().join(format!("cv1t-vrlog-remembered-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         for tag in [" H", ""] {
             let a = format!(
@@ -505,14 +501,13 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn overflow_forgets_the_remembered_base_until_a_later_bootstrap() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-overflow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         std::fs::write(
             &path,
@@ -543,13 +538,12 @@ mod tests {
             watch.bases.last_of_headset("LHR-EXAMPLE"),
             Some("LHB-8765DCBA")
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn an_unterminated_line_stays_bounded_and_is_not_parsed_after_truncation() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-long-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         let boot = "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best)";
         std::fs::write(&path, format!("header\n{boot}{}", "x".repeat(32 * 1024))).unwrap();
@@ -574,13 +568,12 @@ mod tests {
             "the overlong line must be discarded"
         );
         assert_eq!(w.bases.of_headset(), Some("LHB-1234ABCD"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn an_overlong_line_cannot_hide_a_tracking_change_during_a_capture() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-discard-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         for ending in ["\n", ""] {
             std::fs::write(
@@ -605,7 +598,6 @@ mod tests {
                 "discarding a line lost its tracking change"
             );
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     const BOOT: &str = "Thu Oct 15 2026 17:14:51.820611 [Info] - lighthouse: LHR-D6E2112A H: ----- BOOTSTRAPPED base 2B1973A2 (best) distance 3.28m velocity 0.44m/s base pitch ~135.0 deg roll ~-7.5 deg -----";
@@ -731,8 +723,8 @@ mod tests {
 
     #[test]
     fn the_tail_reads_what_was_added_and_a_new_log_from_its_start() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrlog-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         std::fs::write(
             &path,
@@ -803,13 +795,12 @@ mod tests {
             w.bases.last_of_headset("LHR-D6E2112A"),
             Some("LHB-2B1973A2")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_short_log_that_grows_is_the_same_log() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrgrow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         std::fs::write(&path, "").unwrap();
         let mut w = Watch::new(&path);
@@ -825,13 +816,12 @@ mod tests {
         assert_eq!(w.poll().unwrap().len(), 1);
         assert_eq!(w.poll().unwrap(), vec![]);
         assert_eq!(w.bases.of_headset(), Some("LHB-2B1973A2"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_span_names_the_bases_kept_throughout() {
-        let dir = std::env::temp_dir().join(format!("cv1t-vrspan-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("vrserver.txt");
         std::fs::write(&path, format!("Thu Oct 15 2026 first line\n{BOOT}\n")).unwrap();
         let s = Span::begin(&path);
@@ -852,6 +842,5 @@ mod tests {
         .unwrap();
         assert!(s.finish().is_empty());
         assert!(Span::begin(&dir.join("missing.txt")).finish().is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

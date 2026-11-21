@@ -1286,8 +1286,8 @@ mod frame_tests {
         assert_eq!(size_of::<SensorInfo>(), 120);
         assert_eq!(std::mem::offset_of!(SensorInfo, have_camera_pose), 32);
         assert_eq!(std::mem::offset_of!(SensorInfo, usb_gone), 33);
-        let path =
-            std::env::temp_dir().join(format!("cv1t-sensor-bool-{}.rec", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-sensor-bool.rec");
         let mut payload = vec![0u8; 120];
         payload[..6].copy_from_slice(b"sensor");
         let orient = std::mem::offset_of!(SensorInfo, camera_orient);
@@ -1422,13 +1422,6 @@ mod tests {
     use std::ffi::c_char;
     use std::path::PathBuf;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("cv1t-rec-test-{}-{tag}.rec", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
-    }
-
     fn blobs() -> [Blob; 2] {
         [
             Blob {
@@ -1476,11 +1469,8 @@ mod tests {
     fn a_cancelled_start_never_claims_a_completed_file() {
         for stopped in [false, true] {
             let r = Recorder::new(4096);
-            let path = std::env::temp_dir().join(format!(
-                "cv1t-cancelled-{}-{}.rec",
-                std::process::id(),
-                crate::shm::now_ns()
-            ));
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("cv1t-cancelled.rec");
             let reserved = r.reserve_with_frames(&path, false).unwrap();
             if stopped {
                 assert!(r.request_stop(None));
@@ -1723,7 +1713,7 @@ mod tests {
         let r = Recorder::new(4096);
         let begun = Instant::now();
         r.start_with_sink(
-            &tmp("query-cadence"),
+            &tempfile::tempdir().unwrap().path().join("capture.rec"),
             1,
             false,
             Box::new(CountingSpace {
@@ -1803,7 +1793,8 @@ mod tests {
     #[test]
     fn size_limit_finishes_a_readable_recording_for_summary_and_replay() {
         for limit in [872, 900] {
-            let path = tmp(&format!("capped-{limit}"));
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("capture.rec");
             let r = Recorder::new(4096);
             let available = Arc::new(std::sync::atomic::AtomicU64::new(100 << 30));
             r.start_session(&path, 1, limit, false, || {
@@ -1826,7 +1817,9 @@ mod tests {
             wait_finished(&r);
             assert!(!r.active());
             // A capped session retains its reason until stop acknowledges it.
-            assert!(r.start(&tmp("capped-replacement"), 2).is_err());
+            assert!(r
+                .start(&tempfile::tempdir().unwrap().path().join("capture.rec"), 2)
+                .is_err());
             let status = r.stop_timeout(None, Duration::from_secs(2)).unwrap();
             assert_eq!(status.state, State::Complete);
             assert!(status.reason.unwrap().contains("size limit"));
@@ -1880,7 +1873,8 @@ mod tests {
 
     #[test]
     fn low_disk_space_finishes_only_whole_records_and_says_how_much_is_kept() {
-        let path = tmp("disk-reserve");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(4096);
         let available = Arc::new(std::sync::atomic::AtomicU64::new((2 << 30) + 591));
         r.start_session(&path, 1, RECORDING_BYTES, false, || {
@@ -1906,12 +1900,12 @@ mod tests {
         let mut reader = Reader::open(&path).unwrap();
         assert_eq!(reader.by_ref().count(), 1);
         assert!(reader.error().is_none());
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn reserve_refuses_a_start_without_enough_space_and_is_capped_on_large_disks() {
-        let path = tmp("reserve-refusal");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(4096);
         let available = Arc::new(std::sync::atomic::AtomicU64::new(1 << 30));
         let error = r
@@ -2034,7 +2028,7 @@ mod tests {
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         r.start_with_sink(
-            &tmp("drop-blocked"),
+            &tempfile::tempdir().unwrap().path().join("capture.rec"),
             1,
             false,
             Box::new(SyncGate {
@@ -2084,8 +2078,10 @@ mod tests {
 
     #[test]
     fn scoped_stop_preserves_other_sessions_and_reaps_failed_writer() {
-        let path = tmp("scoped-stop");
-        let other = tmp("scoped-other");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 20);
         assert!(r.stop_if(&path).is_none());
         r.start(&path, 111).unwrap();
@@ -2106,12 +2102,12 @@ mod tests {
         assert_eq!(r.stop_if(&other).unwrap().write_errors, 1);
         assert!(!r.has_session());
         std::fs::remove_file(path).unwrap();
-        std::fs::remove_file(other).unwrap();
     }
 
     #[test]
     fn roundtrip() {
-        let path = tmp("roundtrip");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 20);
         assert!(!r.active());
         r.start(&path, 111).unwrap();
@@ -2144,11 +2140,11 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), stats.bytes);
 
         // A finished recorder can start a new file.
-        let path2 = tmp("roundtrip2");
+        let tmp = tempfile::tempdir().unwrap();
+        let path2 = tmp.path().join("capture.rec");
         r.start(&path2, 1).unwrap();
         r.stop();
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_file(&path2).unwrap();
     }
 
     /// Review Focus 4: failures are reported, nothing is overwritten, the recorder stays inactive.
@@ -2165,17 +2161,18 @@ mod tests {
         r.write(RAW_REPORT, 1, &[&0u32.to_le_bytes()]);
         assert_eq!(r.stats().records, 0);
 
-        let path = tmp("exists");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         std::fs::write(&path, b"keep me").unwrap();
         let err = r.start(&path, 1).unwrap_err();
         assert!(err.contains("exists"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn boundary_that_does_not_fit_stops_recording() {
-        let path = tmp("boundary-full");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(64);
         r.start(&path, 1).unwrap();
         r.write_boundary(SENSOR_ADDED, 2, &[&[b'x'; 128]]);
@@ -2191,12 +2188,12 @@ mod tests {
         let stats = r.stop();
         assert_eq!((stats.dropped, stats.records), (1, 0));
         assert_eq!(Reader::open(&path).unwrap().count(), 0);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn byte_limit_before_boundary_stops_later_records() {
-        let path = tmp("boundary-limit");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(4096);
         r.start(&path, 1).unwrap();
         {
@@ -2209,12 +2206,12 @@ mod tests {
         r.write(RAW_REPORT, 3, &[b"later"]);
         r.stop();
         assert_eq!(Reader::open(&path).unwrap().count(), 0);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn boundary_is_an_additive_v2_record() {
-        let path = tmp("boundary-legacy");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(4096);
         r.start(&path, 1).unwrap();
         r.write_boundary(SENSOR_ADDED, 2, &[b"fictional"]);
@@ -2226,24 +2223,24 @@ mod tests {
             [12, FRAME_OBS]
         );
         assert_eq!(records[0].payload, b"fictional");
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn oversized_record_dropped() {
-        let path = tmp("small");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(64);
         r.start(&path, 1).unwrap();
         let state = ControllerState::default();
         r.write(CONTROLLER_STATE, 1, &[&[0u8; 8], as_bytes(&state)]);
         let stats = r.stop();
         assert_eq!((stats.dropped, stats.records), (1, 0));
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn truncated_tail_is_ignored() {
-        let path = tmp("truncated");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 20);
         r.start(&path, 1).unwrap();
         write_three(&r);
@@ -2252,12 +2249,12 @@ mod tests {
         std::fs::write(&path, &data[..data.len() - 10]).unwrap(); // crash mid-record
         let hosts: Vec<u64> = Reader::open(&path).unwrap().map(|r| r.host_ns).collect();
         assert_eq!(hosts, [222, 333]);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn v2_records_round_trip() {
-        let path = tmp("v2");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 20);
         r.start(&path, 1).unwrap();
         let mut info = FrameInfo::default();
@@ -2307,12 +2304,12 @@ mod tests {
         let (device, model) = decode_led_model(&recs[2].payload).unwrap();
         assert_eq!((device, model.len(), model[1].dir), (2, 2, [0.0, 1.0, 0.0]));
         assert!(decode_frame_obs(&recs[0].payload[..100]).is_none());
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn v2_keeps_old_frames_and_new_identity_lifetimes() {
-        let path = tmp("identity-epochs");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 20);
         r.start(&path, 1).unwrap();
         let mut info = FrameInfo::default();
@@ -2366,12 +2363,12 @@ mod tests {
             records.iter().map(|r| r.host_ns).collect::<Vec<_>>(),
             [2, 3, 4, 5]
         );
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn reader_rejects_version_1() {
-        let path = tmp("v1");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let mut header = [0u8; 32];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -2379,7 +2376,6 @@ mod tests {
         std::fs::write(&path, header).unwrap();
         let err = Reader::open(&path).err().unwrap();
         assert!(err.contains("version 1"), "{err}");
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -2416,7 +2412,8 @@ mod tests {
             };
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
         }
-        let path = tmp("write-error");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let r = Recorder::new(1 << 16);
         r.start(&path, 1).unwrap();
         r.write(RAW_REPORT, 1, &[&[0u8; 8192]]);
@@ -2428,14 +2425,14 @@ mod tests {
         }
         let stopped = !r.active();
         let stats = r.stop();
-        std::fs::remove_file(&path).unwrap();
         assert_eq!(stats.write_errors, 1);
         assert!(stopped, "failed writes must disable recording immediately");
     }
 
     #[test]
     fn oversized_record_lengths_are_rejected_before_allocation() {
-        let path = tmp("oversized-length");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         let mut data = [0u8; FILE_HEADER_LEN + RECORD_HEADER_LEN];
         data[..8].copy_from_slice(MAGIC);
         data[8..12].copy_from_slice(&VERSION.to_le_bytes());
@@ -2452,7 +2449,6 @@ mod tests {
             .unwrap();
         let mut reader = Reader::open(&path).unwrap();
         let got = reader.next();
-        std::fs::remove_file(&path).unwrap();
         assert!(
             got.is_none(),
             "reader accepted a payload larger than the recorder's maximum ring"
@@ -2475,10 +2471,10 @@ mod tests {
 
     #[test]
     fn rejects_non_recording() {
-        let path = tmp("junk");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("capture.rec");
         std::fs::write(&path, b"not a recording at all, definitely not").unwrap();
         assert!(Reader::open(&path).is_err());
-        std::fs::remove_file(&path).unwrap();
     }
 
     /// Review fix 5: a sleeping controller must not keep the sensors' intrinsics (or the awake

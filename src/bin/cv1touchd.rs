@@ -8137,10 +8137,10 @@ mod tests {
         fn a_dropout_the_ring_no_longer_holds_is_not_saved() {
             const S: u64 = 1_000_000_000;
             let d = status_daemon();
-            let dir = std::env::temp_dir().join(format!("cv1t-too-old-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
             let (saved, reports) = std::sync::mpsc::channel();
-            let writer = flight_writer::Writer::start(dir.clone(), move |m| {
+            let writer = flight_writer::Writer::start(dir.to_path_buf(), move |m| {
                 let _ = saved.send(m);
             })
             .unwrap();
@@ -8155,11 +8155,11 @@ mod tests {
             // One writer, in order: the left recording would have been reported first.
             let report = reports.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(report.starts_with("right: recorded the radio"), "{report}");
-            let files = flight::recordings(&dir);
+            let files = flight::recordings(dir);
             assert_eq!(files.len(), 1, "{files:?}");
             assert!(files[0].to_string_lossy().ends_with("-right.rec"));
             drop(writer);
-            fs::remove_dir_all(&dir).unwrap();
+            fs::remove_dir_all(dir).unwrap();
             assert_eq!(
                 too_old_notice(
                     &flight::Dropout {
@@ -8457,6 +8457,20 @@ mod tests {
 
     pub(crate) fn status_daemon() -> Daemon {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Control servers keep their daemon until the process exits, so the segments go then.
+        #[cfg(unix)]
+        extern "C" fn unlink_all() {
+            for n in 0..NEXT.load(Ordering::Relaxed) {
+                let name = format!("/cv1t-dynamic-status-{}-{n}\0", std::process::id());
+                // SAFETY: a NUL-terminated name.
+                unsafe { libc::shm_unlink(name.as_ptr().cast()) };
+            }
+        }
+        #[cfg(unix)]
+        if NEXT.load(Ordering::Relaxed) == 0 {
+            // SAFETY: registers a plain function with no captured state.
+            unsafe { libc::atexit(unlink_all) };
+        }
         let name = format!(
             "/cv1t-dynamic-status-{}-{}",
             std::process::id(),
@@ -10221,11 +10235,8 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let mut state = LiveSensorState::default();
             let sensor = live_sensor("SENSORALPHA", 7);
-            let path = std::env::temp_dir().join(format!(
-                "cv1t-admission-{}-{expected}-{}.rec",
-                std::process::id(),
-                shm::now_ns()
-            ));
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("cv1t-admission.rec");
             d.rec.start(&path, 1).unwrap();
             poll_sensors(&d, 1, Ok(vec![sensor.clone()]));
             poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![sensor]));
@@ -10251,11 +10262,8 @@ mod tests {
         let fake = FakeLive::new(&d);
         let mut state = LiveSensorState::default();
         let sensor = live_sensor(&"S".repeat(5000), 7);
-        let path = std::env::temp_dir().join(format!(
-            "cv1t-admission-full-{}-{}.rec",
-            std::process::id(),
-            shm::now_ns()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-admission-full.rec");
         d.rec.start(&path, 1).unwrap();
         poll_sensors(&d, 1, Ok(vec![sensor.clone()]));
         poll_sensors(&d, 1 + sensor_hotplug::DEBOUNCE_NS, Ok(vec![sensor]));
@@ -10269,7 +10277,6 @@ mod tests {
             .unwrap()
             .contains("could not keep up"));
         d.rec.stop();
-        std::fs::remove_file(path).unwrap();
     }
 
     /// A NO_DEVICE start of a live add retires the sensor like a removal; once two scans confirm
@@ -12509,8 +12516,8 @@ mod tests {
     /// The daemon thins only the backups its own writes made, oldest first.
     #[test]
     fn only_the_daemons_own_backups_are_thinned() {
-        let dir = std::env::temp_dir().join(format!("cv1t-own-backups-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let theirs = dir.join("calibration.json.bak-1");
         std::fs::write(&theirs, "setup's").unwrap();
         let mut own = Vec::new();
@@ -12526,7 +12533,6 @@ mod tests {
                 && !dir.join("calibration.json.bak-101").exists()
         );
         assert!(dir.join("calibration.json.bak-102").exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn serial_field(name: &str) -> [std::os::raw::c_char; 32] {
@@ -12620,8 +12626,8 @@ mod tests {
     /// than the device's, rather than failing with "has no sensor"; the file's spelling stays.
     #[test]
     fn a_new_pose_is_written_to_a_calibration_entry_in_another_letter_case() {
-        let dir = std::env::temp_dir().join(format!("cv1t-reposed-case-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let path = dir.join("calibration.json");
@@ -12666,14 +12672,13 @@ mod tests {
         assert_eq!(written.sensors[0].pos, [0.1, 2.0, 1.0]);
         assert_eq!(written.sensors[0].observations, 4000);
         assert_eq!(written.sensors.len(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A sensor's new pose is written into the loaded file only while it is still that file.
     #[test]
     fn a_new_pose_is_written_only_into_the_file_that_was_loaded() {
-        let dir = std::env::temp_dir().join(format!("cv1t-reposed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let path = dir.join("calibration.json");
@@ -12747,7 +12752,6 @@ mod tests {
             sha,
             "the checkpoint in the supplied state directory follows the new calibration"
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A connected controller the tracker has no state for (it woke, or a wrong lock was dropped)
@@ -18485,11 +18489,8 @@ mod tests {
             }
             return;
         }
-        let gate = std::env::temp_dir().join(format!(
-            "cv1t-rec-stderr-{}-{}",
-            std::process::id(),
-            shm::now_ns()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = tmp.path().join("gate");
         let mut child = process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -18516,7 +18517,6 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         };
         let output = child.wait_with_output().unwrap();
-        fs::remove_file(gate).unwrap();
         assert!(timely, "recording did not finish with closed stderr");
         assert!(
             output.status.success(),
@@ -19502,7 +19502,8 @@ mod tests {
     #[test]
     fn scoped_record_stop_reports_outcome_and_preserves_unrelated_session() {
         let d = status_daemon();
-        let path = std::env::temp_dir().join(format!("cv1touch-scoped-stop-{}.rec", shm::now_ns()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1touch-scoped-stop.rec");
         let other = path.with_extension("other.rec");
         let status: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
@@ -19525,7 +19526,6 @@ mod tests {
         assert!(!d.rec.has_session());
         assert!(!d.rec.frames_enabled());
         assert_eq!(handle(&d, &stop), "ok not-matching");
-        fs::remove_file(path).unwrap();
     }
 
     /// A control client's `record start` is what every capture sends. The recording must open
@@ -20061,12 +20061,9 @@ mod tests {
 
     #[test]
     fn invalid_live_reload_retains_active_config_and_missing_file_resets_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "cv1touch-input-reload-{}-{}",
-            std::process::id(),
-            shm::now_ns()
-        ));
-        cv1touch::platform::fs::create_private_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        cv1touch::platform::fs::create_private_dir_all(dir).unwrap();
         let path = dir.join("input.json");
         let original = input_config();
         let runtime = Mutex::new(InputRuntime {

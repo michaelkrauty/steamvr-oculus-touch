@@ -1381,8 +1381,8 @@ mod tests {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
 
-        let d = dir("startup-stall");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let (mut sink, blocked) = UnixStream::pair().unwrap();
         sink.set_nonblocking(true).unwrap();
         loop {
@@ -1394,7 +1394,7 @@ mod tests {
         }
         sink.set_nonblocking(false).unwrap();
         let fd: OwnedFd = sink.into();
-        let mut log = Writer::with_open(&d, move |dir| {
+        let mut log = Writer::with_open(d, move |dir| {
             let mut log = Log::open(dir).unwrap();
             log.file = Some(File::from(fd));
             log
@@ -1421,7 +1421,6 @@ mod tests {
         // Always unblock the log before asserting, so the old reader order can fail cleanly.
         drop(blocked);
         let code = supervisor.join().unwrap();
-        std::fs::remove_dir_all(d).unwrap();
         assert_eq!(code, 0);
         assert!(
             drained,
@@ -1433,7 +1432,8 @@ mod tests {
     fn lost_output_is_reported_even_after_the_child_that_wrote_it_ends() {
         use std::io::{BufRead, BufReader};
 
-        let d = dir("lost-after-exit");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let current = log_path(&d, 0);
         let done = d.join("quiet-done");
         std::fs::create_dir_all(&current).unwrap();
@@ -1515,7 +1515,6 @@ mod tests {
         });
         let stderr = reader.join().unwrap();
         let lines = std::fs::read_to_string(&current).unwrap_or_default();
-        std::fs::remove_dir_all(d).unwrap();
         assert!(
             quiet,
             "startup records did not drain: {consumed} notices; {stderr}"
@@ -1618,7 +1617,8 @@ mod tests {
         );
         assert_eq!(lines.len(), 1024);
         assert_eq!(dropped.load(Ordering::Relaxed), 8);
-        let d = dir("lost-lines");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         output_line(&mut log, &dropped, "caught up");
         assert_eq!(
@@ -1630,7 +1630,6 @@ mod tests {
         );
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1663,7 +1662,8 @@ mod tests {
 
     #[test]
     fn the_log_truncates_text_at_a_utf8_boundary() {
-        let d = dir("utf8");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), &("x".to_string() + &"é".repeat(8192)))
             .unwrap();
@@ -1671,12 +1671,12 @@ mod tests {
         assert!(text.len() <= 8192 + TRUNCATED.len());
         assert!(text.ends_with(TRUNCATED));
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn failed_log_writes_are_counted_until_the_log_recovers() {
-        let d = dir("lost-writes");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         let blocker = log_path(&d, 1);
         std::fs::create_dir_all(blocker.join("occupied")).unwrap();
@@ -1696,7 +1696,6 @@ mod tests {
         );
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1721,17 +1720,18 @@ mod tests {
         let line = rx.recv().unwrap();
         assert!(line.len() <= 8192 + TRUNCATED.len());
         assert!(line.ends_with(TRUNCATED));
-        let d = dir("lossy-marker");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), &line).unwrap();
         assert_eq!(texts(&log.path()), [line]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_full_log_that_cannot_rotate_does_not_grow() {
-        let d = dir("bounded");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "kept").unwrap();
         std::fs::create_dir_all(log_path(&d, 1).join("occupied")).unwrap();
@@ -1743,12 +1743,12 @@ mod tests {
         assert_eq!(read(&log.path()), before);
         assert_eq!(log.written, LOG_MAX_BYTES);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn an_append_crossing_the_limit_is_refused_before_writing() {
-        let d = dir("crossing");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "kept").unwrap();
         std::fs::create_dir_all(log_path(&d, 1).join("occupied")).unwrap();
@@ -1758,20 +1758,19 @@ mod tests {
         assert_eq!(read(&log.path()), before);
         assert_eq!(log.written, LOG_MAX_BYTES - 1);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_locked_archive_survives_repeated_rotation_attempts() {
-        let d = dir("locked-archive");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for age in 0..=EARLIER_LOGS {
-            std::fs::write(log_path(&d, age), format!("log {age}\n")).unwrap();
+            std::fs::write(log_path(d, age), format!("log {age}\n")).unwrap();
         }
-        let locked = log_path(&d, 1);
+        let locked = log_path(d, 1);
         let mut rotation = Rotation::default();
         for _ in 0..=EARLIER_LOGS + 2 {
-            let result = rotation.set_aside_with(&d, |step| match &step {
+            let result = rotation.set_aside_with(d, |step| match &step {
                 RotationStep::Rename(from, to) if *from == locked || *to == locked => Err(
                     io::Error::new(io::ErrorKind::PermissionDenied, "injected archive lock"),
                 ),
@@ -1780,32 +1779,31 @@ mod tests {
             assert!(result.is_err());
             for age in 0..=EARLIER_LOGS {
                 assert_eq!(
-                    std::fs::read_to_string(log_path(&d, age)).ok(),
+                    std::fs::read_to_string(log_path(d, age)).ok(),
                     Some(format!("log {age}\n"))
                 );
             }
             assert!(!rotation.pending());
             assert_eq!(
-                std::fs::read_dir(&d)
+                std::fs::read_dir(d)
                     .unwrap()
                     .filter(|e| e.as_ref().unwrap().file_name() != LOG_LOCK)
                     .count(),
                 EARLIER_LOGS + 1
             );
         }
-        rotation.set_aside(&d).unwrap();
-        assert!(!log_path(&d, 0).exists());
+        rotation.set_aside(d).unwrap();
+        assert!(!log_path(d, 0).exists());
         for age in 1..=EARLIER_LOGS {
-            assert_eq!(read(&log_path(&d, age)), format!("log {}\n", age - 1));
+            assert_eq!(read(&log_path(d, age)), format!("log {}\n", age - 1));
         }
         assert_eq!(
-            std::fs::read_dir(&d)
+            std::fs::read_dir(d)
                 .unwrap()
                 .filter(|e| e.as_ref().unwrap().file_name() != LOG_LOCK)
                 .count(),
             EARLIER_LOGS
         );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// No release wrote these names, and the current rotation never touches them.
@@ -1815,7 +1813,8 @@ mod tests {
             format!("{LOG_NAME}.log.moving"),
             format!("{LOG_NAME}.{EARLIER_LOGS}.log.moving"),
         ] {
-            let d = dir(&name);
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path().join("logs");
             seed_archives(&d, &[0, 1, 2, 3, 4]);
             std::fs::write(d.join(&name), "interrupted log\n").unwrap();
             let mut log = Log::open(&d).unwrap();
@@ -1832,13 +1831,13 @@ mod tests {
 
     #[test]
     fn a_restart_recovers_a_rotation_without_its_in_memory_undo_list() {
-        let d = dir("rotation-restart");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for age in 0..=EARLIER_LOGS {
-            std::fs::write(log_path(&d, age), format!("log {age}\n")).unwrap();
+            std::fs::write(log_path(d, age), format!("log {age}\n")).unwrap();
         }
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Rotation::default().set_aside_with(&d, |step| {
+            Rotation::default().set_aside_with(d, |step| {
                 let moved = matches!(step, RotationStep::Rename(..));
                 step.run()?;
                 assert!(!moved, "injected supervisor crash after moving a log");
@@ -1846,14 +1845,14 @@ mod tests {
             })
         }));
         assert!(interrupted.is_err());
-        let mut log = Log::open(&d).unwrap();
+        let mut log = Log::open(d).unwrap();
         log.line(SystemTime::now(), "after restart").unwrap();
         assert!(
-            (0..=EARLIER_LOGS).any(|age| read(&log_path(&d, age)).contains("log 0\n")),
+            (0..=EARLIER_LOGS).any(|age| read(&log_path(d, age)).contains("log 0\n")),
             "the current log was stranded outside the archive chain"
         );
         assert_eq!(
-            std::fs::read_dir(&d)
+            std::fs::read_dir(d)
                 .unwrap()
                 .filter(|e| e.as_ref().unwrap().file_name() != LOG_LOCK)
                 .count(),
@@ -1864,7 +1863,6 @@ mod tests {
             .unwrap();
         assert_eq!(texts(&log.path()), ["after normal rotation"]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     fn seed_archives(dir: &Path, ages: &[usize]) {
@@ -1913,7 +1911,8 @@ mod tests {
     #[test]
     fn a_restart_after_each_forward_step_recovers_from_files_alone() {
         for ages in [&[0, 1, 2, 3, 4][..], &[0, 2, 4][..]] {
-            let d = dir(&format!("forward-restart-{}", ages.len()));
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path().join("logs");
             seed_archives(&d, ages);
             let mut count = 0;
             Rotation::default()
@@ -1960,7 +1959,8 @@ mod tests {
     #[test]
     fn a_restart_after_each_undo_step_recovers_from_files_alone() {
         for ages in [&[0, 1, 2, 3, 4][..], &[0, 2, 4][..]] {
-            let d = dir(&format!("undo-restart-{}", ages.len()));
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path().join("logs");
             for staged in 1..=ages.len() {
                 for crash in 1..=staged + 1 {
                     seed_archives(&d, ages);
@@ -2055,7 +2055,8 @@ mod tests {
 
     #[test]
     fn the_writer_keeps_one_bounded_fifo_and_counts_both_kinds_of_loss() {
-        let d = dir("writer-fifo");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let (entered, opening) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let mut writer = Writer::with_open(&d, move |dir| {
@@ -2103,12 +2104,12 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("cannot fit")));
         assert_eq!(writer.notices_dropped.load(Ordering::Relaxed), 0);
         drop(writer);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_terminal_only_exit_does_not_touch_the_logs_folder() {
-        let d = dir("terminal-only");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut writer = Writer::open(&d);
         writer.terminal("a supervisor is already running");
         writer.finish(Instant::now() + LAST_LINES);
@@ -2167,11 +2168,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_blocked_log_open_does_not_prevent_a_child_restart() {
-        let d = dir("open-restart");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let (release, gate) = mpsc::sync_channel(1);
         restart_while_log_is_blocked(
-            d,
+            d.to_path_buf(),
             move |dir| {
                 gate.recv_timeout(Duration::from_secs(10)).unwrap();
                 Log::open(dir).unwrap()
@@ -2185,8 +2186,8 @@ mod tests {
     fn a_blocked_log_write_does_not_prevent_a_child_restart() {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
-        let d = dir("file-restart");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let (mut sink, blocked) = UnixStream::pair().unwrap();
         sink.set_nonblocking(true).unwrap();
         loop {
@@ -2199,7 +2200,7 @@ mod tests {
         sink.set_nonblocking(false).unwrap();
         let fd: OwnedFd = sink.into();
         restart_while_log_is_blocked(
-            d,
+            d.to_path_buf(),
             move |dir| {
                 let mut log = Log::open(dir).unwrap();
                 log.file = Some(File::from(fd));
@@ -2211,7 +2212,8 @@ mod tests {
 
     #[test]
     fn a_contended_logs_lock_keeps_the_child_running_without_touching_logs() {
-        let d = dir("contended-log-owner");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let owner = Log::open(&d).unwrap();
         let before = archive_files(&d);
         let other = Log::open(&d).expect("logs ownership must not stop tracking");
@@ -2239,12 +2241,12 @@ mod tests {
         let recovered = Log::open(&d).unwrap();
         assert!(recovered.lock.is_some());
         drop(recovered);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_real_write_failure_backs_off_before_touching_the_file_again() {
-        let d = dir("write-backoff");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         // An actual OS write failure on an otherwise readable, empty regular file.
         log.file = Some(File::open(log.path()).unwrap());
@@ -2265,7 +2267,6 @@ mod tests {
         log.line_at(SystemTime::now(), "recovered", retry).unwrap();
         assert_eq!(texts(&log.path()), ["recovered"]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -2328,7 +2329,8 @@ mod tests {
 
     #[test]
     fn a_writer_spawn_failure_preserves_the_queue_and_does_not_stop_the_child() {
-        let d = dir("writer-spawn-failure");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut writer = Writer::with_spawn(
             &d,
             |dir| Log::open(dir).unwrap(),
@@ -2394,13 +2396,12 @@ mod tests {
         assert!(lines.iter().any(|line| line == "recovered"));
         assert_eq!(writer.dropped.load(Ordering::Relaxed), 0);
         drop(writer);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn writer_failures_reach_stderr_once_when_writing_resumes() {
-        let d = dir("writer-failure-notices");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         for (test, reason) in [
             (
                 "a_panicking_writer_is_replaced_while_the_child_keeps_running",
@@ -2446,12 +2447,12 @@ mod tests {
             assert!(stderr.contains(reason), "{stderr}");
             assert!(stderr.contains("Tracking continues"), "{stderr}");
         }
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_failed_writer_is_not_replaced_until_its_teardown_finishes() {
-        let d = dir("writer-teardown");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let (started, teardown) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let mut writer = Writer::with_open(&d, move |dir| {
@@ -2477,12 +2478,12 @@ mod tests {
             "a writer still releasing files must not be replaced"
         );
         drop(writer);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_panicking_writer_is_replaced_while_the_child_keeps_running() {
-        let d = dir("panicking-writer");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut writer = Writer::with_open(&d, |_| panic!("injected writer open failure"));
         let mut runs = 0;
         assert_eq!(
@@ -2513,12 +2514,12 @@ mod tests {
         assert!(writer.failure_reported);
         assert!(texts(writer.path()).iter().any(|line| line == "recovered"));
         drop(writer);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn maintenance_and_full_log_output_share_one_rotation_retry_deadline() {
-        let d = dir("shared-rotation-deadline");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let blocker = log_path(&d, 1);
         std::fs::create_dir_all(&blocker).unwrap();
         File::create(log_path(&d, 0))
@@ -2563,12 +2564,12 @@ mod tests {
             .iter()
             .any(|line| line.contains("dropped 15 daemon output lines")));
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_quiet_child_retries_recovery_after_a_startup_blocker_is_removed() {
-        let d = dir("quiet-startup-recovery");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let staging = rotation_dir(&d);
         std::fs::create_dir(&staging).unwrap();
@@ -2591,12 +2592,12 @@ mod tests {
         assert_eq!(read(&log.path()), "");
         log.line(SystemTime::now(), "after recovery").unwrap();
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_write_retry_does_not_require_a_blocked_rotation_to_succeed() {
-        let d = dir("write-retry-with-blocked-rotation");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let blocker = log_path(&d, 1);
         std::fs::create_dir_all(&blocker).unwrap();
         std::fs::write(log_path(&d, 0), "x previous\n").unwrap();
@@ -2617,12 +2618,12 @@ mod tests {
         assert_eq!(texts(&log.path()), expected);
         assert!(blocker.is_dir());
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_quiet_child_recovers_after_a_replacement_cannot_be_opened() {
-        let d = dir("quiet-replacement");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "before").unwrap();
         let at = Instant::now();
@@ -2643,15 +2644,14 @@ mod tests {
             .any(|l| l.contains("dropped 3 daemon output lines")));
         assert_eq!(log.dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn a_full_supervisor_stderr_does_not_prevent_a_child_restart() {
         use std::os::fd::{AsRawFd, FromRawFd};
-        let d = dir("stderr-restart");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let mut fds = [-1; 2];
         // SAFETY: pipe initializes both descriptors, each then owned by one File.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -2679,7 +2679,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("CV1TOUCH_TEST_STDERR_RESTART", &d)
+            .env("CV1TOUCH_TEST_STDERR_RESTART", d)
             .stdout(Stdio::null())
             .stderr(Stdio::from(write))
             .spawn()
@@ -2698,7 +2698,6 @@ mod tests {
         };
         drop(read);
         let restarted = d.join("restarted").exists();
-        std::fs::remove_dir_all(d).unwrap();
         assert!(
             status.is_some_and(|s| s.success()),
             "supervision waited for stderr: {status:?}"
@@ -2737,7 +2736,8 @@ mod tests {
 
     #[test]
     fn round6_initial_metadata_failures_retry_opening_without_aging_logs() {
-        let d = dir("initial-metadata");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let mut log = Log::open_using(
             &d,
@@ -2780,12 +2780,12 @@ mod tests {
         log.line(SystemTime::now(), "recovered").unwrap();
         assert_eq!(texts(&log.path()), ["recovered"]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn round6_logging_retries_without_waiting_for_more_child_output() {
-        let d = dir("quiet-retry");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         std::fs::create_dir_all(log_path(&d, 0)).unwrap();
         let mut log = Log::open(&d).unwrap();
         let until = log.rotate_after.unwrap();
@@ -2802,12 +2802,12 @@ mod tests {
             .any(|l| l.contains("dropped 2 daemon output lines")));
         assert_eq!(log.dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn round6_a_startup_move_failure_names_the_locked_log() {
-        let d = dir("initial-rename");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let mut log = Log::open_with(&d, |step| match &step {
             RotationStep::Rename(from, _) if *from == log_path(&d, 0) => Err(io::Error::new(
@@ -2828,12 +2828,12 @@ mod tests {
         log.line(SystemTime::now(), "goes on").unwrap();
         assert_eq!(texts(&log.path()).last().unwrap(), "goes on");
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn round6_a_folder_at_the_current_log_does_not_stop_the_daemon() {
-        let d = dir("unwritable-current");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let current = log_path(&d, 0);
         std::fs::create_dir_all(&current).unwrap();
         std::fs::write(current.join("keep"), "unrelated data").unwrap();
@@ -2860,18 +2860,17 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "recovered");
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn round6_a_link_at_the_current_log_does_not_stop_the_daemon() {
-        let d = dir("unwritable-link");
-        std::fs::create_dir_all(&d).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
         let target = d.join("unrelated");
         std::fs::write(&target, "keep this").unwrap();
-        std::os::unix::fs::symlink(&target, log_path(&d, 0)).unwrap();
-        let mut log = Log::open(&d).expect("a link must not stop tracking");
+        std::os::unix::fs::symlink(&target, log_path(d, 0)).unwrap();
+        let mut log = Log::open(d).expect("a link must not stop tracking");
         let dropped = Arc::clone(&log.dropped);
         output_line(&mut log, &dropped, "lost");
         assert_eq!(log.dropped.load(Ordering::Relaxed), 1);
@@ -2882,23 +2881,22 @@ mod tests {
         output_line(&mut log, &dropped, "recovered");
         assert_eq!(texts(&log.path()).last().unwrap(), "recovered");
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
     fn round6_a_locked_current_log_does_not_stop_the_daemon() {
         use std::os::windows::fs::OpenOptionsExt;
-        let d = dir("unwritable-lock");
-        std::fs::create_dir_all(&d).unwrap();
-        let current = log_path(&d, 0);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let current = log_path(d, 0);
         std::fs::write(&current, "x previous\n").unwrap();
         let held = File::options()
             .read(true)
             .share_mode(0)
             .open(&current)
             .unwrap();
-        let mut log = Log::open(&d).expect("a locked file must not stop tracking");
+        let mut log = Log::open(d).expect("a locked file must not stop tracking");
         let dropped = Arc::clone(&log.dropped);
         output_line(&mut log, &dropped, "lost");
         assert_eq!(log.dropped.load(Ordering::Relaxed), 1);
@@ -2909,15 +2907,15 @@ mod tests {
         assert_eq!(texts(&log.path()).last().unwrap(), "recovered");
         assert!(
             read(&log.path()).starts_with("x previous\n")
-                || read(&log_path(&d, 1)) == "x previous\n"
+                || read(&log_path(d, 1)) == "x previous\n"
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn round6_an_unavailable_logs_folder_does_not_stop_the_daemon() {
-        let d = dir("unwritable-dir");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         std::fs::write(&d, "unrelated data").unwrap();
         let mut log = Log::open(&d).expect("a log folder error must not stop tracking");
         let dropped = Arc::clone(&log.dropped);
@@ -2931,12 +2929,12 @@ mod tests {
         assert_eq!(texts(&log.path()).last().unwrap(), "recovered");
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn round6_two_log_owners_cannot_recover_the_same_state() {
-        let d = dir("logs-lock");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let first = Log::open(&d).unwrap();
         let before = archive_files(&d);
@@ -2948,12 +2946,12 @@ mod tests {
         let second = Log::open(&d).unwrap();
         assert!(second.lock.is_some());
         drop(second);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_notice_lost_during_opening_keeps_its_count() {
-        let d = dir("opening-notice-count");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         std::fs::create_dir_all(log_path(&d, 1)).unwrap();
         File::create(log_path(&d, 0))
             .unwrap()
@@ -2977,14 +2975,14 @@ mod tests {
             .filter_map(|line| line.split_once(" supervisor notice"))
             .map(|(count, _)| count.parse::<u64>().unwrap())
             .sum();
-        std::fs::remove_dir_all(d).unwrap();
         // The blocked-opening notice, then the child's started and stopped notices.
         assert_eq!(lost, 3, "{stderr}");
     }
 
     #[test]
     fn round6_unavailable_logging_is_reported_to_supervisor_stderr() {
-        let d = dir("notice-stderr");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         std::fs::create_dir_all(log_path(&d, 0)).unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -3008,7 +3006,6 @@ mod tests {
         );
         assert!(stderr.contains("Tracking isn't affected"), "{stderr}");
         assert!(!stderr.contains("rotate"), "{stderr}");
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -3028,7 +3025,8 @@ mod tests {
     #[test]
     fn a_refused_recovery_blocks_rotation_but_not_the_daemon() {
         for kind in 0..7 {
-            let d = dir(&format!("foreign-staging-{kind}"));
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path().join("logs");
             let blocker = seed_refusal(&d, kind);
             let current = PathBuf::from(format!("{LOG_NAME}.log"));
             let mut before = archive_files(&d);
@@ -3086,7 +3084,8 @@ mod tests {
     fn a_blocked_rotation_resumes_when_the_file_in_the_way_is_moved() {
         for kind in [0, 3, 5] {
             for restart in [false, true] {
-                let d = dir(&format!("blocked-resumes-{kind}-{restart}"));
+                let tmp = tempfile::tempdir().unwrap();
+                let d = tmp.path().join("logs");
                 let blocker = seed_refusal(&d, kind);
                 let mut log = Log::open(&d).unwrap();
                 log.line(SystemTime::now(), "goes on").unwrap();
@@ -3170,7 +3169,8 @@ mod tests {
         for committed in [false, true] {
             let steps = if committed { 7 } else { 4 };
             for failure in 1..=steps {
-                let d = dir(&format!("recovery-io-{committed}-{failure}"));
+                let tmp = tempfile::tempdir().unwrap();
+                let d = tmp.path().join("logs");
                 seed_archives(&d, &[0, 1, 2, 3, 4]);
                 let staging = rotation_dir(&d);
                 std::fs::create_dir(&staging).unwrap();
@@ -3239,7 +3239,8 @@ mod tests {
     /// too; the daemon starts all the same.
     #[test]
     fn a_failed_move_and_undo_at_startup_do_not_stop_the_daemon() {
-        let d = dir("startup-undo");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let staging = rotation_dir(&d);
         let mut log = Log::open_with(&d, |step| match &step {
@@ -3256,12 +3257,12 @@ mod tests {
         .unwrap_or_else(|e| panic!("the daemon could not start: {e}"));
         assert_started_blocked(&mut log, &staging, 0..=EARLIER_LOGS);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_start_that_undoes_an_interrupted_rotation_begins_a_new_log() {
-        let d = dir("undone-start");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         seed_archives(&d, &[0, 1, 2, 3, 4]);
         let staging = rotation_dir(&d);
         std::fs::create_dir(&staging).unwrap();
@@ -3274,12 +3275,12 @@ mod tests {
         }
         assert!(!rotation_dir(&d).exists());
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn every_failed_rotation_step_can_be_recovered() {
-        let d = dir("rotation-steps");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         for failure in 1..=14 {
             seed_archives(&d, &[0, 1, 2, 3, 4]);
             let mut calls = 0;
@@ -3309,7 +3310,8 @@ mod tests {
 
     #[test]
     fn an_interrupted_restore_finishes_before_another_rotation() {
-        let d = dir("rotation-restore");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "original").unwrap();
         let original = read(&log.path());
@@ -3370,7 +3372,6 @@ mod tests {
             EARLIER_LOGS + 1
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     fn archive_files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -3403,7 +3404,8 @@ mod tests {
 
     #[test]
     fn metadata_failures_do_not_rotate_the_replacement_again() {
-        let d = dir("replacement-archives");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "kept").unwrap();
         let before = read(&log.path());
@@ -3443,17 +3445,13 @@ mod tests {
         assert_eq!(read(&log_path(&d, 2)), before);
         assert_eq!(texts(&log.path()), ["next"]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn reopening_or_metadata_failure_backs_off_the_whole_rotation() {
         for metadata in [false, true] {
-            let d = dir(if metadata {
-                "metadata-backoff"
-            } else {
-                "open-backoff"
-            });
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path().join("logs");
             let mut log = Log::open(&d).unwrap();
             log.line(SystemTime::now(), "kept").unwrap();
             let before = read(&log.path());
@@ -3496,19 +3494,13 @@ mod tests {
 
     #[test]
     fn an_existing_log_counts_toward_the_limit_when_rotation_fails() {
-        let d = dir("existing-size");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         std::fs::create_dir_all(log_path(&d, 1).join("occupied")).unwrap();
         std::fs::write(log_path(&d, 0), b"x existing\n").unwrap();
         let log = Log::open(&d).unwrap();
         assert_eq!(log.written, std::fs::metadata(log.path()).unwrap().len());
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
-    }
-
-    fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cv1t-supervise-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
     }
 
     fn read(path: &Path) -> String {
@@ -3623,7 +3615,8 @@ mod tests {
 
     #[test]
     fn each_start_begins_a_new_log_and_keeps_four_earlier_ones() {
-        let d = dir("rotate");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         for n in 0..6 {
             let mut log = Log::open(&d).unwrap();
             log.line(SystemTime::now(), &format!("run {n}\n")).unwrap();
@@ -3633,12 +3626,12 @@ mod tests {
             assert_eq!(texts(&log_path(&d, age)), [format!("run {}", 5 - age)]);
         }
         assert!(!log_path(&d, 5).exists());
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_full_log_is_set_aside() {
-        let d = dir("full");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "first").unwrap();
         log.written = LOG_MAX_BYTES;
@@ -3646,13 +3639,13 @@ mod tests {
         assert_eq!(texts(&log_path(&d, 1)), ["first"]);
         assert_eq!(texts(&log_path(&d, 0)), ["second"]);
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// A sharing lock on the current log leaves all earlier logs where they were.
     #[test]
     fn earlier_logs_survive_a_current_log_that_cannot_be_moved() {
-        let d = dir("stuck");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Log::open(&d).unwrap();
         log.line(SystemTime::now(), "current").unwrap();
         for age in 1..=4 {
@@ -3676,7 +3669,6 @@ mod tests {
             assert_eq!(texts(&log_path(&d, age)), [format!("run {age}")]);
         }
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// When the newest earlier log cannot make room (here directories stand in the earlier logs'
@@ -3684,7 +3676,8 @@ mod tests {
     /// it.
     #[test]
     fn a_log_that_cannot_be_set_aside_stays_the_current_one() {
-        let d = dir("no-room");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         for age in 1..=4 {
             std::fs::create_dir_all(log_path(&d, age).join("occupied")).unwrap();
         }
@@ -3706,7 +3699,6 @@ mod tests {
         assert_eq!(lines[2], "goes on");
         assert!(!rotation_dir(&d).exists());
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -3811,9 +3803,9 @@ mod tests {
 
     #[test]
     fn asked_to_stop_the_supervisor_asks_the_daemon_and_waits_for_it() {
-        let d = dir("asked");
-        std::fs::create_dir_all(&d).unwrap();
-        let mut log = Writer::open(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut log = Writer::open(d);
         let file = d.join("stop");
         let asked = file.clone();
         let mut stopping = stop_after(
@@ -3834,15 +3826,14 @@ mod tests {
             .starts_with("cv1touchd supervisor: the daemon stopped"));
         assert!(!lines.iter().any(|l| l.contains("ending it")), "{lines:?}");
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// A daemon that does not take requests yet (it is just starting) is asked again.
     #[test]
     fn a_daemon_not_yet_taking_requests_is_asked_again() {
-        let d = dir("not-yet");
-        std::fs::create_dir_all(&d).unwrap();
-        let mut log = Writer::open(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut log = Writer::open(d);
         let file = d.join("stop");
         let asked = file.clone();
         let mut tries = 0;
@@ -3869,14 +3860,13 @@ mod tests {
         );
         assert!(!lines.iter().any(|l| l.contains("ending it")), "{lines:?}");
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_daemon_that_does_not_stop_when_asked_is_ended() {
-        let d = dir("deaf");
-        std::fs::create_dir_all(&d).unwrap();
-        let mut log = Writer::open(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut log = Writer::open(d);
         let file = d.join("never");
         let mut stopping = stop_when_ready(&file, || Ok(()), Duration::from_secs(10));
         let code = run(|| stand_in(&file), &mut log, quick(10, 5), &mut stopping);
@@ -3889,7 +3879,6 @@ mod tests {
             "{lines:?}"
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// A request once the stand-in is running, and the time it has to stop after accepting it.
@@ -3985,9 +3974,9 @@ mod tests {
 
     #[test]
     fn a_stop_while_waiting_to_start_the_daemon_again_ends_the_supervisor() {
-        let d = dir("waiting");
-        std::fs::create_dir_all(&d).unwrap();
-        let mut log = Writer::open(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut log = Writer::open(d);
         // The stop comes once the supervisor is waiting to start the daemon again. A stop after
         // a fixed time arrived while the daemon still ran on a loaded machine, and stopped that
         // run instead. Counting starts checks the restart did not happen: a wall-clock bound
@@ -4013,7 +4002,6 @@ mod tests {
             "cv1touchd supervisor: Ctrl+C: not starting the daemon again"
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     fn quick(delay_ms: u64, quick_failures: usize) -> Policy {
@@ -4026,7 +4014,8 @@ mod tests {
 
     #[test]
     fn a_failing_daemon_runs_again_after_the_delay_until_the_limit() {
-        let d = dir("fails");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Writer::open(&d);
         let mut runs = 0;
         let started = Instant::now();
@@ -4067,12 +4056,12 @@ mod tests {
              not starting it again"
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_clean_stop_ends_the_supervisor() {
-        let d = dir("stops");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Writer::open(&d);
         let mut runs = 0;
         let code = run(
@@ -4090,12 +4079,12 @@ mod tests {
             .unwrap()
             .starts_with("cv1touchd supervisor: the daemon stopped"));
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn arguments_the_daemon_refuses_end_the_supervisor() {
-        let d = dir("usage");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Writer::open(&d);
         let mut runs = 0;
         let code = run(
@@ -4109,12 +4098,12 @@ mod tests {
         );
         assert_eq!((code, runs), (1, 1));
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_daemon_that_cannot_start_is_tried_again() {
-        let d = dir("missing");
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("logs");
         let mut log = Writer::open(&d);
         let code = run(
             || Command::new(d.join("no-such-daemon")),
@@ -4130,7 +4119,6 @@ mod tests {
             .count();
         assert_eq!(tries, 2, "{lines:?}");
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// Something the daemon started that still holds its output does not keep the supervisor
@@ -4138,9 +4126,9 @@ mod tests {
     /// daemon's last lines; waiting for that output would record the line.
     #[test]
     fn the_daemon_ending_is_seen_while_its_output_is_still_held() {
-        let d = dir("held");
-        std::fs::create_dir_all(&d).unwrap();
-        let mut log = Writer::open(&d);
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let mut log = Writer::open(d);
         #[cfg(windows)]
         std::fs::write(
             d.join("hold.cmd"),
@@ -4173,6 +4161,5 @@ mod tests {
             "the supervisor waited for output that outlived the daemon: {lines:?}"
         );
         drop(log);
-        std::fs::remove_dir_all(d).unwrap();
     }
 }

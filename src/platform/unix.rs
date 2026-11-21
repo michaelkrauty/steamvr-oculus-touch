@@ -1623,7 +1623,8 @@ mod tests {
 
     #[test]
     fn process_scan_matches_exact_kernel_names_and_ignores_exited_processes() {
-        let proc = std::env::temp_dir().join(format!("cv1t-process-scan-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path();
         let node = |pid: &str, name: &[u8]| {
             std::fs::create_dir_all(proc.join(pid)).unwrap();
             std::fs::write(proc.join(pid).join("comm"), name).unwrap();
@@ -1633,19 +1634,20 @@ mod tests {
         node("self", b"vrserver\n");
         node("14", b"VRSERVER\n");
         std::fs::create_dir_all(proc.join("13")).unwrap();
-        assert!(!process_running_in(&proc, "vrserver").unwrap());
+        assert!(!process_running_in(proc, "vrserver").unwrap());
         node("15", b"vrserver\n");
-        assert!(process_running_in(&proc, "vrserver").unwrap());
+        assert!(process_running_in(proc, "vrserver").unwrap());
         let long = "cv1touch-long-process";
         node("16", format!("{}\n", &long[..PROCESS_NAME_MAX]).as_bytes());
-        assert!(process_running_in(&proc, long).unwrap());
-        std::fs::remove_dir_all(&proc).unwrap();
-        assert!(process_running_in(&proc, "vrserver").is_err());
+        assert!(process_running_in(proc, long).unwrap());
+        std::fs::remove_dir_all(proc).unwrap();
+        assert!(process_running_in(proc, "vrserver").is_err());
     }
 
     #[test]
     fn finds_the_headset_interfaces_among_the_hidraw_nodes() {
-        let sys = std::env::temp_dir().join(format!("cv1t-hidraw-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path();
         let node = |name: &str, uevent: &str| {
             let dir = sys.join(name).join("device");
             std::fs::create_dir_all(&dir).unwrap();
@@ -1658,20 +1660,19 @@ mod tests {
         node("hidraw27", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input0\n");
         node("hidraw26", "DRIVER=hid-generic\nHID_ID=0003:00002833:00000031\nHID_NAME=Oculus VR, Inc. Rift\nHID_PHYS=usb-0000:02:00.0-1.1/input1\n");
         assert_eq!(
-            headset_hidraw(&sys, 1),
+            headset_hidraw(sys, 1),
             Some(std::path::PathBuf::from("/dev/hidraw26"))
         );
         assert_eq!(
-            headset_hidraw(&sys, 0),
+            headset_hidraw(sys, 0),
             Some(std::path::PathBuf::from("/dev/hidraw27"))
         );
         std::fs::remove_dir_all(sys.join("hidraw26")).unwrap();
         assert_eq!(
-            headset_hidraw(&sys, 1),
+            headset_hidraw(sys, 1),
             None,
             "the headset's other interface is not the radio"
         );
-        std::fs::remove_dir_all(&sys).unwrap();
     }
 
     #[test]
@@ -1679,8 +1680,8 @@ mod tests {
         use std::fs::DirBuilder;
         use std::os::unix::fs::DirBuilderExt;
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("cv1t-lockdir-{}", std::process::id()));
-        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let target = dir.join("target");
         let link = dir.join("link");
         DirBuilder::new().mode(0o700).create(&target).unwrap();
@@ -1694,7 +1695,6 @@ mod tests {
             private_lock_directory(&target).is_err(),
             "accepted a shared lock directory"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn recycled_usb_address(incarnation_available: bool) {
@@ -1780,8 +1780,8 @@ mod tests {
 
     #[test]
     fn hotplug_linux_reads_only_rift_sensor_metadata_and_waits_for_access() {
-        let root = std::env::temp_dir().join(format!("cv1t-hotplug-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let (sys, dev) = (root.join("sys"), root.join("dev"));
         let file = |name: &str, value: &str| {
             let path = sys.join(name);
@@ -1845,7 +1845,6 @@ mod tests {
             usb_sensors_in(&sys, &dev).unwrap().is_empty(),
             "a missing serial is still enumerating or leaving, not a failure of the whole scan"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// NotFound is a missing attribute. ENODEV is a node that leaves between open and read.
@@ -1869,8 +1868,8 @@ mod tests {
     #[test]
     fn one_unreadable_sensor_entry_does_not_hide_another() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("cv1t-hotplug-skip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let (sys, dev) = (root.join("sys"), root.join("dev"));
         let file = |name: &str, value: &str| {
             let path = sys.join(name);
@@ -1908,7 +1907,6 @@ mod tests {
             usb_sensors_in(&sys, &dev).is_err(),
             "a garbled bus number is not a device that is leaving"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A tree laid out as /sys/bus/usb/devices: a sensor with its video interface bound to
@@ -1916,8 +1914,8 @@ mod tests {
     #[test]
     fn usb_devices_are_read_from_sysfs() {
         use crate::platform::usb::Node;
-        let root = std::env::temp_dir().join(format!("cv1t-sysfs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let file = |path: &str, text: &str| {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1954,7 +1952,7 @@ mod tests {
                 parent: parent.map(String::from),
             };
         assert_eq!(
-            usb_devices_in(&root, 0x2833).unwrap(),
+            usb_devices_in(root, 0x2833).unwrap(),
             [
                 node("1-2", 0x0211, "Rift Sensor (5000 Mb/s)", Some("usb"), None),
                 node(
@@ -1969,15 +1967,13 @@ mod tests {
                 node("3-1.2", 0x0330, "", None, None),
             ]
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn unreadable_usb_identity_is_unknown_instead_of_an_absent_sensor() {
         for field in ["idVendor", "idProduct"] {
-            let root = std::env::temp_dir()
-                .join(format!("cv1t-usb-identity-{}-{field}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
             let device = root.join("1-2");
             std::fs::create_dir_all(&device).unwrap();
             std::fs::write(device.join("idVendor"), "2833\n").unwrap();
@@ -1985,8 +1981,7 @@ mod tests {
             // A directory cannot be read as an identity file, even as an elevated user.
             std::fs::remove_file(device.join(field)).unwrap();
             std::fs::create_dir(device.join(field)).unwrap();
-            let result = usb_devices_in(&root, 0x2833);
-            std::fs::remove_dir_all(&root).unwrap();
+            let result = usb_devices_in(root, 0x2833);
             assert!(
                 result.is_err(),
                 "unreadable {field} became known absence: {result:?}"
@@ -1999,8 +1994,8 @@ mod tests {
     #[test]
     fn a_sensor_is_opened_through_its_device_file() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("cv1t-usb-open-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let (sys, dev) = (root.join("sys"), root.join("dev"));
         std::fs::create_dir_all(sys.join("2-5")).unwrap();
         std::fs::create_dir_all(dev.join("002")).unwrap();
@@ -2024,7 +2019,6 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

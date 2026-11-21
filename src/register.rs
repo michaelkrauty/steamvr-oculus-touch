@@ -864,7 +864,8 @@ mod tests {
                 touch: [Some(*c), None],
             })
             .collect();
-        let file = std::env::temp_dir().join(format!("cv1t-session-{}.json", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cv1t-session.json");
         save_session(&file, "LHR-TEST-REFERENCE", 1772213422, &samples).unwrap();
         let (serial, universe, back) = load_session(&file).unwrap();
         assert_eq!(
@@ -879,7 +880,6 @@ mod tests {
             1e-5,
             1e-4,
         );
-        std::fs::remove_file(&file).ok();
     }
 
     /// 90 s at 100 Hz: the Touch and the reference resting on a desk, picked up, clamped

@@ -1389,8 +1389,8 @@ mod tests {
 
     #[test]
     fn mixed_case_landmarks_follow_frames_and_forget_the_same_sensor() {
-        let path =
-            std::env::temp_dir().join(format!("cv1t-landmark-case-{}.json", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1t-landmark-case.json");
         let refs = vec![Landmark {
             serial: "camera1".into(),
             x: 100.0,
@@ -1419,7 +1419,6 @@ mod tests {
         assert!(m.refs.is_empty() && m.seen.is_empty() && m.latest.is_empty());
         assert_eq!(forget_in_file(&path, "CAMERA1").unwrap(), 1);
         assert!(load(&path).unwrap().landmarks.is_empty());
-        std::fs::remove_file(path).unwrap();
     }
 
     fn jitter(k: usize) -> Vector2<f64> {

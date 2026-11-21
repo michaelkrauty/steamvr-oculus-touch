@@ -127,7 +127,8 @@ mod tests {
 
     #[test]
     fn biases_round_trip_and_a_missing_file_is_empty() {
-        let dir = std::env::temp_dir().join(format!("cv1touch-biases-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("sub/imu-biases.json");
         assert_eq!(load(&path), BiasFile::default());
         let mut f = BiasFile::default();
@@ -143,6 +144,5 @@ mod tests {
         assert_eq!(load(&path), f);
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(load(&path), BiasFile::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

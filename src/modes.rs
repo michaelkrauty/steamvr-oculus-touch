@@ -88,13 +88,6 @@ mod tests {
         }
     }
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("cv1t-modes-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("calibration.json")
-    }
-
     #[test]
     fn capture_observes_only_and_keeps_the_rest() {
         let o = capture(&EngineOptions {
@@ -120,23 +113,23 @@ mod tests {
 
     #[test]
     fn calibrated_loads_the_file() {
-        let path = tmp("ok");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         file::save(&path, &CalibrationFile::example()).unwrap();
         let (o, n) = calibrated(&base(), &path).unwrap();
         assert_eq!(n, 2);
         assert!(o.fixed_poses_only);
         assert_eq!(o.fixed_poses[0].serial, "WMTD000000001");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// Review Focus 4: a bad file is an error (the daemon then keeps its current mode).
     #[test]
     fn failed_load_is_an_error_and_changes_nothing() {
-        let path = tmp("bad");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         assert!(calibrated(&base(), &path).is_err()); // missing
         std::fs::write(&path, "{\"format\":\"cv1touch-calibration\"}").unwrap();
         assert!(calibrated(&base(), &path).is_err()); // incomplete
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -182,7 +175,8 @@ mod tests {
     /// Review fix 4: in calibrated mode an open sensor without a pose only observes; name it.
     #[test]
     fn names_open_sensors_without_a_calibrated_pose() {
-        let path = tmp("unposed");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calibration.json");
         file::save(&path, &CalibrationFile::example()).unwrap();
         let (o, _) = calibrated(&base(), &path).unwrap();
         let open = [
@@ -196,6 +190,5 @@ mod tests {
         );
         assert!(unposed_sensors(&provisional(&o), &open).is_empty());
         assert!(unposed_sensors(&capture(&o), &open).is_empty());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

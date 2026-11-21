@@ -1313,7 +1313,8 @@ mod tests {
             l.record(1, 100 + k as u64, &c);
         }
         assert_eq!(l.of(1).len(), MAX_LAYOUTS);
-        let dir = std::env::temp_dir().join(format!("cv1t-layouts-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("station-layouts.json");
         assert_eq!(load_layouts(&path), Layouts::default());
         save_layouts(&path, &l).unwrap();
@@ -1327,7 +1328,6 @@ mod tests {
         assert!(record_layout(&path, 3, 3, &b).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         assert_eq!(load_layouts(&path), Layouts::default());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn registration() -> Registration {
@@ -1398,8 +1398,8 @@ mod tests {
 
     #[test]
     fn station_quaternions_are_validated_without_requiring_unit_norm() {
-        let dir = std::env::temp_dir().join(format!("cv1t-station-quats-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("registration.json");
         let mut value = serde_json::to_value(registration()).unwrap();
         value["stations"] = serde_json::json!([{
@@ -1444,14 +1444,12 @@ mod tests {
         value.as_object_mut().unwrap().remove("stations");
         std::fs::write(&path, value.to_string()).unwrap();
         assert!(load_registration(&path).unwrap().stations.is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn zero_and_overflowing_station_quaternions_are_rejected() {
-        let dir =
-            std::env::temp_dir().join(format!("cv1t-bad-station-quats-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("registration.json");
         let mut value = serde_json::to_value(registration()).unwrap();
         // Check every station, not just the first one.
@@ -1472,7 +1470,7 @@ mod tests {
             std::fs::write(&path, value.to_string()).unwrap();
             results.push((q, load_registration(&path)));
         }
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
         let accepted: Vec<_> = results
             .iter()
             .filter(|(_, r)| r.is_ok())
@@ -1492,7 +1490,8 @@ mod tests {
 
     #[test]
     fn files_round_trip_and_validate() {
-        let dir = std::env::temp_dir().join(format!("cv1t-align-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("registration.json");
         assert!(save(&path, &registration()).unwrap().is_none());
         assert_eq!(load_registration(&path).unwrap(), registration());
@@ -1518,6 +1517,5 @@ mod tests {
         wrong.hands[0].hand = "middle".into();
         save(&rpath, &wrong).unwrap();
         assert!(load_render(&rpath).unwrap_err().contains("hand"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -635,8 +635,9 @@ mod tests {
             assert!(fd >= 0);
             libc::close(fd);
         }
-        assert!(matches!(ShmReader::open(&name), Err(ShmError::NotRunning)));
+        let opened = ShmReader::open(&name);
         unsafe { libc::shm_unlink(cname.as_ptr()) };
+        assert!(matches!(opened, Err(ShmError::NotRunning)));
     }
 
     /// A clean stop retires the segment while other threads still hold the writer: readers see

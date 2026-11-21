@@ -150,15 +150,10 @@ pub fn save(path: &Path, s: &Settings) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cv1t-settings-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("settings.json")
-    }
-
     #[test]
     fn bounded_read_rejects_growth_after_metadata_check() {
-        let path = temp("growth");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"").unwrap();
         let file = crate::platform::fs::open_read_nonblocking(&path).unwrap();
@@ -171,24 +166,24 @@ mod tests {
         drop(writer);
         let error = read_bounded(file, &path).unwrap_err();
         assert!(error.contains("byte limit"), "{error}");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn saved_settings_load_back() {
-        let path = temp("round-trip");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
         let s = Settings {
             tilt_deg: Some(3.0),
             ..Settings::default()
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), Ok(s));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn no_file_gives_the_defaults_and_a_bad_one_an_error() {
-        let path = temp("bad");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
         assert_eq!(load(&path), Ok(Settings::default()), "missing");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         for text in [
@@ -199,13 +194,13 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             assert!(load(&path).is_err(), "{text}");
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The tilt (`cv1touch tilt`) is kept with its sign and left out when none.
     #[test]
     fn the_tilt_is_kept_and_none_by_default() {
-        let path = temp("tilt");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
         let s = Settings {
             tilt_deg: Some(-7.5),
             ..Settings::default()
@@ -216,7 +211,6 @@ mod tests {
         assert_eq!(Settings::default().tilt_deg(), 0.0);
         save(&path, &Settings::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("tilt_deg"));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A file from an older version keeps its tilt; its prediction percents and latency
@@ -224,7 +218,8 @@ mod tests {
     /// back, as 100, so that 0.4.3 and earlier still load the file.
     #[test]
     fn an_older_file_keeps_only_the_tilt() {
-        let path = temp("older");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
@@ -247,6 +242,5 @@ mod tests {
             !text.contains("rotation") && !text.contains("latency"),
             "{text}"
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -351,10 +351,8 @@ mod tests {
             frame("WMTD000000001", 1_000_000_000, 7, &[1], 5)
         ])
         .is_ok());
-        let path = std::env::temp_dir().join(format!(
-            "cv1touch-capture-corrupt-{}.rec",
-            std::process::id()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cv1touch-capture-corrupt.rec");
         let mut bytes = vec![0u8; 32];
         bytes[..8].copy_from_slice(recorder::MAGIC);
         bytes[8..12].copy_from_slice(&recorder::VERSION.to_le_bytes());
@@ -374,7 +372,6 @@ mod tests {
         let error =
             load(&path).expect_err("malformed suffix must not become a usable calibration capture");
         assert!(error.contains("payload"), "{error}");
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
