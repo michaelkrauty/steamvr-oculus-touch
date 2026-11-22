@@ -140,6 +140,15 @@ impl SessionInfo {
         (sensors, new)
     }
 
+    /// Marks controller `device`'s LED model written; true if it was not yet.
+    pub fn model_written(&mut self, device: i32) -> bool {
+        let new = !self.models_written.contains(&device);
+        if new {
+            self.models_written.push(device);
+        }
+        new
+    }
+
     /// True once `sensors` (the open serials) and `controllers` LED models are written.
     pub fn complete(&self, sensors: &[String], controllers: usize) -> bool {
         !sensors.is_empty()

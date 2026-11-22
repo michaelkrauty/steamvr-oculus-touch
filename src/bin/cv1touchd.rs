@@ -957,7 +957,9 @@ fn sensor_status(s: &engine::Sensor) -> SensorStatus {
 
 /// Writes whatever session info (the open sensors' intrinsics, each controller's LED model) has
 /// become available and is not in the recording yet: a sensor added while the engine runs is
-/// described once it is open. `sensors`: the engine's sensors, as just read.
+/// described once it is open. A controller's LED model is written here when the recording started
+/// after its tracker got the body (`record_led_model`), or when no tracker takes the body (no
+/// radio thread, or no factory IMU position). `sensors`: the engine's sensors, as just read.
 fn write_session_info(d: &Daemon, e: &Engine, sensors: &[engine::Sensor]) {
     let serials: Vec<String> = sensors.iter().map(engine::sensor_serial).collect();
     let mut session = d.session.lock().unwrap();
@@ -982,15 +984,29 @@ fn write_session_info(d: &Daemon, e: &Engine, sensors: &[engine::Sensor]) {
         );
     }
     for (device, model) in models.iter().filter(|(dev, _)| devices.contains(dev)) {
-        d.rec.write(
-            recorder::LED_MODEL,
-            now,
-            &[
-                &recorder::led_model_prefix(*device, model.len()),
-                recorder::slice_bytes(model),
-            ],
-        );
+        write_led_model(d, now, *device, model);
     }
+}
+
+/// Records controller `device`'s LED model as its tracker gets the body, unless the recording
+/// has it already, so that a replay starts that hand's tracker where the daemon did. The session
+/// info can still write it first, when its check falls in the engine pass that handed the body
+/// over, before the install; the record is then early by at most that gap.
+fn record_led_model(d: &Daemon, device: i32, model: &[engine::LedEntry]) {
+    if d.rec.active() && d.session.lock().unwrap().model_written(device) {
+        write_led_model(d, shm::now_ns(), device, model);
+    }
+}
+
+fn write_led_model(d: &Daemon, at: u64, device: i32, model: &[engine::LedEntry]) {
+    d.rec.write(
+        recorder::LED_MODEL,
+        at,
+        &[
+            &recorder::led_model_prefix(device, model.len()),
+            recorder::slice_bytes(model),
+        ],
+    );
 }
 
 /// The tracking pipeline for an engine just opened: calibrated sensors only (None without any, so
@@ -3370,6 +3386,8 @@ fn thin_own_backups(own: &mut Vec<PathBuf>, backup: PathBuf) {
 struct NewBody {
     hand: usize,
     device_id: i32,
+    /// The engine's LED model, for the recording.
+    model: Vec<engine::LedEntry>,
     leds: Vec<calib::capture::Led>,
     imu: nalgebra::Vector3<f64>,
 }
@@ -3479,13 +3497,14 @@ fn deliver_engine_queues(
     deliver_pose_changes(link, handle);
 }
 
-/// Installs each queued controller body after the queue lock is released. The engine thread
-/// pushes the next body on that lock. A `for` keeps its iterator temporaries until the loop
-/// ends, in every edition, so a `for` over the locked queue would keep it through tracker setup
-/// and the log line.
-fn deliver_new_bodies(queued: &Mutex<Vec<NewBody>>, mut install: impl FnMut(NewBody)) {
+/// Installs each queued controller body after the queue lock is released, recording its LED
+/// model first (`record_led_model`). The engine thread pushes the next body on that lock. A `for`
+/// keeps its iterator temporaries until the loop ends, in every edition, so a `for` over the
+/// locked queue would keep it through tracker setup and the log line.
+fn deliver_new_bodies(d: &Daemon, queued: &Mutex<Vec<NewBody>>, mut install: impl FnMut(NewBody)) {
     let queued = mem::take(&mut *queued.lock().unwrap());
     for body in queued {
+        record_led_model(d, body.device_id, &body.model);
         install(body);
     }
 }
@@ -3687,6 +3706,7 @@ impl BodyFinder {
                     link.bodies.lock().unwrap().push(NewBody {
                         hand: h,
                         device_id: c.device_id,
+                        model,
                         leds,
                         imu,
                     });
@@ -4133,7 +4153,7 @@ fn radio_main(
                     d.shm.signal();
                     holds.note(arrived, shm::now_ns());
                 }
-                deliver_new_bodies(&link.bodies, |b| {
+                deliver_new_bodies(d, &link.bodies, |b| {
                     pipe.body(b.device_id, b.leds.clone(), b.imu);
                     log!(
                         "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
@@ -9675,15 +9695,17 @@ mod tests {
         assert!(link.reposed.lock().unwrap().is_empty());
         assert!(link.biases.lock().unwrap().is_none());
 
-        deliver_new_bodies(&link.bodies, |_| panic!("no body was queued"));
+        let d = status_daemon();
+        deliver_new_bodies(&d, &link.bodies, |_| panic!("no body was queued"));
         link.bodies.lock().unwrap().push(NewBody {
             hand: HAND_LEFT,
             device_id: 1,
+            model: Vec::new(),
             leds: Vec::new(),
             imu: nalgebra::Vector3::zeros(),
         });
         let mut installed = 0;
-        deliver_new_bodies(&link.bodies, |body| {
+        deliver_new_bodies(&d, &link.bodies, |body| {
             assert!(
                 link.bodies.try_lock().is_ok(),
                 "bodies stays locked while a controller body is installed"
@@ -9839,6 +9861,79 @@ mod tests {
             enqueue_frame(&queue, "cam".into(), 1, 8, 12);
         });
         assert_eq!(queue.lock().unwrap().pop_frame(), Some(12));
+    }
+
+    /// A controller's LED model is recorded as its tracker gets the body, before the tracker
+    /// sees any sample, so that a replay starts that hand's tracker there; the session info does
+    /// not write it again. A body taken while nothing records is left to the session info of a
+    /// recording started later.
+    #[test]
+    fn recorder_a_controllers_led_model_is_recorded_as_its_tracker_gets_the_body() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let model = vec![
+            engine::LedEntry {
+                pos: [0.01, 0.02, 0.03],
+                dir: [0.0, 0.0, 1.0],
+            },
+            engine::LedEntry {
+                pos: [-0.01, 0.02, 0.03],
+                dir: [0.0, 1.0, 0.0],
+            },
+        ];
+        let body = |hand, device_id| NewBody {
+            hand,
+            device_id,
+            model: model.clone(),
+            leds: Vec::new(),
+            imu: nalgebra::Vector3::zeros(),
+        };
+        // nothing records: the right hand's model waits for a recording's session info
+        link.bodies
+            .lock()
+            .unwrap()
+            .push(body(HAND_RIGHT, calib::DEVICE_RIGHT));
+        deliver_new_bodies(&d, &link.bodies, |_| ());
+        let dir = socket_dir::SocketDir::new();
+        let path = dir.path().join("bodies.rec");
+        d.rec.start(&path, 1).unwrap();
+        link.bodies
+            .lock()
+            .unwrap()
+            .push(body(HAND_LEFT, calib::DEVICE_LEFT));
+        let (before, records) = (shm::now_ns(), d.rec.stats().records);
+        let mut written = None;
+        deliver_new_bodies(&d, &link.bodies, |b| {
+            assert_eq!(b.hand, HAND_LEFT);
+            written = Some(d.rec.stats().records - records);
+        });
+        let after = shm::now_ns();
+        assert_eq!(
+            written,
+            Some(1),
+            "the model was not recorded before the install"
+        );
+        assert_eq!(
+            d.session.lock().unwrap().plan(
+                &[],
+                &[(calib::DEVICE_LEFT, true), (calib::DEVICE_RIGHT, true)]
+            ),
+            (vec![], vec![calib::DEVICE_RIGHT])
+        );
+        d.rec.stop();
+        let mut reader = recorder::Reader::open(&path).unwrap();
+        let models: Vec<_> = reader
+            .by_ref()
+            .filter(|r| r.rtype == recorder::LED_MODEL)
+            .map(|r| (r.host_ns, recorder::decode_led_model(&r.payload).unwrap()))
+            .collect();
+        assert_eq!(reader.error(), None);
+        assert_eq!(models.len(), 1);
+        let (at, (device, leds)) = &models[0];
+        assert!((before..=after).contains(at));
+        assert_eq!(*device, calib::DEVICE_LEFT);
+        let entries = |m: &[engine::LedEntry]| m.iter().map(|l| (l.pos, l.dir)).collect::<Vec<_>>();
+        assert_eq!(entries(leds), entries(&model));
     }
 
     /// Each engine open is marked in a recording before the new engine's identity notices,

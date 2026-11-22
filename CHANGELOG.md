@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- A recording now carries a controller's LED model from the moment its tracker gets the controller, instead of up to 250 ms later, so a replay starts that controller's tracker where the daemon did and can reproduce a first lock made in between.
+
 ## [0.5.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) - 2026-11-22
 
 ### Fixed
