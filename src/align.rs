@@ -310,6 +310,25 @@ impl Registration {
             placement: w.placement,
         })
     }
+
+    /// The base station SteamVR tracks the headset from (`base`), if no registration measured it:
+    /// it is placed by SteamVR's layouts (`station_map`), or not at all, so the controllers can be
+    /// shown centimetres off until a headset registration made while SteamVR tracks from it
+    /// measures it (`status::unmeasured_base_note`). None for no base, a measured station, or one
+    /// a registration that measured none places by its own layout.
+    pub fn unmeasured_base<'a>(
+        &self,
+        base: Option<&'a str>,
+        layouts: &[Vec<(String, Isometry3<f64>)>],
+    ) -> Option<&'a str> {
+        let b = base?;
+        if let Some(Placement::Measured | Placement::Fit) =
+            self.station_map(layouts).get(b).map(|w| w.placement)
+        {
+            return None;
+        }
+        Some(b)
+    }
 }
 
 /// What the registration is followed through now (`Registration::follow_now`).
@@ -1232,6 +1251,26 @@ mod tests {
         let map = two.station_map(&layouts);
         assert_eq!(map[&world[1].0].placement, Placement::Measured);
         assert_eq!(map[&world[2].0].placement, Placement::Layouts(2));
+    }
+
+    /// Only a station no registration measured is worth a warning: one placed by SteamVR's
+    /// layouts, or one the registration has no place for.
+    #[test]
+    fn a_base_station_no_registration_measured_is_said() {
+        let (world, reg) = fitted(
+            &iso((0.3, -0.7, -2.4), (0.0, 2.3, 0.0)),
+            &[Isometry3::identity(); 3],
+        );
+        assert_eq!(world[0].0, "LHB-A");
+        assert_eq!(reg.unmeasured_base(Some("LHB-A"), &[]), None);
+        assert_eq!(reg.unmeasured_base(None, &[]), None);
+        // a registration that measured none: each station is where its own layout puts it
+        let mut old = reg.clone();
+        old.measured.clear();
+        assert_eq!(old.unmeasured_base(Some(&world[1].0), &[]), None);
+        for b in [world[1].0.as_str(), "LHB-X"] {
+            assert_eq!(reg.unmeasured_base(Some(b), &[]), Some(b));
+        }
     }
 
     /// A registration from before the tracking base was recorded measured none: every station is

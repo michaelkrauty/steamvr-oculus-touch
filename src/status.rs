@@ -339,6 +339,13 @@ pub fn sensor_hotplug_note(
     hotplug_note(&unexplained_pending(value, explained), value)
 }
 
+/// While SteamVR tracks the headset from a base station no headset registration measured
+/// (`alignment.unmeasured_base`), what doctor and the status board say about it.
+pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
+    let b = value["alignment"]["unmeasured_base"].as_str()?;
+    Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from {b}"))
+}
+
 /// The doctor's `sensor_hotplug` check: whether it passes, and the note. A sensor the engine is
 /// opening, one waiting for the headset the engine opens with, or one whose USB change is still
 /// settling needs nothing of its own; one the engine could not open (`open_failed`), or that must

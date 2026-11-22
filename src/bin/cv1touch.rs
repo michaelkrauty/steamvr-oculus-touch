@@ -420,13 +420,27 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     checks.push(("daemon", daemon.is_some(), detail));
     checks.push(("sensor_streams", stream_ok, stream_detail));
     if let Some(d) = &daemon {
-        let (ok, detail) = sensor_poses_check(d);
-        checks.push(("sensor_poses", ok, detail));
-        if let Some((ok, note)) = status::sensor_hotplug_check(d, &explained) {
-            checks.push(("sensor_hotplug", ok, note));
-        }
+        checks.extend(daemon_checks(d, &explained));
     }
     (checks, daemon)
+}
+
+/// The checks `doctor` makes from the daemon's status: the sensors' poses, their hot-plug
+/// state (less the sensors the video check `explained`), and a warning while SteamVR tracks the
+/// headset from a base station no registration measured.
+fn daemon_checks(
+    status: &serde_json::Value,
+    explained: &std::collections::BTreeSet<String>,
+) -> Vec<DoctorCheck> {
+    let (ok, detail) = sensor_poses_check(status);
+    let mut checks = vec![("sensor_poses", ok, detail)];
+    if let Some((ok, note)) = status::sensor_hotplug_check(status, explained) {
+        checks.push(("sensor_hotplug", ok, note));
+    }
+    if let Some(note) = status::unmeasured_base_note(status) {
+        checks.push(("headset_alignment", true, format!("warning: {note}")));
+    }
+    checks
 }
 
 /// A replayed sensor's agreement with the others, with the observed counts the pose watch
@@ -648,6 +662,9 @@ fn status_board(shm_name: &str) -> i32 {
             .as_ref()
             .and_then(|v| status::sensor_hotplug_note(v, &stream_explained))
         {
+            println!("{note}");
+        }
+        if let Some(note) = complete.as_ref().and_then(status::unmeasured_base_note) {
             println!("{note}");
         }
         let _ = io::stdout().flush();
@@ -7340,6 +7357,39 @@ mod tests {
         assert_eq!(
             agreement_line("S0", &a),
             "sensor S0: agrees with the others to 0.50 px median, offset 0.00 px (30 cross-checks); missed 3 of 40 frames with observed LEDs (70 of 100 checks including unlabelled blobs)"
+        );
+    }
+
+    /// `doctor`'s checks from the daemon's status: the sensors' poses and hot-plug state, and a
+    /// warning, which does not fail, while SteamVR tracks the headset from a base station no
+    /// registration measured; nothing of the last otherwise.
+    #[test]
+    fn doctor_checks_the_daemons_status_including_the_headset_alignment() {
+        let status = |base: Option<&str>| {
+            serde_json::json!({
+                "alignment": {"registration": true, "unmeasured_base": base},
+                "sensors": [{"serial": "S0"}],
+                "sensor_hotplug": {"pending": [{"serial": "S1", "state": "opening", "detail": "The engine is opening this sensor"}], "scan_error": null},
+            })
+        };
+        let names = |checks: &[DoctorCheck]| checks.iter().map(|c| c.0).collect::<Vec<_>>();
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(
+            names(&daemon_checks(&status(None), &none)),
+            ["sensor_poses", "sensor_hotplug"]
+        );
+        let checks = daemon_checks(&status(Some("LHB-X")), &none);
+        assert_eq!(
+            names(&checks),
+            ["sensor_poses", "sensor_hotplug", "headset_alignment"]
+        );
+        assert_eq!(
+            checks[2],
+            (
+                "headset_alignment",
+                true,
+                "warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-X".to_string()
+            )
         );
     }
 

@@ -238,6 +238,9 @@ struct Daemon {
     universe_watch_on: AtomicBool,
     /// What the watch follows the registration through now, for `universe-watch`.
     universe_following: Mutex<String>,
+    /// While SteamVR tracks the headset from a base station no registration measured, its serial
+    /// (`align::Registration::unmeasured_base`), for `status`.
+    universe_unmeasured: Mutex<Option<String>>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
     /// `publish_alignment`).
     alignment_publish: Mutex<()>,
@@ -1397,6 +1400,8 @@ fn universe_watch(d: Arc<Daemon>) {
     // since when the base station is placed but SteamVR does not report it, and whether it was said
     let mut held: Option<(std::time::Instant, bool)> = None;
     let say = |text: String| *d.universe_following.lock().unwrap() = text;
+    let unmeasured =
+        |serial: Option<&str>| *d.universe_unmeasured.lock().unwrap() = serial.map(str::to_string);
     while !d.quit.load(Ordering::Acquire) {
         sleep_until(&d, if first { 5_000 } else { UNIVERSE_TICK_MS }, || {
             d.universe_recheck.swap(false, Ordering::AcqRel)
@@ -1404,6 +1409,7 @@ fn universe_watch(d: Arc<Daemon>) {
         first = false;
         if !d.universe_watch_on.load(Ordering::Acquire) {
             say(String::new());
+            unmeasured(None);
             continue;
         }
         match steamvr_log.poll() {
@@ -1424,9 +1430,11 @@ fn universe_watch(d: Arc<Daemon>) {
             }
         }
         let Ok(reg) = align::load_registration(&align::registration_path()) else {
+            unmeasured(None);
             continue;
         };
         if reg.stations.is_empty() {
+            unmeasured(None);
             continue;
         }
         // the station SteamVR tracks the headset from, or last tracked it from in this session
@@ -1455,12 +1463,14 @@ fn universe_watch(d: Arc<Daemon>) {
         let Some(now) = now else {
             if connection.state != UniverseConnectionState::Connected {
                 say(String::new());
+                unmeasured(None);
             }
             continue;
         };
         if now.is_empty() {
             continue;
         }
+        unmeasured(reg.unmeasured_base(base.as_deref(), &layouts.of(reg.universe_id)));
         let seen = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -5605,7 +5615,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -5617,6 +5627,7 @@ fn status_json(d: &Daemon) -> String {
         al.valid & ffi::CV1T_ALIGN_RENDER_LEFT != 0,
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
         al.universe_id,
+        serde_json::to_string(&*d.universe_unmeasured.lock().unwrap()).unwrap(),
         recording_json,
         recording.state == recorder::State::Recording,
         st.records,
@@ -6735,6 +6746,7 @@ fn main() {
         universe_connection: Mutex::new(UniverseConnection::default()),
         universe_watch_on: AtomicBool::new(true),
         universe_following: Mutex::new(String::new()),
+        universe_unmeasured: Mutex::new(None),
         alignment_publish: Mutex::new(()),
         settings_path,
         tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
@@ -8414,6 +8426,21 @@ mod tests {
         assert!(!due[1].began_in_use);
     }
 
+    /// `status` reports, with the alignment, what the universe watch says about a base station
+    /// no registration measured, and nothing otherwise.
+    #[test]
+    fn status_says_when_the_headset_base_station_was_not_measured() {
+        let d = status_daemon();
+        let alignment = |d: &Daemon| {
+            let value: serde_json::Value =
+                serde_json::from_str(status_json(d).strip_prefix("ok ").unwrap()).unwrap();
+            value["alignment"]["unmeasured_base"].clone()
+        };
+        assert_eq!(alignment(&d), serde_json::Value::Null);
+        *d.universe_unmeasured.lock().unwrap() = Some("LHB-X".into());
+        assert_eq!(alignment(&d), "LHB-X");
+    }
+
     #[test]
     fn mixed_case_landmark_status_and_forget_join_device_and_file_names() {
         let d = status_daemon();
@@ -8579,6 +8606,7 @@ mod tests {
             universe_connection: Mutex::new(UniverseConnection::default()),
             universe_watch_on: AtomicBool::new(true),
             universe_following: Mutex::new(String::new()),
+            universe_unmeasured: Mutex::new(None),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
                 .join(format!(

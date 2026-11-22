@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- While SteamVR runs, `cv1touch doctor` and `cv1touch status` warn when SteamVR tracks the headset from a base station that no headset registration measured (`unmeasured_base` in `status --json`), since the controllers can then be shown centimetres off. The warning names the station and says to run `cv1touch setup --redo headset` while SteamVR tracks the headset from it.
+
 ### Fixed
 
 - A recording now carries a controller's LED model from the moment its tracker gets the controller, instead of up to 250 ms later, so a replay starts that controller's tracker where the daemon did and can reproduce a first lock made in between.
