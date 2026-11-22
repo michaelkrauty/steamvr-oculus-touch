@@ -11,6 +11,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- When SteamVR moves its base stations, the controllers now follow within about 0.1 s instead of up to 3 s. The SteamVR driver looks at the stations every 100 ms and reports a change at once, and the daemon follows each report as it arrives.
 - A headset registration whose recording measures no base station, for example because SteamVR moved the station it tracked the headset from, no longer drops the stations measured before: it changes nothing and asks to record again. After writing a registration, `cv1touch setup` now says which station the recording measured and how each base station is placed.
 - A recording now carries a controller's LED model from the moment its tracker gets the controller, instead of up to 250 ms later, so a replay starts that controller's tracker where the daemon did and can reproduce a first lock made in between.
 

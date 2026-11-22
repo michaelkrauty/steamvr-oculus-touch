@@ -72,12 +72,15 @@ void Provider::RunFrame()
 	}
 }
 
-/* Every 2 s, the Lighthouse base stations' raw poses to the daemon, which follows the universe with
- * them: read here inside vrserver, so the daemon needs no SteamVR connection of its own (each one
- * costs vrserver an app connect, binding load and disconnect). */
+/* The Lighthouse base stations' raw poses to the daemon, which follows the universe with them:
+ * read here inside vrserver, so the daemon needs no SteamVR connection of its own (each one costs
+ * vrserver an app connect, binding load and disconnect). Looked at every 100 ms and sent when
+ * they change, so a move SteamVR makes is followed at once, and every 2 s besides
+ * (StationReports). */
 void Provider::station_loop()
 {
 	ControlClient control;
+	StationReports reports;
 	while (running_) {
 		vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 		vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.0f, poses, vr::k_unMaxTrackedDeviceCount);
@@ -92,10 +95,9 @@ void Provider::station_loop()
 				continue;
 			stations.push_back(station_pose(props->GetStringProperty(c, vr::Prop_SerialNumber_String), poses[i].mDeviceToAbsoluteTracking));
 		}
-		if (!stations.empty())
+		if (!stations.empty() && reports.due(stations, cv1t_now_ns()))
 			control.send(stations_line(stations));
-		for (int k = 0; k < 20 && running_; k++)
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
 }
 

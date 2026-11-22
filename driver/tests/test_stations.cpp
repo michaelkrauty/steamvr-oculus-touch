@@ -43,10 +43,46 @@ static void formats_the_line_the_daemon_reads()
 	assert(stations_line({bad, b}).rfind("stations LHB-TEST-B ", 0) == 0);
 }
 
+/* Sent at once on a change of the set or of a pose beyond 0.1 mm or 0.01 deg, else every 2 s. */
+static void reports_a_change_at_once_and_keeps_the_report_fresh()
+{
+	const uint64_t ms = 1'000'000;
+	StationPose a{"LHB-TEST-A", {1.85, 0.36, -2.61}, {0, 0, 0, 1}};
+	StationPose b{"LHB-TEST-B", {-1.5, 0.35, -2.56}, {0, 0, 0, 1}};
+	StationReports r;
+	uint64_t t = 5000 * ms;
+	assert(r.due({a, b}, t));
+	// the same, in another order, and within 0.1 mm and 0.01 deg: not before 2 s
+	StationPose near = a;
+	near.pos[0] += 0.00009;
+	const double h = 0.009 * 3.14159265358979323846 / 360; // half of 0.009 deg, about z
+	near.quat[2] = std::sin(h), near.quat[3] = std::cos(h);
+	for (t += 100 * ms; t < 7000 * ms; t += 100 * ms)
+		assert(!r.due({b, near}, t));
+	assert(r.due({b, near}, t));
+	// the 2 s run from the last report sent
+	assert(!r.due({a, b}, t + 100 * ms));
+	StationPose moved = a;
+	moved.pos[1] += 0.00011;
+	assert(r.due({moved, b}, t += 200 * ms));
+	StationPose turned = moved;
+	const double k = 0.011 * 3.14159265358979323846 / 360;
+	turned.quat[0] = std::sin(k), turned.quat[3] = std::cos(k);
+	assert(r.due({turned, b}, t += 100 * ms));
+	// a station gone, back, or replaced
+	assert(r.due({turned}, t += 100 * ms));
+	assert(r.due({turned, b}, t += 100 * ms));
+	StationPose c = b;
+	c.serial = "LHB-TEST-C";
+	assert(r.due({turned, c}, t += 100 * ms));
+	assert(!r.due({turned, c}, t += 100 * ms));
+}
+
 int main()
 {
 	reads_a_pose_matrix();
 	formats_the_line_the_daemon_reads();
+	reports_a_change_at_once_and_keeps_the_report_fresh();
 	std::puts("test_stations: ok");
 	return 0;
 }

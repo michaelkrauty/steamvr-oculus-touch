@@ -1215,7 +1215,8 @@ const UNIVERSE_CHECK_MS: u64 = 60_000;
 const UNIVERSE_RETRY_MAX_MS: u64 = 15 * 60_000;
 const UNIVERSE_PROCESS_CHECK_MS: u64 = 10_000;
 /// How often the watch reads SteamVR's log and looks at the stations the driver reports (cheap:
-/// no SteamVR connection; the driver reports every 2 s).
+/// no SteamVR connection), besides at each report: the driver reports a change at once and
+/// otherwise every 2 s.
 const UNIVERSE_TICK_MS: u64 = 1_000;
 /// The driver's report counts as current this long; past it, the watch connects to SteamVR itself
 /// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS` while connected.
@@ -1378,8 +1379,9 @@ impl UniverseConnection {
 /// follows that station alone, from where it is in the world (`align::Registration::station_map`)
 /// and where SteamVR has it now; SteamVR's log names it (`steamvr_log`). Through a dropout the
 /// watch keeps to the last station named; skipped log input forgets that name. Without a trusted
-/// name it follows the stations' moves together. The stations' poses come from the driver every
-/// 2 s, or a short-lived background OpenVR connection at most once a minute while SteamVR runs
+/// name it follows the stations' moves together. The stations' poses come from the driver as
+/// they change and every 2 s, each report waking the watch, or a short-lived background OpenVR
+/// connection at most once a minute while SteamVR runs
 /// (one that never keeps SteamVR from quitting, with longer waits after failed inits); each
 /// layout SteamVR settles on is kept (`align::Layouts`), to place the stations no registration
 /// measured.
@@ -5749,6 +5751,9 @@ fn handle(d: &Daemon, line: &str) -> String {
                 })
                 .collect();
             *d.driver_stations.lock().unwrap() = Some((shm::now_ns(), poses));
+            // the driver reports a move at once: follow it now, not at the next tick
+            d.universe_recheck.store(true, Ordering::Release);
+            d.wake_sleepers();
             "ok".into()
         }
         Ok(Command::TestInject(on)) => {
@@ -7328,6 +7333,26 @@ mod tests {
     fn universe_watch_status_waits_for_the_first_check() {
         let d = status_daemon();
         assert!(handle(&d, "universe-watch").contains("waiting to check SteamVR"));
+    }
+
+    #[test]
+    fn a_stations_report_wakes_the_universe_watch() {
+        let d = status_daemon();
+        assert_eq!(handle(&d, "stations LHB-TEST-A 1 2 3 0 0 0 1"), "ok");
+        // the watch's own sleep: over at once, as the report asked it to look again
+        let start = std::time::Instant::now();
+        sleep_until(&d, 60_000, || {
+            d.universe_recheck.swap(false, Ordering::AcqRel)
+        });
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            d.driver_stations
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.1.len()),
+            Some(1)
+        );
     }
 
     #[test]

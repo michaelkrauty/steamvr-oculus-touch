@@ -46,4 +46,38 @@ std::string stations_line(const std::vector<StationPose> &stations)
 	return line + "\n";
 }
 
+static bool same_pose(const StationPose &a, const StationPose &b)
+{
+	const double dx = a.pos[0] - b.pos[0], dy = a.pos[1] - b.pos[1], dz = a.pos[2] - b.pos[2];
+	// the rotation from a to b: conj(a) * b
+	const double *p = a.quat, *q = b.quat;
+	const double w = p[3] * q[3] + p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+	const double x = p[3] * q[0] - p[0] * q[3] - p[1] * q[2] + p[2] * q[1];
+	const double y = p[3] * q[1] + p[0] * q[2] - p[1] * q[3] - p[2] * q[0];
+	const double z = p[3] * q[2] - p[0] * q[1] + p[1] * q[0] - p[2] * q[3];
+	const double angle = 2 * std::atan2(std::sqrt(x * x + y * y + z * z), std::fabs(w));
+	return std::sqrt(dx * dx + dy * dy + dz * dz) < 1e-4 && angle < 0.01 * 3.14159265358979323846 / 180;
+}
+
+bool StationReports::due(const std::vector<StationPose> &stations, uint64_t now_ns)
+{
+	bool same = any_ && now_ns - sent_ns_ < KEEP_ALIVE_NS && stations.size() == sent_.size();
+	for (const auto &s : stations) {
+		if (!same)
+			break;
+		same = false;
+		for (const auto &o : sent_)
+			if (o.serial == s.serial) {
+				same = same_pose(o, s);
+				break;
+			}
+	}
+	if (same)
+		return false;
+	sent_ = stations;
+	sent_ns_ = now_ns;
+	any_ = true;
+	return true;
+}
+
 } // namespace cv1t
