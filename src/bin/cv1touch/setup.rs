@@ -1450,14 +1450,17 @@ fn run_stage(
             recordings.push(rec);
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
-            log.quiet(|| {
-                let code = register_from_capture_with(&base, true, Some("hmd"), true, false, None);
-                if code == 0 {
-                    send_quiet("alignment reload")
-                } else {
-                    code
+            let code = log
+                .quiet(|| register_from_capture_with(&base, true, Some("hmd"), true, false, None));
+            if code != 0 {
+                code
+            } else {
+                if let Ok(reg) = align::load_registration(&align::registration_path()) {
+                    let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
+                    println!("{}", ui::station_summary(&reg, &reg.station_map(&layouts)));
                 }
-            })
+                log.quiet(|| send_quiet("alignment reload"))
+            }
         }
         // its own errors say what went wrong (a controller asleep, travel too short)
         Stage::Inputs => calibrate_inputs_result(None, false, true).map(|()| 0)?,

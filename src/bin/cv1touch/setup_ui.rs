@@ -3,6 +3,9 @@
 //! What the guided setup shows a person: plain stage names, a short checklist, the checks only
 //! when one fails, and one line per finished stage. Pure functions, so wording is testable.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use cv1touch::align::{Placement, Registration, StationWorld};
 use cv1touch::setup::{Stage, StageReport, State};
 
 /// Marks for the checklist and results; ASCII on a dumb terminal.
@@ -277,6 +280,37 @@ pub(super) fn result_summary(stage: Stage, installed: Option<&serde_json::Value>
     }
 }
 
+/// After a headset registration `reg` is written: the base station its recording measured, and
+/// how it places each station its recording saw or a registration measured (`map`, from
+/// `Registration::station_map`).
+pub(super) fn station_summary(reg: &Registration, map: &BTreeMap<String, StationWorld>) -> String {
+    let mut lines = vec![match &reg.tracking_base {
+        Some(b) => format!("This recording measured base station {b}. Base stations now:"),
+        None => "This recording measured no base station. Base stations now:".into(),
+    }];
+    let serials: BTreeSet<&String> = reg
+        .stations
+        .iter()
+        .map(|s| &s.serial)
+        .chain(reg.measured.iter().map(|m| &m.serial))
+        .collect();
+    for serial in serials {
+        let how = if reg.tracking_base.as_ref() == Some(serial) {
+            "measured by this recording"
+        } else if reg.measured.iter().any(|m| &m.serial == serial) {
+            "measured by an earlier recording"
+        } else {
+            match map.get(serial).map(|w| w.placement) {
+                Some(Placement::Layouts(_)) => "placed by SteamVR's layouts",
+                Some(_) => "placed where SteamVR had it during this recording",
+                None => "not placed",
+            }
+        };
+        lines.push(format!("  {serial}: {how}"));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +520,56 @@ mod tests {
         assert_eq!(
             result_summary(Stage::Registration, Some(&serde_json::json!({}))),
             "done"
+        );
+    }
+
+    #[test]
+    fn the_station_summary_says_how_each_station_is_placed() {
+        use cv1touch::align::{MeasuredStation, PoseEntry, StationPose};
+        let pose = PoseEntry::from_iso(&nalgebra::Isometry3::identity());
+        let measured = |serial: &str| MeasuredStation {
+            serial: serial.into(),
+            world_from_station: pose,
+            registered_unix_s: 1,
+            calibration_unix_s: 1,
+        };
+        let placed = |placement| StationWorld {
+            world_from_station: nalgebra::Isometry3::identity(),
+            placement,
+        };
+        let mut reg = crate::initial_registration(7);
+        reg.stations = ["LHB-A", "LHB-C", "LHB-D"]
+            .map(|serial| StationPose {
+                serial: serial.into(),
+                pose,
+            })
+            .into();
+        // B, measured before, is off during this recording; D no layout places
+        reg.tracking_base = Some("LHB-A".into());
+        reg.measured = vec![measured("LHB-A"), measured("LHB-B")];
+        let map = BTreeMap::from([
+            ("LHB-A".to_string(), placed(Placement::Measured)),
+            ("LHB-B".to_string(), placed(Placement::Measured)),
+            ("LHB-C".to_string(), placed(Placement::Layouts(3))),
+        ]);
+        assert_eq!(
+            station_summary(&reg, &map),
+            "This recording measured base station LHB-A. Base stations now:\n  \
+             LHB-A: measured by this recording\n  \
+             LHB-B: measured by an earlier recording\n  \
+             LHB-C: placed by SteamVR's layouts\n  \
+             LHB-D: not placed"
+        );
+        // nothing measured: each station is where this recording's layout puts it
+        reg.tracking_base = None;
+        reg.measured.clear();
+        let map = BTreeMap::from([("LHB-A".to_string(), placed(Placement::Fit))]);
+        assert_eq!(
+            station_summary(&reg, &map),
+            "This recording measured no base station. Base stations now:\n  \
+             LHB-A: placed where SteamVR had it during this recording\n  \
+             LHB-C: not placed\n  \
+             LHB-D: not placed"
         );
     }
 }

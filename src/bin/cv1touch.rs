@@ -4493,6 +4493,51 @@ fn capture_layouts(universe: u64) -> Vec<(u64, align::Stations)> {
 const STATION_STILL_M: f64 = 0.0005;
 const STATION_STILL_DEG: f64 = 0.05;
 
+/// The base stations a registration fitted as `x` from capture `tf` measures, and that one
+/// alone: the station SteamVR tracked `reference` from throughout (`tracking_base`), if it left
+/// that station still; then those of `previous` it keeps (`align::merge_measured`). A capture that
+/// measures none would drop them all, so while `previous` holds one against this calibration it
+/// is refused, in one line for `cv1touch setup` to show.
+fn capture_measurements(
+    tf: &eval::TruthFile,
+    tracking_base: Option<&str>,
+    reference: &str,
+    x: &nalgebra::Isometry3<f64>,
+    previous: &[align::MeasuredStation],
+    calibration_unix_s: u64,
+) -> Result<(Option<align::MeasuredStation>, Vec<align::MeasuredStation>), String> {
+    let track = |serial: &str| {
+        let o = tf
+            .others
+            .iter()
+            .find(|o| o.kind == "base" && o.serial == serial)?;
+        let s = eval::truth_samples(&o.samples);
+        Some((s.get(s.len() / 2)?.pose, eval::spread(&s)?))
+    };
+    let why = match tracking_base {
+        Some(b) => match track(b) {
+            Some((p, (m, r))) if m <= STATION_STILL_M && r <= STATION_STILL_DEG.to_radians() => {
+                println!("SteamVR tracked {reference} from base station {b} throughout: the registration measures where that station is");
+                let now =
+                    align::MeasuredStation::from_fit(b, x, &p, unix_now(), calibration_unix_s);
+                let merged = align::merge_measured(previous, Some(now.clone()), calibration_unix_s);
+                return Ok((Some(now), merged));
+            }
+            Some((_, (m, r))) => format!("SteamVR moved base station {b}, which it tracked {reference} from, by up to {:.1} mm, {:.2} deg during the capture", m * 1e3, r.to_degrees()),
+            None => format!("base station {b} is not among the stations this capture recorded"),
+        },
+        None => format!("SteamVR's log does not say which base station tracked {reference} throughout the capture"),
+    };
+    if previous
+        .iter()
+        .any(|m| m.calibration_unix_s == calibration_unix_s)
+    {
+        return Err(format!("{why}: no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+    }
+    println!("{why}: no station measured");
+    Ok((None, Vec::new()))
+}
+
 /// Registration from a capture in which the Touches moved rigidly with the reference (pressed to
 /// the headset while the wearer turns, looks up and down and tilts): every 20 ms a pair.
 fn initial_registration(universe_id: u64) -> align::Registration {
@@ -4792,45 +4837,17 @@ fn register_from_capture_with(
         // where it is in the world, if SteamVR left the station where it was throughout (it moves
         // its tracking base too when it re-solves the layout)
         let calibration_unix_s = file::load(&file::default_path())?.created_unix_s;
-        let spread = |serial: &str| {
-            let o = tf
-                .others
-                .iter()
-                .find(|o| o.kind == "base" && o.serial == serial)?;
-            eval::spread(&eval::truth_samples(&o.samples))
-        };
-        let measured_now = match &tracking_base {
-            Some(b) => match (stations.iter().find(|(s, _)| s == b), spread(b)) {
-                (Some((_, p)), Some((m, r)))
-                    if m <= STATION_STILL_M && r <= STATION_STILL_DEG.to_radians() =>
-                {
-                    println!("SteamVR tracked {ref_serial} from base station {b} throughout: the registration measures where that station is");
-                    Some(align::MeasuredStation::from_fit(
-                        b,
-                        &x,
-                        p,
-                        unix_now(),
-                        calibration_unix_s,
-                    ))
-                }
-                (Some(_), Some((m, r))) => {
-                    println!("SteamVR moved base station {b}, which it tracked {ref_serial} from, by up to {:.1} mm, {:.2} deg during the capture: no station measured", m * 1e3, r.to_degrees());
-                    None
-                }
-                _ => {
-                    println!("base station {b} is not among the stations this capture recorded: no station measured");
-                    None
-                }
-            },
-            None => {
-                println!("SteamVR's log does not say which base station tracked {ref_serial} throughout the capture: no station measured");
-                None
-            }
-        };
         let previous = align::load_registration(&reg_path)
             .map(|r| r.measured)
             .unwrap_or_default();
-        let measured = align::merge_measured(&previous, measured_now.clone(), calibration_unix_s);
+        let (measured_now, measured) = capture_measurements(
+            &tf,
+            tracking_base.as_deref(),
+            &ref_serial,
+            &x,
+            &previous,
+            calibration_unix_s,
+        )?;
         for m in &previous {
             let when = cv1touch::calendar::Utc::of(
                 std::time::UNIX_EPOCH + Duration::from_secs(m.registered_unix_s),
@@ -4841,12 +4858,11 @@ fn register_from_capture_with(
                     "  keeps the measurement of {} from the registration of {when}",
                     m.serial
                 ),
-                None => println!("  drops the measurement of {} from the registration of {when}: a registration that measures no station follows its own fit", m.serial),
                 Some(n) if n.serial == m.serial => {
                     let d = m.world_from_station.iso().inverse() * n.world_from_station.iso();
                     println!("  replaces the measurement of {} from the registration of {when} ({:.1} mm, {:.2} deg from it)", m.serial, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees());
                 }
-                Some(_) => println!("  drops the measurement of {} from the registration of {when}: it was against another calibration", m.serial),
+                _ => println!("  drops the measurement of {} from the registration of {when}: it was against another calibration", m.serial),
             }
         }
         let mut preview = reg.clone();
@@ -8368,6 +8384,75 @@ mod tests {
         assert_eq!(r.universe_id, 42);
         assert_eq!(r.format, align::REGISTRATION_FORMAT);
         assert!(r.stations.is_empty());
+    }
+
+    /// A headset capture tracked from LHB-TEST-A, which SteamVR moves 3 mm halfway through when
+    /// `moved`.
+    fn tracked_capture(moved: bool) -> eval::TruthFile {
+        let base: Vec<_> = (0..10)
+            .map(|i| {
+                let x = if moved && i >= 5 { 2.003 } else { 2.0 };
+                serde_json::json!([i * 10_000_000, 0, 0, 0, 1, x, 2.2, -1.0])
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "format": eval::TRUTH_FORMAT, "version": 1, "reference": "LHR-TEST", "universe_id": 1,
+            "windows": [], "samples": [[0,0,0,0,1,0,1.6,0]],
+            "others": [
+                {"serial": "LHB-TEST-A", "kind": "base", "samples": base},
+                {"serial": "LHB-TEST-B", "kind": "base", "samples": [[0,0,0,0,1,-2,2.2,-1]]}
+            ],
+            "tracking_bases": {"LHR-TEST": "LHB-TEST-A"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_capture_that_measures_no_station_keeps_the_stations_measured_before() {
+        let x = nalgebra::Isometry3::identity();
+        let earlier = [align::MeasuredStation::from_fit(
+            "LHB-TEST-B",
+            &x,
+            &x,
+            5,
+            100,
+        )];
+        let tf = tracked_capture(true);
+        let base = Some("LHB-TEST-A");
+        let refused = capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100).unwrap_err();
+        assert_eq!(
+            refused,
+            "SteamVR moved base station LHB-TEST-A, which it tracked LHR-TEST from, by up to 3.0 mm, 0.00 deg during the capture: no station measured, so the registration is unchanged and keeps the stations measured before; record again"
+        );
+        // nothing to keep: written as before, measuring none
+        for previous in [
+            vec![],
+            vec![align::MeasuredStation::from_fit(
+                "LHB-TEST-B",
+                &x,
+                &x,
+                5,
+                99,
+            )],
+        ] {
+            assert_eq!(
+                capture_measurements(&tf, base, "LHR-TEST", &x, &previous, 100),
+                Ok((None, vec![]))
+            );
+        }
+        // a base this capture did not record, or none named: the same
+        for base in [Some("LHB-TEST-C"), None] {
+            assert!(capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100)
+                .unwrap_err()
+                .ends_with("no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+        }
+        // the base left still: measured, beside the earlier one
+        let (now, kept) =
+            capture_measurements(&tracked_capture(false), base, "LHR-TEST", &x, &earlier, 100)
+                .unwrap();
+        assert_eq!(now.as_ref().map(|m| m.serial.as_str()), Some("LHB-TEST-A"));
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&earlier[0]));
     }
 
     #[test]
