@@ -1163,8 +1163,9 @@ fn republish_settings(d: &Daemon) {
 }
 
 /// Puts the tracker's pose into the published state as measured: the newest sample's pose,
-/// stamped when the controller was there, with the tracked velocities at the published point.
-/// SteamVR extrapolates with them; nothing here carries the pose forward.
+/// stamped when the controller was there, with the tracked velocities at the published point and
+/// the filter's uncertainties for that pose. SteamVR extrapolates with them; nothing here carries
+/// the pose forward.
 fn apply_tracked(state: &mut ControllerState, s: &Stamped) {
     let q = s.output.world_from_model.rotation;
     let t = s.output.world_from_model.translation.vector;
@@ -1172,6 +1173,8 @@ fn apply_tracked(state: &mut ControllerState, s: &Stamped) {
     state.pos = [t.x as f32, t.y as f32, t.z as f32];
     let v = s.output.vel;
     state.lin_vel = [v.x as f32, v.y as f32, v.z as f32];
+    state.pos_stddev = s.output.pos_stddev.cast::<f32>().into();
+    state.rot_stddev = s.output.rot_stddev.cast::<f32>().into();
     // the driver gives SteamVR ang_vel - gyro_bias as the body rate it integrates in: the gyro
     // sample less the filter's bias
     state.ang_vel = [s.gyro.x as f32, s.gyro.y as f32, s.gyro.z as f32];
@@ -17835,6 +17838,8 @@ mod tests {
                 accel_bias: Vector3::zeros(),
                 tracking: true,
                 last_fix: 0,
+                pos_stddev: Vector3::new(0.002, 0.003, 0.004),
+                rot_stddev: Vector3::new(0.01, 0.02, 0.03),
             },
             gyro: q.inverse() * rate + bias,
             gyro_bias: bias,
@@ -17843,8 +17848,9 @@ mod tests {
     }
 
     /// The newest sample is published as measured: its own time, the gyro's rate less the
-    /// filter's bias, and the tracked linear velocity at the published point. Nothing is carried
-    /// forward or reshaped for SteamVR's extrapolation.
+    /// filter's bias, the tracked linear velocity at the published point, and the filter's
+    /// uncertainties in place of the engine's. Nothing is carried forward or reshaped for
+    /// SteamVR's extrapolation.
     #[test]
     fn the_tracked_velocities_are_published_as_they_are() {
         use nalgebra::Vector3;
@@ -17852,12 +17858,20 @@ mod tests {
         let s = tracked_sample();
         let (q, rate) = (s.output.world_from_model.rotation, s.output.ang_vel_world);
         let v3 = |a: [f32; 3]| Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
-        let mut st = ControllerState::default();
+        // the engine's own uncertainties, as the hand had them before
+        let mut st = ControllerState {
+            pos_stddev: [0.5; 3],
+            rot_stddev: [0.5; 3],
+            ..Default::default()
+        };
         apply_tracked(&mut st, &s);
         // the body rate the driver hands SteamVR (ang_vel - gyro_bias), and the linear velocity
         assert!((q * (v3(st.ang_vel) - v3(st.gyro_bias)) - rate).norm() < 1e-5);
         assert!((v3(st.ang_vel) - s.gyro).norm() < 1e-6);
         assert!((v3(st.lin_vel) - s.output.vel).norm() < 1e-6);
+        // the tracker's uncertainties, not the engine's
+        assert!((v3(st.pos_stddev) - s.output.pos_stddev).norm() < 1e-6);
+        assert!((v3(st.rot_stddev) - s.output.rot_stddev).norm() < 1e-6);
         assert_eq!(st.sample_host_ns, s.host_ns);
         assert_eq!(st.last_position_fix_host_ns, s.last_fix_host_ns);
     }

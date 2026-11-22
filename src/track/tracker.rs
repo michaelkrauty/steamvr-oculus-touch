@@ -255,6 +255,12 @@ pub struct Output {
     /// Controller time of the newest optical fix while the position is tracked; 0 while it is
     /// not (a lost track, or one no second sensor has confirmed, has no fix to show).
     pub last_fix: u64,
+    /// Standard deviations from the filter's covariance (`published_stddev`): of the model
+    /// origin's position along the world axes, m, and of the orientation about the model's own
+    /// axes, rad. While the position is not `tracking`, the position's is that of the dead
+    /// reckoning, not of the held position.
+    pub pos_stddev: Vector3<f64>,
+    pub rot_stddev: Vector3<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,6 +904,7 @@ impl Tracker {
             pose.translation.vector = self.held?;
             vel = Vector3::zeros();
         }
+        let (pos_stddev, rot_stddev) = published_stddev(&f, &self.body);
         Some(Output {
             t,
             world_from_model: pose,
@@ -907,6 +914,8 @@ impl Tracker {
             accel_bias: f.x.ba,
             tracking,
             last_fix: if tracking { self.last_fix } else { 0 },
+            pos_stddev,
+            rot_stddev,
         })
     }
 
@@ -1990,6 +1999,24 @@ impl Tracker {
     }
 }
 
+/// The standard deviations of the pose `Body::world_from_model` puts at filter `f`: the model
+/// origin's position along the world axes, which takes the orientation's error through the lever
+/// arm from the IMU (q Exp(d0) r = q r - q [r]x d0 for small d0), and the orientation about the
+/// model's own axes (the filter's local rotation error).
+fn published_stddev(f: &Filter, body: &Body) -> (Vector3<f64>, Vector3<f64>) {
+    // the pose block (rotation, position) alone, as the association uses it
+    let p6 = f.cov.fixed_view::<6, 6>(ROT, ROT);
+    let mut j = nalgebra::SMatrix::<f64, 3, 6>::zeros();
+    j.fixed_view_mut::<3, 3>(0, ROT)
+        .copy_from(&-(f.x.q.to_rotation_matrix().matrix() * super::eskf::skew(&-body.imu_pos)));
+    j.fixed_view_mut::<3, 3>(0, POS)
+        .copy_from(&Matrix3::identity());
+    // the diagonal of j p6 j^T alone
+    let pos = (j * p6).component_mul(&j).column_sum().map(f64::sqrt);
+    let rot = p6.fixed_view::<3, 3>(ROT, ROT).diagonal().map(f64::sqrt);
+    (pos, rot)
+}
+
 #[cfg(test)]
 mod tests {
     mod hot_paths;
@@ -1998,6 +2025,40 @@ mod tests {
     use nalgebra::{Point3, Translation3, UnitQuaternion, Vector2};
 
     const G: f64 = 9.80665;
+
+    /// The published position's uncertainty is the model origin's, not the IMU's: an
+    /// orientation error about the model's z axis moves the origin 2 cm from the IMU across
+    /// that lever arm, here along the world x axis.
+    #[test]
+    fn the_published_stddevs_are_the_published_points() {
+        let body = Body {
+            leds: Vec::new(),
+            imu_pos: Vector3::new(0.02, 0.0, 0.0),
+        };
+        let mut cov = Cov::zeros();
+        let (sr, sp) = (0.1, 0.003);
+        cov[(ROT + 2, ROT + 2)] = sr * sr;
+        for i in 0..3 {
+            cov[(POS + i, POS + i)] = sp * sp;
+        }
+        let f = Filter {
+            x: Nominal {
+                q: UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::FRAC_PI_2),
+                p: Vector3::new(0.1, 1.0, -0.2),
+                v: Vector3::zeros(),
+                bg: Vector3::zeros(),
+                ba: Vector3::zeros(),
+            },
+            cov,
+        };
+        let (pos, rot) = published_stddev(&f, &body);
+        let across = (sp * sp + (sr * 0.02).powi(2)).sqrt();
+        assert!(
+            (pos - Vector3::new(across, sp, sp)).norm() < 1e-9,
+            "{pos:?}"
+        );
+        assert!((rot - Vector3::new(0.0, 0.0, sr)).norm() < 1e-12, "{rot:?}");
+    }
 
     /// A removed sensor's held search exposures and accepted updates go with it; the other
     /// cameras keep theirs.
@@ -2457,6 +2518,10 @@ mod tests {
             tr.stats
         );
         let o = tr.output().unwrap();
+        // the uncertainties are those of the newest state's published pose
+        let newest = published_stddev(&tr.history.back().unwrap().1, &tr.body);
+        assert_eq!((o.pos_stddev, o.rot_stddev), newest);
+        assert!(newest.0.min() > 0.0 && newest.1.min() > 0.0, "{newest:?}");
         let truth_v = (w.motion.pose(10.0 + 1e-4).translation.vector
             - w.motion.pose(10.0 - 1e-4).translation.vector)
             / 2e-4;

@@ -100,8 +100,12 @@ typedef struct cv1t_controller_state {
 	float gyro_bias[3];
 	float imu_accel[3];                 /* newest IMU sample, factory-calibrated, IMU frame: m/s^2 */
 	float imu_gyro[3];                  /* same sample: rad/s */
-	float pos_stddev[3];
-	float rot_stddev[3];
+	float pos_stddev[3];                /* m: standard deviation of pos along the world x y z axes,
+	                                     * the IMU's position and the orientation's error across the
+	                                     * lever arm to pos; without CV1T_FLAG_POSITION pos is held
+	                                     * where last seen and this is the dead reckoning's */
+	float rot_stddev[3];                /* rad: of orient about the controller's own x y z axes;
+	                                     * a pose from OpenHMD carries OpenHMD's estimates */
 	float trigger;                      /* 0..1 */
 	float grip;                         /* 0..1 */
 	float stick[2];                     /* -1..1 */

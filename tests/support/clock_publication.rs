@@ -10,7 +10,7 @@ pub struct Publication {
     stamps: [u64; 4],
     pos: [f64; 3],
     quat: [f64; 4],
-    vectors: [[f64; 3]; 6],
+    vectors: [[f64; 3]; 8],
     tracking: bool,
 }
 
@@ -29,6 +29,8 @@ impl From<Stamped> for Publication {
                 o.accel_bias,
                 s.gyro,
                 s.gyro_bias,
+                o.pos_stddev,
+                o.rot_stddev,
             ]
             .map(Into::into),
             tracking: o.tracking,
@@ -38,7 +40,7 @@ impl From<Stamped> for Publication {
 
 impl From<Publication> for Stamped {
     fn from(p: Publication) -> Self {
-        let [vel, ang_vel_world, gyro_bias, accel_bias, gyro, stamp_bias] =
+        let [vel, ang_vel_world, gyro_bias, accel_bias, gyro, stamp_bias, pos_stddev, rot_stddev] =
             p.vectors.map(Vector3::from);
         Self {
             host_ns: p.stamps[0],
@@ -59,6 +61,8 @@ impl From<Publication> for Stamped {
                 gyro_bias,
                 accel_bias,
                 tracking: p.tracking,
+                pos_stddev,
+                rot_stddev,
             },
         }
     }
