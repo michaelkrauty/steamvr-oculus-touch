@@ -280,6 +280,35 @@ pub(super) fn result_summary(stage: Stage, installed: Option<&serde_json::Value>
     }
 }
 
+/// Before a headset recording: the base station SteamVR tracks the headset from (`base`, as its
+/// log says), whether the registration on disk (`reg`) measured it, and that the recording
+/// measures it.
+pub(super) fn headset_base_plan(base: Option<&str>, reg: Option<&Registration>) -> String {
+    let measured = |b: &str| reg.is_some_and(|r| r.measured.iter().any(|m| m.serial == b));
+    match base {
+        Some(b) if measured(b) => format!("SteamVR tracks the headset from base station {b}, which an earlier recording measured.\nThis recording measures it again."),
+        Some(b) => format!("SteamVR tracks the headset from base station {b}, which no recording has measured yet.\nThis recording measures it."),
+        None => "SteamVR's log names no base station it tracks the headset from, so this recording may measure none.".into(),
+    }
+}
+
+/// After a headset registration `reg` is written: the stations its recording saw that no
+/// recording measured yet, and how to measure one; None when every one is measured.
+pub(super) fn stations_to_measure(reg: &Registration) -> Option<String> {
+    let left: Vec<&str> = reg
+        .stations
+        .iter()
+        .map(|s| s.serial.as_str())
+        .filter(|s| !reg.measured.iter().any(|m| m.serial == *s))
+        .collect();
+    (!left.is_empty()).then(|| {
+        format!(
+            "Not measured yet: {}. To measure one, run `cv1touch setup --redo headset` while SteamVR\ntracks the headset from it (`cv1touch universe` names the station it tracks the headset from).",
+            left.join(", ")
+        )
+    })
+}
+
 /// After a headset registration `reg` is written: the base station its recording measured, and
 /// how it places each station its recording saw or a registration measured (`map`, from
 /// `Registration::station_map`).
@@ -571,5 +600,44 @@ mod tests {
              LHB-C: not placed\n  \
              LHB-D: not placed"
         );
+    }
+
+    #[test]
+    fn the_headset_stage_names_the_station_it_measures_and_those_left() {
+        use cv1touch::align::{MeasuredStation, PoseEntry, StationPose};
+        let pose = PoseEntry::from_iso(&nalgebra::Isometry3::identity());
+        let mut reg = crate::initial_registration(7);
+        reg.stations = ["LHB-A", "LHB-B", "LHB-C"]
+            .map(|serial| StationPose {
+                serial: serial.into(),
+                pose,
+            })
+            .into();
+        reg.measured = vec![MeasuredStation {
+            serial: "LHB-A".into(),
+            world_from_station: pose,
+            registered_unix_s: 1,
+            calibration_unix_s: 1,
+        }];
+        assert_eq!(
+            headset_base_plan(Some("LHB-A"), Some(&reg)),
+            "SteamVR tracks the headset from base station LHB-A, which an earlier recording measured.\nThis recording measures it again."
+        );
+        for plan in [
+            headset_base_plan(Some("LHB-B"), Some(&reg)),
+            headset_base_plan(Some("LHB-B"), None),
+        ] {
+            assert_eq!(plan, "SteamVR tracks the headset from base station LHB-B, which no recording has measured yet.\nThis recording measures it.");
+        }
+        assert_eq!(
+            headset_base_plan(None, Some(&reg)),
+            "SteamVR's log names no base station it tracks the headset from, so this recording may measure none."
+        );
+        assert_eq!(
+            stations_to_measure(&reg).as_deref(),
+            Some("Not measured yet: LHB-B, LHB-C. To measure one, run `cv1touch setup --redo headset` while SteamVR\ntracks the headset from it (`cv1touch universe` names the station it tracks the headset from).")
+        );
+        reg.stations.truncate(1);
+        assert_eq!(stations_to_measure(&reg), None);
     }
 }

@@ -6,6 +6,7 @@ use super::*;
 use cv1touch::headset_watch::{Cue, HeadsetCapture};
 use cv1touch::input_calibration;
 use cv1touch::setup::{self, Artifact, Checkpoint, Snapshot, Stage, State};
+use cv1touch::steamvr_log;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -1387,6 +1388,15 @@ fn run_stage(
             log.quiet(|| fit_render(Some(&rec)))
         }
         Stage::Registration => {
+            // the station this recording will measure, as SteamVR's log names it now
+            let reg = align::load_registration(&align::registration_path()).ok();
+            let mut steamvr = steamvr_log::Watch::new(&steamvr_log::server_log());
+            let reference = reg.as_ref().map_or("", |r| r.reference.as_str());
+            let tracked = steamvr.poll().is_ok() && !steamvr.bases.tracking_unknown(reference);
+            let tracked_from = tracked
+                .then(|| steamvr.bases.last_of_headset(reference))
+                .flatten();
+            println!("{}", ui::headset_base_plan(tracked_from, reg.as_ref()));
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
@@ -1458,6 +1468,9 @@ fn run_stage(
                 if let Ok(reg) = align::load_registration(&align::registration_path()) {
                     let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
                     println!("{}", ui::station_summary(&reg, &reg.station_map(&layouts)));
+                    if let Some(left) = ui::stations_to_measure(&reg) {
+                        println!("{left}");
+                    }
                 }
                 log.quiet(|| send_quiet("alignment reload"))
             }
