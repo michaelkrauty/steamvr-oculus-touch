@@ -178,11 +178,11 @@ impl Tracker {
         }
         self.inspection_frames.retain(|f| f.until > s.t);
         let cutoff = s.t.saturating_sub(self.params.history_ns);
+        // a frame as old as the history looks back from its exposure for another sensor's update
+        // (`others_set_prior`) or a sighting of the track (`seen_by`)
+        let kept = cutoff.saturating_sub(self.params.history_ns.max(CROSS_CHECK_NS));
         for updates in &mut self.camera_updates {
-            while updates
-                .front()
-                .is_some_and(|t| *t < cutoff.saturating_sub(CROSS_CHECK_NS))
-            {
+            while updates.front().is_some_and(|t| *t < kept) {
                 updates.pop_front();
             }
         }
@@ -497,7 +497,7 @@ fn stillness_through_imu_preserves_camera_expiry_priors_and_gap_cleanup() {
     a.provisional = Some(first.t - 8_000_000);
     populate_camera_bookkeeping(&mut a, first.t);
     // Exact strict-cutoff boundary, with expired and retained entries on both sides.
-    let cutoff = first.t - a.params.history_ns - CROSS_CHECK_NS;
+    let cutoff = first.t - a.params.history_ns - a.params.history_ns.max(CROSS_CHECK_NS);
     a.camera_updates[0] = VecDeque::from([cutoff - 1, cutoff, cutoff + 1]);
     let mut b = a.clone();
     let original_frames = a.inspection_frames.clone();

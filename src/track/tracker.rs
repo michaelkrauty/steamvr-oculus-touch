@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use nalgebra::{Isometry3, Matrix3, UnitQuaternion, Vector2, Vector3};
+use nalgebra::{Isometry3, Matrix2, Matrix3, UnitQuaternion, Vector2, Vector3};
 
 use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
 use super::search::{self, SearchParams};
@@ -66,11 +66,12 @@ pub struct Params {
     /// dropped out, may have moved meanwhile, and its clock may have jumped. The state is dropped
     /// (the bias estimates kept) and the controller acquired afresh.
     pub max_imu_gap_ns: u64,
-    /// After refusing the engine's poses for this long, the orientation memory is dropped: it is
-    /// the one that is wrong.
+    /// After refusing the engine's poses for this long, the orientation memory is dropped, once
+    /// two sensors' refused poses agree (see `Tracker::same_hypothesis`): then it is the one that
+    /// is wrong. One sensor's alone can be the other controller's blobs under this one's labels.
     pub max_refusing_ns: u64,
     /// Blobs this close to an LED of the other controller (as it is tracked at the same exposure)
-    /// are left to it, unless the engine labelled them as ours.
+    /// are left to it, unless the engine labelled them as ours (see `ForeignLed`).
     pub foreign_px: f64,
     /// For this long after the last fix the dead-reckoned state is close enough for the
     /// tracker's own (shift-search) association to re-lock without the engine.
@@ -271,6 +272,37 @@ pub enum Outcome {
     UnknownCamera,
 }
 
+/// An LED of the other controller facing the sensor (as the association judges facing), where its
+/// track puts it in the frame; only those within `AssocParams::max_px` of a blob. A match on a
+/// blob within its association gate (`AssocParams::gate`, under its covariance) is evidence of
+/// this controller only if this controller's prediction (its track, or the dead-reckoned state a
+/// re-lock is fitted from) explains the blob better. Each prediction is judged by its own
+/// covariance, so an uncertain one loses a near tie to an established one. An acquisition has no
+/// prediction to judge the blobs by, since a pose fitted to them always explains them: there a
+/// match on a blob within `foreign_px` of one is no evidence of this controller while the other
+/// is in this sensor's view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForeignLed {
+    pub uv: Vector2<f64>,
+    /// The prediction's pixel covariance (see `vision::predicted_near`).
+    pub cov: Matrix2<f64>,
+    /// The other controller took an update from this sensor within the history. One hidden
+    /// behind this controller on the sensor's line of sight did not, and its LEDs, predicted
+    /// where this one's blobs are, say nothing of them.
+    pub seen: bool,
+}
+
+/// A blob at `xy` under the prediction `uv` with covariance `cov`: its Mahalanobis^2, and its
+/// negative log-likelihood (less a constant).
+fn prediction_fit(uv: Vector2<f64>, cov: &Matrix2<f64>, xy: Vector2<f64>) -> (f64, f64) {
+    let d = xy - uv;
+    cov.try_inverse()
+        .map_or((f64::INFINITY, f64::INFINITY), |s| {
+            let d2 = (d.transpose() * s * d)[0];
+            (d2, d2 + cov.determinant().ln())
+        })
+}
+
 /// How well one sensor agrees with the others: an exponentially weighted mean of the median
 /// pixel residual of its matched LEDs under a prior the other sensors set (another sensor updated
 /// the track within `CROSS_CHECK_NS`). A sensor that moved since calibration stands out: a little,
@@ -340,6 +372,10 @@ pub struct Tracker {
     last_confirmed: u64,
     /// When the current run of refused acquisitions began (0: none).
     refusing_since: u64,
+    /// In that run, each sensor's newest refused pose, as its turn (world frame) from the kept
+    /// orientation: the gyro carries the kept orientation, and with it the pose, so the turn holds
+    /// while the controller moves.
+    refused_by: Vec<(usize, UnitQuaternion<f64>)>,
     /// The exposure of an acquisition no second sensor has confirmed yet, one from an engine pose
     /// rated only good or from the tracker's own search (`search_kept`): either can fit one view
     /// and be wrong. Until a second sensor confirms it the track takes updates but is not
@@ -511,6 +547,7 @@ impl Tracker {
             track_confirmed: false,
             last_confirmed: 0,
             refusing_since: 0,
+            refused_by: Vec::new(),
             provisional: None,
             undecided: None,
             held: None,
@@ -549,6 +586,16 @@ impl Tracker {
 
     pub fn newest_imu(&self) -> Option<u64> {
         self.imu.back().map(|s| s.t)
+    }
+
+    /// Whether sensor `camera` updated the track within the history before controller time `t`.
+    pub fn seen_by(&self, camera: usize, t: u64) -> bool {
+        self.camera_updates.get(camera).is_some_and(|u| {
+            u.iter()
+                .rev()
+                .find(|&&x| x <= t)
+                .is_some_and(|&x| t - x <= self.params.history_ns)
+        })
     }
 
     /// Controller time of the newest optical fix while the position is tracked; 0 while it is not
@@ -638,11 +685,11 @@ impl Tracker {
         }
         self.inspection_frames.retain(|f| f.until > s.t);
         let cutoff = s.t.saturating_sub(self.params.history_ns);
+        // a frame as old as the history looks back from its exposure for another sensor's update
+        // (`others_set_prior`) or a sighting of the track (`seen_by`)
+        let kept = cutoff.saturating_sub(self.params.history_ns.max(CROSS_CHECK_NS));
         for updates in &mut self.camera_updates {
-            while updates
-                .front()
-                .is_some_and(|t| *t < cutoff.saturating_sub(CROSS_CHECK_NS))
-            {
+            while updates.front().is_some_and(|t| *t < kept) {
                 updates.pop_front();
             }
         }
@@ -1027,7 +1074,7 @@ impl Tracker {
     /// One sensor frame whose exposure was at controller time `t_e`. `engine` is the engine's
     /// world_from_model for this controller in this frame, when it found one it rates good or
     /// strong.
-    /// `foreign`: where the other controller's LEDs are in this frame, as it is tracked.
+    /// `foreign`: the other controller's LEDs in this frame, as it is tracked (see `ForeignLed`).
     pub fn frame(
         &mut self,
         t_e: u64,
@@ -1035,7 +1082,7 @@ impl Tracker {
         cam: &Camera,
         blobs: &[Blob],
         engine: Option<EnginePose>,
-        foreign: &[Vector2<f64>],
+        foreign: &[ForeignLed],
     ) -> Outcome {
         if camera >= self.camera_updates.len() {
             return Outcome::UnknownCamera;
@@ -1068,7 +1115,7 @@ impl Tracker {
                 ours || (!theirs
                     && !foreign
                         .iter()
-                        .any(|f| (f - b.xy).norm() < self.params.foreign_px))
+                        .any(|f| (f.uv - b.xy).norm() < self.params.foreign_px))
             })
             .copied()
             .collect();
@@ -1185,6 +1232,15 @@ impl Tracker {
             if checked || observed {
                 self.check_camera(camera, fit.is_err(), observed);
             }
+            // the other controller's track can explain the matched blobs better (see `ForeignLed`)
+            let fit = fit.and_then(|fit| {
+                if self.evidence(cam, blobs, &fit.pairs, &prior, foreign) < self.params.fit.min_leds
+                {
+                    Err(vision::Miss::Rejected)
+                } else {
+                    Ok(fit)
+                }
+            });
             match fit {
                 Ok(fit) => {
                     if self.debug {
@@ -1307,12 +1363,26 @@ impl Tracker {
             if f.x.q.angle_to(&e.world_from_model.rotation) > self.params.acquire_max_turn_rad {
                 if self.refusing_since == 0 {
                     self.refusing_since = t_e;
+                    self.refused_by.clear();
                 }
-                if t_e.saturating_sub(self.refusing_since) < self.params.max_refusing_ns {
+                let agreed = t_e.saturating_sub(self.refusing_since) >= self.params.max_refusing_ns
+                    && self.refused_by.iter().any(|&(c, turn)| {
+                        c != camera
+                            && self.same_hypothesis(
+                                cam,
+                                blobs,
+                                &e.world_from_model,
+                                &(turn * f.x.q),
+                            )
+                    });
+                self.refused_by.retain(|&(c, _)| c != camera);
+                self.refused_by
+                    .push((camera, e.world_from_model.rotation * f.x.q.inverse()));
+                if agreed {
+                    self.last_confirmed = 0;
+                } else {
                     self.stats.refused_acquisitions += 1;
                     refused = true;
-                } else {
-                    self.last_confirmed = 0;
                 }
             }
         }
@@ -1382,6 +1452,11 @@ impl Tracker {
                         turned_by = Some(k);
                     }
                 }
+                // the other controller's blobs under our labels fit a pose as well as ours do
+                if self.independent(blobs, &chosen.1.pairs, foreign) < fit_params.min_leds {
+                    self.stats.refused_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
                 if !e.strong {
                     self.stats.good_acquisitions += 1;
                 }
@@ -1399,7 +1474,7 @@ impl Tracker {
                 }
                 self.searched_at[camera] = t_e;
                 self.stats.searches += 1;
-                match self.search_kept(cam, blobs, &f, carried.as_ref(), &fit_params) {
+                match self.search_kept(cam, blobs, foreign, &f, carried.as_ref(), &fit_params) {
                     Some(h) => {
                         self.stats.searched_acquisitions += 1;
                         (h, false, true)
@@ -1496,12 +1571,7 @@ impl Tracker {
         let pose = self.body.world_from_model(&f.x);
         // each hypothesis matched afresh from its own pose; one that cannot be fitted at all
         // leaves unexplained all but three of the blobs the other matched
-        let cost = |p: &Isometry3<f64>| {
-            let prior = self.acquisition_prior(p, None);
-            vision::fit_frame(cam, &self.body, &prior, blobs, &[], &self.params.fit)
-                .ok()
-                .map(|fit| (self.acquisition_cost(cam, blobs, &fit), fit.pairs.len()))
-        };
+        let cost = |p: &Isometry3<f64>| self.hypothesis_cost(cam, blobs, p);
         let unfit =
             |(c, n): (f64, usize)| self.params.alias_miss_cost * n.saturating_sub(3) as f64 + c;
         let own = cost(&pose);
@@ -1544,6 +1614,39 @@ impl Tracker {
                 lead: vec![0.0; self.aliases.len()],
                 turns: self.aliases.iter().map(|a| a.turn).collect(),
             });
+        }
+    }
+
+    /// A hypothesis's cost on the frame (see `acquisition_cost`), matched afresh from its own pose,
+    /// and how many LEDs it matched; None when it cannot be fitted at all.
+    fn hypothesis_cost(
+        &self,
+        cam: &Camera,
+        blobs: &[Blob],
+        pose: &Isometry3<f64>,
+    ) -> Option<(f64, usize)> {
+        let prior = self.acquisition_prior(pose, None);
+        vision::fit_frame(cam, &self.body, &prior, blobs, &[], &self.params.fit)
+            .ok()
+            .map(|fit| (self.acquisition_cost(cam, blobs, &fit), fit.pairs.len()))
+    }
+
+    /// Whether the frame cannot tell `pose` from the same position turned to `rotation`: neither
+    /// leads the other by `alias_margin`.
+    fn same_hypothesis(
+        &self,
+        cam: &Camera,
+        blobs: &[Blob],
+        pose: &Isometry3<f64>,
+        rotation: &UnitQuaternion<f64>,
+    ) -> bool {
+        let rival = Isometry3::from_parts(pose.translation, *rotation);
+        match (
+            self.hypothesis_cost(cam, blobs, pose),
+            self.hypothesis_cost(cam, blobs, &rival),
+        ) {
+            (Some(a), Some(b)) => (a.0 - b.0).abs() < self.params.alias_margin,
+            _ => false,
         }
     }
 
@@ -1627,12 +1730,14 @@ impl Tracker {
     /// The controller in this frame from the kept orientation `kept` alone (see `search`): each
     /// position the frame supports is fitted, which corrects the orientation too. With nothing
     /// else to back it, a fit counts only if it explains the frame almost wholly
-    /// (`explains_frame`); costed like an engine pose, the cheapest is taken, and a second sensor
+    /// (`explains_frame`), with enough matches the other controller does not account for
+    /// (`independent`); costed like an engine pose, the cheapest is taken, and a second sensor
     /// still has to confirm it (see `provisional`).
     fn search_kept(
         &self,
         cam: &Camera,
         blobs: &[Blob],
+        foreign: &[ForeignLed],
         kept: &Filter,
         carried: Option<&Filter>,
         fit_params: &FitParams,
@@ -1650,10 +1755,67 @@ impl Tracker {
                     fit_params,
                 )
             })
-            .filter(|(_, fit)| self.explains_frame(cam, blobs, fit))
+            .filter(|(_, fit)| {
+                self.independent(blobs, &fit.pairs, foreign) >= fit_params.min_leds
+                    && self.explains_frame(cam, blobs, fit)
+            })
             .map(|h| (self.acquisition_cost(cam, blobs, &h.1), h))
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, h)| h)
+    }
+
+    /// How many of `pairs` are evidence of this controller under `prior` (see `ForeignLed`): a
+    /// blob within the association's limits (`AssocParams::max_px` and `gate`) of one of the other
+    /// controller's LEDs counts only if
+    /// `prior` explains it, as the LED it was matched to, better.
+    fn evidence(
+        &self,
+        cam: &Camera,
+        blobs: &[Blob],
+        pairs: &[(usize, usize)],
+        prior: &Filter,
+        foreign: &[ForeignLed],
+    ) -> usize {
+        let p6 = prior.cov.fixed_view::<6, 6>(0, 0).into_owned();
+        let var = Matrix2::identity() * self.params.fit.update.sigma_px.powi(2);
+        pairs
+            .iter()
+            .filter(|&&(led, b)| {
+                let xy = blobs[b].xy;
+                let Some(theirs) = foreign
+                    .iter()
+                    .filter(|f| (f.uv - xy).norm() <= self.params.fit.assoc.max_px)
+                    .map(|f| prediction_fit(f.uv, &f.cov, xy))
+                    .filter(|&(d2, _)| d2 < self.params.fit.assoc.gate)
+                    .map(|(_, cost)| cost)
+                    .reduce(f64::min)
+                else {
+                    return true;
+                };
+                vision::project(cam, &self.body, &prior.x, led).is_some_and(|pr| {
+                    prediction_fit(pr.uv, &(pr.j * p6 * pr.j.transpose() + var), xy).1 < theirs
+                })
+            })
+            .count()
+    }
+
+    /// How many of `pairs` are evidence of this controller where there is no prediction to judge
+    /// the blobs by (see `ForeignLed`): those not on an LED of the other controller in this
+    /// sensor's view.
+    fn independent(
+        &self,
+        blobs: &[Blob],
+        pairs: &[(usize, usize)],
+        foreign: &[ForeignLed],
+    ) -> usize {
+        pairs
+            .iter()
+            .filter(|&&(_, b)| {
+                !foreign
+                    .iter()
+                    .any(|f| f.seen && (f.uv - blobs[b].xy).norm() < self.params.foreign_px)
+            })
+            .count()
     }
 
     /// A fit pairs enough LEDs, nearly all those it shows the camera, closely, and leaves next to
@@ -2008,6 +2170,74 @@ mod tests {
         /// The tracker sees this sensor this far from where it is (world from where it is
         /// believed to be: a few mm and a fraction of a degree, as a knocked sensor).
         misplaced: Option<(usize, Isometry3<f64>)>,
+        /// The engine_flipped span applies to the sensors from this one on (0: all).
+        flip_from: usize,
+        /// The other controller, from this time on (see `Other`).
+        other: Option<(f64, Other)>,
+    }
+
+    /// The other controller, as tracked by its own tracker: it is handed to the tracker as
+    /// `ForeignLed`s at its true pose.
+    #[derive(Clone, Copy)]
+    struct Other {
+        /// Where it is, given this controller's pose and the first sensor's.
+        place: fn(&Isometry3<f64>, &Camera) -> Isometry3<f64>,
+        /// The frames show it and not this controller, under this controller's labels, and the
+        /// engine gives its pose as this controller's (as when the engine takes it for this one).
+        mislabelled: bool,
+        /// The sensors from this one on have seen it (`ForeignLed::seen`).
+        seen_from: usize,
+        /// Its track's position sd, m.
+        pos_sd: f64,
+    }
+
+    /// Beside this controller, 10 cm along the world x axis.
+    fn beside(pose: &Isometry3<f64>, _: &Camera) -> Isometry3<f64> {
+        Translation3::new(0.1, 0.0, 0.0) * pose
+    }
+
+    /// 10 cm behind this controller on the first sensor's line of sight: hidden by it from that
+    /// sensor, its LEDs a pixel or less from this controller's in that sensor's image.
+    fn behind(pose: &Isometry3<f64>, cam: &Camera) -> Isometry3<f64> {
+        let ray = (pose.translation.vector - cam.world_from_cam.translation.vector).normalize();
+        Translation3::from(ray * 0.1) * pose
+    }
+
+    /// `pose`'s LEDs that face `cam` near `blobs`, as a track of it known to `pos_sd` (and a fifth
+    /// of a degree) predicts them.
+    fn foreign_at(
+        w: &World,
+        cam: &Camera,
+        pose: &Isometry3<f64>,
+        blobs: &[Blob],
+        seen: bool,
+        pos_sd: f64,
+    ) -> Vec<ForeignLed> {
+        let p = Params::default();
+        let mut cov = Cov::identity() * 1e-6;
+        for k in 0..3 {
+            cov[(ROT + k, ROT + k)] = 0.2f64.to_radians().powi(2);
+            cov[(POS + k, POS + k)] = pos_sd * pos_sd;
+        }
+        let x = Nominal {
+            q: pose.rotation,
+            p: (pose * Point3::from(w.body.imu_pos)).coords,
+            v: Vector3::zeros(),
+            bg: Vector3::zeros(),
+            ba: Vector3::zeros(),
+        };
+        vision::predicted_near(
+            cam,
+            &w.body,
+            &Filter { x, cov },
+            blobs,
+            p.fit.assoc.max_px,
+            p.fit.update.sigma_px,
+            p.fit.assoc.min_facing,
+        )
+        .into_iter()
+        .map(|(uv, cov)| ForeignLed { uv, cov, seen })
+        .collect()
     }
 
     /// Motion: IMU at 500 Hz, three sensors at 52 Hz, frames arriving 25 ms after exposure.
@@ -2062,6 +2292,7 @@ mod tests {
             let shown = at(opts.phantom_at, 1) || at(opts.phantom_late.map(|p| p.0), 2);
             Translation3::new(if shown { 0.2 } else { 0.0 }, 0.0, 0.0)
         };
+        let other_at = |te: f64| opts.other.filter(|(from, _)| te >= *from).map(|(_, o)| o);
         let held_back = |c: usize, te: f64| {
             opts.phantom_late
                 .filter(|&(a, _)| c < 2 && te >= a && te < a + dt_frame)
@@ -2104,17 +2335,17 @@ mod tests {
                         } else {
                             0.0
                         } + held_back(c, next_frame);
+                        let shown = match other_at(next_frame) {
+                            Some(o) if o.mislabelled => {
+                                (o.place)(&w.motion.pose(next_frame), &w.cams[0])
+                            }
+                            _ => phantom(c, next_frame) * w.motion.pose(next_frame),
+                        };
                         pending.push((
                             next_frame,
                             next_frame + delay + late,
                             c,
-                            sight_posed(
-                                w,
-                                cam,
-                                &(phantom(c, next_frame) * w.motion.pose(next_frame)),
-                                &mut rng,
-                                pixel_noise,
-                            ),
+                            sight_posed(w, cam, &shown, &mut rng, pixel_noise),
                         ));
                     }
                 }
@@ -2131,7 +2362,17 @@ mod tests {
                     }
                 }
                 let mut engine = Some(phantom(c, te) * w.motion.pose(te));
-                if opts.engine_flipped.is_some_and(|(a, b)| te >= a && te < b) {
+                let mut foreign = Vec::new();
+                if let Some(o) = other_at(te) {
+                    let pose = (o.place)(&w.motion.pose(te), &w.cams[0]);
+                    foreign = foreign_at(w, &seen[c], &pose, &blobs, c >= o.seen_from, o.pos_sd);
+                    if o.mislabelled {
+                        engine = Some(pose);
+                    }
+                }
+                if c >= opts.flip_from
+                    && opts.engine_flipped.is_some_and(|(a, b)| te >= a && te < b)
+                {
                     engine = engine.map(|mut e| {
                         e.rotation *= UnitQuaternion::from_scaled_axis(Vector3::new(
                             0.0,
@@ -2158,7 +2399,7 @@ mod tests {
                                 ((te - 0.01) * 52.0).round() as usize % n == n - 1
                             }),
                     }),
-                    &[],
+                    &foreign,
                 );
             }
             if t > opts.measure_after.unwrap_or(1.0) {
@@ -3520,6 +3761,279 @@ mod tests {
         assert!(tr.stats.refused_acquisitions > 0, "{:?}", tr.stats);
         assert_eq!(tr.stats.acquisitions, 2, "{:?}", tr.stats);
         assert!(pct(&errors, 0.99) < 5e-3, "{:?}", tr.stats);
+    }
+
+    /// The engine takes the other controller, tracked 10 cm away, for this one, which no sensor
+    /// sees: its blobs under this controller's labels, its pose rated strong. Fitted, they
+    /// explain the frame as well as this controller's would; only the other's track tells them
+    /// apart, and no track is started from them.
+    #[test]
+    fn the_other_controllers_blobs_under_this_ones_labels_start_no_track() {
+        let w = world(3);
+        let other = Other {
+            place: beside,
+            mislabelled: true,
+            seen_from: 0,
+            pos_sd: 0.0005,
+        };
+        let (tr, errors) = run_with(
+            &w,
+            3.0,
+            0.3,
+            &Run {
+                other: Some((0.0, other)),
+                ..Run::default()
+            },
+        );
+        assert!(errors.is_empty() && !tr.tracking(), "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 0, "{:?}", tr.stats);
+        assert!(tr.stats.refused_acquisitions > 50, "{:?}", tr.stats);
+    }
+
+    /// As above with good poses, and with the first sensor not yet among those that see the other
+    /// controller: there the blobs start a track, which waits for a second sensor. The others fit
+    /// the same blobs, but the other controller's established track explains them better, and
+    /// nothing confirms the track.
+    #[test]
+    fn a_second_sensor_fitting_the_other_controllers_blobs_confirms_nothing() {
+        let w = world(3);
+        let other = Other {
+            place: beside,
+            mislabelled: true,
+            seen_from: 1,
+            pos_sd: 0.0005,
+        };
+        let (tr, errors) = run_with(
+            &w,
+            3.0,
+            0.3,
+            &Run {
+                engine_good: true,
+                other: Some((0.0, other)),
+                ..Run::default()
+            },
+        );
+        assert!(errors.is_empty() && !tr.tracking(), "{:?}", tr.stats);
+        assert!(
+            tr.stats.good_acquisitions > 0
+                && tr.stats.unconfirmed_acquisitions + 1 >= tr.stats.good_acquisitions,
+            "{:?}",
+            tr.stats
+        );
+    }
+
+    /// The controller is lost from sight while the other moves in where it was, 4 cm off, under
+    /// this controller's labels: within the re-lock window its dead-reckoned state finds them,
+    /// but the other controller's track explains them better, and it does not re-lock.
+    #[test]
+    fn a_lost_controller_does_not_relock_onto_the_other_controllers_blobs() {
+        fn near(pose: &Isometry3<f64>, _: &Camera) -> Isometry3<f64> {
+            Translation3::new(0.04, 0.0, 0.0) * pose
+        }
+        let w = world(3);
+        let other = Other {
+            place: near,
+            mislabelled: true,
+            seen_from: 0,
+            pos_sd: 0.0005,
+        };
+        let (tr, errors) = run_with(
+            &w,
+            5.0,
+            0.3,
+            &Run {
+                other: Some((3.0, other)),
+                ..Run::default()
+            },
+        );
+        assert!(!tr.tracking(), "{:?}", tr.stats);
+        assert_eq!(
+            (tr.stats.acquisitions, tr.stats.relocks),
+            (1, 0),
+            "{:?}",
+            tr.stats
+        );
+        // tracked from 1.0 s until lost 0.5 s after the other took its place
+        assert!(errors.len() < 1260, "{} tracked", errors.len());
+    }
+
+    /// The other controller is held 10 cm behind this one on the first sensor's line of sight: its
+    /// LEDs lie a pixel or less from this controller's in that sensor's image, nearly all within
+    /// their association gates. This controller's track explains its own blobs better, and that
+    /// sensor's frames keep updating it.
+    #[test]
+    fn a_controller_overlapping_the_other_in_the_image_keeps_its_track() {
+        let w = world(3);
+        let other = Other {
+            place: behind,
+            mislabelled: false,
+            seen_from: 0,
+            pos_sd: 0.0005,
+        };
+        let (tr, errors) = run_with(
+            &w,
+            5.0,
+            0.3,
+            &Run {
+                other: Some((2.0, other)),
+                ..Run::default()
+            },
+        );
+        assert!(tr.tracking(), "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(
+            tr.seen_by(0, tr.newest_imu().unwrap()),
+            "{:?}",
+            tr.camera_updates
+        );
+        assert!(pct(&errors, 0.99) < 4e-3, "{:?}", tr.stats);
+    }
+
+    /// As above with the first sensor alone, and the other controller's track uncertain (5 mm):
+    /// the blobs in its gates are better explained by this controller's track, and still count.
+    #[test]
+    fn a_contested_blob_our_track_explains_better_still_counts() {
+        let w = world(3);
+        let other = Other {
+            place: behind,
+            mislabelled: false,
+            seen_from: 0,
+            pos_sd: 0.005,
+        };
+        let (tr, errors) = run_with(
+            &w,
+            5.0,
+            0.3,
+            &Run {
+                cameras_after: Some((2.0, 1)),
+                other: Some((2.0, other)),
+                ..Run::default()
+            },
+        );
+        assert!(tr.tracking(), "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(
+            errors.len() > 1990,
+            "{} tracked {:?}",
+            errors.len(),
+            tr.stats
+        );
+    }
+
+    /// The kept orientation went wrong (60 degrees) while the controller was lost, and only one
+    /// sensor sees it again, its engine pose refused by the kept orientation. One sensor's poses
+    /// alone, however long refused, are no proof that the memory is wrong (they can be the other
+    /// controller's LEDs under this one's labels): it is kept, and nothing is acquired.
+    #[test]
+    fn one_sensors_refused_poses_keep_the_orientation_memory() {
+        let w = touch_world(7);
+        let (tr, _) = run_with(
+            &w,
+            8.0,
+            0.3,
+            &Run {
+                blackout: Some((3.0, 6.5)),
+                turn_memory_at: Some((4.0, Vector3::y() * 60f64.to_radians())),
+                cameras_after: Some((6.5, 1)),
+                ..Run::default()
+            },
+        );
+        assert!(tr.stats.refused_acquisitions > 50, "{:?}", tr.stats);
+        assert_ne!(tr.last_confirmed, 0, "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+    }
+
+    /// The kept orientation went wrong (60 degrees) while the controller was lost. Two sensors
+    /// then show the controller, their engine poses the same and refused by it: past
+    /// `max_refusing_ns` the memory is dropped and the controller taken where they put it.
+    #[test]
+    fn two_sensors_agreeing_drop_the_orientation_memory() {
+        let w = touch_world(7);
+        let (tr, errors) = run_with(
+            &w,
+            8.0,
+            0.3,
+            &Run {
+                blackout: Some((3.0, 6.5)),
+                turn_memory_at: Some((4.0, Vector3::y() * 60f64.to_radians())),
+                cameras_after: Some((6.5, 2)),
+                measure_after: Some(6.5),
+                ..Run::default()
+            },
+        );
+        assert!(tr.tracking(), "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 2, "{:?}", tr.stats);
+        // shown from max_refusing_ns after the sensors' first frames
+        assert!(errors.len() > 400, "{} tracked", errors.len());
+        assert!(pct(&errors, 0.5) < 1e-3, "{:?}", tr.stats);
+    }
+
+    /// As above, but the second sensor's engine pose is turned a quarter turn from the first's:
+    /// both refused, they are not the same pose, and the memory is kept.
+    #[test]
+    fn two_sensors_disagreeing_keep_the_orientation_memory() {
+        let w = touch_world(7);
+        let (tr, _) = run_with(
+            &w,
+            8.0,
+            0.3,
+            &Run {
+                blackout: Some((3.0, 6.5)),
+                turn_memory_at: Some((4.0, Vector3::y() * 60f64.to_radians())),
+                cameras_after: Some((6.5, 2)),
+                engine_flipped: Some((6.5, 8.0)),
+                flip_from: 1,
+                ..Run::default()
+            },
+        );
+        assert!(tr.stats.refused_acquisitions > 50, "{:?}", tr.stats);
+        assert_ne!(tr.last_confirmed, 0, "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+    }
+
+    /// The other controller's track is uncertain enough that its gate reaches past
+    /// `AssocParams::max_px`: a blob farther than that from its LED is no candidate for it, as the
+    /// association would not pair them either, and still counts for this controller.
+    #[test]
+    fn a_blob_beyond_max_px_of_the_other_controllers_led_counts() {
+        let w = world(3);
+        let tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let (cam, pose) = (&w.cams[0], w.motion.pose(1.0));
+        let blobs = sight_posed(&w, cam, &pose, &mut Rng::new(1), 0.0);
+        let pair = [((blobs[0].led_id & 0xff) as usize, 0)];
+        let mut prior = tr.acquisition_prior(&pose, None);
+        prior.cov *= 100.0;
+        let p6 = prior.cov.fixed_view::<6, 6>(0, 0).into_owned();
+        let pr = vision::project(cam, &w.body, &prior.x, pair[0].0).unwrap();
+        let var = Matrix2::identity() * tr.params.fit.update.sigma_px.powi(2);
+        let ours = prediction_fit(pr.uv, &(pr.j * p6 * pr.j.transpose() + var), blobs[0].xy);
+        // just past max_px, at the variance that makes its likelihood there highest
+        let off = tr.params.fit.assoc.max_px + 1.0;
+        let theirs = ForeignLed {
+            uv: blobs[0].xy + Vector2::new(off, 0.0),
+            cov: Matrix2::identity() * (off * off / 2.0),
+            seen: true,
+        };
+        let (d2, cost) = prediction_fit(theirs.uv, &theirs.cov, blobs[0].xy);
+        assert!(
+            d2 < tr.params.fit.assoc.gate && cost < ours.1,
+            "{d2} {cost} {ours:?}"
+        );
+        assert_eq!(tr.evidence(cam, &blobs, &pair, &prior, &[theirs]), 1);
+    }
+
+    /// A frame arrives as late as the history allows: whether the other controller was seen by its
+    /// sensor is looked up as far back from its exposure, and the update that shows it is kept.
+    #[test]
+    fn a_late_frame_still_finds_the_sensors_sighting() {
+        let w = world(3);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let ns = |t: f64| (1e9 + t * 1e9) as u64;
+        tr.note_camera_update(0, ns(1.0));
+        for k in 1..=725 {
+            tr.imu(imu(&w, k as f64 * 0.002));
+        }
+        assert!(tr.seen_by(0, ns(1.15)), "{:?}", tr.camera_updates);
     }
 
     /// The controller sleeps 20 s and is turned a quarter turn before it wakes (its clock jumps);

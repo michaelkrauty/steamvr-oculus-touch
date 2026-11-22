@@ -186,6 +186,32 @@ pub fn predicted_pixels(
     out
 }
 
+/// The LEDs the state puts facing the camera within `radius` px of one of `blobs`, each with its
+/// pixel and that prediction's covariance: the state's pose uncertainty, plus `sigma_px` of blob
+/// noise.
+pub fn predicted_near(
+    cam: &Camera,
+    body: &Body,
+    f: &Filter,
+    blobs: &[Blob],
+    radius: f64,
+    sigma_px: f64,
+    min_facing: f64,
+) -> Vec<(Vector2<f64>, Matrix2<f64>)> {
+    let projector = Projector::new(cam, body, &f.x);
+    let p6 = f.cov.fixed_view::<6, 6>(0, 0).into_owned();
+    let var = Matrix2::identity() * (sigma_px * sigma_px);
+    (0..body.leds.len())
+        .filter(|&i| {
+            projector.pixel(i).is_some_and(|(uv, facing)| {
+                facing > min_facing && blobs.iter().any(|b| (b.xy - uv).norm() < radius)
+            })
+        })
+        .filter_map(|i| projector.project(i))
+        .map(|pr| (pr.uv, pr.j * p6 * pr.j.transpose() + var))
+        .collect()
+}
+
 /// How many LEDs the state predicts in the image, facing the camera.
 pub fn visible_leds(cam: &Camera, body: &Body, x: &Nominal, p: &AssocParams) -> usize {
     let projector = Projector::new(cam, body, x);

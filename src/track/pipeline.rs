@@ -16,7 +16,7 @@ use nalgebra::{Isometry3, Vector2, Vector3};
 use super::clock::{LinearClock, Unwrap32};
 use super::epochs::{Checks, Evidence, State};
 use super::tracker::{
-    CameraAgreement, EnginePose, ImuSample, Outcome, Output, Params, Stats, Tracker,
+    CameraAgreement, EnginePose, ForeignLed, ImuSample, Outcome, Output, Params, Stats, Tracker,
 };
 use super::vision::{Blob, Body, Camera};
 use crate::calib::camera::CameraModel;
@@ -1117,16 +1117,28 @@ impl Pipeline {
                 pending.remove(0);
                 continue;
             }
-            let foreign = other
+            let foreign: Vec<ForeignLed> = other
                 .filter(|o| o.tracking())
                 .and_then(|o| {
                     let t = (other_clock.to_device(p.exposure_host_ns)? as i64
                         + opts.exposure_offset_ns)
                         .max(0) as u64;
                     let f = o.filter_at(t)?;
-                    Some(super::vision::predicted_pixels(
-                        &p.cam, &o.body, &f.x, min_facing,
-                    ))
+                    let seen = o.seen_by(p.camera, t);
+                    Some(
+                        super::vision::predicted_near(
+                            &p.cam,
+                            &o.body,
+                            &f,
+                            &p.blobs,
+                            opts.params.fit.assoc.max_px,
+                            opts.params.fit.update.sigma_px,
+                            min_facing,
+                        )
+                        .into_iter()
+                        .map(|(uv, cov)| ForeignLed { uv, cov, seen })
+                        .collect(),
+                    )
                 })
                 .unwrap_or_default();
             let tracked = if opts.trace {

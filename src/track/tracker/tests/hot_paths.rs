@@ -365,7 +365,7 @@ fn acquisition_and_streamed_search_match_original() {
             for cap in [0, 1, 4] {
                 tr.params.search.max_candidates = cap;
                 let old = tr.original_search_kept(cam, &blobs, &kept, None, &tr.params.fit);
-                let new = tr.search_kept(cam, &blobs, &kept, None, &tr.params.fit);
+                let new = tr.search_kept(cam, &blobs, &[], &kept, None, &tr.params.fit);
                 if let Some((_, fit)) = &new {
                     assert_eq!(
                         tr.acquisition_cost(cam, &blobs, fit).to_bits(),
