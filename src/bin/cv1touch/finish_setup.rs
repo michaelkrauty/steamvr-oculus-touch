@@ -14,6 +14,20 @@ enum Step {
     Start,
 }
 
+#[cfg(any(windows, test))]
+impl Step {
+    /// The heading the window and its log show for this step.
+    fn label(self) -> &'static str {
+        match self {
+            Step::SteamVrStopped => "Checking that SteamVR is closed",
+            Step::Stop => "Stopping cv1touch",
+            Step::Sensors => "Giving the sensors their driver",
+            Step::SteamVr => "Adding cv1touch to SteamVR",
+            Step::Start => "Starting cv1touch",
+        }
+    }
+}
+
 /// Printed before the reasons setup is incomplete; the installer shows the lines after it.
 #[cfg(any(windows, test))]
 const INCOMPLETE: &str = "Setup is incomplete:";
@@ -94,8 +108,8 @@ pub(super) fn run() -> i32 {
                 Step::SteamVr => (tool.clone(), &["steamvr", "install"]),
                 Step::Start => (tool.with_file_name("cv1touchd-quiet.exe"), &[]),
             };
-            println!("\n{step:?}...");
-            let mut command = Command::new(program);
+            println!("\n{}...", step.label());
+            let mut command = Command::new(&program);
             command.args(args);
             if step == Step::Start {
                 // The detached supervisor must not inherit our capture pipes: output() would
@@ -113,7 +127,14 @@ pub(super) fn run() -> i32 {
                         String::from_utf8_lossy(&output.stderr)
                     ),
                 ),
-                Err(error) => (1, format!("Could not run {step:?}: {error}\n")),
+                Err(error) => (
+                    1,
+                    format!(
+                        "{}: could not run {}: {error}\n",
+                        step.label(),
+                        program.display()
+                    ),
+                ),
             };
             if step == Step::Stop
                 && ["daemon.lock", "supervisor.lock"]
@@ -123,7 +144,7 @@ pub(super) fn run() -> i32 {
                 code = STILL_RUNNING;
             }
             print!("{text}");
-            log_error |= writeln!(log, "{step:?}: exit {code}\n{text}").is_err();
+            log_error |= writeln!(log, "{}: exit {code}\n{text}", step.label()).is_err();
             code
         });
         log.sync_all().map_err(|e| e.to_string())?;
@@ -182,6 +203,19 @@ mod tests {
             );
             assert_eq!(called.last(), Some(&failed));
             assert!(!called.contains(&Step::Sensors));
+        }
+    }
+
+    #[test]
+    fn steps_have_plain_labels() {
+        for step in [
+            Step::SteamVrStopped,
+            Step::Stop,
+            Step::Sensors,
+            Step::SteamVr,
+            Step::Start,
+        ] {
+            assert!(step.label().contains(' '), "{step:?}");
         }
     }
 

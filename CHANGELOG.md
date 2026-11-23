@@ -32,6 +32,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - While SteamVR tracks the headset from a base station no registration measured and the driver has set it to start from a measured one, `cv1touch doctor` and `cv1touch status` say to restart SteamVR instead of recording again.
 - `cv1touch steamvr uninstall`, which the uninstallers run, now asks to quit SteamVR first, since SteamVR rewrites its settings when it quits.
 - On Linux, `scripts/install.py` looks for SteamVR before it builds, so a missing SteamVR is reported in seconds instead of after the build; the README and setup guide say to start SteamVR once, then quit it, before installing. The uninstaller's last line now says where your calibration, settings and recordings are kept and that a udev rule you installed stays.
+- On Windows, **Finish setting up cv1touch** and its log name each step in words ("Giving the sensors their driver") instead of internal names such as `Sensors`. When the uninstaller cannot remove cv1touch from SteamVR, it now says to install cv1touch again, quit SteamVR and uninstall again, and names the log it keeps, instead of suggesting a report from the program it is removing.
 
 ### Fixed
 

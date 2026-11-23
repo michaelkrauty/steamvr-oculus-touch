@@ -172,7 +172,7 @@ begin
   Tool := ExpandConstant('{app}\bin\cv1touch.exe');
   ExecAndLogOutput(Tool, 'steamvr uninstall', '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code, nil);
   if Code <> 0 then
-    SuppressibleMsgBox('SteamVR registration could not be removed. Your files and calibration are safe. Send a cv1touch report before removing its saved settings if you need help.', mbInformation, MB_OK, IDOK);
+    SuppressibleMsgBox('cv1touch could not remove itself from SteamVR. Your calibration is kept. To retry, install cv1touch again, quit SteamVR, then uninstall again. What went wrong is in ' + ExpandConstant('{localappdata}') + '\cv1touch\state\logs\uninstaller.log.', mbInformation, MB_OK, IDOK);
   ExecAndLogOutput(Tool, 'sensors remove', '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code, nil);
   if Code <> 0 then
     SuppressibleMsgBox('Windows did not finish removing the sensor driver. Restart Windows if requested. To retry, reinstall cv1touch, plug in all sensors, then uninstall again and allow the permission prompt.', mbInformation, MB_OK, IDOK);

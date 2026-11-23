@@ -18,7 +18,7 @@ cv1touch adds original Oculus Rift CV1 Touch controllers to an existing SteamVR 
 1. Install SteamVR, start it once with your usual headset, and confirm that headset works. Then quit SteamVR. Plug in the CV1 headset's USB cable and every sensor.
 2. Download `cv1touch-setup-<version>.exe` from the [releases](https://github.com/michaelkrauty/steamvr-oculus-touch/releases) and run it. Windows may warn that it comes from an unknown publisher: cv1touch is not signed. It installs for you alone.
 3. Once during the install, Windows asks whether to allow a change (and, if your account is not an administrator's, for an administrator's password): that is `cv1touch sensors install`, which gives your sensors Windows' own USB driver ("WinUsb Device", which Windows ships and Microsoft signed). cv1touch reads the sensors through it. Nothing else is installed on your system, and the uninstaller takes it off again.
-4. The installer registers cv1touch with SteamVR and starts it. From then on it starts whenever you log in, without a window. If SteamVR is running, the installer waits until you quit it.
+4. The installer registers cv1touch with SteamVR and starts it. From then on it starts whenever you log in, without a window. If SteamVR is running, the installer asks you to quit it first.
 
    If something could not be done, the installer says what it was and what to do about it, for example to plug in a sensor or to allow Windows' prompt. Do that, then choose **Finish setting up cv1touch** in the Start menu. It tries again and keeps your calibration. Restart Windows if it asks you to.
 
