@@ -88,8 +88,9 @@ class ReportTests(unittest.TestCase):
         for section in ("Checks (cv1touch doctor)", "Oculus USB devices (vendor 2833)", "Programs",
                         "Daemon status", "Setup (cv1touch setup --check --json)"):
             self.assertIn(section, summary)
-        self.assertIn("FAIL daemon", summary)
-        self.assertIn("sensor_streams: skipped: daemon isn't running", summary)
+        self.assertIn("FAIL daemon: cv1touchd isn't running. Start it with systemctl --user start cv1touchd.",
+                      summary)
+        self.assertNotIn("skipped: daemon isn't running", summary)  # the daemon being down is the one cause given
         self.assertIn("cv1touchd: not answering", summary)
         self.assertIn("SteamVR (vrserver): not running", summary)
         self.assertIn("calibration.json.bak-1  19 bytes", summary)

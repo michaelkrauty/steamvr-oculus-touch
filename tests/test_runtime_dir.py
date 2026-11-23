@@ -308,7 +308,8 @@ class CliControlErrorTests(unittest.TestCase):
             ["setup", "--check"],
             "Start cv1touchd with access to the CV1 USB devices. (cv1touchd isn't running)")
 
-    def test_doctor_daemon_check_and_video_skip_do_not_suggest_starting(self):
-        checks = self.check_absent_daemon(["doctor"])
-        self.assertTrue(checks["sensor_streams"]["ok"])
-        self.assertEqual(checks["sensor_streams"]["detail"], "skipped: daemon isn't running")
+    def test_doctor_says_how_to_start_the_daemon_and_skips_nothing_else(self):
+        # Doctor's failure gives the fix; the video check it cannot make is left out.
+        checks = self.check_absent_daemon(
+            ["doctor"], "cv1touchd isn't running. Start it with systemctl --user start cv1touchd.")
+        self.assertNotIn("sensor_streams", checks)

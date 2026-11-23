@@ -106,6 +106,16 @@ enum DaemonPurpose {
 
 const DAEMON_NOT_RUNNING: &str = "cv1touchd isn't running";
 
+/// How to start the daemon.
+#[cfg(unix)]
+const START_DAEMON: &str = "Start it with systemctl --user start cv1touchd.";
+#[cfg(windows)]
+const START_DAEMON: &str = "Choose Start cv1touch in the Start menu.";
+
+/// Said when a command needs the sensor calibration loaded: the daemon runs without it until
+/// setup has made one, and sets it aside while a calibration capture runs.
+const NOT_CALIBRATED: &str = "cv1touch: the sensors aren't calibrated yet, or a calibration is being captured: run cv1touch setup, or wait until the capture has finished";
+
 fn daemon_log_hint() -> String {
     #[cfg(unix)]
     {
@@ -146,11 +156,7 @@ fn daemon_error(
             if matches!(purpose, DaemonPurpose::Check) {
                 return io::Error::new(error.kind(), DAEMON_NOT_RUNNING);
             }
-            #[cfg(unix)]
-            let start = "Start it with systemctl --user start cv1touchd.";
-            #[cfg(windows)]
-            let start = "Choose Start cv1touch in the Start menu.";
-            format!("{DAEMON_NOT_RUNNING}. {start} ({error})")
+            format!("{DAEMON_NOT_RUNNING}. {START_DAEMON} ({error})")
         }
         io::ErrorKind::PermissionDenied => format!(
             "cannot access cv1touchd's control socket at {}: it belongs to another user or has the wrong permissions ({error})",
@@ -344,81 +350,62 @@ type DoctorCheck = (&'static str, bool, String);
 /// The Oculus USB vendor: the headset, its sensors and the Touch controllers' dongle.
 const OCULUS: u16 = 0x2833;
 
-/// What `doctor` checks, and the daemon's status if it answered.
+/// What `doctor` checks, and the daemon's status if it answered. One cause gives one line:
+/// without SteamVR its files are not looked for, and with the daemon down its sensors are not
+/// judged. What setup has not made yet is one "todo" line, not a failure.
 fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
     let runtime = steamvr::runtime_root();
     let calibration = file::load(&file::default_path());
-    let registration = align::load_registration(&align::registration_path());
-    let render = align::load_render(&align::render_path());
-    let mut checks = vec![
-        (
-            "steamvr_runtime",
-            steamvr::vrpathreg().is_file(),
-            runtime.display().to_string(),
-        ),
-        (
+    let mut checks = steamvr_checks(&runtime);
+    checks.push(match steamvr::driver_assets() {
+        Ok(_) => (
             "driver_assets",
-            steamvr::driver_assets().is_ok(),
+            true,
             "installed payload or development build".into(),
         ),
-        (
-            "openvr_library",
-            vr::runtime_library().is_file(),
-            "SteamVR native OpenVR client library".into(),
+        Err(e) => (
+            "driver_assets",
+            false,
+            format!("cv1touch's SteamVR driver is incomplete ({e}): install cv1touch again"),
         ),
-        match steamvr::check_input_profile(&steamvr::driver_dir(), &runtime) {
-            Ok(profile) => (
-                "input_profile",
-                true,
-                format!(
-                    "{}, made from SteamVR's Oculus Touch profile",
-                    profile.display()
-                ),
-            ),
-            Err(e) => ("input_profile", false, e),
-        },
-        (
-            "render_models",
-            rendermodel::steamvr_body_obj(true).is_file()
-                && rendermodel::steamvr_body_obj(false).is_file(),
-            "SteamVR CV1 models".into(),
-        ),
+    });
+    checks.extend(setup_file_checks([
         (
             "calibration",
-            calibration.is_ok(),
-            calibration
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| file::default_path().display().to_string()),
+            "sensor calibration",
+            file::default_path(),
+            calibration.as_ref().map(|_| ()).map_err(Clone::clone),
         ),
         (
             "registration",
-            registration.is_ok(),
-            registration
-                .err()
-                .unwrap_or_else(|| align::registration_path().display().to_string()),
+            "alignment with the headset",
+            align::registration_path(),
+            align::load_registration(&align::registration_path()).map(|_| ()),
         ),
         (
             "render_offsets",
-            render.is_ok(),
-            render
-                .err()
-                .unwrap_or_else(|| align::render_path().display().to_string()),
+            "fit of the controller models",
+            align::render_path(),
+            align::load_render(&align::render_path()).map(|_| ()),
         ),
-    ];
+    ]));
     #[cfg(windows)]
     checks.push(sensors::doctor_check());
     let ((stream_ok, stream_detail), explained, daemon) =
         sensor_streams::doctor(calibration.as_ref().ok());
     let socket = control::socket_path();
-    let detail = daemon
-        .as_ref()
-        .err()
-        .map_or_else(|| socket.display().to_string(), ToString::to_string);
+    let detail = match &daemon {
+        Ok(_) => socket.display().to_string(),
+        Err(e) if e.to_string() == DAEMON_NOT_RUNNING => {
+            format!("{DAEMON_NOT_RUNNING}. {START_DAEMON}")
+        }
+        Err(e) => e.to_string(),
+    };
     let daemon = daemon.ok().flatten();
     checks.push(("daemon", daemon.is_some(), detail));
-    checks.push(("sensor_streams", stream_ok, stream_detail));
+    if daemon.is_some() || !stream_ok {
+        checks.push(("sensor_streams", stream_ok, stream_detail));
+    }
     if let Some(d) = &daemon {
         checks.extend(daemon_checks(d, &explained));
     }
@@ -542,53 +529,173 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
     (true, format!("warning: {detail}"))
 }
 
-fn doctor(json: bool) -> i32 {
-    let (checks, daemon) = doctor_checks();
-    if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "checks": checks.iter().map(|(name, ok, detail)| serde_json::json!({"name": name, "ok": ok, "detail": detail})).collect::<Vec<_>>(), "daemon": daemon, "note": "Wake sleeping controllers before checking tracking; calibration and registration require physical capture." })).unwrap());
+/// SteamVR's files cv1touch uses. Without SteamVR at `runtime` that one line says it all.
+fn steamvr_checks(runtime: &Path) -> Vec<DoctorCheck> {
+    let mut checks = vec![if steamvr::steamvr_present(runtime) {
+        ("steamvr_runtime", true, runtime.display().to_string())
     } else {
-        for (name, ok, detail) in &checks {
-            let label = if !ok {
-                "FAIL"
-            } else if detail.starts_with("warning: ") {
-                "warning"
-            } else {
-                "ok"
-            };
-            println!(
-                "{label} {name}: {}",
-                detail.strip_prefix("warning: ").unwrap_or(detail)
-            );
-        }
-        #[cfg(unix)]
-        println!("Wake sleeping controllers before checking tracking. USB access needs active-session udev permissions; logs: journalctl --user _COMM=cv1touchd.");
-        #[cfg(windows)]
-        println!(
-            "Wake sleeping controllers before checking tracking. The daemon's log: {}",
-            cv1touch::supervise::log_file().display()
+        (
+            "steamvr_runtime",
+            false,
+            steamvr::steamvr_not_found(runtime, steamvr::REINSTALL),
+        )
+    }];
+    if checks[0].1 {
+        let verify = "have Steam verify SteamVR's files (its Properties, Installed Files)";
+        let library = vr::runtime_library();
+        checks.push(if library.is_file() {
+            (
+                "openvr_library",
+                true,
+                "SteamVR native OpenVR client library".into(),
+            )
+        } else {
+            (
+                "openvr_library",
+                false,
+                format!(
+                    "SteamVR's OpenVR library is missing ({}): {verify}",
+                    library.display()
+                ),
+            )
+        });
+        checks.push(
+            match steamvr::check_input_profile(&steamvr::driver_dir(), runtime) {
+                Ok(profile) => (
+                    "input_profile",
+                    true,
+                    format!(
+                        "{}, made from SteamVR's Oculus Touch profile",
+                        profile.display()
+                    ),
+                ),
+                Err(e) => ("input_profile", false, e),
+            },
         );
-        println!("To send someone everything they need to see what went wrong: cv1touch report");
+        let models = [true, false].map(rendermodel::steamvr_body_obj);
+        checks.push(if models.iter().all(|m| m.is_file()) {
+            ("render_models", true, "SteamVR CV1 models".into())
+        } else {
+            (
+                "render_models",
+                false,
+                format!(
+                    "SteamVR's Rift CV1 controller models are missing ({}): {verify}",
+                    models[0].parent().unwrap_or(runtime).display()
+                ),
+            )
+        });
     }
-    if checks.iter().all(|(_, ok, _)| *ok) {
-        0
-    } else {
-        1
-    }
+    checks
 }
 
+/// The files setup makes: (check name, what it is, its path, whether it loaded). Those never
+/// made are one "todo" line, as setup has not been run; one that is there but unusable fails.
+fn setup_file_checks(
+    files: [(&'static str, &'static str, PathBuf, Result<(), String>); 3],
+) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    let mut missing = Vec::new();
+    for (name, what, path, loaded) in files {
+        match loaded {
+            Ok(()) => checks.push((name, true, path.display().to_string())),
+            // only a file known to be absent was never made: a folder that cannot be searched
+            // is a failure of its own
+            Err(_) if matches!(path.try_exists(), Ok(false)) => missing.push(what),
+            Err(e) => checks.push((
+                name,
+                false,
+                format!("the {what} can't be used ({e}): run cv1touch setup to make it again"),
+            )),
+        }
+    }
+    if !missing.is_empty() {
+        checks.push((
+            "setup",
+            true,
+            format!(
+                "todo: not set up yet (no {}): run cv1touch setup",
+                missing.join(", no ")
+            ),
+        ));
+    }
+    checks
+}
+
+/// The label a check prints under: FAIL, warning, todo or ok, and its detail without the
+/// label's prefix.
+fn doctor_label(ok: bool, detail: &str) -> (&'static str, &str) {
+    if !ok {
+        return ("FAIL", detail);
+    }
+    for label in ["warning", "todo"] {
+        if let Some(rest) = detail
+            .strip_prefix(label)
+            .and_then(|d| d.strip_prefix(": "))
+        {
+            return (label, rest);
+        }
+    }
+    ("ok", detail)
+}
+
+fn doctor(json: bool) -> i32 {
+    let (checks, daemon) = doctor_checks();
+    let failed = checks.iter().any(|(_, ok, _)| !ok);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "checks": checks.iter().map(|(name, ok, detail)| serde_json::json!({"name": name, "ok": ok, "detail": detail})).collect::<Vec<_>>(), "daemon": daemon })).unwrap());
+    } else {
+        for line in doctor_lines(&checks) {
+            println!("{line}");
+        }
+    }
+    i32::from(failed)
+}
+
+/// `doctor`'s text: a line per check, then where to look further when one failed.
+fn doctor_lines(checks: &[DoctorCheck]) -> Vec<String> {
+    let mut lines: Vec<String> = checks
+        .iter()
+        .map(|(name, ok, detail)| {
+            let (label, detail) = doctor_label(*ok, detail);
+            format!("{label} {name}: {detail}")
+        })
+        .collect();
+    if checks.iter().any(|(_, ok, _)| !ok) {
+        lines.push(format!("A fix above didn't help? {}", daemon_log_hint()));
+        lines.push(
+            "To send someone everything they need to see what went wrong: cv1touch report".into(),
+        );
+    }
+    lines
+}
+
+/// The daemon's full status for the board, or what to say instead. `alive`: its shared memory
+/// shows a fresh heartbeat, so a missing socket means this command looks in the wrong place.
 fn board_status(
     generation: u64,
+    alive: bool,
     request: impl FnOnce(&str, Duration) -> io::Result<String>,
 ) -> (Option<serde_json::Value>, Option<String>) {
     let reply = match request("status", Duration::from_millis(200)) {
         Ok(reply) => reply,
         Err(error) => {
+            let absent = matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            );
+            let error = if alive && absent {
+                format!(
+                    "cv1touchd is running, but cv1touch can't reach its control socket at {}: run cv1touch as the same user, in the same login session, as cv1touchd",
+                    control::socket_path().display()
+                )
+            } else {
+                error.to_string()
+            };
             return (
                 None,
-                Some(format!(
-                    "{error}; showing the SHM compatibility prefix (at most eight sensors)."
-                )),
-            )
+                Some(format!("{error}. Only the first eight sensors are shown.")),
+            );
         }
     };
     let complete = reply
@@ -604,14 +711,20 @@ fn board_sensors<'a>(
     prefix: impl FnOnce() -> Vec<shm::SensorStatus>,
 ) -> (Vec<shm::SensorStatus>, &'a str) {
     match complete.map(status::sensors_from_status) {
-            Some(Ok(sensors)) => {
-                let note = if complete.unwrap()["sensor_total"].as_u64().is_none() {
-                    "Legacy daemon diagnostics may show only the first eight sensors."
-                } else { "" };
-                (sensors, note)
-            }
-            _ => (prefix(),
-                unavailable.unwrap_or("Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors).")),
+        Some(Ok(sensors)) => {
+            let note = if complete.unwrap()["sensor_total"].as_u64().is_none() {
+                "This cv1touchd is older than cv1touch and shows only the first eight sensors."
+            } else {
+                ""
+            };
+            (sensors, note)
+        }
+        _ => (
+            prefix(),
+            unavailable.unwrap_or(
+                "cv1touchd's status couldn't be read. Only the first eight sensors are shown.",
+            ),
+        ),
     }
 }
 
@@ -640,7 +753,8 @@ fn status_board(shm_name: &str) -> i32 {
             };
         }
         let r = reader.as_ref().unwrap();
-        let (complete, unavailable) = board_status(r.generation(), daemon_request);
+        let alive = !r.stale(now, 500_000_000);
+        let (complete, unavailable) = board_status(r.generation(), alive, daemon_request);
         if let Some(current) = &complete {
             match &stream_sample {
                 Some((then, previous))
@@ -656,7 +770,7 @@ fn status_board(shm_name: &str) -> i32 {
             }
         } else {
             stream_sample = None;
-            stream_note = "sensor_streams: skipped: control diagnostics unavailable".into();
+            stream_note.clear();
             stream_explained.clear();
         }
         let (sensors, sensor_note) =
@@ -671,12 +785,14 @@ fn status_board(shm_name: &str) -> i32 {
         let age = now.saturating_sub(r.heartbeat_ns()) as f64 / 1e9;
         println!(
             "\x1b[H\x1b[2J{}",
-            status::render(&hands, &sensors, &rates, age, r.generation())
+            status::render(&hands, &sensors, &rates, age)
         );
         if !sensor_note.is_empty() {
             println!("{sensor_note}");
         }
-        println!("{stream_note}");
+        if !stream_note.is_empty() {
+            println!("{stream_note}");
+        }
         if let Some(message) = complete
             .as_ref()
             .and_then(|v| v["recording_status"]["message"].as_str())
@@ -1335,9 +1451,7 @@ fn register_cmd(check_only: bool, force: bool) -> i32 {
         .as_deref()
         != Some("calibrated")
     {
-        eprintln!(
-            "cv1touch: cv1touchd must be running in calibrated mode (cv1touch status --json)"
-        );
+        eprintln!("{NOT_CALIBRATED}");
         return 1;
     }
     let saved = if check_only {
@@ -1781,7 +1895,7 @@ fn eval_capture() -> i32 {
     };
     catch_interrupts();
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
-        eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
+        eprintln!("{NOT_CALIBRATED}");
         return 1;
     }
     let client = match vr::Client::connect() {
@@ -3182,7 +3296,7 @@ fn capture_free_named_with_feedback(
         1
     })?);
     if status.as_ref().and_then(|v| v["mode"].as_str()) != Some("calibrated") {
-        eprintln!("cv1touch: cv1touchd must be running in calibrated mode");
+        eprintln!("{NOT_CALIBRATED}");
         return Err(1);
     }
     let client = match vr::Client::connect() {
@@ -7081,7 +7195,7 @@ mod tests {
     fn control_error_board_note(kind: io::ErrorKind) -> String {
         let socket = Path::new("/fixture/run/cv1touch/control.sock");
         let mut description = None;
-        let (complete, note) = board_status(42, |line, timeout| {
+        let (complete, note) = board_status(42, false, |line, timeout| {
             assert_eq!(line, "status");
             assert_eq!(timeout, Duration::from_millis(200));
             let error = daemon_error(
@@ -7106,7 +7220,7 @@ mod tests {
         assert!(note.starts_with(&description.unwrap()), "{note}");
         assert!(note.contains("fixture OS detail"), "{note}");
         assert!(
-            note.ends_with("showing the SHM compatibility prefix (at most eight sensors)."),
+            note.ends_with(". Only the first eight sensors are shown."),
             "{note}"
         );
         note.to_owned()
@@ -7122,6 +7236,39 @@ mod tests {
             #[cfg(windows)]
             assert!(note.contains("Start cv1touch in the Start menu"), "{note}");
             assert!(note.contains("(fixture OS detail)"), "{note}");
+        }
+    }
+
+    /// With a fresh heartbeat in shared memory the daemon runs: a missing socket means this
+    /// command looks for it elsewhere, so the board says that rather than how to start it.
+    #[test]
+    fn a_running_daemons_missing_socket_is_not_called_stopped() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            let (complete, note) = board_status(42, true, |_, timeout| {
+                Err(daemon_error(
+                    io::Error::new(kind, "fixture OS detail"),
+                    Path::new("/fixture/control.sock"),
+                    timeout,
+                    DaemonPurpose::Command,
+                ))
+            });
+            assert!(complete.is_none());
+            let note = note.unwrap();
+            assert!(!note.contains("isn't running"), "{note}");
+            assert!(!note.contains("SHM"), "{note}");
+            let unreachable = format!(
+                "cv1touchd is running, but cv1touch can't reach its control socket at {}: run cv1touch as the same user, in the same login session, as cv1touchd. Only the first eight sensors are shown.",
+                control::socket_path().display()
+            );
+            if kind == io::ErrorKind::PermissionDenied {
+                assert!(note.contains("another user"), "{note}");
+            } else {
+                assert_eq!(note, unreachable);
+            }
         }
     }
 
@@ -7176,7 +7323,7 @@ mod tests {
     #[test]
     fn unknown_control_errors_keep_their_details() {
         let note = control_error_board_note(io::ErrorKind::InvalidData);
-        assert!(note.starts_with("fixture OS detail;"), "{note}");
+        assert!(note.starts_with("fixture OS detail."), "{note}");
         assert!(!note.contains("isn't running"), "{note}");
         assert!(!note.contains("permissions"), "{note}");
     }
@@ -7203,7 +7350,7 @@ mod tests {
     fn the_board_keeps_the_control_path_length_error() {
         let path = format!("/{}/control.sock", "r".repeat(94));
         let socket = Path::new(&path);
-        let (complete, note) = board_status(42, |_, timeout| {
+        let (complete, note) = board_status(42, false, |_, timeout| {
             let long = platform::ipc::path_too_long(socket).unwrap();
             Err(daemon_error(
                 io::Error::new(io::ErrorKind::InvalidInput, long),
@@ -7237,7 +7384,7 @@ mod tests {
             ("{\"generation\":42}", false),
         ] {
             let mut calls = 0;
-            let (complete, problem) = board_status(42, |line, timeout| {
+            let (complete, problem) = board_status(42, false, |line, timeout| {
                 calls += 1;
                 assert_eq!(line, "status");
                 assert_eq!(timeout, Duration::from_millis(200));
@@ -7312,7 +7459,7 @@ mod tests {
             (serde_json::json!({"sensors": [], "sensor_total": 0}), ""),
             (
                 serde_json::json!({"sensors": []}),
-                "Legacy daemon diagnostics may show only the first eight sensors.",
+                "This cv1touchd is older than cv1touch and shows only the first eight sensors.",
             ),
         ] {
             let (sensors, note) = board_sensors(Some(&value), Some("unused failure"), || {
@@ -7332,7 +7479,10 @@ mod tests {
                 }]
             });
             assert_eq!(sensors[0].frames, 77);
-            assert_eq!(note, "Control diagnostics unavailable; showing the SHM compatibility prefix (at most eight sensors).");
+            assert_eq!(
+                note,
+                "cv1touchd's status couldn't be read. Only the first eight sensors are shown."
+            );
         }
     }
 
@@ -7434,6 +7584,115 @@ mod tests {
                 "warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-X".to_string()
             )
         );
+    }
+
+    /// Setup files never made are one "todo" line that passes; one that is there but unusable
+    /// fails and says setup makes it again; one that loads is named by its path.
+    #[test]
+    fn doctor_counts_setup_files_never_made_as_one_todo() {
+        let dir = std::env::temp_dir().join(format!("cv1touch-doctor-{}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("registration.json");
+        std::fs::write(&broken, "{").unwrap();
+        let absent = |name: &str| (dir.join(name), Err(format!("{name}: no such file")));
+        let ((c, c_err), (r, r_err)) = (absent("calibration.json"), absent("render.json"));
+        let checks = setup_file_checks([
+            ("calibration", "sensor calibration", c, c_err),
+            (
+                "registration",
+                "alignment with the headset",
+                broken.clone(),
+                Err("bad JSON".into()),
+            ),
+            ("render_offsets", "fit of the controller models", r, r_err),
+        ]);
+        assert_eq!(
+            checks,
+            [
+                (
+                    "registration",
+                    false,
+                    "the alignment with the headset can't be used (bad JSON): run cv1touch setup to make it again".to_string()
+                ),
+                (
+                    "setup",
+                    true,
+                    "todo: not set up yet (no sensor calibration, no fit of the controller models): run cv1touch setup".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            doctor_lines(&checks[1..]),
+            ["todo setup: not set up yet (no sensor calibration, no fit of the controller models): run cv1touch setup"]
+        );
+        // a file whose presence cannot be told is not "never made" (here its folder is a file,
+        // which Unix refuses to search; Windows calls that path not found)
+        #[cfg(unix)]
+        {
+            let hidden = broken.join("calibration.json");
+            let checks = setup_file_checks([
+                (
+                    "calibration",
+                    "sensor calibration",
+                    hidden,
+                    Err("cannot read it".into()),
+                ),
+                ("registration", "b", broken.clone(), Ok(())),
+                ("render_offsets", "c", broken.clone(), Ok(())),
+            ]);
+            assert_eq!(
+                checks[0],
+                (
+                    "calibration",
+                    false,
+                    "the sensor calibration can't be used (cannot read it): run cv1touch setup to make it again".to_string()
+                )
+            );
+            assert!(checks.iter().all(|c| c.0 != "setup"));
+        }
+        let loaded = setup_file_checks([
+            ("calibration", "a", broken.clone(), Ok(())),
+            ("registration", "b", broken.clone(), Ok(())),
+            ("render_offsets", "c", broken.clone(), Ok(())),
+        ]);
+        assert!(loaded
+            .iter()
+            .all(|c| c.1 && c.2 == broken.display().to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Without SteamVR, its files are not looked for: one line, with what to do.
+    #[test]
+    fn doctor_reports_missing_steamvr_once() {
+        let runtime = Path::new("/fixture/no/SteamVR");
+        let checks = steamvr_checks(runtime);
+        assert_eq!(
+            checks,
+            [(
+                "steamvr_runtime",
+                false,
+                steamvr::steamvr_not_found(runtime, steamvr::REINSTALL)
+            )]
+        );
+    }
+
+    /// The footer appears only after a failure; passes, warnings and todos print one line each.
+    #[test]
+    fn doctor_prints_the_footer_only_after_a_failure() {
+        let passing = [
+            ("a", true, "fine".to_string()),
+            ("b", true, "warning: look".to_string()),
+            ("c", true, "todo: later".to_string()),
+        ];
+        assert_eq!(
+            doctor_lines(&passing),
+            ["ok a: fine", "warning b: look", "todo c: later"]
+        );
+        let failing = [("a", false, "broken: fix it".to_string())];
+        let lines = doctor_lines(&failing);
+        assert_eq!(lines[0], "FAIL a: broken: fix it");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].ends_with("cv1touch report"));
     }
 
     /// `doctor`'s sensor_poses check reads the daemon's pose watch: moved beats placed, given up

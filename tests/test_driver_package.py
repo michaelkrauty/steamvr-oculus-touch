@@ -83,9 +83,12 @@ class DriverPackageTests(unittest.TestCase):
         (self.package / ".cv1touch-owned.json").unlink()
         shutil.rmtree(self.package / "resources")
 
-    def doctor_profile_check(self):
+    def doctor_checks(self):
         result = subprocess.run([BINARY, "doctor", "--json"], env=self.env, cwd=self.root, capture_output=True, text=True, timeout=30)
-        return {c["name"]: c for c in json.loads(result.stdout)["checks"]}["input_profile"]
+        return {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+
+    def doctor_profile_check(self):
+        return self.doctor_checks()["input_profile"]
 
     def test_install_makes_the_input_profile_from_steamvrs_and_uninstall_removes_it(self):
         self.cli("install")
@@ -193,7 +196,9 @@ class DriverPackageTests(unittest.TestCase):
                 self.assertNotIn("scripts/install.py", result.stderr)
         self.assertEqual(self.log_text(), "")
         self.assertFalse(self.package.exists())
-        check = self.doctor_profile_check()
+        checks = self.doctor_checks()
+        self.assertNotIn("input_profile", checks)  # one line for the one cause
+        check = checks["steamvr_runtime"]
         self.assertFalse(check["ok"])
         self.assertIn("SteamVR was not found at", check["detail"])
         self.assertIn("install it from Steam", check["detail"])

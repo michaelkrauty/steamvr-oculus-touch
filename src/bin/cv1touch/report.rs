@@ -167,10 +167,8 @@ fn summary(created: SystemTime, report: &mut Report) -> String {
     ];
     let (checks, daemon) = doctor_checks();
     for (name, ok, detail) in &checks {
-        text.push(format!(
-            "  {} {name}: {detail}",
-            if *ok { "ok" } else { "FAIL" }
-        ));
+        let (label, detail) = doctor_label(*ok, detail);
+        text.push(format!("  {label} {name}: {detail}"));
     }
     text.push(String::new());
     text.push(format!("Oculus USB devices (vendor {OCULUS:04x})"));

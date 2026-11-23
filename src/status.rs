@@ -75,8 +75,7 @@ impl VideoCounterKind {
         match self {
             Self::RawReceived => "received frames/s",
             Self::JpegDecoded => "decoded frames/s",
-            Self::LegacyReceived => "legacy payloads/s",
-            Self::LegacyReleased => "legacy released buffers/s",
+            Self::LegacyReceived | Self::LegacyReleased => "video frames/s",
         }
     }
 }
@@ -401,7 +400,7 @@ fn hotplug_note(pending: &[&serde_json::Value], value: &serde_json::Value) -> Op
 
 fn state_text(s: &ControllerState) -> &'static str {
     if s.flags & FLAG_CALIBRATED == 0 {
-        "not paired / never seen"
+        "not heard from yet: press a button on it"
     } else if s.flags & FLAG_ASLEEP != 0 {
         "asleep"
     } else if s.flags & FLAG_CONNECTED == 0 {
@@ -433,11 +432,10 @@ pub fn render(
     sensors: &[SensorStatus],
     rates: &HashMap<String, SensorRates>,
     heartbeat_age_s: f64,
-    generation: u64,
 ) -> String {
     let mut lines = vec![
         format!(
-            "cv1touchd generation {generation:#x}   heartbeat {:.0} ms ago",
+            "cv1touchd: last update {:.0} ms ago",
             heartbeat_age_s * 1000.0
         ),
         String::new(),
@@ -482,7 +480,7 @@ pub fn render(
             "NOT placed"
         };
         lines.push(format!(
-            "sensor {serial}: {placed}  {video}  fixes/s L {left:5.1} R {right:5.1}"
+            "sensor {serial}: {placed}  {video}  sightings/s L {left:5.1} R {right:5.1}"
         ));
     }
     lines.join("\n")
@@ -569,7 +567,6 @@ mod tests {
             &sensors,
             &HashMap::new(),
             0.0,
-            1,
         );
         assert_eq!(
             text.lines().filter(|s| s.starts_with("sensor ")).count(),
@@ -604,7 +601,6 @@ mod tests {
             &[sensor],
             &rates,
             0.004,
-            0x2A,
         );
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[2].contains("left") && lines[2].contains("STANDBY"));
@@ -624,7 +620,6 @@ mod tests {
             &[],
             &HashMap::new(),
             0.004,
-            0x2A,
         );
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[2].contains("left") && lines[2].contains("radio silent: held as it was"));
@@ -641,7 +636,6 @@ mod tests {
             &[],
             &HashMap::new(),
             0.004,
-            0x2A,
         );
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[2].contains("left") && lines[2].contains("asleep"));
@@ -683,9 +677,12 @@ mod tests {
             &[],
             &HashMap::new(),
             0.0,
-            1,
         );
-        assert_eq!(text.matches("not paired / never seen").count(), 2);
+        assert_eq!(
+            text.matches("not heard from yet: press a button on it")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -777,19 +774,18 @@ mod tests {
             let value = quality_snapshot(format, 0, decoded);
             let rates =
                 VideoRateHistory::default().update(1_000_000_000, 1, &[sensor], Some(&value));
-            let text = render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0, 1);
+            let text = render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0);
             assert!(text.contains(expected), "{text}");
         }
         for (field, expected) in [
-            ("frames", "legacy released buffers/s"),
-            ("frames_received", "legacy payloads/s"),
+            ("frames", "video frames/s   0.0"),
+            ("frames_received", "video frames/s   0.0"),
         ] {
             let value = json!({"sensors":[{"serial":"camera1",field:0}]});
             let rates =
                 VideoRateHistory::default().update(1_000_000_000, 1, &[sensor], Some(&value));
             assert!(
-                render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0, 1)
-                    .contains(expected)
+                render(&[ControllerState::default(); 2], &[sensor], &rates, 0.0).contains(expected)
             );
             assert!(video_frame_counters(&value).is_empty());
         }
