@@ -1113,6 +1113,16 @@ pub fn flush_console_input() {
     unsafe { libc::tcflush(0, libc::TCIFLUSH) };
 }
 
+pub fn console_width() -> Option<usize> {
+    // SAFETY: a plain terminal call on stdout filling a zeroed structure; it fails when stdout
+    // is not a terminal.
+    unsafe {
+        let mut size: libc::winsize = std::mem::zeroed();
+        (libc::ioctl(1, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0)
+            .then_some(size.ws_col as usize)
+    }
+}
+
 pub fn console_closes_with_us() -> bool {
     false
 }

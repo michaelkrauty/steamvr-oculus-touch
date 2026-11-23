@@ -28,6 +28,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - `cv1touch doctor` said "judged moved by mistake and let go" for every sensor the daemon put back into tracking as calibrated, also when no new position for it was found in time. It now says what happened and what to do in each case, including when cv1touch checks the sensor again. `status --json` gives the reason as `pose.cause` and the time of that check as `pose.next_check_ns`.
 - The daemon's log no longer fills with battery lines when a controller's battery reading alternates between two neighbouring percentages, which could write thousands of lines a day. A change is logged once; going back to the previous percentage is not logged again. `cv1touch status` still shows the newest reading.
 - A controller the tracker has no position for yet, such as one just woken, was shown turned as it was one motion sample (about 2 ms) earlier. Its orientation is now carried on to the newest sample.
+- `cv1touch status` cleared the terminal for every redraw, five times a second, so the terminal's scrollback filled with copies of the board and of any message on it, such as the one saying the control socket can't be reached. The board is now drawn over itself in place and leaves one copy.
 
 ## [0.5.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) - 2026-11-23
 

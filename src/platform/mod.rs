@@ -609,6 +609,12 @@ pub mod console {
         os::interrupted()
     }
 
+    /// The width in columns of the terminal standard output writes to; None when it is not a
+    /// terminal.
+    pub fn width() -> Option<usize> {
+        os::console_width()
+    }
+
     /// Whether this process is the only one at its console, so that Windows closes the window
     /// when it ends: a program started from Explorer or as an administrator by `run_elevated`
     /// gets a console of its own, whose output vanishes with it. On Linux the terminal stays:

@@ -2434,6 +2434,21 @@ pub fn append_private(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+pub fn console_width() -> Option<usize> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: the standard output handle and a zeroed structure; the call fails when standard
+    // output is not a console.
+    unsafe {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        // Lines wrap at the buffer's width.
+        (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) != 0
+            && info.dwSize.X > 0)
+            .then_some(info.dwSize.X as usize)
+    }
+}
+
 pub fn console_closes_with_us() -> bool {
     use windows_sys::Win32::System::Console::GetConsoleProcessList;
     let mut processes = [0u32; 2];

@@ -820,6 +820,35 @@ fn board_sensors<'a>(
     }
 }
 
+fn push_line(frame: &mut String, line: &str) {
+    frame.push('\n');
+    frame.push_str(line);
+}
+
+/// One board frame drawn over the previous one in place: clearing the screen instead would
+/// push a copy of every frame, and of any error on it, into the terminal's scrollback. A line
+/// that ends on the terminal's last column leaves the cursor there, so erasing after it would
+/// take its last character: the rest of its row is already written.
+fn board_frame(text: &str, width: Option<usize>) -> String {
+    let mut out = String::from("\x1b[H");
+    for line in text.lines() {
+        out.push_str(line);
+        let len = line.chars().count();
+        if !width.is_some_and(|w| len > 0 && len % w == 0) {
+            out.push_str("\x1b[K");
+        }
+        out.push('\n');
+    }
+    out.push_str("\x1b[J");
+    out
+}
+
+fn redraw(text: &str) {
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(board_frame(text, console::width()).as_bytes());
+    let _ = stdout.flush();
+}
+
 fn status_board(shm_name: &str) -> i32 {
     if let Some(problem) = socket_path_problem(&control::socket_path()) {
         eprintln!("cv1touch: cannot reach cv1touchd: {problem}");
@@ -837,8 +866,7 @@ fn status_board(shm_name: &str) -> i32 {
             reader = match ShmReader::open(shm_name) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    println!("\x1b[H\x1b[2Jwaiting for cv1touchd: {e}");
-                    let _ = io::stdout().flush();
+                    redraw(&format!("waiting for cv1touchd: {e}"));
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -875,40 +903,37 @@ fn status_board(shm_name: &str) -> i32 {
             r.hand(HAND_RIGHT).unwrap_or_default(),
         ];
         let age = now.saturating_sub(r.heartbeat_ns()) as f64 / 1e9;
-        println!(
-            "\x1b[H\x1b[2J{}",
-            status::render(&hands, &sensors, &rates, age)
-        );
+        let mut frame = status::render(&hands, &sensors, &rates, age);
         if let Some(note) = complete
             .as_ref()
             .and_then(|v| status::radio_loss_note(v, &hands))
         {
-            println!("{note}");
+            push_line(&mut frame, &note);
         }
         if !sensor_note.is_empty() {
-            println!("{sensor_note}");
+            push_line(&mut frame, sensor_note);
         }
         if !stream_note.is_empty() {
-            println!("{stream_note}");
+            push_line(&mut frame, &stream_note);
         }
         if let Some(message) = complete
             .as_ref()
             .and_then(|v| v["recording_status"]["message"].as_str())
         {
             if !message.is_empty() {
-                println!("{message}");
+                push_line(&mut frame, message);
             }
         }
         if let Some(note) = complete
             .as_ref()
             .and_then(|v| status::sensor_hotplug_note(v, &stream_explained))
         {
-            println!("{note}");
+            push_line(&mut frame, &note);
         }
         if let Some(note) = complete.as_ref().and_then(status::unmeasured_base_note) {
-            println!("{note}");
+            push_line(&mut frame, &note);
         }
-        let _ = io::stdout().flush();
+        redraw(&frame);
         thread::sleep(Duration::from_millis(200));
     }
 }
@@ -6955,6 +6980,36 @@ mod tests {
     }
 
     use super::*;
+
+    /// The board redraws over its last frame instead of clearing the screen, so an error on it
+    /// is not copied into the scrollback on every frame; leftovers of a longer frame are erased.
+    #[test]
+    fn board_frame_redraws_in_place() {
+        let frame = board_frame(
+            "cv1touchd: last update 1 ms ago\ncv1touchd is running, but ...",
+            None,
+        );
+        assert_eq!(
+            frame,
+            "\x1b[Hcv1touchd: last update 1 ms ago\x1b[K\ncv1touchd is running, but ...\x1b[K\n\x1b[J"
+        );
+        assert!(!frame.contains("\x1b[2J"), "{frame:?}");
+    }
+
+    /// A line that fills the terminal's width, or a multiple of it, leaves the cursor on the
+    /// last column, where an erase would take the line's last character; shorter lines, empty
+    /// ones and any line when the width is unknown are erased after as before.
+    #[test]
+    fn board_frame_keeps_the_last_column_of_a_full_line() {
+        let erased =
+            |line: &str, width| board_frame(&format!("{line}\n"), width).contains("\x1b[K");
+        assert!(!erased("abcd", Some(4)));
+        assert!(!erased("abcdefgh", Some(4)));
+        assert!(erased("abc", Some(4)));
+        assert!(erased("abcde", Some(4)));
+        assert!(erased("", Some(4)));
+        assert!(erased("abcd", None));
+    }
 
     fn serial_fixture() -> (
         tempfile::TempDir,
