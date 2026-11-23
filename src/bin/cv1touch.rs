@@ -248,7 +248,7 @@ fn daemon_error(
             if matches!(purpose, DaemonPurpose::Check) {
                 return io::Error::new(error.kind(), DAEMON_NOT_RUNNING);
             }
-            format!("{DAEMON_NOT_RUNNING}. {START_DAEMON} ({error})")
+            format!("{DAEMON_NOT_RUNNING}. {START_DAEMON}")
         }
         io::ErrorKind::PermissionDenied => format!(
             "cannot access cv1touchd's control socket at {}: it belongs to another user or has the wrong permissions ({error})",
@@ -287,8 +287,12 @@ fn socket_path_problem(socket: &Path) -> Option<String> {
     )
 }
 
-/// What is printed when the daemon cannot be reached at `socket`.
+/// What is printed when the daemon cannot be reached at `socket`. A stopped daemon is said
+/// with how to start it alone: the path and the OS error help only with the other causes.
 fn cannot_reach(socket: &Path, error: &io::Error) -> String {
+    if error.to_string().starts_with(DAEMON_NOT_RUNNING) {
+        return format!("cv1touch: {error}");
+    }
     format!(
         "cv1touch: cannot reach cv1touchd at {}: {error}",
         socket.display()
@@ -453,7 +457,7 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
         Ok(_) => (
             "driver_assets",
             true,
-            "installed payload or development build".into(),
+            "cv1touch's SteamVR driver files are complete".into(),
         ),
         Err(e) => (
             "driver_assets",
@@ -794,10 +798,7 @@ fn board_status(
             } else {
                 error.to_string()
             };
-            return (
-                None,
-                Some(format!("{error}. Only the first eight sensors are shown.")),
-            );
+            return (None, Some(error));
         }
     };
     let complete = reply
@@ -807,11 +808,13 @@ fn board_status(
     (complete, None)
 }
 
-fn board_sensors<'a>(
+/// The sensors the board shows and its note about them. Without the daemon's status they are
+/// the shared memory's prefix, which holds at most eight: only a full one may leave some out.
+fn board_sensors(
     complete: Option<&serde_json::Value>,
-    unavailable: Option<&'a str>,
+    unavailable: Option<&str>,
     prefix: impl FnOnce() -> Vec<shm::SensorStatus>,
-) -> (Vec<shm::SensorStatus>, &'a str) {
+) -> (Vec<shm::SensorStatus>, String) {
     match complete.map(status::sensors_from_status) {
         Some(Ok(sensors)) => {
             let note = if complete.unwrap()["sensor_total"].as_u64().is_none() {
@@ -819,14 +822,19 @@ fn board_sensors<'a>(
             } else {
                 ""
             };
+            (sensors, note.into())
+        }
+        _ => {
+            let sensors = prefix();
+            let mut note = unavailable
+                .unwrap_or("cv1touchd's status couldn't be read")
+                .to_string();
+            note.push('.');
+            if sensors.len() >= shm::MAX_SENSORS {
+                note.push_str(" Only the first eight sensors are shown.");
+            }
             (sensors, note)
         }
-        _ => (
-            prefix(),
-            unavailable.unwrap_or(
-                "cv1touchd's status couldn't be read. Only the first eight sensors are shown.",
-            ),
-        ),
     }
 }
 
@@ -859,6 +867,22 @@ fn redraw(text: &str) {
     let _ = stdout.flush();
 }
 
+/// Why the daemon's shared memory can't be opened, with how to start a stopped daemon.
+fn shm_open_error(error: &shm::ShmError) -> String {
+    match error {
+        shm::ShmError::NotRunning => format!("{error}. {START_DAEMON}"),
+        _ => error.to_string(),
+    }
+}
+
+/// What the board shows while the daemon's shared memory can't be opened; it keeps trying.
+fn board_waiting(error: &shm::ShmError) -> String {
+    match error {
+        shm::ShmError::NotRunning => shm_open_error(error),
+        _ => format!("waiting for cv1touchd: {error}"),
+    }
+}
+
 fn status_board(shm_name: &str) -> i32 {
     if let Some(problem) = socket_path_problem(&control::socket_path()) {
         eprintln!("cv1touch: cannot reach cv1touchd: {problem}");
@@ -876,7 +900,7 @@ fn status_board(shm_name: &str) -> i32 {
             reader = match ShmReader::open(shm_name) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    redraw(&format!("waiting for cv1touchd: {e}"));
+                    redraw(&board_waiting(&e));
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -921,7 +945,7 @@ fn status_board(shm_name: &str) -> i32 {
             push_line(&mut frame, &note);
         }
         if !sensor_note.is_empty() {
-            push_line(&mut frame, sensor_note);
+            push_line(&mut frame, &sensor_note);
         }
         if !stream_note.is_empty() {
             push_line(&mut frame, &stream_note);
@@ -3054,7 +3078,7 @@ fn input_test() -> i32 {
     let reader = match ShmReader::open(shm::DEFAULT_NAME) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("cv1touch: cv1touchd is not running ({e})");
+            eprintln!("cv1touch: {}", shm_open_error(&e));
             return 1;
         }
     };
@@ -5940,12 +5964,22 @@ fn universe_none(reg: &align::Registration) -> Option<&'static str> {
         .then_some("Your headset is not tracked by base stations, so there is nothing to follow.")
 }
 
+/// The registration `cv1touch universe` describes; before setup has made one, what to do.
+fn universe_registration(path: &Path) -> Result<align::Registration, String> {
+    if !path.exists() {
+        return Err(
+            "the controllers aren't lined up with the headset yet: run cv1touch setup".into(),
+        );
+    }
+    align::load_registration(path)
+}
+
 /// How the installed registration applies now: the base station SteamVR tracks the headset from
 /// (its log), where each station is in the world and how, and how SteamVR has each since the
 /// registration (what cv1touchd's universe watch follows).
 fn universe_cmd() -> i32 {
     let run = || -> Result<(), String> {
-        let reg = align::load_registration(&align::registration_path())?;
+        let reg = universe_registration(&align::registration_path())?;
         if let Some(note) = universe_none(&reg) {
             println!("{note}");
             return Ok(());
@@ -7665,12 +7699,8 @@ mod tests {
         });
         assert_eq!(sensors[0].frames, 77);
         assert!(note.starts_with(&description.unwrap()), "{note}");
-        assert!(note.contains("fixture OS detail"), "{note}");
-        assert!(
-            note.ends_with(". Only the first eight sensors are shown."),
-            "{note}"
-        );
-        note.to_owned()
+        assert!(!note.contains("first eight"), "{note}");
+        note
     }
 
     #[test]
@@ -7682,8 +7712,52 @@ mod tests {
             assert!(note.contains("systemctl --user start cv1touchd"), "{note}");
             #[cfg(windows)]
             assert!(note.contains("Start cv1touch in the Start menu"), "{note}");
-            assert!(note.contains("(fixture OS detail)"), "{note}");
+            assert!(!note.contains("fixture OS detail"), "{note}");
+            let line = cannot_reach(
+                Path::new("/fixture/control.sock"),
+                &daemon_error(
+                    io::Error::new(kind, "fixture OS detail"),
+                    Path::new("/fixture/control.sock"),
+                    Duration::from_secs(1),
+                    DaemonPurpose::Command,
+                ),
+            );
+            assert_eq!(
+                line,
+                format!("cv1touch: cv1touchd isn't running. {START_DAEMON}")
+            );
         }
+    }
+
+    /// The board says how to start a daemon whose shared memory is absent, as other commands do.
+    #[test]
+    fn the_board_says_how_to_start_a_stopped_daemon() {
+        assert_eq!(
+            board_waiting(&shm::ShmError::NotRunning),
+            format!("cv1touchd isn't running. {START_DAEMON}")
+        );
+        let other = shm::ShmError::Io(io::Error::other("fixture OS detail"));
+        assert_eq!(
+            board_waiting(&other),
+            "waiting for cv1touchd: fixture OS detail"
+        );
+    }
+
+    /// Before setup has lined the controllers up, `universe` says so and what to run.
+    #[test]
+    fn universe_before_setup_says_to_run_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = universe_registration(&dir.path().join("registration.json"))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "the controllers aren't lined up with the headset yet: run cv1touch setup"
+        );
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, "{").unwrap();
+        let error = universe_registration(&broken).err().unwrap();
+        assert!(error.contains("broken.json"), "{error}");
     }
 
     /// With a fresh heartbeat in shared memory the daemon runs: a missing socket means this
@@ -7708,7 +7782,7 @@ mod tests {
             assert!(!note.contains("isn't running"), "{note}");
             assert!(!note.contains("SHM"), "{note}");
             let unreachable = format!(
-                "cv1touchd is running, but cv1touch can't reach its control socket at {}: run cv1touch as the same user, in the same login session, as cv1touchd. Only the first eight sensors are shown.",
+                "cv1touchd is running, but cv1touch can't reach its control socket at {}: run cv1touch as the same user, in the same login session, as cv1touchd",
                 control::socket_path().display()
             );
             if kind == io::ErrorKind::PermissionDenied {
@@ -7926,10 +8000,20 @@ mod tests {
                 }]
             });
             assert_eq!(sensors[0].frames, 77);
-            assert_eq!(
-                note,
-                "cv1touchd's status couldn't be read. Only the first eight sensors are shown."
-            );
+            assert_eq!(note, "cv1touchd's status couldn't be read.");
+        }
+        // a full prefix may leave sensors out; a shorter one holds them all
+        for (count, expected) in [
+            (shm::MAX_SENSORS - 1, "cv1touchd's status couldn't be read."),
+            (
+                shm::MAX_SENSORS,
+                "cv1touchd's status couldn't be read. Only the first eight sensors are shown.",
+            ),
+        ] {
+            let (sensors, note) =
+                board_sensors(None, None, || vec![shm::SensorStatus::default(); count]);
+            assert_eq!(sensors.len(), count);
+            assert_eq!(note, expected);
         }
     }
 

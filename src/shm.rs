@@ -297,7 +297,7 @@ pub enum ShmError {
 impl fmt::Display for ShmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ShmError::NotRunning => write!(f, "cv1touchd is not running"),
+            ShmError::NotRunning => write!(f, "cv1touchd isn't running"),
             ShmError::Abi { version, size } => write!(
                 f,
                 "shared-memory ABI mismatch: version {version} size {size}, expected {} {}",

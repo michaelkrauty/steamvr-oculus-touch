@@ -245,7 +245,8 @@ class CliControlErrorTests(unittest.TestCase):
     def assert_start_advice(self, text):
         self.assertIn("cv1touchd isn't running", text)
         self.assertIn("systemctl --user start cv1touchd", text)
-        self.assertIn("os error", text)
+        self.assertNotIn("os error", text)
+        self.assertNotIn("control.sock", text)
 
     def test_a_missing_control_socket_explains_how_to_start_the_daemon(self):
         for command in (["status", "--json"], ["inputs", "--json"], ["tilt"]):
