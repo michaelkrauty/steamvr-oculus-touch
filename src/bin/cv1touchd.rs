@@ -5743,8 +5743,8 @@ fn status_json(d: &Daemon) -> String {
         .zip(radio_lost)
         .map(|(((s, name), (t, tracking)), radio_lost)| {
             format!(
-                "{{\"hand\":\"{name}\",\"flags\":{},\"radio_lost_percent\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
-                s.flags, serde_json::json!(radio_lost), t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
+                "{{\"hand\":\"{name}\",\"flags\":{},\"radio_lost_percent\":{},\"battery_percent\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
+                s.flags, serde_json::json!(radio_lost), serde_json::json!(cv1touch::status::battery_percent(s)), t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
             )
         })
         .collect();
@@ -8839,6 +8839,39 @@ mod tests {
         assert_eq!(value["hands"][0]["radio_lost_percent"], 7.5);
         assert_eq!(
             value["hands"][1]["radio_lost_percent"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn status_reports_each_hands_published_battery_or_null() {
+        let d = status_daemon();
+        let state = |battery_percent| ControllerState {
+            flags: ffi::CV1T_FLAG_CONNECTED,
+            battery_percent,
+            ..Default::default()
+        };
+        d.shm.publish_hand(HAND_LEFT, &state(87));
+        d.shm.publish_hand(HAND_RIGHT, &state(-1));
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["hands"][0]["battery_percent"], 87);
+        assert_eq!(
+            value["hands"][1]["battery_percent"],
+            serde_json::Value::Null
+        );
+        // asleep or out of range: the level it sent before is not shown
+        d.shm.publish_hand(
+            HAND_LEFT,
+            &ControllerState {
+                flags: 0,
+                ..state(87)
+            },
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(
+            value["hands"][0]["battery_percent"],
             serde_json::Value::Null
         );
     }

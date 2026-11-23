@@ -449,6 +449,16 @@ fn state_text(s: &ControllerState) -> &'static str {
     }
 }
 
+/// The battery level the controller sent last, while it is on: the radio carries it only from an
+/// awake controller, so the level of one asleep or out of range would be old news.
+pub fn battery_percent(s: &ControllerState) -> Option<i32> {
+    (s.flags & FLAG_CONNECTED != 0 && s.battery_percent >= 0).then_some(s.battery_percent)
+}
+
+fn battery_text(s: &ControllerState) -> String {
+    battery_percent(s).map_or(String::new(), |p| format!(", battery {p} %"))
+}
+
 fn names(mask: u32, table: &[(&str, u32)]) -> String {
     let v: Vec<&str> = table
         .iter()
@@ -476,7 +486,12 @@ pub fn render(
         String::new(),
     ];
     for (i, s) in hands.iter().enumerate() {
-        lines.push(format!("{:>5}: {}", HAND_NAMES[i], state_text(s)));
+        lines.push(format!(
+            "{:>5}: {}{}",
+            HAND_NAMES[i],
+            state_text(s),
+            battery_text(s)
+        ));
     }
     lines.push(String::new());
     for (i, s) in hands.iter().enumerate() {
@@ -797,6 +812,28 @@ mod tests {
         assert!(note.starts_with("radio: right 13 % of"), "{note}");
         let unknown = serde_json::json!({"hands": [{"radio_lost_percent": null}, {}]});
         assert_eq!(radio_loss_note(&unknown, &[on, on]), None);
+    }
+
+    #[test]
+    fn render_shows_the_battery_of_a_controller_that_is_on() {
+        let with = |flags, battery_percent| ControllerState {
+            battery_percent,
+            ..state(flags)
+        };
+        let on = FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_POSITION;
+        let text = render(
+            &[with(on, 87), with(FLAG_CALIBRATED | FLAG_ASLEEP, 50)],
+            &[],
+            &HashMap::new(),
+            0.0,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], " left: 6DoF, battery 87 %");
+        assert!(!lines[3].contains("battery"), "{}", lines[3]);
+        let text = render(&[with(on, -1), with(on, 0)], &[], &HashMap::new(), 0.0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], " left: 6DoF");
+        assert_eq!(lines[3], "right: 6DoF, battery 0 %");
     }
 
     #[test]
