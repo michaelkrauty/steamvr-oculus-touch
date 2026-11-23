@@ -2573,14 +2573,15 @@ mod tests {
         let waker = std::sync::Arc::new(Waker::new().unwrap());
         let mut buf = [0u8; 64];
 
+        // a wait on Windows can end up to a timer tick (15.6 ms) before its timeout
         let before = Instant::now();
         assert_eq!(
             device
-                .wait(&waker, Some(Duration::from_millis(30)))
+                .wait(&waker, Some(Duration::from_millis(100)))
                 .unwrap(),
             Woke::default()
         );
-        assert!(before.elapsed() >= Duration::from_millis(20));
+        assert!(before.elapsed() >= Duration::from_millis(50));
         assert_eq!(device.try_read(&mut buf).unwrap(), None);
 
         let remote = waker.clone();
