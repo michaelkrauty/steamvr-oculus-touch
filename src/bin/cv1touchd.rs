@@ -2713,11 +2713,17 @@ enum PoseNote {
     GivenUp {
         since_ns: u64,
         attempts: u32,
+        cause: repose::GaveUpOn,
         reason: String,
     },
-    /// Judged moved, then let go: a false alarm (its pose was placed where it was calibrated),
-    /// or no pose came in time; tracked with again, as calibrated.
-    Released { at_ns: u64, why: String },
+    /// Judged moved, then let go and tracked with again, as calibrated, for `cause`; `why` is
+    /// its log text. The monitor leaves it alone until `next_check_ns`.
+    Released {
+        at_ns: u64,
+        cause: repose::LetGo,
+        why: &'static str,
+        next_check_ns: u64,
+    },
 }
 
 /// How often the radio thread judges the sensors' agreement and tends the placing.
@@ -2831,9 +2837,8 @@ impl Reposing {
     }
 
     /// Lets a probed sensor go, tracked with again as calibrated: the engine gets its pose back,
-    /// the monitor leaves it alone for a while, and `status` says `why`. A starved probation is
+    /// the monitor leaves it alone for a while, and `status` says why. A starved probation is
     /// no verdict: the sensor is judged again after a short retry, outside the release run.
-    #[allow(clippy::too_many_arguments)]
     fn release(
         &mut self,
         d: &Daemon,
@@ -2841,8 +2846,7 @@ impl Reposing {
         pipe: &mut Pipeline,
         serial: &str,
         now: u64,
-        why: &str,
-        starved: bool,
+        reason: repose::LetGo,
     ) {
         if let Some(camera) = pipe.camera_id(serial) {
             self.reposer.forget(camera);
@@ -2851,7 +2855,7 @@ impl Reposing {
         pipe.reset_agreement(serial);
         self.probed_since
             .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
-        let cooldown = if starved {
+        let cooldown = if reason == repose::LetGo::Starved {
             self.monitor.starved_retry(serial)
         } else {
             let run = self.releases.entry(serial.to_string()).or_insert((0, now));
@@ -2868,10 +2872,15 @@ impl Reposing {
             serial.to_string(),
             PoseNote::Released {
                 at_ns: now,
-                why: why.to_string(),
+                cause: reason,
+                why: reason.log(),
+                next_check_ns: now + cooldown,
             },
         );
-        log!("sensor {serial}: {why}; tracking with it again as calibrated");
+        log!(
+            "sensor {serial}: {}; tracking with it again as calibrated",
+            reason.log()
+        );
     }
 
     /// A positive movement verdict hands the sensor to the solver; the placement limit must
@@ -2899,6 +2908,7 @@ impl Reposing {
                 PoseNote::GivenUp {
                     since_ns: now,
                     attempts: 0,
+                    cause: repose::GaveUpOn::KeepsMoving,
                     reason: format!("placed again {recent} times in half an hour"),
                 },
             );
@@ -3074,15 +3084,7 @@ impl Reposing {
                         continue;
                     };
                     if repose::false_alarm(&cam.world_from_cam, &fit.world_from_cam) {
-                        self.release(
-                            d,
-                            link,
-                            pipe,
-                            &serial,
-                            now,
-                            "a false alarm: placed again, it stands where it was calibrated",
-                            false,
-                        );
+                        self.release(d, link, pipe, &serial, now, repose::LetGo::FalseAlarm);
                         continue;
                     }
                     let delta = cam.world_from_cam.inverse() * fit.world_from_cam;
@@ -3145,6 +3147,7 @@ impl Reposing {
                         PoseNote::GivenUp {
                             since_ns: now,
                             attempts,
+                            cause: repose::GaveUpOn::NoPose,
                             reason: reason.clone(),
                         },
                     );
@@ -3177,7 +3180,7 @@ impl Reposing {
         *d.sensor_agreement.lock().unwrap() = agreement.into_iter().collect();
         // a probed sensor that gathers no labelled sighting in `PROBATION_NS`, or whose probes
         // bring no pose in `PATIENCE_NS`, is let go, so that the engine's search on it ends
-        let waited_out: Vec<(String, &str, bool)> = self
+        let waited_out: Vec<(String, repose::LetGo)> = self
             .probed_since
             .iter()
             .filter_map(|(serial, since)| {
@@ -3185,21 +3188,23 @@ impl Reposing {
                 let gathered = pipe
                     .camera_id(serial)
                     .is_some_and(|c| self.reposer.gathered(c) > 0);
-                if !gathered && waited >= PROBATION_NS {
-                    if repose::IdentityEvidence::starved(&pipe.identity_evidence(serial), [true; 2]) {
-                        Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it saw them, but neither turned enough on its own to be told apart, so it is judged again shortly", true))
+                let reason = if !gathered && waited >= PROBATION_NS {
+                    if repose::IdentityEvidence::starved(&pipe.identity_evidence(serial), [true; 2])
+                    {
+                        repose::LetGo::Starved
                     } else {
-                        Some((serial.clone(), "no labelled sighting of a controller in it for 30 s: it was not it that moved, or nothing was in its view", false))
+                        repose::LetGo::Unseen
                     }
                 } else if waited >= repose::PATIENCE_NS {
-                    Some((serial.clone(), "no pose for it in 3 minutes (too little controller motion in its view, or no pose fits)", false))
+                    repose::LetGo::TimedOut
                 } else {
-                    None
-                }
+                    return None;
+                };
+                Some((serial.clone(), reason))
             })
             .collect();
-        for (serial, why, starved) in waited_out {
-            self.release(d, link, pipe, &serial, now, why, starved);
+        for (serial, reason) in waited_out {
+            self.release(d, link, pipe, &serial, now, reason);
         }
         for probe in std::mem::take(&mut pipe.probes) {
             self.reposer.add(probe);
@@ -10174,12 +10179,17 @@ mod tests {
             pipe.frame(&info, &[]);
             reposing.tick(&d, &link, &mut pipe, &mut None, start + PROBATION_NS);
             assert!(!reposing.probed_since.contains_key(serial), "seen {seen}");
-            let Some(PoseNote::Released { why, .. }) =
+            let Some(PoseNote::Released { cause, .. }) =
                 d.sensor_poses.lock().unwrap().get(serial).cloned()
             else {
                 panic!("seen {seen}: the sensor must be released")
             };
-            assert_eq!(why.contains("judged again shortly"), seen, "{why}");
+            let expected = if seen {
+                repose::LetGo::Starved
+            } else {
+                repose::LetGo::Unseen
+            };
+            assert_eq!(cause, expected);
             assert_eq!(reposing.releases.contains_key(serial), !seen);
             // The starved retry counts on: the next one would wait twice as long.
             let s = 1_000_000_000;
@@ -10192,6 +10202,59 @@ mod tests {
                 [(PoseChange::Set(r), 0)] if r.serial == serial && !r.write
             ));
         }
+    }
+
+    /// A moved sensor whose probes bring no position in `PATIENCE_NS` is let go as timed out,
+    /// not as a false alarm or an unseen sensor, with its next check after the cooldown.
+    #[test]
+    fn a_placing_without_a_position_in_time_is_let_go_as_timed_out() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut pipe = Pipeline::new(Default::default());
+        let serial = "CameraA";
+        pipe.sensor(
+            serial,
+            calib::camera::CameraModel {
+                width: 1280,
+                height: 960,
+                fx: 800.0,
+                fy: 800.0,
+                cx: 640.0,
+                cy: 480.0,
+                k: [0.0; 4],
+            },
+            nalgebra::Isometry3::translation(1.0, 2.0, 3.0),
+        );
+        pipe.probe(serial, true);
+        let camera = pipe.camera_id(serial).unwrap();
+        let mut reposing = Reposing::start();
+        let start = 1_000_000_000;
+        reposing.probed_since.insert(serial.to_string(), start);
+        reposing.reposer.watch(camera);
+        reposing.reposer.add(cv1touch::track::pipeline::Probe {
+            camera,
+            hand: HAND_RIGHT,
+            device_id: calib::DEVICE_RIGHT,
+            identity_epoch: 0,
+            world_from_model: nalgebra::Isometry3::translation(0.0, 0.0, 1.0),
+            pos_sd: 0.001,
+            blobs: vec![nalgebra::Vector2::zeros()],
+            labels: vec![calib::DEVICE_RIGHT << 8],
+        });
+        assert_eq!(reposing.reposer.gathered(camera), 1);
+        let now = start + repose::PATIENCE_NS;
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(!reposing.probed_since.contains_key(serial));
+        let Some(PoseNote::Released {
+            cause,
+            next_check_ns,
+            ..
+        }) = d.sensor_poses.lock().unwrap().get(serial).cloned()
+        else {
+            panic!("the sensor must be released")
+        };
+        assert_eq!(cause, repose::LetGo::TimedOut);
+        assert_eq!(next_check_ns, now + repose::COOLDOWN_NS);
     }
 
     fn hotplug_sensor(serial: &str) -> platform::usb::Sensor {

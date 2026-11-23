@@ -459,9 +459,11 @@ fn agreement_line(serial: &str, a: &track::tracker::CameraAgreement) -> String {
 }
 
 /// Whether the sensors stand where the calibration says (the daemon's pose watch, `status`):
-/// one that moved is being placed again from the others, one that could not be is waiting for
-/// `setup`, and with fewer than two sensors agreeing nothing can be told.
+/// one that moved is being placed again from the others, one that could not be is left out
+/// until `setup`, one let go is used as calibrated again for the reason given, and with fewer
+/// than two sensors agreeing nothing can be told.
 fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
+    use track::repose::{GaveUpOn, LetGo};
     let sensors = status["sensors"].as_array().cloned().unwrap_or_default();
     let mut moved = Vec::new();
     let mut given_up = Vec::new();
@@ -469,11 +471,26 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
     let mut released = Vec::new();
     for s in &sensors {
         let serial = s["serial"].as_str().unwrap_or("?");
-        match s["pose"]["state"].as_str() {
+        let pose = &s["pose"];
+        match pose["state"].as_str() {
             Some("moved") => moved.push(serial),
-            Some("given_up") => given_up.push(serial),
+            Some("given_up") => {
+                let cause =
+                    serde_json::from_value(pose["cause"].clone()).unwrap_or(GaveUpOn::NoPose);
+                given_up.push(format!("sensor {serial} {}", cause.advice()));
+            }
             Some("placed") => placed.push(serial),
-            Some("released") => released.push(serial),
+            Some("released") => {
+                let wait = pose["next_check_ns"]
+                    .as_u64()
+                    .and_then(|next| next.checked_sub(shm::now_ns()));
+                released.push((
+                    serial,
+                    serde_json::from_value::<LetGo>(pose["cause"].clone())
+                        .ok()
+                        .map(|cause| cause.advice(wait)),
+                ))
+            }
             _ => {}
         }
     }
@@ -481,13 +498,7 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
         return (false, track::repose::UNSURE_ADVICE.to_string());
     }
     if !given_up.is_empty() {
-        return (
-            false,
-            format!(
-                "{} could not be placed from the other sensors: run cv1touch setup",
-                given_up.join(", ")
-            ),
-        );
+        return (false, given_up.join("; "));
     }
     if !moved.is_empty() {
         return (
@@ -498,21 +509,37 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
             ),
         );
     }
-    let mut detail = format!("{} sensor(s) stand where calibrated", sensors.len());
+    // a sensor that may be off comes first, then the rest
+    let (warned, released): (Vec<_>, Vec<_>) = released
+        .into_iter()
+        .partition(|(_, advice)| advice.as_ref().is_some_and(|a| a.1));
+    let mut parts: Vec<String> = warned
+        .iter()
+        .map(|(serial, advice)| format!("sensor {serial} {}", advice.as_ref().unwrap().0))
+        .collect();
+    let others = if warned.is_empty() { "" } else { "other " };
+    parts.push(format!(
+        "{} {others}sensor(s) stand where calibrated",
+        sensors.len() - warned.len()
+    ));
     if !placed.is_empty() {
-        detail = format!(
-            "{} sensor(s); {} placed again since the daemon started",
-            sensors.len(),
+        parts.push(format!(
+            "{} placed again since the daemon started",
             placed.join(", ")
-        );
-    }
-    if !released.is_empty() {
-        detail.push_str(&format!(
-            "; {} judged moved by mistake and let go",
-            released.join(", ")
         ));
     }
-    (true, detail)
+    for (serial, advice) in released {
+        let advice = advice.map_or_else(
+            || "looked as if it had moved and is used as calibrated again".to_string(),
+            |a| a.0,
+        );
+        parts.push(format!("sensor {serial} {advice}"));
+    }
+    let detail = parts.join("; ");
+    if warned.is_empty() {
+        return (true, detail);
+    }
+    (true, format!("warning: {detail}"))
 }
 
 fn doctor(json: bool) -> i32 {
@@ -7427,19 +7454,87 @@ mod tests {
         );
         let (ok, detail) = sensor_poses_check(&status(false, &[None, Some("placed")]));
         assert!(ok && detail.contains("S1 placed again"), "{detail}");
-        let (ok, detail) = sensor_poses_check(&status(false, &[Some("released"), None]));
-        assert!(
-            ok && detail.contains("S0 judged moved by mistake"),
-            "{detail}"
-        );
         let (ok, detail) = sensor_poses_check(&status(false, &[Some("placed"), Some("moved")]));
         assert!(!ok && detail.starts_with("S1 moved"), "{detail}");
         let (ok, detail) = sensor_poses_check(&status(false, &[Some("moved"), Some("given_up")]));
-        assert!(!ok && detail.starts_with("S1 could not"), "{detail}");
+        assert!(
+            !ok && detail.starts_with("sensor S1 moved, and no new position"),
+            "{detail}"
+        );
         let (ok, detail) = sensor_poses_check(&status(true, &[Some("given_up")]));
         assert!(
             !ok && detail.starts_with("cv1touch is still checking whether a sensor moved")
-                && detail.ends_with("if it stays unsure for several minutes, run cv1touch setup"),
+                && detail.ends_with(
+                    "if it stays unsure for several minutes, run cv1touch setup --redo sensors"
+                ),
+            "{detail}"
+        );
+    }
+
+    /// A sensor let go, or left out, is reported for the cause the daemon gives: a timed-out
+    /// placing is not a false alarm, and it and a starved one are warnings that come first and
+    /// say when the sensor is checked again.
+    #[test]
+    fn doctor_tells_why_a_sensor_was_let_go_or_left_out() {
+        let status = |pose: serde_json::Value| serde_json::json!({"sensors": [{"serial": "S0", "pose": pose}, {"serial": "S1"}]});
+        let in_5_minutes = shm::now_ns() + 300_000_000_000;
+        let released = |cause: &str, next: u64| {
+            sensor_poses_check(&status(
+                serde_json::json!({"state": "released", "cause": cause, "next_check_ns": next}),
+            ))
+        };
+        let (ok, detail) = released("timed_out", in_5_minutes);
+        assert!(ok, "{detail}");
+        assert!(
+            detail.starts_with(
+                "warning: sensor S0 looks moved, but no new position for it was found in 3 minutes"
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("checks it again in about 5 minutes"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("run cv1touch setup --redo sensors"),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("; 1 other sensor(s) stand where calibrated"),
+            "{detail}"
+        );
+        let (ok, detail) = released("timed_out", 0);
+        assert!(
+            ok && detail.contains("checks it again whenever the controllers are in its view"),
+            "{detail}"
+        );
+        let (ok, detail) = released("starved", in_5_minutes);
+        assert!(
+            ok && detail.starts_with("warning: sensor S0 may have moved")
+                && detail.contains("checks it again in about 5 minutes"),
+            "{detail}"
+        );
+        for cause in ["false_alarm", "unseen"] {
+            let (ok, detail) = released(cause, in_5_minutes);
+            assert!(
+                ok && detail.starts_with(
+                    "2 sensor(s) stand where calibrated; sensor S0 looked as if it had moved"
+                ),
+                "{detail}"
+            );
+            assert!(detail.ends_with("nothing to do"), "{detail}");
+        }
+        let (ok, detail) = released("unknown", 0);
+        assert!(
+            ok && detail
+                .ends_with("sensor S0 looked as if it had moved and is used as calibrated again"),
+            "{detail}"
+        );
+        let (ok, detail) = sensor_poses_check(&status(
+            serde_json::json!({"state": "given_up", "cause": "keeps_moving"}),
+        ));
+        assert!(
+            !ok && detail == "sensor S0 moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then run cv1touch setup --redo sensors",
             "{detail}"
         );
     }

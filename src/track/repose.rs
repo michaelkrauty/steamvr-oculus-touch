@@ -62,7 +62,69 @@ pub const STARVED_RETRY_NS: u64 = 60_000_000_000;
 
 /// The advice while fewer than two sensors agree with each other (`Change::Unsure`), for the
 /// daemon's log and `cv1touch doctor` alike.
-pub const UNSURE_ADVICE: &str = "cv1touch is still checking whether a sensor moved: fewer than two sensors agree on where the controllers are. Keep the controllers where the sensors can see them; if it stays unsure for several minutes, run cv1touch setup";
+pub const UNSURE_ADVICE: &str = "cv1touch is still checking whether a sensor moved: fewer than two sensors agree on where the controllers are. Keep the controllers where the sensors can see them; if it stays unsure for several minutes, run cv1touch setup --redo sensors";
+
+/// Why a sensor judged moved went back into tracking as calibrated (`status`: `pose.cause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LetGo {
+    /// Placed again where it was calibrated.
+    FalseAlarm,
+    /// No labelled sighting in its probation: it was not it that moved, or nothing was in view.
+    Unseen,
+    /// Controllers seen but none told apart in its probation: no verdict, judged again soon.
+    Starved,
+    /// No pose in `PATIENCE_NS` although it was judged moved.
+    TimedOut,
+}
+
+impl LetGo {
+    /// The daemon's log line, before "; tracking with it again as calibrated".
+    pub fn log(self) -> &'static str {
+        match self {
+            LetGo::FalseAlarm => "a false alarm: placed again, it stands where it was calibrated",
+            LetGo::Unseen => "no labelled sighting of a controller in it for 30 s: it was not it that moved, or nothing was in its view",
+            LetGo::Starved => "no labelled sighting of a controller in it for 30 s: it saw them, but neither turned enough on its own to be told apart, so it is judged again shortly",
+            LetGo::TimedOut => "no pose for it in 3 minutes (too little controller motion in its view, or no pose fits)",
+        }
+    }
+
+    /// What `cv1touch doctor` says after the sensor's name, and whether it is a warning;
+    /// `wait_ns` is how long until the monitor may judge it again, if that is still ahead.
+    pub fn advice(self, wait_ns: Option<u64>) -> (String, bool) {
+        let when = match wait_ns.map(|ns| ns.div_ceil(60_000_000_000)) {
+            Some(0) | None => "whenever the controllers are in its view".to_string(),
+            Some(1) => "in about a minute".to_string(),
+            Some(m) => format!("in about {m} minutes"),
+        };
+        match self {
+            LetGo::FalseAlarm => ("looked as if it had moved, but it stands where it was calibrated: nothing to do".into(), false),
+            LetGo::Unseen => ("looked as if it had moved, but no controller came into its view for 30 seconds to check, so it is used as calibrated again: nothing to do".into(), false),
+            LetGo::Starved => (format!("may have moved, but the controllers in its view did not turn enough on their own to tell which is which, so it is used as calibrated for now. cv1touch checks it again {when}: then turn each controller on its own in front of it"), true),
+            LetGo::TimedOut => (format!("looks moved, but no new position for it was found in 3 minutes, so it is used as calibrated again and the controllers can look off where it sees them. cv1touch checks it again {when}: then move the controllers around in front of it. If that does not place it, run cv1touch setup --redo sensors"), true),
+        }
+    }
+}
+
+/// Why a sensor judged moved stays out of tracking (`status`: `pose.cause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GaveUpOn {
+    /// No pose fits it from the other sensors.
+    NoPose,
+    /// Placed again too often in a short time.
+    KeepsMoving,
+}
+
+impl GaveUpOn {
+    /// What `cv1touch doctor` says after the sensor's name.
+    pub fn advice(self) -> &'static str {
+        match self {
+            GaveUpOn::NoPose => "moved, and no new position for it could be found from the other sensors, so it is left out of tracking: run cv1touch setup --redo sensors",
+            GaveUpOn::KeepsMoving => "moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then run cv1touch setup --redo sensors",
+        }
+    }
+}
 
 /// What a window of checks said about a sensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
