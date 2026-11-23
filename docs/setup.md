@@ -164,14 +164,7 @@ The live status board lists every sensor. `camera_queue.dropped_frames` counts e
 
 ## Upgrade
 
-**From v0.2.0 to v0.3.x:** update both the daemon and the SteamVR driver with the
-installer, then restart the daemon and SteamVR. The shared-memory ABI changed
-from v3 to v4; mixing the two releases disconnects the controllers rather than
-reading incompatible poses. Calibration and settings are kept. Run
-`cv1touch doctor` and `cv1touch setup --check` after upgrading. The controllers
-now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch
-bindings, but custom bindings for the old controller type may need to be selected
-or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
+**From v0.2.0 to v0.3.x:** update both the daemon and the SteamVR driver with the installer, then start SteamVR again. The shared-memory ABI changed from v3 to v4; mixing the two releases disconnects the controllers rather than reading incompatible poses. Calibration and settings are kept. Run `cv1touch doctor` and `cv1touch setup --check` after upgrading. The controllers now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch bindings, but custom bindings for the old controller type may need to be selected or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
 
 Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.5.1` with the desired published tag:
 
@@ -179,12 +172,11 @@ Quit SteamVR and select the desired release before running the installer. For a 
 git fetch origin --tags
 git checkout --detach v0.5.1
 python3 scripts/install.py
-systemctl --user restart cv1touchd
 ```
 
-For a source-archive installation, extract the desired release into a new directory and run `python3 scripts/install.py` there, then restart the service.
+For a source-archive installation, extract the desired release into a new directory and run `python3 scripts/install.py` there.
 
-The installer replaces managed binaries and keeps calibration/state. A running process can continue using its previous mapped code until restarted. SteamVR loads a new driver on its next start. Keep a known-good release available if you need rollback; newer configuration schemas may need corresponding backups. A cv1touch from before the right Oculus button could be bound refuses the driver package a newer one installed: before going back to one, quit SteamVR and run `cv1touch steamvr uninstall` with the newer one. Its controllers are SteamVR's Oculus Touch again; bindings you made for Oculus Touch (cv1touch) stay saved in SteamVR, unused.
+The installer replaces managed binaries, keeps calibration and settings, and restarts the cv1touchd service so that the new daemon runs (with `--no-service`, it says how to restart the daemon yourself). SteamVR loads the new driver on its next start. With `--no-steamvr`, SteamVR may be running: its controllers disconnect while the daemon restarts and come back once the new one is publishing, if its driver and the new daemon share the same shared-memory version. Keep a known-good release available if you need rollback; newer configuration schemas may need corresponding backups. A cv1touch from before the right Oculus button could be bound refuses the driver package a newer one installed: before going back to one, quit SteamVR and run `cv1touch steamvr uninstall` with the newer one. Its controllers are SteamVR's Oculus Touch again; bindings you made for Oculus Touch (cv1touch) stay saved in SteamVR, unused.
 
 After SteamVR updates, run `cv1touch doctor`. If its `input_profile` check says cv1touch's copy of SteamVR's Oculus Touch profile is out of date, or that SteamVR's dashboard bindings for Oculus Touch changed, quit SteamVR and run `cv1touch steamvr install` (on Windows: choose Finish setting up cv1touch in the Start menu).
 

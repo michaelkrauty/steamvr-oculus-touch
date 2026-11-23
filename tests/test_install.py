@@ -38,6 +38,11 @@ if name == "systemctl":
         (root / "enabled").write_text("enabled")
     if "disable" in args:
         (root / "enabled").unlink()
+    # a daemon starts on restart, and on enable --now only when none runs
+    running = root / "running"
+    if "restart" in args or ("--now" in args and "enable" in args and not running.exists()):
+        with running.open("a") as starts:
+            starts.write("started\n")
     sys.exit(0)
 assert name == "cv1touch" and args[0] == "steamvr", sys.argv
 driver = root / "registered-driver"
@@ -392,6 +397,50 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(failed.stdout, f"Installing in {self.prefix}... failed\n")
         self.assertEqual(failed.stderr, "cv1touch: SteamVR was not found\n")
 
+    def test_upgrade_runs_the_new_daemon_and_says_setup_is_kept(self):
+        self.fake_integrations()
+        first = self.invoke(service=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("Next: run cv1touch setup", first.stdout)
+        self.assertIn("Starting the cv1touchd service... done", first.stdout)
+        upgraded = self.invoke(service=True)
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        # the daemon that was running is replaced by one from the new files
+        self.assertEqual((self.root / "running").read_text(), "started\n" * 2)
+        self.assertIn("Restarting the cv1touchd service... done", upgraded.stdout)
+        self.assertNotIn("cv1touch setup", upgraded.stdout)
+        self.assertIn("cv1touch is updated, and your calibration and settings are kept.", upgraded.stdout)
+        self.assertIn("cv1touch doctor", upgraded.stdout)
+        manual = self.invoke()
+        self.assertEqual(manual.returncode, 0, manual.stderr)
+        self.assertIn("Restart cv1touchd yourself so that the new version runs: systemctl --user restart cv1touchd",
+                      manual.stdout)
+        self.assertNotIn("Start it yourself", manual.stdout)
+
+    def test_no_service_gives_systemctl_only_for_a_service_that_exists(self):
+        daemon = shlex.quote(str(self.prefix / "bin/cv1touchd"))
+        # never had the service: no unit file, so run the daemon directly
+        first = self.invoke()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"Setup needs cv1touchd running. Run {daemon} in a terminal of its own; "
+                      "it keeps running there, so leave that terminal open while you use cv1touch.", first.stdout)
+        self.assertNotIn("systemctl", first.stdout)
+        upgraded = self.invoke()
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        self.assertIn(f"If cv1touchd is running, stop it (Ctrl+C in its terminal), then run {daemon} again", upgraded.stdout)
+        self.assertNotIn("systemctl", upgraded.stdout)
+        # a cv1touchd.service of the user's own, which the installer refuses to replace without --no-service
+        unit = Path(self.env["XDG_CONFIG_HOME"]) / "systemd/user/cv1touchd.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/opt/cv1touchd\n")
+        refused = self.invoke(service=True)
+        self.assertIn("use --no-service", refused.stderr)
+        own = self.invoke()
+        self.assertEqual(own.returncode, 0, own.stderr)
+        self.assertIn(f"The installer did not change your own cv1touchd service. Make it run {daemon}, "
+                      "then restart it so that this version runs: systemctl --user restart cv1touchd", own.stdout)
+        self.assertEqual(unit.read_text(), "[Service]\nExecStart=/opt/cv1touchd\n")
+
     def test_next_steps_ask_only_for_what_is_missing(self):
         rules = self.root / "rules.d"
         rules.mkdir()
@@ -417,7 +466,8 @@ class InstallTests(unittest.TestCase):
         steps = "\n".join(INSTALLER.next_steps(self.prefix, True, path=f"/usr/bin:{binaries}", **unusable))
         self.assertNotIn("PATH", steps)
         self.assertNotIn("sudo", steps)
-        self.assertIn("Start cv1touchd yourself", steps)
+        self.assertIn(f"Run {shlex.quote(binaries + '/cv1touchd')} in a terminal of its own", steps)
+        self.assertNotIn("systemctl", steps)
 
     def test_connected_devices_count_as_usable_only_when_all_can_be_opened(self):
         sysfs, dev = self.root / "sys", self.root / "dev"

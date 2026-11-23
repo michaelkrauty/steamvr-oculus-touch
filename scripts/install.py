@@ -322,10 +322,13 @@ def install(args):
             record.pop("steamvr_pending", None)
             write_manifest(prefix, record)
     if not args.no_service:
-        with stage("Starting the cv1touchd service"):
+        with stage("Restarting the cv1touchd service" if previous.get("service") else "Starting the cv1touchd service"):
             run(["systemctl", "--user", "daemon-reload"])
-            run(["systemctl", "--user", "enable", "--now", "cv1touchd.service"])
-    print("\n".join(next_steps(prefix, args.no_service)))
+            run(["systemctl", "--user", "enable", "cv1touchd.service"])
+            # `enable --now` leaves an already-running daemon on the old binary.
+            run(["systemctl", "--user", "restart", "cv1touchd.service"])
+    unit_state = "managed" if previous.get("service") else "own" if unit_path.exists() or unit_path.is_symlink() else None
+    print("\n".join(next_steps(prefix, args.no_service, upgrade=bool(previous.get("files")), unit=unit_state)))
 
 
 def rule_lines(text):
@@ -369,7 +372,7 @@ def devices_usable(sysfs=Path("/sys"), dev=Path("/dev"), usable=lambda node: os.
     return bool(nodes) and all(usable(node) for node in nodes)
 
 
-def next_steps(prefix, no_service, path=None, rule_dirs=UDEV_RULE_DIRS, usable=devices_usable):
+def next_steps(prefix, no_service, upgrade=False, unit=None, path=None, rule_dirs=UDEV_RULE_DIRS, usable=devices_usable):
     lines = [""]
     binaries = prefix / "bin"
     path = os.environ.get("PATH", "") if path is None else path
@@ -384,8 +387,22 @@ def next_steps(prefix, no_service, path=None, rule_dirs=UDEV_RULE_DIRS, usable=d
                   f"  sudo install -m 0644 {shlex.quote(str(rule))} /etc/udev/rules.d/70-cv1touch.rules",
                   "  sudo udevadm control --reload-rules",
                   "Then unplug the headset and the sensors and plug them back in.", ""]
-    if no_service:
-        lines.append("Start cv1touchd yourself; setup needs it running.")
+    daemon = shlex.quote(str(binaries / "cv1touchd"))
+    if no_service and unit == "own":
+        lines.append(f"The installer did not change your own cv1touchd service. Make it run {daemon}, "
+                     "then restart it so that this version runs: systemctl --user restart cv1touchd")
+    elif no_service and unit == "managed":
+        lines.append("Restart cv1touchd yourself so that the new version runs: systemctl --user restart cv1touchd")
+    elif no_service and upgrade:
+        lines.append(f"If cv1touchd is running, stop it (Ctrl+C in its terminal), then run {daemon} again "
+                     "so that the new version runs. It keeps running in that terminal; leave the terminal open.")
+    elif no_service:
+        lines.append(f"Setup needs cv1touchd running. Run {daemon} in a terminal of its own; "
+                     "it keeps running there, so leave that terminal open while you use cv1touch.")
+    if upgrade:
+        lines.append("cv1touch is updated, and your calibration and settings are kept. "
+                     "If something stops working, cv1touch doctor says what is wrong.")
+        return lines
     lines.append("Next: run cv1touch setup, which walks you through calibration. "
                  "If something stops working later, cv1touch doctor says what is wrong.")
     return lines
