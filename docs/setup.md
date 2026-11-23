@@ -39,7 +39,7 @@ Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or r
 
 ## Install
 
-Quit SteamVR, then run `python3 scripts/install.py` from the repository root. A clone of the `v0.5.1` tag or an extracted [v0.5.1 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
+Start SteamVR once, so that it records where it is installed, then quit it and run `python3 scripts/install.py` from the repository root. If the installer does not find SteamVR, it says so before it builds anything. A clone of the `v0.5.1` tag or an extracted [v0.5.1 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
 
 | Location | Purpose |
 | --- | --- |

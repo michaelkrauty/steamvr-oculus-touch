@@ -35,6 +35,28 @@ def run(args, **kwargs):
                           text=True, **kwargs).stdout
 
 
+def xdg(name, fallback):
+    # As cv1touch resolves it: a relative value is ignored.
+    value = os.environ.get(name)
+    return Path(value) if value and Path(value).is_absolute() else Path(os.environ.get("HOME", "")) / fallback
+
+
+def steamvr_runtime():
+    # Where `cv1touch steamvr check` looks (runtime_root in src/steamvr.rs), so that a missing
+    # SteamVR is found before the build rather than after it.
+    if (configured := os.environ.get("CV1TOUCH_STEAMVR")) is not None:
+        return Path(configured)
+    try:
+        runtimes = json.loads((xdg("XDG_CONFIG_HOME", ".config") / "openvr/openvrpaths.vrpath").read_text())["runtime"]
+    except (OSError, ValueError, KeyError, TypeError):
+        runtimes = []
+    for runtime in runtimes if isinstance(runtimes, list) else []:
+        if isinstance(runtime, str) and Path(runtime).is_dir():
+            return Path(runtime)
+    steam = os.environ.get("CV1TOUCH_STEAM_ROOT")
+    return (Path(steam) if steam is not None else Path(os.environ.get("HOME", "")) / ".steam/steam") / "steamapps/common/SteamVR"
+
+
 @contextmanager
 def stage(header):
     print(f"{header}...", end="", flush=True)
@@ -242,6 +264,11 @@ def install(args):
             raise RuntimeError("quit SteamVR before installing; it rewrites settings when exiting")
         if active.returncode != 1:
             raise RuntimeError("could not check whether SteamVR is running")
+        runtime = steamvr_runtime()
+        if not (runtime / "bin/vrpathreg.sh").is_file():
+            raise RuntimeError(f"SteamVR was not found at {runtime}: install it from Steam; if it is installed, start it once "
+                               "so it records where it is installed, or set CV1TOUCH_STEAMVR to its folder; then quit "
+                               "SteamVR and run `python3 scripts/install.py` again")
     with tempfile.TemporaryDirectory(prefix="cv1touch-install-") as temporary:
         bundle = artifacts(args, Path(temporary))
         with stage(f"Installing in {prefix}"):
@@ -453,7 +480,9 @@ def uninstall(args):
         write_manifest(prefix, record)
         raise RuntimeError("modified files remain; installation manifest retained")
     manifest.unlink()
-    print("Uninstalled managed files. Calibration, recordings, and SteamVR settings are retained.")
+    print(f"cv1touch is removed. Your calibration and settings are kept in {xdg('XDG_CONFIG_HOME', '.config') / 'cv1touch'} "
+          f"and your recordings in {xdg('XDG_STATE_HOME', '.local/state') / 'cv1touch'} (delete those folders to remove "
+          "them too). If you installed the udev rule, it stays in /etc/udev/rules.d.")
 
 
 def main():

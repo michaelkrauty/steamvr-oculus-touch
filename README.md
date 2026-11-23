@@ -22,7 +22,7 @@ This repository supplies controllers, not a CV1 display/headset driver. Sandboxe
 
 **Linux:**
 
-Quit SteamVR before installing. Install the build dependencies from [setup](docs/setup.md#build-dependencies), then:
+Start SteamVR once, so that it records where it is installed, then quit it before installing. Install the build dependencies from [setup](docs/setup.md#build-dependencies), then:
 
 ```sh
 git clone --branch v0.5.1 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
@@ -40,7 +40,7 @@ Then wake both controllers by pressing a button on each, and run:
 cv1touch setup
 ```
 
-It walks you through every calibration step, one at a time, and remembers the finished ones if you stop ([guided setup](docs/setup.md#guided-setup)). Its last step needs SteamVR running with your headset tracking. Calibration is specific to your sensor placement, so none is shipped. Once setup is complete, the daemon starts automatically and reconnects to the devices. If something stops working later, `cv1touch doctor` says what is wrong.
+It walks you through every calibration step, one at a time, and remembers the finished ones if you stop ([guided setup](docs/setup.md#guided-setup)). Its last step needs SteamVR running with your headset tracking. Calibration is specific to your sensor placement, so none is shipped. The daemon the installer started keeps running, starts again each time you log in, and reconnects to the devices. If something stops working later, `cv1touch doctor` says what is wrong.
 
 ## Documentation
 

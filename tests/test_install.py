@@ -216,7 +216,13 @@ class InstallTests(unittest.TestCase):
         for name in ("cv1touch", "cv1touchd", "libopenhmd.so", "libopenhmd.so.0", "driver_cv1touch.so", "driver.vrdrivermanifest"):
             (self.bundle / name).write_bytes(f"fake-{name}".encode())
         self.prefix = self.root / "prefix with spaces"
-        self.env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"))
+        steamvr = self.root / "SteamVR"
+        (steamvr / "bin").mkdir(parents=True)
+        (steamvr / "bin/vrpathreg.sh").write_text("#!/bin/sh\n")
+        self.env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"),
+                        CV1TOUCH_STEAMVR=str(steamvr))
+        for name in ("XDG_STATE_HOME", "CV1TOUCH_STEAM_ROOT"):
+            self.env.pop(name, None)
 
     def test_opencv_notices_are_staged_and_installed(self):
         target = self.root / "target"
@@ -349,9 +355,49 @@ class InstallTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.prefix / "bin/cv1touch").read_bytes(), b"upgraded")
-        self.assertEqual(self.invoke("--uninstall").returncode, 0)
+        removed = self.invoke("--uninstall")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(removed.stdout, f"cv1touch is removed. Your calibration and settings are kept in {data.parent} and your "
+                         f"recordings in {self.root / '.local/state/cv1touch'} (delete those folders to remove them too). "
+                         "If you installed the udev rule, it stays in /etc/udev/rules.d.\n")
         self.assertFalse((self.prefix / "bin/cv1touch").exists())
         self.assertEqual(data.read_text(), "personal calibration")
+
+    def test_missing_steamvr_stops_before_the_build(self):
+        fakebin = self.root / "fakebin"
+        fakebin.mkdir()
+        for name in ("cargo", "pgrep"):
+            (fakebin / name).write_text(f"#!{sys.executable}\n" + FAKE_INTEGRATION)
+            (fakebin / name).chmod(0o755)
+        self.env.pop("CV1TOUCH_STEAMVR")
+        self.env.update(PATH=str(fakebin), FAKE_ROOT=str(self.root))
+        command = [sys.executable, str(SCRIPT), "--prefix", str(self.prefix), "--no-service"]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        usual = self.root / ".steam/steam/steamapps/common/SteamVR"
+        self.assertIn(f"SteamVR was not found at {usual}: install it from Steam; if it is installed, start it once", result.stderr)
+        self.assertIn("run `python3 scripts/install.py` again", result.stderr)
+        calls = [json.loads(line)[0] for line in (self.root / "calls").read_text().splitlines()]
+        self.assertEqual(calls, ["pgrep"])
+        self.assertFalse((self.prefix / "bin").exists())
+
+    def test_steamvr_is_looked_for_where_cv1touch_looks(self):
+        library = self.root / "library/SteamVR"
+        (library / "bin").mkdir(parents=True)
+        registry = self.root / "config/openvr/openvrpaths.vrpath"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"runtime": [str(self.root / "gone"), str(library)]}))
+        env = dict(self.env)
+        env.pop("CV1TOUCH_STEAMVR")
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(INSTALLER.steamvr_runtime(), library)
+            registry.write_text("{}")
+            self.assertEqual(INSTALLER.steamvr_runtime(), self.root / ".steam/steam/steamapps/common/SteamVR")
+            os.environ["CV1TOUCH_STEAM_ROOT"] = str(self.root / "steam")
+            self.assertEqual(INSTALLER.steamvr_runtime(), self.root / "steam/steamapps/common/SteamVR")
+            os.environ["CV1TOUCH_STEAMVR"] = str(library)
+            self.assertEqual(INSTALLER.steamvr_runtime(), library)
 
     def test_conflicting_file_is_not_overwritten(self):
         path = self.prefix / "bin/cv1touch"
