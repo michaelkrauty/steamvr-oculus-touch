@@ -30,6 +30,8 @@ name = "cv1touchd-quiet"
 path = "src/bin/cv1touchd_quiet.rs"
 
 [dependencies]
+aes = "0.8"
+ccm = { version = "0.5", default-features = false }
 libc = "0.2"
 miniz_oxide = "0.8"
 nalgebra = "0.33"
