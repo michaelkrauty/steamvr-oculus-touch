@@ -8028,7 +8028,7 @@ mod tests {
             (
                 "headset_alignment",
                 true,
-                "warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-X".to_string()
+                format!("warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: {} while SteamVR tracks the headset from LHB-X", track::repose::redo_headset(cfg!(windows)))
             )
         );
         let mut other = status(None);

@@ -347,7 +347,7 @@ pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
     let pin = &value["alignment"]["base_pin"];
     match pin["base"].as_str() {
         Some(p) if p != b && pin["owner"] == "cv1touch" => Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: restart SteamVR to fix it (it then starts from base station {p}, which is measured)")),
-        _ => Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from {b}")),
+        _ => Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: {} while SteamVR tracks the headset from {b}", crate::track::repose::redo_headset(cfg!(windows)))),
     }
 }
 
@@ -361,7 +361,7 @@ pub fn other_headset_note(value: &serde_json::Value) -> Option<String> {
             if cfg!(windows) {
                 "choose Line up the controllers with your headset in the Start menu"
             } else {
-                "run `cv1touch setup --redo headset`"
+                crate::track::repose::redo_headset(false)
             }
         )
     })
@@ -628,7 +628,7 @@ mod tests {
     fn the_base_station_notes() {
         let status = |unmeasured: Option<&str>, pin: serde_json::Value| serde_json::json!({"alignment": {"unmeasured_base": unmeasured, "base_pin": pin}});
         let pin = |base: Option<&str>, owner: Option<&str>, waiting: Option<&str>| serde_json::json!({"base": base, "owner": owner, "waiting_for": waiting});
-        let redo = "SteamVR tracks the headset from base station LHB-C, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-C";
+        let redo = format!("SteamVR tracks the headset from base station LHB-C, which no headset registration measured, so the controllers can be shown centimetres off: {} while SteamVR tracks the headset from LHB-C", crate::track::repose::redo_headset(cfg!(windows)));
         for p in [
             pin(None, None, None),
             pin(Some("LHB-A"), Some("user"), None),
@@ -637,7 +637,7 @@ mod tests {
         ] {
             assert_eq!(
                 unmeasured_base_note(&status(Some("LHB-C"), p)).as_deref(),
-                Some(redo)
+                Some(redo.as_str())
             );
         }
         assert_eq!(
@@ -684,7 +684,7 @@ mod tests {
         assert!(note.ends_with(if cfg!(windows) {
             "choose Line up the controllers with your headset in the Start menu, and follow its steps"
         } else {
-            "run `cv1touch setup --redo headset`, and follow its steps"
+            "redo Headset alignment in cv1touch setup, and follow its steps"
         }));
     }
     use crate::hand::{BTN_A, FLAG_CALIBRATED, FLAG_CONNECTED, FLAG_POSITION, TOUCH_TRIGGER};

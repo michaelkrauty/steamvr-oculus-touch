@@ -16,6 +16,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Changed
 
+- While a setup stage waits, `cv1touch setup` now says only what to do, without the stage's internal state after it (for example `✗ Controller model: press a button on each controller`), and a new sensor no longer hides what Sensor positions waits for. `cv1touch doctor` and `cv1touch status` now say to redo Headset alignment in `cv1touch setup` (on Windows, in **Set up cv1touch**) instead of naming `--redo headset`.
 - On Windows, when the installer cannot finish setting up, it now says which step did not finish and what to do about it (plug in a sensor, allow Windows' prompt, quit SteamVR, restart Windows), instead of one general message. **Finish setting up cv1touch** ends with the same lines.
 - The Windows Start menu's **Start cv1touch** now opens a window that says when cv1touch is running, and the installer's last page asks you to wake both controllers and start SteamVR before setup.
 - The Windows guide and the first-test checklist point to the installer on the latest release, and the checklist asks testers only for the report and a few words on what did not work.

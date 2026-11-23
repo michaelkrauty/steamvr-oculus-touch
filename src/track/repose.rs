@@ -73,6 +73,15 @@ pub const fn redo_sensors(windows: bool) -> &'static str {
     }
 }
 
+/// The way back to the headset stage, on Windows (`windows`) or elsewhere, as `redo_sensors`.
+pub const fn redo_headset(windows: bool) -> &'static str {
+    if windows {
+        "redo Headset alignment in Set up cv1touch"
+    } else {
+        "redo Headset alignment in cv1touch setup"
+    }
+}
+
 /// The advice while fewer than two sensors agree with each other (`Change::Unsure`), for the
 /// daemon's log and `cv1touch doctor` alike.
 pub fn unsure_advice() -> String {
@@ -1242,6 +1251,14 @@ mod tests {
             "redo Sensor positions in Set up cv1touch"
         );
         assert_eq!(REDO_SENSORS, redo_sensors(cfg!(windows)));
+        assert_eq!(
+            redo_headset(false),
+            "redo Headset alignment in cv1touch setup"
+        );
+        assert_eq!(
+            redo_headset(true),
+            "redo Headset alignment in Set up cv1touch"
+        );
         assert!(unsure_advice().ends_with(&format!("for several minutes, {REDO_SENSORS}")));
         let (timed_out, _) = LetGo::TimedOut.advice(None);
         assert!(timed_out.ends_with(&format!("If that does not place it, {REDO_SENSORS}")));

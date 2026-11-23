@@ -322,6 +322,16 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(next(r for r in report["stages"] if r["stage"] == "registration")["state"], "blocked")
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
+    def test_a_waiting_stage_says_only_what_to_do(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        (directory / "render-offsets.json").unlink()
+        self.awake = False
+        output = self.terminal_guide("q\n", expected_code=1)
+        self.assertIn("\n✗ Controller model: press a button on each controller\n", output)
+        self.assertNotIn("requires", output)
+        self.assertNotIn("artifact", output)
+
     def test_sleeping_hands_reuse_valid_files_without_capture_or_erasure(self):
         directory = self.fixtures()
         self.terminal_guide("keep\n" * 4)

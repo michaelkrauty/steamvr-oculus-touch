@@ -56,7 +56,7 @@ The command-line tools are named `cv1touch` and `cv1touchd`. Run `cv1touch help 
 
 ## Limitations
 
-Tracking needs camera visibility. Occlusion, too few visible LEDs, or insufficient overlapping views reduce tracking quality. The radio and USB transport set a latency floor; local software timing is not end-to-end motion-to-photon latency. Registration can drift when SteamVR changes its tracking-space solution; base-station following handles approximately rigid changes, while significant disagreement requires repeating registration. A headset that base stations do not track (such as a Rift S or a Quest) gives nothing to follow: if the controllers are no longer where your hands are, repeat headset alignment with `cv1touch setup --redo headset`. Battery reports come from controller firmware and may not predict a weak battery or intermittent contact reliably.
+Tracking needs camera visibility. Occlusion, too few visible LEDs, or insufficient overlapping views reduce tracking quality. The radio and USB transport set a latency floor; local software timing is not end-to-end motion-to-photon latency. Registration can drift when SteamVR changes its tracking-space solution; base-station following handles approximately rigid changes, while significant disagreement requires repeating registration. A headset that base stations do not track (such as a Rift S or a Quest) gives nothing to follow: if the controllers are no longer where your hands are, redo Headset alignment in `cv1touch setup` (on Windows, in **Set up cv1touch**). Battery reports come from controller firmware and may not predict a weak battery or intermittent contact reliably.
 
 ## License and credits
 

@@ -378,10 +378,15 @@ fn reports(inspection: &Inspection, checkpoint: &Checkpoint) -> Vec<setup::Stage
         } else {
             State::Stale
         };
-        reports[0].reason = format!(
+        // a live blocker stays first, as `setup::plan` puts it
+        let unplaced = format!(
             "{} connected sensor(s) need placement",
             inspection.unplaced.len()
         );
+        reports[0].reason = match inspection.snapshot.blocked.get(&Stage::Camera) {
+            Some(blocker) => format!("{blocker}; {unplaced}"),
+            None => unplaced,
+        };
         for report in reports
             .iter_mut()
             .filter(|r| matches!(r.stage, Stage::Gravity | Stage::Registration))
@@ -1828,7 +1833,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                         "{} {}: {}",
                         g.fail,
                         ui::stage_name(report.stage),
-                        report.reason
+                        ui::waiting_for(report)
                     );
                 }
                 show_list = true;
@@ -1967,6 +1972,26 @@ mod tests {
             engine_ready: Some(true),
             moved: Default::default(),
         }
+    }
+    /// An unplaced sensor makes Sensor positions the next stage; what keeps it waiting stays
+    /// the first thing its line says.
+    #[test]
+    fn an_unplaced_sensor_keeps_what_the_sensor_stage_waits_on() {
+        let mut inspection = saved();
+        inspection.unplaced = vec!["NEWCAM".into()];
+        let checkpoint = Checkpoint::default();
+        let report = &reports(&inspection, &checkpoint)[0];
+        assert_eq!(
+            (report.state, report.reason.as_str()),
+            (State::Stale, "1 connected sensor(s) need placement")
+        );
+        inspection
+            .snapshot
+            .blocked
+            .insert(Stage::Camera, "press a button on each controller".into());
+        let report = &reports(&inspection, &checkpoint)[0];
+        assert_eq!(report.state, State::Blocked);
+        assert_eq!(ui::waiting_for(report), "press a button on each controller");
     }
     #[test]
     fn a_sensor_calibrated_in_another_letter_case_is_placed() {

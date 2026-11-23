@@ -67,11 +67,22 @@ fn state_words(report: &StageReport) -> String {
         State::Stale => "needs redoing (its result or an earlier step changed)".into(),
         State::Unknown => "saved earlier, not verified".into(),
         State::Invalid => "saved file unusable: redo it".into(),
-        // the report's reason is "what blocks it; its own state": the blocker is what to act on
-        State::Blocked => format!(
-            "waiting: {}",
-            report.reason.split("; ").next().unwrap_or(&report.reason)
-        ),
+        State::Blocked => format!("waiting: {}", waiting_for(report)),
+    }
+}
+
+/// What a person does for a waiting stage. The report's reason is "what blocks it; its own
+/// state", and its own state is for `setup --check --json`; a stage waiting on nothing live
+/// waits on an earlier stage or on SteamVR's files.
+pub(super) fn waiting_for(report: &StageReport) -> &str {
+    match report.reason.split("; ").next().unwrap_or(&report.reason) {
+        "requires valid camera calibration" | "place connected sensors before completing setup" => {
+            "finish Sensor positions first"
+        }
+        "requires valid controller geometry and source meshes" => {
+            "SteamVR's Rift controller models are missing or damaged: have Steam verify SteamVR's files (its Properties, Installed Files)"
+        }
+        blocker => blocker,
     }
 }
 
@@ -484,6 +495,22 @@ mod tests {
             waiting,
             "  ✗ Buttons and sticks  waiting: wake both controllers with a face button"
         );
+        // a waiting stage's line says only what to do, whatever its own state behind the blocker
+        for (reason, says) in [
+            (
+                "press a button on each controller; requires valid controller geometry and source meshes",
+                "press a button on each controller",
+            ),
+            ("a sensor isn't sending video; artifact is missing", "a sensor isn't sending video"),
+            ("requires valid camera calibration", "finish Sensor positions first"),
+            ("place connected sensors before completing setup", "finish Sensor positions first"),
+            (
+                "requires valid controller geometry and source meshes",
+                "SteamVR's Rift controller models are missing or damaged: have Steam verify SteamVR's files (its Properties, Installed Files)",
+            ),
+        ] {
+            assert_eq!(waiting_for(&report(Stage::Render, State::Blocked, reason)), says);
+        }
         // the planner's reasons are for --check --json; the list says what it means to a person
         let changed = checklist(
             &[
