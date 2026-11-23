@@ -29,6 +29,8 @@ struct Inspection {
     generation: Option<u64>,
     sensors: BTreeSet<String>,
     engine_ready: Option<bool>,
+    /// `moved_sensors` of the daemon's status.
+    moved: (Vec<String>, Vec<String>),
 }
 
 pub(super) fn journal_path() -> PathBuf {
@@ -52,6 +54,35 @@ fn artifact(path: &Path, validate: impl FnOnce() -> Result<(), String>) -> Artif
 
 fn read_status() -> io::Result<Option<serde_json::Value>> {
     daemon_status(Duration::from_millis(750), DaemonPurpose::Command)
+}
+
+/// What the daemon's status says about sensors it judged moved: the sensors it left out of
+/// tracking, which stay out until Sensor positions is set up again, then a sensor it is still
+/// placing again or checking, which it settles by itself.
+fn moved_sensors(status: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let (mut left_out, mut settling) = (Vec::new(), Vec::new());
+    for sensor in status["sensors"].as_array().into_iter().flatten() {
+        let serial = sensor["serial"].as_str().unwrap_or("?");
+        let pose = &sensor["pose"];
+        match pose["state"].as_str() {
+            Some("given_up") => {
+                let cause = serde_json::from_value(pose["cause"].clone())
+                    .unwrap_or(track::repose::GaveUpOn::NoPose);
+                left_out.push(format!(
+                    "Sensor {serial} {}",
+                    cause.advice("set up Sensor positions again")
+                ));
+            }
+            Some("moved") => settling.push(format!(
+                "Sensor {serial} moved and cv1touch is placing it again: move the controllers where it sees them"
+            )),
+            _ => {}
+        }
+    }
+    if status["sensors_unsure"] == true {
+        settling.push(track::repose::UNSURE_ADVICE.into());
+    }
+    (left_out, settling)
 }
 
 /// Connected sensors the calibration has no pose for. It may spell a serial in another letter
@@ -308,6 +339,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             .map(|s| status::sensor_identity(&shm::serial_str(s)))
             .collect(),
         engine_ready: second.as_ref().and_then(|v| v["engine_ready"].as_bool()),
+        moved: second.as_ref().map(moved_sensors).unwrap_or_default(),
     }
 }
 
@@ -1654,6 +1686,26 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                     }
                     continue;
                 }
+                // a sensor left out of tracking comes back only with this stage, as with --redo
+                // sensors; one the daemon is still placing or checking settles by itself
+                let (left_out, settling) = &inspection.moved;
+                for line in left_out {
+                    println!("{} {line}", g.fail);
+                }
+                for line in settling {
+                    println!("{} {line}", g.later);
+                }
+                if !left_out.is_empty() {
+                    if ask(&ui::stage_prompt(Stage::Camera, false), START_OR_QUIT)?
+                        == ui::Answer::Quit
+                    {
+                        return Ok(());
+                    }
+                    checkpoint.completed.remove(&Stage::Camera);
+                    checkpoint.pending.insert(Stage::Camera);
+                    retry = Some(Stage::Camera);
+                    continue;
+                }
                 human_action("Saved setup is complete. Check both hands in SteamVR: position, buttons and haptics.");
                 return Ok(());
             };
@@ -1799,6 +1851,7 @@ mod tests {
             generation: Some(1),
             sensors: BTreeSet::from(["CAMTEST".into()]),
             engine_ready: Some(true),
+            moved: Default::default(),
         }
     }
     #[test]

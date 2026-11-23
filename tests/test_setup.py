@@ -39,6 +39,8 @@ class SetupTests(unittest.TestCase):
         self.awake = False
         self.counter = 10
         self.extra_sensor = False
+        self.pose = None
+        self.unsure = False
         self.mutation_checkpoints = []
         self.socket_path = self.root / "run/cv1touch/control.sock"
         self.socket_path.parent.mkdir(parents=True)
@@ -73,12 +75,12 @@ class SetupTests(unittest.TestCase):
                 if command == "status":
                     self.counter += 1
                     sensors = [{"serial": "CAMTEST", "placed": 1, "frames": self.counter,
-                                "fixes": [0, 0]}] if self.configured else []
+                                "fixes": [0, 0], "pose": self.pose}] if self.configured else []
                     if self.extra_sensor:
                         sensors.append({"serial": "CAMNEW", "placed": 0, "frames": self.counter,
                                         "fixes": [0, 0]})
                     reply = {"generation": 1, "engine_ready": self.engine_ready, "mode": "calibrated" if self.configured else "provisional",
-                             "recording_scoped_stop": True, "recording_durable_stop": self.durable_stop, "recording": self.recording, "recording_status": {"pending": self.recording_pending}, "sensor_total": len(sensors), "sensors": sensors, "hands": [],
+                             "recording_scoped_stop": True, "recording_durable_stop": self.durable_stop, "recording": self.recording, "recording_status": {"pending": self.recording_pending}, "sensor_total": len(sensors), "sensors": sensors, "sensors_unsure": self.unsure, "hands": [],
                              "alignment": {"registration": self.configured and self.loaded_configuration,
                                            "render": [self.configured and self.loaded_configuration] * 2},
                              "input_calibration": {"calibrated": [self.configured and self.loaded_configuration] * 2}}
@@ -401,6 +403,40 @@ class SetupTests(unittest.TestCase):
         output = self.terminal_guide("q\n", expected_code=1)
         self.assertIn("not using the saved setup", output)
         self.assertNotIn("Saved setup is complete", output)
+
+    def test_complete_setup_offers_sensor_positions_for_a_sensor_left_out_of_tracking(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        for cause, why in [("no_pose", "no new position for it could be found"),
+                           ("keeps_moving", "fix it in place so that it cannot shift")]:
+            self.pose = {"state": "given_up", "cause": cause}
+            output = self.terminal_guide("q\n")
+            self.assertIn("Sensor CAMTEST moved", output)
+            self.assertIn(why, output)
+            self.assertIn("Sensor positions (~2 min). Enter: start", output)
+            self.assertNotIn("Saved setup is complete", output)
+            self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+        # Enter starts the stage, as --redo sensors does
+        self.terminal_guide("\nq\n", expected_code=1)
+        self.assertIn("calibration capture", self.commands)
+        self.assertIn("camera", self.mutation_checkpoints[0]["pending"])
+
+    def test_complete_setup_only_says_that_cv1touch_is_still_placing_or_checking_a_sensor(self):
+        self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        for pose, unsure, said in [({"state": "moved"}, False, "Sensor CAMTEST moved and cv1touch is placing it again"),
+                                   (None, True, "still checking whether a sensor moved")]:
+            self.pose, self.unsure = pose, unsure
+            output = self.terminal_guide()
+            self.assertIn(said, output)
+            self.assertIn("Saved setup is complete", output)
+            self.assertNotIn("Enter: start", output)
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
     def test_pending_engine_reload_blocks_capture_despite_advancing_old_streams(self):
         directory = self.fixtures()

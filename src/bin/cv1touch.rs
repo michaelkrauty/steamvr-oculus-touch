@@ -556,7 +556,10 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
             Some("given_up") => {
                 let cause =
                     serde_json::from_value(pose["cause"].clone()).unwrap_or(GaveUpOn::NoPose);
-                given_up.push(format!("sensor {serial} {}", cause.advice()));
+                given_up.push(format!(
+                    "sensor {serial} {}",
+                    cause.advice("run cv1touch setup --redo sensors")
+                ));
             }
             Some("placed") => placed.push(serial),
             Some("released") => {

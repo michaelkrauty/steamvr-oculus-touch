@@ -117,11 +117,11 @@ pub enum GaveUpOn {
 }
 
 impl GaveUpOn {
-    /// What `cv1touch doctor` says after the sensor's name.
-    pub fn advice(self) -> &'static str {
+    /// What is said after the sensor's name; `then` is how to set its position up again.
+    pub fn advice(self, then: &str) -> String {
         match self {
-            GaveUpOn::NoPose => "moved, and no new position for it could be found from the other sensors, so it is left out of tracking: run cv1touch setup --redo sensors",
-            GaveUpOn::KeepsMoving => "moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then run cv1touch setup --redo sensors",
+            GaveUpOn::NoPose => format!("moved, and no new position for it could be found from the other sensors, so it is left out of tracking: {then}"),
+            GaveUpOn::KeepsMoving => format!("moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then {then}"),
         }
     }
 }
