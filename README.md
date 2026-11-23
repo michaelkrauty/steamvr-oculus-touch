@@ -10,7 +10,7 @@ SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a nati
 
 - Original **Rift CV1 Touch** controllers, already paired to a CV1 headset. Rift S and Quest Touch controllers are unsupported. Pairing is not implemented here.
 - A **CV1 headset connected over USB**, used as the controllers' radio receiver. The CV1 display is not used by this driver.
-- CV1 tracking sensors. Use at least two with overlapping views for reliable position tracking. There is no fixed sensor-count cap; USB bandwidth, CPU capacity, and available memory determine the usable count. One sensor has weaker depth observability and is not the recommended configuration. See [adding sensors](docs/setup.md#add-or-remove-sensors).
+- Two or more CV1 tracking sensors with overlapping views of the play area ([adding sensors](docs/setup.md#add-or-remove-sensors)).
 - A working native Linux SteamVR installation and an independently tracked SteamVR headset for coordinate registration. A separate reference controller is optional.
 - Linux x86-64, Rust 1.85 or newer, and the native build dependencies below. The default service setup uses systemd user services and logind device access.
 
@@ -32,20 +32,15 @@ python3 scripts/install.py
 
 Linux v0.5.1 is distributed as source, including [tagged source archives](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1). Native dependencies are dynamically linked; build locally on the distribution where you will run it. For development on `main`, see [Contributing](CONTRIBUTING.md).
 
-The installer builds with the locked dependency graph, installs into `~/.local`, registers the SteamVR driver, backs up SteamVR settings before enabling multiple drivers, and starts a user service. It never runs sudo. Put `~/.local/bin` on your PATH.
+The installer builds with the locked dependency graph, installs into `~/.local`, registers the SteamVR driver, backs up SteamVR settings before enabling multiple drivers, and starts a user service. It never runs sudo. When it ends, it prints what is still to do: the two commands that install the [udev rule](docs/setup.md#device-access) when that rule is not installed and the headset and sensors cannot be opened yet, then reconnecting the headset and sensors, and the line that puts `~/.local/bin` on your PATH if it is not there.
 
-Install the supplied [udev rule](docs/setup.md#device-access) once, reconnect the USB devices, then run:
+Then wake both controllers by pressing a button on each, and run:
 
 ```sh
-cv1touch doctor
-cv1touch status --json
+cv1touch setup
 ```
 
-Until setup is complete, doctor shows it as not set up yet. Then run `cv1touch setup`, which walks you through every calibration step ([guided setup](docs/setup.md#guided-setup)); the manual steps in [setup and calibration](docs/setup.md#calibrate-and-align) remain available. Calibration is specific to your camera placement; no personal room calibration is shipped. Setup includes camera calibration, gravity levelling, registration to your SteamVR headset, and guided trigger/grip/thumbstick calibration. Once complete, the daemon starts automatically and reconnects to devices.
-
-## Guided setup
-
-`cv1touch setup` guides camera calibration, gravity alignment, render fitting, input calibration, and finally headset registration, retaining completed stages across runs. A fresh accepted camera solve also completes gravity alignment from the same capture. `cv1touch setup --check` or `cv1touch setup --check --json` reports the plan without changing configuration or capturing data. See [guided setup](docs/setup.md#guided-setup) for prerequisites and adoption of existing configurations. Physical calibration and visual verification are still required. The guide does not pair controllers, change permissions, or manage services.
+It walks you through every calibration step, one at a time, and remembers the finished ones if you stop ([guided setup](docs/setup.md#guided-setup)). Its last step needs SteamVR running with your headset tracking. Calibration is specific to your sensor placement, so none is shipped. Once setup is complete, the daemon starts automatically and reconnects to the devices. If something stops working later, `cv1touch doctor` says what is wrong.
 
 ## Documentation
 
