@@ -211,7 +211,7 @@ class SetupTests(unittest.TestCase):
     def test_a_daemon_that_is_not_running_is_left_to_the_guided_checks(self):
         self.stop_daemon()
         output = self.terminal_guide("q\n", expected_code=1)
-        self.assertIn("Start cv1touchd", output)
+        self.assertIn("start it with systemctl --user start cv1touchd", output)
         self.assertIn("cv1touchd isn't running", output)
         self.assertIn("press Enter to check again", output)
         self.assertNotIn("before recording", output)
@@ -220,7 +220,7 @@ class SetupTests(unittest.TestCase):
     def test_a_busy_daemon_is_left_to_the_guided_checks(self):
         self.recording = True
         output = self.terminal_guide("q\n", expected_code=1)
-        self.assertIn("finish any active recording", output)
+        self.assertIn("a recording is running: wait for it to finish", output)
         self.assertIn("press Enter to check again", output)
         self.assertNotIn("record stop", output)
         self.assertEqual(self.mutation_checkpoints, [])
@@ -237,7 +237,7 @@ class SetupTests(unittest.TestCase):
         for stage in report["stages"]:
             if stage["stage"] != "inputs":
                 self.assertEqual(stage["state"], "blocked", stage)
-                self.assertIn("daemon is busy", stage["reason"])
+                self.assertIn("cv1touchd is busy", stage["reason"])
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
         self.assertFalse((self.root / "state").exists())
 
@@ -257,7 +257,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertEqual(self.mutation_checkpoints, [])
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
-        self.assertIn("finish any active recording", output)
+        self.assertIn("a recording is running: wait for it to finish", output)
         self.assertIn("press Enter to check again", output)
 
     def test_a_second_setup_names_the_running_guide_not_a_recording_to_stop(self):
@@ -416,9 +416,9 @@ class SetupTests(unittest.TestCase):
         result = self.cli("--check", "--json")
         report = json.loads(result.stdout)
         self.assertEqual(report["stages"][0]["state"], "blocked")
-        self.assertIn("initializing or reloading", report["stages"][0]["reason"])
+        self.assertIn("tracking is starting up", report["stages"][0]["reason"])
         output = self.terminal_guide("q\n", expected_code=1)
-        self.assertIn("initializing or reloading", output)
+        self.assertIn("tracking is starting up", output)
         self.assertEqual(journal.read_bytes(), checkpoint)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)

@@ -157,16 +157,17 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         .flatten();
     thread::sleep(Duration::from_millis(300));
     let second = daemon_status(Duration::from_millis(750), DaemonPurpose::Check);
-    let daemon_detail = second.as_ref().err().map_or_else(
-        || daemon_start_advice().to_string(),
-        |error| {
-            if error.kind() == io::ErrorKind::InvalidInput {
-                error.to_string()
-            } else {
-                format!("{} ({error})", daemon_start_advice())
-            }
-        },
-    );
+    let daemon_detail = match second.as_ref() {
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            error.to_string()
+        }
+        _ => daemon_start_advice().to_string(),
+    };
     let second = second.ok().flatten();
     let streaming = first.as_ref().zip(second.as_ref()).is_some_and(|(a, b)| {
         if a["generation"].as_u64().is_none()
@@ -211,16 +212,44 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             && v["alignment"]["render"] == serde_json::json!([true, true])
             && v["input_calibration"]["calibrated"] == serde_json::json!([true, true])
     });
-    let checks = vec![
+    let starting = second.as_ref().is_some_and(|v| v["engine_ready"] == false);
+    let restart = sensor_streams::RESTART.trim_start_matches("then ");
+    let idle_detail = if starting {
+        "tracking is starting up: wait a few seconds".to_string()
+    } else if recording {
+        "a recording is running: wait for it to finish".to_string()
+    } else {
+        format!("another calibration is running: finish it first; if none is, {restart}")
+    };
+    let steamvr_assets = steamvr_problem(&runtime, runtime_ok);
+    // enumerates USB devices: only when it is shown
+    let stream_detail = if streaming {
+        String::new()
+    } else {
+        sensor_streams::setup_detail(first.as_ref(), second.as_ref())
+    };
+    let saved = [&camera, &registration, &render, &inputs]
+        .iter()
+        .all(|a| matches!(a, Artifact::Valid(_)));
+    let mut checks = vec![
         Check { name: "daemon", ok: second.is_some(), detail: daemon_detail },
-        Check { name: "sensor_streams", ok: streaming, detail: "Every connected sensor must deliver advancing frames; check USB access/bandwidth if stopped.".into() },
-        Check { name: "controllers_awake", ok: fresh, detail: "Wake both Touch controllers with a face button before a capture.".into() },
-        Check { name: "idle", ok: !recording && normal_mode && second.as_ref().is_none_or(|v| v["engine_ready"] != false), detail: "Wait for engine initialization/reload and finish any active recording or capture before starting the guide.".into() },
-        Check { name: "steamvr_assets", ok: runtime_ok && steamvr::driver_assets().is_ok(), detail: "Install the driver and native SteamVR runtime before setup; start SteamVR before headset registration.".into() },
-        Check { name: "sensor_coverage", ok: unplaced.is_empty() && !sensors.is_empty(), detail: "New connected sensors need placement; disconnected saved sensors can remain in the calibration.".into() },
-        Check { name: "render_geometry", ok: matches!(render_sources, Artifact::Valid(_)), detail: "Both controller identities and installed SteamVR meshes must be valid.".into() },
-        Check { name: "tracking_configuration", ok: loaded, detail: "The daemon must report camera calibration, both render offsets, registration and both input calibrations loaded. Reload configuration explicitly if saved files are ready but this check fails.".into() },
+        Check { name: "sensor_streams", ok: streaming, detail: stream_detail },
+        Check { name: "controllers_awake", ok: fresh, detail: "a controller is asleep or out of range: press a button on each controller".into() },
+        Check { name: "idle", ok: !recording && normal_mode && !starting, detail: idle_detail },
+        Check { name: "steamvr_assets", ok: steamvr_assets.is_none(), detail: steamvr_assets.unwrap_or_default() },
+        Check { name: "sensor_coverage", ok: unplaced.is_empty() && !sensors.is_empty(), detail: if sensors.is_empty() { "no sensor is connected: plug in the sensors" } else { "a connected sensor has no saved position: redo Sensor positions" }.into() },
+        Check { name: "render_geometry", ok: matches!(render_sources, Artifact::Valid(_)), detail: if known_identities { "SteamVR's Rift controller models are missing or damaged: have Steam verify SteamVR's files (its Properties, Installed Files)" } else { "press a button on each controller so setup can tell which controllers these are" }.into() },
+        Check { name: "tracking_configuration", ok: loaded, detail: if saved { format!("cv1touchd hasn't loaded the saved setup: {restart}") } else { "setup isn't finished: run cv1touch setup".into() } },
     ];
+    // what needs the daemon cannot be judged without it
+    if second.is_none() {
+        for check in checks
+            .iter_mut()
+            .filter(|c| !matches!(c.name, "daemon" | "steamvr_assets"))
+        {
+            check.detail = format!("not checked: {DAEMON_NOT_RUNNING}");
+        }
+    }
     let mut blocked = BTreeMap::new();
     for stage in [
         Stage::Camera,
@@ -230,21 +259,21 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         Stage::Inputs,
     ] {
         let reason = if second.is_none() {
-            Some("daemon unavailable")
+            Some(DAEMON_NOT_RUNNING)
         } else if second.as_ref().is_some_and(|v| v["engine_ready"] == false) {
-            Some("tracking engine is initializing or reloading; wait for it to resume")
+            Some("tracking is starting up; wait a few seconds")
         } else if recording || !normal_mode {
-            Some("daemon is busy; finish its active operation first")
+            Some("cv1touchd is busy with a recording or another calibration")
         } else if !fresh {
-            Some("wake both controllers with a face button")
+            Some("press a button on each controller")
         } else if stage != Stage::Inputs && !streaming {
-            Some("sensor frames are stopped; check USB access and bandwidth")
+            Some("a sensor isn't sending video")
         } else if matches!(stage, Stage::Gravity | Stage::Registration)
             && second.as_ref().is_none_or(|v| v["mode"] != "calibrated")
         {
             Some("load the saved camera calibration before this stage")
         } else if matches!(stage, Stage::Render | Stage::Registration) && !runtime_ok {
-            Some("install native SteamVR assets first")
+            Some("SteamVR or cv1touch's SteamVR driver is missing")
         } else {
             None
         };
@@ -284,9 +313,27 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
 
 fn daemon_start_advice() -> &'static str {
     if cfg!(windows) {
-        "Choose Start cv1touch in the Start menu. If it still fails, choose Send a cv1touch report."
+        "cv1touch isn't running: choose Start cv1touch in the Start menu; if it still fails, choose Send a cv1touch report"
     } else {
-        "Start cv1touchd with access to the CV1 USB devices."
+        "cv1touchd isn't running: start it with systemctl --user start cv1touchd"
+    }
+}
+
+/// What is wrong with the SteamVR installation or cv1touch's driver files, and the fix; `None`
+/// when both are in place. `runtime_ok`: SteamVR's OpenVR library and Touch profile are there.
+fn steamvr_problem(runtime: &Path, runtime_ok: bool) -> Option<String> {
+    if !runtime_ok && !steamvr::steamvr_present(runtime) {
+        Some(steamvr::steamvr_not_found(runtime, steamvr::REINSTALL))
+    } else if !runtime_ok {
+        Some("SteamVR's files are incomplete: have Steam verify SteamVR's files (its Properties, Installed Files)".into())
+    } else if steamvr::driver_assets().is_err() {
+        Some(if cfg!(windows) {
+            "cv1touch's SteamVR driver files are missing: run the cv1touch installer again"
+        } else {
+            "cv1touch's SteamVR driver files are missing: run `python3 scripts/install.py` again in the folder you installed cv1touch from"
+        }.into())
+    } else {
+        None
     }
 }
 
@@ -321,7 +368,7 @@ fn report_json(
     let stages = reports(inspection, checkpoint);
     let ready =
         stages.iter().all(|r| r.state == State::Ready) && inspection.checks.iter().all(|c| c.ok);
-    let json = serde_json::json!({"ready": ready, "checks": inspection.checks, "stages": stages, "note": "Saved dependency reuse does not verify physical alignment. Setup never pairs or resets controllers."});
+    let json = serde_json::json!({"ready": ready, "checks": inspection.checks, "stages": stages, "note": "A stage done earlier is not measured again: check tracking in SteamVR. Setup never pairs or resets controllers."});
     (ready, stages, json)
 }
 
@@ -339,11 +386,11 @@ fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) ->
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         let g = glyphs();
-        println!(
-            "{}\n\n{}",
-            ui::checks(&check_views(inspection), inspection.sensors.len(), &g),
-            ui::checklist(&stages, &g)
-        );
+        let views = check_views(inspection);
+        println!("{}", ui::checks(&views, inspection.sensors.len(), &g));
+        if !ui::daemon_down(&views) {
+            println!("\n{}", ui::checklist(&stages, &g));
+        }
     }
     ready
 }
@@ -1585,7 +1632,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 shown_checks = check_text;
             }
             let stage_reports = reports(&inspection, &checkpoint);
-            if std::mem::take(&mut show_list) {
+            if std::mem::take(&mut show_list) && !ui::daemon_down(&views) {
                 println!("\n{}\n", ui::checklist(&stage_reports, &g));
             }
             let Some(report) = stage_reports.iter().find(|r| r.state != State::Ready) else {
@@ -1611,7 +1658,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 return Ok(());
             };
             if !ui::checks_pass(&views) || report.state == State::Blocked {
-                if report.state == State::Blocked {
+                if report.state == State::Blocked && !ui::daemon_down(&views) {
                     println!(
                         "{} {}: {}",
                         g.fail,
@@ -1710,6 +1757,30 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steamvr_check_names_the_problem_and_its_fix() {
+        let root =
+            std::env::temp_dir().join(format!("cv1touch-steamvr-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let missing = steamvr_problem(&root, false).unwrap();
+        assert!(
+            missing.starts_with("SteamVR was not found at "),
+            "{missing}"
+        );
+        let tool = root.join(if cfg!(windows) {
+            "bin/win64/vrpathreg.exe"
+        } else {
+            "bin/vrpathreg.sh"
+        });
+        std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        std::fs::write(&tool, "").unwrap();
+        assert_eq!(
+            steamvr_problem(&root, false).unwrap(),
+            "SteamVR's files are incomplete: have Steam verify SteamVR's files (its Properties, Installed Files)"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     fn saved() -> Inspection {
         let valid = || Artifact::Valid("a".repeat(64));
         Inspection {

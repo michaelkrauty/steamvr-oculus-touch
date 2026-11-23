@@ -306,7 +306,7 @@ class CliControlErrorTests(unittest.TestCase):
         # The guide gives its own instruction; the shared formatter adds no platform start advice.
         self.check_absent_daemon(
             ["setup", "--check"],
-            "Start cv1touchd with access to the CV1 USB devices. (cv1touchd isn't running)")
+            "cv1touchd isn't running: start it with systemctl --user start cv1touchd")
 
     def test_doctor_says_how_to_start_the_daemon_and_skips_nothing_else(self):
         # Doctor's failure gives the fix; the video check it cannot make is left out.

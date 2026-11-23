@@ -127,9 +127,19 @@ fn check_label(name: &str, sensors: usize) -> String {
     }
 }
 
+/// Whether the daemon cannot be reached. Then only the checks that do not need it are shown, and
+/// no stage list: every stage would wait for the daemon.
+pub(super) fn daemon_down(checks: &[CheckView]) -> bool {
+    checks.iter().any(|c| c.name == "daemon" && !c.ok)
+}
+
 /// "Checks: daemon ✓  5 sensors ✓ …", then one line per failed check with what to do.
 pub(super) fn checks(checks: &[CheckView], sensors: usize, g: &Glyphs) -> String {
-    let shown: Vec<&CheckView> = checks.iter().filter(|c| shown(c.name)).collect();
+    let down = daemon_down(checks);
+    let shown: Vec<&CheckView> = checks
+        .iter()
+        .filter(|c| shown(c.name) && (!down || matches!(c.name, "daemon" | "steamvr_assets")))
+        .collect();
     // the line lists what a person would check first; the rest appear only when they fail
     let core = |name: &str| {
         matches!(
@@ -353,6 +363,34 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_daemon_hides_the_checks_that_need_it() {
+        let g = Glyphs::for_terminal(true);
+        let view = |name, ok, detail| CheckView { name, ok, detail };
+        let down = [
+            view("daemon", false, "cv1touchd isn't running: start it"),
+            view("sensor_streams", false, "video"),
+            view("controllers_awake", false, "press a button"),
+            view("idle", false, "busy"),
+            view("steamvr_assets", true, ""),
+            view("render_geometry", false, "models"),
+        ];
+        assert!(daemon_down(&down));
+        assert_eq!(
+            checks(&down, 0, &g),
+            "Checks: daemon [!]  SteamVR [x]\n  [!] daemon: cv1touchd isn't running: start it"
+        );
+        let mut no_steamvr = down;
+        no_steamvr[4] = view("steamvr_assets", false, "install SteamVR");
+        assert_eq!(
+            checks(&no_steamvr, 0, &g),
+            "Checks: daemon [!]  SteamVR [!]\n  [!] daemon: cv1touchd isn't running: start it\n  [!] SteamVR: install SteamVR",
+            "what can be judged without the daemon is still shown"
+        );
+        no_steamvr[0].ok = true;
+        assert!(!daemon_down(&no_steamvr));
+    }
+
+    #[test]
     fn the_checklist_names_stages_plainly_and_marks_the_next_one() {
         let g = Glyphs::for_terminal(false);
         let list = checklist(
@@ -487,12 +525,12 @@ mod tests {
             CheckView {
                 name: "render_geometry",
                 ok: false,
-                detail: "Install the SteamVR meshes.",
+                detail: "have Steam verify SteamVR's files",
             },
         ];
         assert_eq!(
             checks(&busy, 1, &g),
-            "Checks: daemon ✓  controller models ✗\n  ✗ controller models: Install the SteamVR meshes.",
+            "Checks: daemon ✓  controller models ✗\n  ✗ controller models: have Steam verify SteamVR's files",
             "secondary checks appear only when they fail"
         );
     }

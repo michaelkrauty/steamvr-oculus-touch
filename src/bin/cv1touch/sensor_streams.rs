@@ -64,6 +64,16 @@ impl Check {
         format!("{label} sensor_streams: {}", self.description())
     }
 
+    /// [`setup_detail`]'s text: two reads a moment apart cannot tell a sensor that is starting
+    /// from one that stopped, so only a confirmed problem is named.
+    fn setup_text(self) -> String {
+        if matches!(self.outcome, Outcome::Fail | Outcome::NotVerified) {
+            self.description()
+        } else {
+            "a sensor's video didn't advance: wait a few seconds; if it stays, run cv1touch doctor to see which sensor and why".into()
+        }
+    }
+
     pub(super) fn conclusion(self) -> (bool, String) {
         let outcome = self.outcome;
         let warning = self.has_warning();
@@ -169,7 +179,24 @@ pub(super) fn board_note(
     first: Option<&serde_json::Value>,
     second: Option<&serde_json::Value>,
 ) -> (String, BTreeSet<String>) {
-    let mut check = from_snapshots(
+    let mut check = from_saved(first, second);
+    let explained = std::mem::take(&mut check.explained);
+    (check.board_line(), explained)
+}
+
+/// What the guided setup says when a sensor's video did not advance between two status reads:
+/// each sensor's own problem and fix where this check finds one, else a pointer to `doctor`,
+/// whose longer samples tell a sensor that is starting from one that stopped.
+pub(super) fn setup_detail(
+    first: Option<&serde_json::Value>,
+    second: Option<&serde_json::Value>,
+) -> String {
+    from_saved(first, second).setup_text()
+}
+
+/// [`from_snapshots`] against the saved sensor calibration.
+fn from_saved(first: Option<&serde_json::Value>, second: Option<&serde_json::Value>) -> Check {
+    from_snapshots(
         || {
             file::load(&file::default_path())
                 .ok()
@@ -178,9 +205,7 @@ pub(super) fn board_note(
         },
         first,
         second,
-    );
-    let explained = std::mem::take(&mut check.explained);
-    (check.board_line(), explained)
+    )
 }
 
 fn calibration_serials(calibration: &file::CalibrationFile) -> Vec<String> {
@@ -200,10 +225,10 @@ fn from_snapshots(
 }
 
 #[cfg(windows)]
-const RESTART: &str =
+pub(super) const RESTART: &str =
     "then restart the daemon: choose Stop cv1touch, then Start cv1touch in the Start menu";
 #[cfg(not(windows))]
-const RESTART: &str = "then restart the daemon: systemctl --user restart cv1touchd";
+pub(super) const RESTART: &str = "then restart the daemon: systemctl --user restart cv1touchd";
 /// The running daemon adds a sensor plugged in while it runs.
 const USED_AGAIN: &str = "the daemon tries to use it again after it is plugged back in";
 
@@ -527,6 +552,23 @@ fn with_sources(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn setup_names_only_confirmed_sensor_problems() {
+        let replug = Check::new(
+            Outcome::Fail,
+            "WMHD000000000A: unplug it and plug it back in",
+        );
+        assert_eq!(
+            replug.setup_text(),
+            "WMHD000000000A: unplug it and plug it back in"
+        );
+        let starting = Check::new(Outcome::Pending, "waiting for a second video sample");
+        assert_eq!(
+            starting.setup_text(),
+            "a sensor's video didn't advance: wait a few seconds; if it stays, run cv1touch doctor to see which sensor and why"
+        );
+    }
 
     fn check(
         calibrated: Option<&[String]>,
