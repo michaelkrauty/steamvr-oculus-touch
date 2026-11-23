@@ -148,6 +148,7 @@ impl Tracker {
         if gap {
             self.reset_imu_history();
         }
+        let s = self.own_rail(s);
         if let Some((t, q, until)) = self.wrong_lock {
             let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
             self.wrong_lock = (s.t < until).then(|| {
@@ -222,6 +223,7 @@ fn tracker(params: Params) -> Tracker {
 fn sample(t: u64) -> ImuSample {
     ImuSample {
         t,
+        hidden: None,
         gyro: Vector3::zeros(),
         accel: Vector3::new(0.0, 9.80665, 0.0),
     }

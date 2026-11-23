@@ -9,6 +9,7 @@ use std::path::Path;
 
 use nalgebra::{Isometry3, Vector3};
 
+use super::factory::Imu;
 use super::pipeline::{device_hand, FrameEvent, Pipeline, Probe};
 use super::tracker::Stats;
 use crate::calib::camera::CameraModel;
@@ -45,11 +46,11 @@ pub struct Replay {
     pub agreement: Vec<(String, super::tracker::CameraAgreement)>,
 }
 
-/// `imu_position` finds a controller's IMU position from its LED model (see `factory`).
+/// `imu` finds a controller's factory IMU data from its LED model (see `factory`).
 pub fn replay(
     path: &Path,
     cal: &CalibrationFile,
-    imu_position: &dyn Fn(&[Led]) -> Option<Vector3<f64>>,
+    imu: &dyn Fn(&[Led]) -> Option<Imu>,
     o: &Options,
 ) -> Result<Replay, String> {
     let mut p = Pipeline::new(o.clone());
@@ -100,8 +101,9 @@ pub fn replay(
                         dir: vec3(l.dir),
                     })
                     .collect();
-                let imu_pos = imu_position(&leds).ok_or_else(|| format!("no factory IMU position for device {device} (no cached Touch configuration matches its LED model)"))?;
-                p.body(device, leds, imu_pos);
+                let imu = imu(&leds).ok_or_else(|| format!("no factory IMU position for device {device} (no cached Touch configuration matches its LED model)"))?;
+                p.body(device, leds, imu.position);
+                p.gyro_range(device, imu.gyro);
             }
             recorder::RAW_REPORT => {
                 if let Some((0, d)) = recorder::decode_raw(&rec.payload) {

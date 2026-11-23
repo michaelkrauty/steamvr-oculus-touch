@@ -3530,7 +3530,7 @@ struct NewBody {
     /// The engine's LED model, for the recording.
     model: Vec<engine::LedEntry>,
     leds: Vec<calib::capture::Led>,
-    imu: nalgebra::Vector3<f64>,
+    imu: track::factory::Imu,
 }
 
 /// Which thread writes a hand's shm slot, which takes one writer at a time: the engine (OpenHMD's
@@ -3842,7 +3842,7 @@ impl BodyFinder {
                     dir: calib::vec3(l.dir),
                 })
                 .collect();
-            match track::factory::imu_position(&track::factory::openhmd_config_dir(), &leds) {
+            match track::factory::imu(&track::factory::openhmd_config_dir(), &leds) {
                 Some(imu) => {
                     link.bodies.lock().unwrap().push(NewBody {
                         hand: h,
@@ -4296,14 +4296,15 @@ fn radio_main(
                     holds.note(arrived, shm::now_ns());
                 }
                 deliver_new_bodies(d, &link.bodies, |b| {
-                    pipe.body(b.device_id, b.leds.clone(), b.imu);
+                    pipe.body(b.device_id, b.leds.clone(), b.imu.position);
+                    pipe.gyro_range(b.device_id, b.imu.gyro);
                     log!(
                         "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
                         ["left", "right"][b.hand],
                         b.leds.len(),
-                        b.imu.x * 1e3,
-                        b.imu.y * 1e3,
-                        b.imu.z * 1e3
+                        b.imu.position.x * 1e3,
+                        b.imu.position.y * 1e3,
+                        b.imu.position.z * 1e3
                     );
                     biases.seed(pipe, b.hand, &b.leds);
                     link.hands.request(b.hand);
@@ -10006,7 +10007,7 @@ mod tests {
             device_id: 1,
             model: Vec::new(),
             leds: Vec::new(),
-            imu: nalgebra::Vector3::zeros(),
+            imu: nalgebra::Vector3::zeros().into(),
         });
         let mut installed = 0;
         deliver_new_bodies(&d, &link.bodies, |body| {
@@ -10190,7 +10191,7 @@ mod tests {
             device_id,
             model: model.clone(),
             leds: Vec::new(),
-            imu: nalgebra::Vector3::zeros(),
+            imu: nalgebra::Vector3::zeros().into(),
         };
         // nothing records: the right hand's model waits for a recording's session info
         link.bodies

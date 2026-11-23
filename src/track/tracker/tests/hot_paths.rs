@@ -201,6 +201,7 @@ fn history_queries_match_original_at_boundaries_and_across_wraps() {
             let t = 1_000_000 + i * 2_000_000;
             tr.imu.push_back(ImuSample {
                 t,
+                hidden: None,
                 gyro: Vector3::new(0.1, 0.2, 0.3),
                 accel: Vector3::new(0.0, G, 0.0),
             });

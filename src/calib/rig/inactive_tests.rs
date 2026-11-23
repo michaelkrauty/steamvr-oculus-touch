@@ -360,7 +360,7 @@ fn replayed_problem(seed: u64) -> (Problem, State) {
     let replay = track::replay::replay(
         &path,
         &cal,
-        &|_| Some(Vector3::zeros()),
+        &|_| Some(Vector3::zeros().into()),
         &Default::default(),
     )
     .unwrap();

@@ -15,6 +15,7 @@ use nalgebra::{Isometry3, Vector2, Vector3};
 
 use super::clock::{LinearClock, Unwrap32};
 use super::epochs::{Checks, Evidence, State};
+use super::factory::Gyro;
 use super::tracker::{
     CameraAgreement, EnginePose, ForeignLed, ImuSample, Outcome, Output, Params, Stats, Tracker,
 };
@@ -492,6 +493,13 @@ impl Pipeline {
         }
     }
 
+    /// Where a controller's gyro readings end (see `Tracker::gyro_range`).
+    pub fn gyro_range(&mut self, device_id: i32, gyro: Gyro) {
+        if let Some(tr) = device_hand(device_id).and_then(|h| self.trackers[h].as_mut()) {
+            tr.gyro_range = Some(gyro);
+        }
+    }
+
     pub fn tracker(&self, hand: usize) -> Option<&Tracker> {
         self.trackers[hand].as_ref()
     }
@@ -612,6 +620,7 @@ impl Pipeline {
             t: device_ns,
             gyro,
             accel,
+            hidden: None,
         });
         if tr.stats.imu_gaps != gaps {
             // A sleep/dropout or clock re-lock invalidates the old exposure mappings.
@@ -2699,7 +2708,7 @@ mod tests {
         let replay = super::super::replay::replay(
             &path,
             &calibration,
-            &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+            &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
             &p.opts,
         )
         .unwrap();
@@ -2735,7 +2744,7 @@ mod tests {
             super::super::replay::replay(
                 file,
                 &calibration,
-                &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+                &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
                 &p.opts,
             )
             .unwrap()
@@ -2836,7 +2845,7 @@ mod tests {
             let replay = super::super::replay::replay(
                 &second,
                 &calibration,
-                &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+                &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
                 &opts,
             )
             .unwrap();
@@ -2876,7 +2885,7 @@ mod tests {
         let replay = super::super::replay::replay(
             &path,
             &calibration,
-            &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+            &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
             &p.opts,
         )
         .unwrap();
@@ -2913,7 +2922,7 @@ mod tests {
             let replay = super::super::replay::replay(
                 &path,
                 &cal,
-                &|_| Some(Vector3::new(0.015, -0.012, 0.008)),
+                &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
                 &options,
             )
             .unwrap();

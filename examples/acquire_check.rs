@@ -137,8 +137,9 @@ fn main() {
                         dir: calib::vec3(l.dir),
                     })
                     .collect();
-                let imu = factory::imu_position(&dir, &leds).expect("factory IMU position");
-                p.body(device, leds.clone(), imu);
+                let imu = factory::imu(&dir, &leds).expect("factory IMU");
+                p.body(device, leds.clone(), imu.position);
+                p.gyro_range(device, imu.gyro);
                 if let Some(e) = bias_file.controllers.get(&biases::key(hand, &leds)) {
                     p.seed_biases(hand, e.gyro());
                 }

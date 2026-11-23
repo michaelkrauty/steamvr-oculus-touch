@@ -320,12 +320,27 @@ pub struct Motion {
     centre: Vector3<f64>,
     pos: [[(f64, f64, f64); 2]; 3],
     ang: [[(f64, f64, f64); 2]; 3],
+    /// (start, span, peak rate) of a flick on top (see `with_flick`).
+    flick: Option<(f64, f64, f64)>,
 }
 
 fn sines(terms: &[(f64, f64, f64); 2], t: f64) -> (f64, f64) {
     terms.iter().fold((0.0, 0.0), |(v, d), &(a, w, ph)| {
         (v + a * (w * t + ph).sin(), d + a * w * (w * t + ph).cos())
     })
+}
+
+/// A raised cosine of unit peak over `span` seconds: its value and its integral `t` seconds
+/// after it starts.
+fn pulse(t: f64, span: f64) -> (f64, f64) {
+    let w = std::f64::consts::TAU / span;
+    let u = t.clamp(0.0, span);
+    let value = if t > 0.0 && t < span {
+        (1.0 - (w * u).cos()) / 2.0
+    } else {
+        0.0
+    };
+    (value, (u - (w * u).sin() / w) / 2.0)
 }
 
 impl Motion {
@@ -347,7 +362,12 @@ impl Motion {
             [term(0.9), term(0.4)],
             [term(1.4), term(0.5)],
         ];
-        Motion { centre, pos, ang }
+        Motion {
+            centre,
+            pos,
+            ang,
+            flick: None,
+        }
     }
 
     /// A controller lying still at `centre`, turned by the angles `turn` (the same three angles
@@ -359,6 +379,7 @@ impl Motion {
             centre,
             pos: [zero; 3],
             ang: [fixed(turn[0]), fixed(turn[1]), fixed(turn[2])],
+            flick: None,
         }
     }
 
@@ -385,6 +406,7 @@ impl Motion {
     }
 
     pub fn pose(&self, t: f64) -> Isometry3<f64> {
+        let (_, turn) = self.flick_at(t);
         let p = Vector3::new(
             sines(&self.pos[0], t).0,
             sines(&self.pos[1], t).0,
@@ -393,7 +415,7 @@ impl Motion {
         let (a, b, g) = (
             sines(&self.ang[0], t).0,
             sines(&self.ang[1], t).0,
-            sines(&self.ang[2], t).0,
+            sines(&self.ang[2], t).0 + turn,
         );
         let r = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), a)
             * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), b)
@@ -403,16 +425,35 @@ impl Motion {
 
     /// Body-frame angular velocity of `pose` (exact, from the Euler rates).
     pub fn gyro(&self, t: f64) -> Vector3<f64> {
-        let ((_, da), (b, db), (g, dg)) = (
+        let ((_, da), (b, db), (g, dg), (rate, turn)) = (
             sines(&self.ang[0], t),
             sines(&self.ang[1], t),
             sines(&self.ang[2], t),
+            self.flick_at(t),
         );
+        let (g, dg) = (g + turn, dg + rate);
         let rx = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), g);
         let ry = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), b);
         rx.inverse() * (ry.inverse() * Vector3::new(0.0, 0.0, da))
             + rx.inverse() * Vector3::new(0.0, db, 0.0)
             + Vector3::new(dg, 0.0, 0.0)
+    }
+
+    /// This motion with a flick from `at` lasting `span` seconds: a turn about the controller's x
+    /// axis whose rate rises and falls as one raised cosine of peak `rate` rad/s.
+    pub fn with_flick(self, at: f64, span: f64, rate: f64) -> Motion {
+        Motion {
+            flick: Some((at, span, rate)),
+            ..self
+        }
+    }
+
+    /// The flick's turn rate and angle about the x axis at `t`.
+    fn flick_at(&self, t: f64) -> (f64, f64) {
+        self.flick.map_or((0.0, 0.0), |(at, span, rate)| {
+            let (value, once) = pulse(t - at, span);
+            (rate * value, rate * once)
+        })
     }
 
     /// Specific force at the IMU (`lever` in the model frame): R^T (p_imu'' + G), by central differences.

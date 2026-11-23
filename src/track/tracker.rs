@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use nalgebra::{Isometry3, Matrix2, Matrix3, UnitQuaternion, Vector2, Vector3};
 
 use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
+use super::factory::{Gyro, GYRO_PER_COUNT};
 use super::search::{self, SearchParams};
 use super::vision::{self, Blob, Body, Camera, FitParams};
 
@@ -42,6 +43,20 @@ pub struct ImuSample {
     /// Body rate, rad/s, and specific force, m/s^2, factory-calibrated.
     pub gyro: Vector3<f64>,
     pub accel: Vector3<f64>,
+    /// The density (rad^2/s, body frame) of the turn rate that gyro axes at their rails may
+    /// hide over the interval this sample ends, set by `Tracker::imu` (see
+    /// `Tracker::own_rail`): none while no axis reads at its rail.
+    pub hidden: Option<Matrix3<f64>>,
+}
+
+/// A gyro axis reading at its rail. Its reading approached the rail at `slope` counts/s and
+/// crossed it at `crossed` (controller time, s), and the true rate is taken to rise on as fast:
+/// `hidden` (count seconds) bounds the turn the reading has missed since.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Clip {
+    crossed: f64,
+    slope: f64,
+    hidden: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -363,6 +378,11 @@ pub struct Tracker {
     pub body: Body,
     /// The OpenHMD device id whose labels this controller's blobs carry.
     pub device_id: i32,
+    /// Where the controller's gyro readings end, from its factory calibration; without it no
+    /// reading is taken for one at its rail.
+    pub gyro_range: Option<Gyro>,
+    /// Per gyro axis, the stretch it has read at its rail.
+    clips: [Option<Clip>; 3],
     history: VecDeque<(u64, Filter)>,
     imu: VecDeque<ImuSample>,
     /// Alongside `imu`: whether the controller was still at each sample (see `Params`), judged on
@@ -498,8 +518,28 @@ fn hole_variance(before: Option<&ImuSample>, prev: &ImuSample, s: &ImuSample) ->
 /// it, as `Filter::propagate` does. One with samples missing runs along the straight line from
 /// `prev` to `s` over the missing part, then holds `s` over its own last period; and the filter
 /// takes on what the missing part hides (`HOLE_VEL`), spread over the missing part.
+/// Then it takes on the turn that gyro readings at their rails may hide (`ImuSample::hidden`).
 #[allow(clippy::too_many_arguments)]
 fn advance(
+    f: &mut Filter,
+    before: Option<&ImuSample>,
+    prev: Option<&ImuSample>,
+    s: &ImuSample,
+    t0: u64,
+    t1: u64,
+    g: &Vector3<f64>,
+    n: &Noise,
+) {
+    advance_readings(f, before, prev, s, t0, t1, g, n);
+    if let Some(rot) = &s.hidden {
+        let dt = t1.saturating_sub(t0) as f64 * 1e-9;
+        f.add_hidden_turn(rot, &(s.accel - f.x.ba), dt);
+    }
+}
+
+/// `advance` as the readings alone tell it.
+#[allow(clippy::too_many_arguments)]
+fn advance_readings(
     f: &mut Filter,
     before: Option<&ImuSample>,
     prev: Option<&ImuSample>,
@@ -546,6 +586,8 @@ impl Tracker {
             params,
             body,
             device_id,
+            gyro_range: None,
+            clips: [None; 3],
             history: VecDeque::new(),
             imu: VecDeque::new(),
             still: VecDeque::new(),
@@ -671,6 +713,7 @@ impl Tracker {
         if gap {
             self.reset_imu_history();
         }
+        let s = self.own_rail(s);
         if let Some((t, q, until)) = self.wrong_lock {
             let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
             self.wrong_lock = (s.t < until).then(|| {
@@ -729,8 +772,68 @@ impl Tracker {
         self.note_held();
     }
 
+    /// `s` with the turn its gyro axes at their rails may hide (`ImuSample::hidden`). While an
+    /// axis reads at its rail, the true rate is taken to go on rising as fast as the reading
+    /// approached the rail over the two intervals before (with no sample before, by the whole
+    /// range in one sample period, the fastest a reading can change), from where that approach
+    /// crossed the rail. Each sample is held over the interval it ends, so the turn it misses is
+    /// that excess at its time over the interval; summed, that bounds the turn the reading has
+    /// missed since it reached the rail, up to half a turn, beyond which the orientation about
+    /// that axis is unknown. The filter takes on the bound's growth as variance on the rotation
+    /// about that axis, so after the stretch its uncertainty there is the most the rail can have
+    /// hidden, and the next fix corrects it at once. With no axis at its rail, nothing changes.
+    fn own_rail(&mut self, mut s: ImuSample) -> ImuSample {
+        let Some(gyro) = self.gyro_range else {
+            return s;
+        };
+        let n = self.imu.len();
+        let earlier = |k: usize| n.checked_sub(k).and_then(|i| self.imu.get(i));
+        let (prev, before) = (earlier(1), earlier(2));
+        let dt = prev.map_or(IMU_PERIOD_NS, |p| s.t - p.t) as f64 * 1e-9;
+        let now = gyro.counts(&s.gyro);
+        let (p, b) = (
+            prev.map(|p| gyro.counts(&p.gyro)),
+            before.map(|b| gyro.counts(&b.gyro)),
+        );
+        let mut q = Matrix3::zeros();
+        for k in 0..3 {
+            let clip = &mut self.clips[k];
+            let Some(end) = Gyro::rail(now[k]) else {
+                *clip = None;
+                continue;
+            };
+            let c = clip.get_or_insert_with(|| {
+                let toward = end.signum();
+                let (Some(prev), Some(p)) = (prev, p) else {
+                    return Clip {
+                        crossed: s.t as f64 * 1e-9,
+                        slope: 65536.0 / (IMU_PERIOD_NS as f64 * 1e-9),
+                        hidden: 0.0,
+                    };
+                };
+                let last = toward * (end - p[k]) / dt;
+                let slope = b.zip(before).map_or(last, |(b, before)| {
+                    last.max(toward * (p[k] - b[k]) / ((prev.t - before.t) as f64 * 1e-9))
+                });
+                Clip {
+                    crossed: prev.t as f64 * 1e-9 + toward * (end - p[k]) / slope,
+                    slope,
+                    hidden: 0.0,
+                }
+            });
+            let axis = gyro.matrix.column(k) * GYRO_PER_COUNT;
+            let was = c.hidden;
+            let excess = c.slope * (s.t as f64 * 1e-9 - c.crossed);
+            c.hidden = (was + excess * dt).min(std::f64::consts::PI / axis.norm());
+            q += axis * axis.transpose() * ((c.hidden * c.hidden - was * was) / dt);
+        }
+        s.hidden = (q != Matrix3::zeros()).then_some(q);
+        s
+    }
+
     fn reset_imu_history(&mut self) {
         self.stats.imu_gaps += 1;
+        self.clips = [None; 3];
         self.camera_updates.iter_mut().for_each(VecDeque::clear);
         self.inspection_frames.clear();
         self.saved_bias = self.history.back().map(|h| h.1).or(self.saved_bias);
@@ -2162,6 +2265,7 @@ mod tests {
     fn imu(w: &World, t: f64) -> ImuSample {
         ImuSample {
             t: (1e9 + t * 1e9) as u64,
+            hidden: None,
             gyro: w.motion.gyro(t) + w.bg,
             accel: w
                 .motion
@@ -2227,6 +2331,11 @@ mod tests {
         phantom_late: Option<(f64, f64)>,
         /// The IMU samples in this span are lost (the radio dropped them).
         imu_lost: Option<(f64, f64)>,
+        /// The gyro reads no further than the ends of `Gyro::default`'s range, as a real one
+        /// saturates; the tracker is told those ends when this is true.
+        clipped: Option<bool>,
+        /// Orientation errors (rad) are kept instead of position errors.
+        rotation: bool,
         /// Position errors are kept from this time on (default 1 s).
         measure_after: Option<f64>,
         /// The track is dropped as a wrong lock at this time.
@@ -2337,6 +2446,7 @@ mod tests {
     fn run_with(w: &World, seconds: f64, pixel_noise: f64, opts: &Run) -> (Tracker, Vec<f64>) {
         let drop_cams_between = opts.blackout;
         let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr.gyro_range = opts.clipped.filter(|&told| told).map(|_| Gyro::default());
         let seen: Vec<Camera> = w
             .cams
             .iter()
@@ -2382,6 +2492,14 @@ mod tests {
             }
             if let Some((_, _, off)) = opts.accel_off.filter(|(a, b, _)| t >= *a && t < *b) {
                 s.accel += off;
+            }
+            if opts.clipped.is_some() {
+                let (lo, hi) = (f64::from(i16::MIN), f64::from(i16::MAX));
+                s.gyro = s.gyro.map(|w| match w / GYRO_PER_COUNT {
+                    c if c > hi => hi * GYRO_PER_COUNT,
+                    c if c < lo => lo * GYRO_PER_COUNT,
+                    _ => w,
+                });
             }
             if !opts.imu_lost.is_some_and(|(a, b)| t > a && t < b) {
                 tr.imu(s);
@@ -2480,11 +2598,12 @@ mod tests {
             if t > opts.measure_after.unwrap_or(1.0) {
                 let Some(o) = tr.output() else { continue };
                 if o.tracking && !opts.engine_flipped.is_some_and(|(a, b)| t >= a && t < b) {
-                    errors.push(
-                        (o.world_from_model.translation.vector
-                            - w.motion.pose(t).translation.vector)
-                            .norm(),
-                    );
+                    let truth = w.motion.pose(t);
+                    errors.push(if opts.rotation {
+                        o.world_from_model.rotation.angle_to(&truth.rotation)
+                    } else {
+                        (o.world_from_model.translation.vector - truth.translation.vector).norm()
+                    });
                 }
             }
         }
@@ -2786,6 +2905,7 @@ mod tests {
     fn sample(t_ms: f64, k: f64) -> ImuSample {
         ImuSample {
             t: (t_ms * 1e6) as u64,
+            hidden: None,
             gyro: Vector3::new(1.3 * k, -0.7, 2.1 * k),
             accel: Vector3::new(3.0 * k, 9.0 + k, -2.0),
         }
@@ -2983,6 +3103,7 @@ mod tests {
         );
         let at = |t_ms: f64, w: f64| ImuSample {
             t: (t_ms * 1e6) as u64,
+            hidden: None,
             gyro: Vector3::new(w, -0.5 * w, 0.3),
             accel: Vector3::zeros(),
         };
@@ -3076,6 +3197,7 @@ mod tests {
         start.cov = Cov::zeros();
         let at = |t_ms: f64| ImuSample {
             t: (t_ms * 1e6) as u64,
+            hidden: None,
             gyro: start.x.bg,
             accel: start.x.q.inverse() * -g + Vector3::new(18.0, -21.0, 9.0) + start.x.ba,
         };
@@ -3153,11 +3275,13 @@ mod tests {
         let (g, n) = (Vector3::new(0.0, -G, 0.0), Noise::default());
         let rail = ImuSample {
             t: 8_000_000,
+            hidden: None,
             gyro: Vector3::repeat(-35.0),
             accel: Vector3::repeat(-157.0),
         };
         let prev = ImuSample {
             t: 10_000_000,
+            hidden: None,
             gyro: Vector3::repeat(35.0),
             accel: Vector3::repeat(157.0),
         };
@@ -3190,6 +3314,119 @@ mod tests {
             tr.stats
         );
         assert_eq!(tr.stats.imu_gaps, 1);
+    }
+
+    /// A controller lying in view of three sensors is flicked at 2 s: a turn about its x axis
+    /// whose rate peaks at 50 rad/s over 40 ms, of which the gyro, saturating at 34.9 rad/s,
+    /// misses about 8 degrees. The orientation errors (rad) of the outputs from `after` seconds
+    /// past the flick on, with the tracker told where the gyro's readings end and not told.
+    fn after_a_flick(after: f64) -> [Vec<f64>; 2] {
+        let mut w = world(3);
+        w.motion = Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.0; 3]).with_flick(2.0, 0.04, 50.0);
+        [true, false].map(|told| {
+            let (tr, errors) = run_with(
+                &w,
+                2.4,
+                0.3,
+                &Run {
+                    clipped: Some(told),
+                    rotation: true,
+                    measure_after: Some(2.04 + after),
+                    ..Run::default()
+                },
+            );
+            assert_eq!((tr.stats.acquisitions, tr.stats.wrong_locks), (1, 0));
+            errors
+        })
+    }
+
+    /// The turn the gyro's rail hides is taken out by the first fixes after it: told where the
+    /// gyro's readings end, the shown orientation is within a degree of the truth from the first
+    /// fix after the flick on and within a quarter of a degree 50 ms later; not told, the filter
+    /// believes the clipped turn and is still more than 4 degrees off 0.35 s later.
+    #[test]
+    fn a_turn_beyond_the_gyros_rail_is_corrected_at_once() {
+        let worst = |e: &[f64]| e.iter().fold(0.0f64, |a, &b| a.max(b)).to_degrees();
+        // frames arrive 25 ms after their exposure: by 35 ms after the flick, two have landed
+        let [told, not] = after_a_flick(0.035);
+        assert!(worst(&told) < 1.0, "{:.2} deg", worst(&told));
+        assert!(worst(&not) > 7.0, "{:.2} deg", worst(&not));
+        let [told, not] = after_a_flick(0.085);
+        assert!(worst(&told) < 0.25, "{:.2} deg", worst(&told));
+        let best = not
+            .iter()
+            .fold(f64::INFINITY, |a, &b| a.min(b))
+            .to_degrees();
+        assert!(best > 4.0, "{best:.2} deg");
+    }
+
+    /// While the gyro stays below its rails, telling the tracker where they are changes nothing,
+    /// to the bit.
+    #[test]
+    fn below_its_rails_the_tracker_is_unchanged() {
+        let w = world(5);
+        let run = |clipped| {
+            run_with(
+                &w,
+                3.0,
+                0.3,
+                &Run {
+                    clipped,
+                    ..Run::default()
+                },
+            )
+        };
+        let ((told, a), (untold, b)) = (run(Some(true)), run(None));
+        assert!(told.gyro_range.is_some() && told.stats.acquisitions > 0);
+        assert!(told.imu.iter().all(|s| s.hidden.is_none()));
+        let bits = |e: &[f64]| e.iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a), bits(&b));
+        super::stillness_tests::assert_state(&told, &untold);
+    }
+
+    /// An axis at its rail grows the filter's uncertainty about that axis alone by the turn the
+    /// rail can have hidden: at the steeper approach over the two intervals before, from where it
+    /// crossed the rail, each sample's excess held over its interval. Leaving the rail ends it.
+    #[test]
+    fn a_reading_at_the_rail_owns_what_it_can_hide() {
+        let w = world(1);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr.gyro_range = Some(Gyro::default());
+        let at = |t_ms: u64, x: f64| ImuSample {
+            t: t_ms * 1_000_000,
+            gyro: Vector3::new(x * GYRO_PER_COUNT, 0.3, -0.2),
+            accel: Vector3::new(0.0, G, 0.0),
+            hidden: None,
+        };
+        let rail = f64::from(i16::MAX);
+        let mut hidden = Vec::new();
+        for s in [
+            at(8, rail - 6000.0),
+            at(10, rail - 2000.0),
+            at(12, rail),
+            at(14, rail),
+            at(18, rail - 1.0),
+            at(20, rail - 3000.0),
+        ] {
+            tr.imu(s);
+            hidden.push(tr.imu.back().unwrap().hidden);
+        }
+        assert_eq!((hidden[0], hidden[1], hidden[5]), (None, None, None));
+        // the approach: 2000 counts/ms, then 1000 to the rail, which it crossed at 11 ms; the
+        // excess 2000 counts at 12 ms held over 2 ms is 4 count seconds, 6000 at 14 ms 12 more,
+        // 14000 at 18 ms over 4 ms 56 more
+        let step = |was: f64, now: f64, dt: f64| {
+            (now * now - was * was) * GYRO_PER_COUNT * GYRO_PER_COUNT / dt
+        };
+        for (h, was, now, dt) in [
+            (hidden[2], 0.0, 4.0, 0.002),
+            (hidden[3], 4.0, 16.0, 0.002),
+            (hidden[4], 16.0, 72.0, 0.004),
+        ] {
+            let h = h.unwrap();
+            assert!((h[(0, 0)] / step(was, now, dt) - 1.0).abs() < 1e-9, "{h}");
+            assert_eq!(h.iter().filter(|&&v| v != 0.0).count(), 1);
+        }
     }
 
     /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of

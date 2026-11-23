@@ -122,7 +122,7 @@ fn main() {
             o.seed_biases[h] = Some(nalgebra::Vector3::new(x[0], x[1], x[2]));
         }
     }
-    let r = replay::replay(&rec, &cal, &|l| factory::imu_position(&dir, l), &o).unwrap();
+    let r = replay::replay(&rec, &cal, &|l| factory::imu(&dir, l), &o).unwrap();
     if let Some(message) = &r.stopped {
         eprintln!("{message}");
     }

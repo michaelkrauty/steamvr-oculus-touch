@@ -220,6 +220,30 @@ impl Filter {
         }
     }
 
+    /// Takes on the turn that gyro readings at their rails may hide over the `dt` seconds just
+    /// propagated: white turn rate of density `rot` (rad^2/s, body frame), integrated through the
+    /// dynamics as `add_white` does, with `f` the specific force less its bias.
+    pub fn add_hidden_turn(&mut self, rot: &Matrix3<f64>, f: &Vector3<f64>, dt: f64) {
+        let rf = self.x.q.to_rotation_matrix().into_inner() * skew(f);
+        let (t2, t3) = (dt * dt, dt * dt * dt);
+        let leak = rf * rot * rf.transpose();
+        for (row, col, block) in [
+            (ROT, ROT, rot * dt),
+            (VEL, ROT, -rf * rot * (t2 / 2.0)),
+            (POS, ROT, -rf * rot * (t3 / 6.0)),
+            (VEL, VEL, leak * (t3 / 3.0)),
+            (POS, VEL, leak * (t2 * t2 / 8.0)),
+            (POS, POS, leak * (t2 * t3 / 20.0)),
+        ] {
+            let mut at = self.cov.fixed_view_mut::<3, 3>(row, col);
+            at += block;
+            if row != col {
+                let mut at = self.cov.fixed_view_mut::<3, 3>(col, row);
+                at += block.transpose();
+            }
+        }
+    }
+
     fn transition(
         &mut self,
         r: &Matrix3<f64>,

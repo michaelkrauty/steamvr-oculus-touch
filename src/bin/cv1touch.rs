@@ -4151,7 +4151,7 @@ fn eval_rig(base: &Path, replay: bool) -> i32 {
             let r = track::replay::replay(
                 &base.with_extension("rec"),
                 &cal,
-                &|l| track::factory::imu_position(&dir, l),
+                &|l| track::factory::imu(&dir, l),
                 &track::replay::Options::default(),
             )?;
             replay_warning(&r);
@@ -4359,7 +4359,7 @@ fn replayed_with_calibration(
     let r = track::replay::replay(
         &base.with_extension("rec"),
         cal,
-        &|l| track::factory::imu_position(&dir, l),
+        &|l| track::factory::imu(&dir, l),
         &track::replay::Options::default(),
     )?;
     replay_warning(&r);
@@ -5759,7 +5759,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
         let mut cal = file::load(path)?;
         let (models, leds) = track::refine::recording_models(rec)?;
         let dir = track::factory::openhmd_config_dir();
-        let imu = |l: &[cv1touch::calib::capture::Led]| track::factory::imu_position(&dir, l);
+        let imu = |l: &[cv1touch::calib::capture::Led]| track::factory::imu(&dir, l);
         let mut changed = Vec::new();
         let mut warned = false;
         for round in 1..=3 {
@@ -5995,7 +5995,7 @@ fn calibrate_place(serial: &str, rec: &Path, path: &Path, write: bool) -> i32 {
         let (recorded, model) = recording_sensor(&models, serial)
             .ok_or_else(|| format!("{serial} is not in {}", rec.display()))?;
         let dir = track::factory::openhmd_config_dir();
-        let imu = |l: &[capture::Led]| track::factory::imu_position(&dir, l);
+        let imu = |l: &[capture::Led]| track::factory::imu(&dir, l);
         let mut without = cal.clone();
         without.remove_sensor(serial);
         let o = track::replay::Options {
@@ -6178,7 +6178,7 @@ fn calibrate_gravity_with(
     let run = || -> Result<(), String> {
         let cal0 = file::load(path)?;
         let dir = track::factory::openhmd_config_dir();
-        let imu = |l: &[capture::Led]| track::factory::imu_position(&dir, l);
+        let imu = |l: &[capture::Led]| track::factory::imu(&dir, l);
         let mut accel: [Vec<(u64, Vector3<f64>)>; 2] = [vec![], vec![]];
         for r in Reader::open(rec)? {
             if r.rtype != recorder::CONTROLLER_STATE {
@@ -6371,7 +6371,7 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
         track::replay::replay(
             &base.with_extension("rec"),
             &cal,
-            &|leds| track::factory::imu_position(&dir, leds),
+            &|leds| track::factory::imu(&dir, leds),
             &o,
         )
     };
