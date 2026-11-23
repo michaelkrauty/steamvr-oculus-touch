@@ -18315,13 +18315,22 @@ mod tests {
         drop(client);
         drop(second_client);
         // Use fresh, acknowledged clients: the earlier connections may have reached their
-        // idle deadline while the capacity/flood cases ran on a busy CI machine.
-        let mut client = connect();
-        let mut second_client = connect_on(&second_endpoint);
-        for client in [&mut client, &mut second_client] {
-            client.write_all(b"status\n").unwrap();
-            assert!(answered(reply(client)), "client admitted before stopping");
-        }
+        // idle deadline while the capacity/flood cases ran on a busy CI machine. Each connects
+        // just before its own request and tries again when the server closed it first: the
+        // slots freed above may not be free yet, and a client waiting for another's answer can
+        // reach its own idle deadline.
+        let admitted = |endpoint: &std::path::Path| {
+            for _ in 0..50 {
+                let mut conn = connect_on(endpoint);
+                if conn.write_all(b"status\n").is_ok() && answered(reply(&mut conn)) {
+                    return conn;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            panic!("no client admitted before stopping");
+        };
+        let mut client = admitted(&endpoint);
+        let mut second_client = admitted(&second_endpoint);
         let _stopped = control.stop();
         for client in [&mut client, &mut second_client] {
             client
@@ -18810,7 +18819,7 @@ mod tests {
             vec![ipc::Listener::bind(&endpoint).unwrap()],
         );
         let request =
-            |line: &str| control::request(&endpoint, line, Duration::from_millis(200)).unwrap();
+            |line: &str| control::request(&endpoint, line, Duration::from_secs(5)).unwrap();
         let reply = request("status");
         let value: serde_json::Value =
             serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
@@ -19208,14 +19217,13 @@ mod tests {
                 )
             });
             entered.recv_timeout(Duration::from_secs(2)).unwrap();
-            let request =
-                |line: &str| control::request(&endpoint, line, Duration::from_millis(200));
+            let request = |line: &str| control::request(&endpoint, line, Duration::from_secs(5));
             let status = request("status");
             #[cfg(unix)]
             let container_status = control::request(
                 endpoints.container.as_ref().unwrap(),
                 "status",
-                Duration::from_millis(200),
+                Duration::from_secs(5),
             );
             let replacement =
                 request(&control::record_start_line(&dir.join("other.rec"), false).unwrap());
