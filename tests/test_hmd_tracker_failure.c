@@ -3,7 +3,6 @@
 /* Exercise the real headset open/cleanup path when tracker construction fails.
  * All HID operations and tracker creation are synthetic; no devices are opened. */
 #define rift_tracker_new fake_tracker_new
-#define rift_hmd_radio_get_address fake_radio_address
 #include "rift.c"
 #include "test_util.h"
 #include "omath.c"
@@ -12,7 +11,18 @@
 
 static int handles, tracker_calls, radio_clears, calibration_clears;
 double ohmd_get_tick(void) { return 0; }
-void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle) { radio->handle = handle; }
+/* The address reaches the tracker from the radio's ops */
+static bool fake_radio_address(rift_hmd_radio_state *radio, uint8_t address[5]) {
+    CHECK(radio->hmd_handle && radio->handle != radio->hmd_handle);
+    memcpy(address, "\x01\x02\x03\x04\x05", 5);
+    return true;
+}
+static const rift_hmd_radio_ops fake_radio_ops = {.get_address = fake_radio_address};
+void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_device *hmd_handle) {
+    radio->ops = &fake_radio_ops;
+    radio->handle = handle;
+    radio->hmd_handle = hmd_handle;
+}
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio) { CHECK(radio->handle); radio_clears++; }
 void rift_touch_clear_calibration(rift_touch_calibration *calibration) { (void)calibration; calibration_clears++; }
 void rift_tracker_free(rift_tracker_ctx *tracker) { (void)tracker; CHECK(false); }
@@ -61,13 +71,8 @@ int hid_get_feature_report(hid_device *handle, unsigned char *data, size_t lengt
     default: CHECK(false); return -1;
     }
 }
-bool fake_radio_address(hid_device *handle, uint8_t address[5]) {
-    CHECK(handle);
-    memset(address, 0, 5);
-    return true;
-}
 rift_tracker_ctx *fake_tracker_new(ohmd_context *ctx, const uint8_t address[5]) {
-    CHECK(ctx && address && handles == 2);
+    CHECK(ctx && address && handles == 2 && memcmp(address, "\x01\x02\x03\x04\x05", 5) == 0);
     tracker_calls++;
     return NULL;
 }

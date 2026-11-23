@@ -387,6 +387,26 @@ pub mod hid {
         }
     }
 
+    /// What the radio thread reads the controllers' reports from: the headset's radio
+    /// interface, or another radio in its place.
+    pub trait RadioPort {
+        /// Waits until a report is ready, `waker` fires, or `timeout` (None: no limit) passes.
+        fn wait(&mut self, waker: &Waker, timeout: Option<Duration>) -> io::Result<Woke>;
+        /// The next report already received into `buf` (its length), or None when none is
+        /// waiting. An error means the radio is gone.
+        fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>>;
+    }
+
+    impl RadioPort for Device {
+        fn wait(&mut self, waker: &Waker, timeout: Option<Duration>) -> io::Result<Woke> {
+            Device::wait(self, waker, timeout)
+        }
+
+        fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+            Device::try_read(self, buf)
+        }
+    }
+
     /// The headset's HID interface `interface`, if connected: 0 carries the headset's own
     /// reports and the radio commands, 1 the radio's messages.
     pub fn headset_interface(interface: u8) -> Option<PathBuf> {

@@ -4262,7 +4262,7 @@ fn radio_main(
     d: &Daemon,
     link: &RadioLink,
     dec: &mut engine::RadioDecoder,
-    radio: &mut hid::Device,
+    radio: &mut impl hid::RadioPort,
     pipe: &mut Pipeline,
     watch: &mut Option<LandmarkWatch>,
 ) {

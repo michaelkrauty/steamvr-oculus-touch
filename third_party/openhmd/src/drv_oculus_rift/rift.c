@@ -632,7 +632,7 @@ static void update_hmd(rift_hmd_t *priv)
 		 * controller state further behind each time */
 		int wait_ms = priv->ctx->cv1touch_config.radio_wait_ms;
 		for (;;) {
-			int size = hid_read_timeout(priv->radio_handle, buffer, FEATURE_BUFFER_SIZE, wait_ms);
+			int size = priv->radio.ops->read_report(&priv->radio, buffer, FEATURE_BUFFER_SIZE, wait_ms);
 			uint64_t ts = ohmd_monotonic_get(priv->ctx);
 			if (size < 0) {
 				priv->io_errors++;
@@ -679,7 +679,7 @@ static void update_hmd(rift_hmd_t *priv)
 			continue;
 
 		// Read all the controller messages from the radio device.
-		size = hid_read(priv->radio_handle, buffer, FEATURE_BUFFER_SIZE);
+		size = priv->radio.ops->read_report(&priv->radio, buffer, FEATURE_BUFFER_SIZE, 0);
 		if(size < 0){
 			LOGE("error reading from controllers");
 			priv->io_errors++;
@@ -1203,7 +1203,7 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 			ohmd_set_error(driver->ctx, "Failed to set non-blocking on radio device");
 			goto cleanup;
 		}
-		rift_hmd_radio_init(&priv->radio, priv->radio_handle);
+		rift_hmd_radio_init(&priv->radio, priv->radio_handle, priv->handle);
 	}
 
 	unsigned char buf[FEATURE_BUFFER_SIZE];
@@ -1251,7 +1251,7 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 				RIFT_TRACKING_PERIOD_US_CV1);
 
 		/* Read the radio ID for CV1 to enable camera sensor sync */
-		rift_hmd_radio_get_address(priv->handle, priv->radio_address);
+		priv->radio.ops->get_address(&priv->radio, priv->radio_address);
 	}
 	else if (desc->revision == REV_DK2)
 	{

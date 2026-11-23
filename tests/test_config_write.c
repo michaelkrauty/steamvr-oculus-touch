@@ -405,6 +405,7 @@ static void a_failed_cache_write_does_not_restart_calibration(void)
 			.ctx = &ctx,
 			.tracker_ctx = (rift_tracker_ctx *)(uintptr_t)1,
 			.radio = {
+				.ops = &rift_hmd_radio_headset_ops,
 				.cur_read_cmd = RIFT_FW_READ_CMD_CALIBRATION,
 				.device_in_progress = RIFT_TOUCH_CONTROLLER_RIGHT,
 				.read_block = (uint8_t *)factory_json,
@@ -470,7 +471,7 @@ static void a_short_write_cannot_poison_a_fresh_calibration_load(void)
 			CHECK(ret == 0 && length == strlen(factory_json) && memcmp(loaded, factory_json, length) == 0);
 			free(loaded);
 			rift_touch_calibration calibration = {0}; rift_touch_calibration_state state = {0};
-			rift_hmd_radio_state radio = {.handle = (hid_device *)(uintptr_t)1};
+			rift_hmd_radio_state radio = {.ops = &rift_hmd_radio_headset_ops, .handle = (hid_device *)(uintptr_t)1};
 			CHECK(rift_touch_get_calibration(&ctx, &radio, RIFT_TOUCH_CONTROLLER_RIGHT, &calibration, &state) == 0);
 			CHECK(calibration.imu_position.x == 0 && !state.cache_rejected);
 			rift_touch_clear_calibration(&calibration);
@@ -486,7 +487,7 @@ static void a_short_write_cannot_poison_a_fresh_calibration_load(void)
 		scenario = CACHE_REAL;
 		CHECK(ohmd_set_config(&ctx, key, replacement, strlen(replacement)) == 0);
 		rift_touch_calibration calibration = {0}; rift_touch_calibration_state state = {0};
-		rift_hmd_radio_state radio = {.handle = (hid_device *)(uintptr_t)1};
+		rift_hmd_radio_state radio = {.ops = &rift_hmd_radio_headset_ops, .handle = (hid_device *)(uintptr_t)1};
 		CHECK(rift_touch_get_calibration(&ctx, &radio, RIFT_TOUCH_CONTROLLER_RIGHT, &calibration, &state) == 0);
 		CHECK(calibration.imu_position.x == 1 && !state.cache_rejected);
 		rift_touch_clear_calibration(&calibration);

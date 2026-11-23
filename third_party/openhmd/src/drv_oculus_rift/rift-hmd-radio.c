@@ -182,6 +182,44 @@ done:
 	return ret;
 }
 
+static int rift_radio_send_haptics(rift_hmd_radio_state *radio, uint8_t device_type, bool low_freq, uint8_t amplitude)
+{
+	/* A write already sent is only waited for */
+	if (radio->cur_read_cmd == RIFT_RADIO_WRITE_CMD_HAPTICS)
+		return rift_radio_write_complete(radio);
+
+	unsigned char buf[31];
+	int buf_size = 31;
+
+	memset(buf, 0, sizeof(buf));
+	if (amplitude != 0) {
+		if (low_freq)
+			buf[3] = 0xa0; /* 160Hz vibration */
+		else
+			buf[4] = 0xa0; /* 320Hz vibration */
+		buf[7] = amplitude; /* Intensity byte */
+	}
+
+	buf[0] = RIFT_CMD_RADIO_READ_DATA;
+
+	return rift_radio_write(radio, 0x02, 0x03, device_type, buf, buf_size);
+}
+
+static int rift_radio_read_report(rift_hmd_radio_state *radio, unsigned char *buf, int size, int wait_ms)
+{
+	return wait_ms > 0 ? hid_read_timeout(radio->handle, buf, size, wait_ms) : hid_read(radio->handle, buf, size);
+}
+
+static bool rift_radio_get_address(rift_hmd_radio_state *radio, uint8_t radio_address[5]);
+
+const rift_hmd_radio_ops rift_hmd_radio_headset_ops = {
+	.read_report = rift_radio_read_report,
+	.read_flash = rift_radio_read_flash,
+	.send_haptics = rift_radio_send_haptics,
+	.drain_abandoned = rift_radio_drain_abandoned,
+	.abandon_command = rift_radio_abandon_command,
+	.get_address = rift_radio_get_address,
+};
 
 static int rift_radio_read_calibration_hash(rift_hmd_radio_state *radio, uint8_t device_type,
 					    uint8_t hash[16])
@@ -190,7 +228,7 @@ static int rift_radio_read_calibration_hash(rift_hmd_radio_state *radio, uint8_t
 		LOGV("Starting FW hash read for controller %d\n", device_type);
 		radio->cur_read_cmd = RIFT_FW_READ_CMD_CALIBRATION_HASH;
 	}
-	return rift_radio_read_flash(radio, device_type, 0x1bf0, 16, hash);
+	return radio->ops->read_flash(radio, device_type, 0x1bf0, 16, hash);
 }
 
 static int rift_radio_read_calibration(rift_hmd_radio_state *radio, uint8_t device_type,
@@ -210,7 +248,7 @@ static int rift_radio_read_calibration(rift_hmd_radio_state *radio, uint8_t devi
 		}
 
 		info->field = "flash header";
-		ret = rift_radio_read_flash(radio, device_type, 0, 20, flash_data);
+		ret = radio->ops->read_flash(radio, device_type, 0, 20, flash_data);
 		if (ret < 0) {
 			if (ret != -EINPROGRESS)
 				radio->cur_read_cmd = RIFT_RADIO_CMD_NONE;
@@ -249,7 +287,7 @@ static int rift_radio_read_calibration(rift_hmd_radio_state *radio, uint8_t devi
 		uint16_t offset = radio->read_data_offset;
 		uint16_t json_offset = offset - 4;
 
-		ret = rift_radio_read_flash(radio, device_type, offset,
+		ret = radio->ops->read_flash(radio, device_type, offset,
 				OHMD_MIN (20, radio->read_data_size - json_offset),
 				radio->read_block + json_offset);
 		if (ret < 0) {
@@ -529,7 +567,7 @@ int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
 
 	state->source = "radio";
 	state->failure = (rift_touch_calibration_info){ .field = "previous radio command" };
-	ret = rift_radio_drain_abandoned(ctx, radio);
+	ret = radio->ops->drain_abandoned(ctx, radio);
 	if (ret < 0) return ret;
 	radio->device_in_progress = device_id;
 	state->failure = (rift_touch_calibration_info){ .field = "calibration hash" };
@@ -623,7 +661,7 @@ int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
 	ret = 0;
 out:
 	if (ret != -EINPROGRESS) {
-		rift_radio_abandon_command(radio);
+		radio->ops->abandon_command(radio);
 		radio->device_in_progress = -1;
 		radio->cur_read_cmd = RIFT_RADIO_CMD_NONE;
 	}
@@ -637,9 +675,11 @@ rift_touch_clear_calibration(rift_touch_calibration *calibration)
 	rift_leds_clear (&calibration->leds);
 }
 
-void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle)
+void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_device *hmd_handle)
 {
+	radio->ops = &rift_hmd_radio_headset_ops;
 	radio->handle = handle;
+	radio->hmd_handle = hmd_handle;
 }
 
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio)
@@ -651,8 +691,9 @@ void rift_hmd_radio_clear(rift_hmd_radio_state *radio)
 	}
 }
 
-bool rift_hmd_radio_get_address(hid_device *handle, uint8_t radio_address[5])
+static bool rift_radio_get_address(rift_hmd_radio_state *radio, uint8_t radio_address[5])
 {
+	hid_device *handle = radio->hmd_handle;
 	unsigned char buf[FEATURE_BUFFER_SIZE];
 	int ret_size;
 
@@ -686,39 +727,19 @@ int rift_touch_send_haptics(ohmd_context *ctx, rift_hmd_radio_state *radio, int 
 	    radio->cur_read_cmd != RIFT_RADIO_WRITE_CMD_HAPTICS)
 		return -EBUSY; /* A different command is in progress */
 
-	ret = rift_radio_drain_abandoned(ctx, radio);
+	ret = radio->ops->drain_abandoned(ctx, radio);
 	if (ret < 0) return ret;
 	radio->device_in_progress = device_id;
 
-	if (radio->cur_read_cmd == RIFT_RADIO_CMD_NONE) {
-		/* Prepare command buffer then dispatch and await */
-		unsigned char buf[31];
-		int buf_size = 31;
-
-		memset(buf, 0, sizeof(buf));
-		if (amplitude != 0) {
-			if (low_freq)
-				buf[3] = 0xa0; /* 160Hz vibration */
-			else
-				buf[4] = 0xa0; /* 320Hz vibration */
-			buf[7] = amplitude; /* Intensity byte */
-		}
-
-		buf[0] = RIFT_CMD_RADIO_READ_DATA;
-
-		radio->cur_read_cmd = RIFT_RADIO_WRITE_CMD_HAPTICS;
-		ret = rift_radio_write(radio, 0x02, 0x03, device_id, buf, buf_size);
-	}
-	else {
-		/* Just waiting for command result */
-		ret = rift_radio_write_complete(radio);
-	}
+	/* Dispatch, or wait for the result of the write already sent */
+	ret = radio->ops->send_haptics(radio, device_id, low_freq, amplitude);
+	radio->cur_read_cmd = RIFT_RADIO_WRITE_CMD_HAPTICS;
 
 	if (ret < 0) {
 		/* Only -EINPROGRESS leaves the write running for the caller to finish. Any other
 		 * failure ends it, and an unreadable status leaves its result behind. */
 		if (ret != -EINPROGRESS)
-			rift_radio_abandon_command(radio);
+			radio->ops->abandon_command(radio);
 		return ret;
 	}
 

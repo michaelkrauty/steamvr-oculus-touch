@@ -423,7 +423,7 @@ static void rejected_cache_and_invalid_radio_release_buffers(void)
 		ohmd_context ctx = {0};
 		rift_touch_calibration_state state = {0};
 		rift_touch_calibration calibration = {0};
-		rift_hmd_radio_state radio = {.handle = (hid_device *)(uintptr_t)1};
+		rift_hmd_radio_state radio = {.ops = &rift_hmd_radio_headset_ops, .handle = (hid_device *)(uintptr_t)1};
 		cached_json = cases[i];
 		CHECK(rift_touch_get_calibration(&ctx, &radio, 1, &calibration, &state) < 0);
 		CHECK(state.cache_rejected && owned == 0 && cache_writes == 0);
@@ -437,6 +437,7 @@ static void radio_storage_is_borrowed_even_on_failure(void)
 	char json[sizeof valid_json];
 	memcpy(json, "{", 2);
 	rift_hmd_radio_state radio = {
+		.ops = &rift_hmd_radio_headset_ops,
 		.cur_read_cmd = RIFT_FW_READ_CMD_CALIBRATION,
 		.device_in_progress = 1,
 		.read_block = (uint8_t *)json,
@@ -460,7 +461,7 @@ static void cached_success_releases_both_buffers(void)
 	ohmd_context ctx = {0};
 	rift_touch_calibration_state state = {0};
 	rift_touch_calibration calibration = {0};
-	rift_hmd_radio_state radio = {.handle = (hid_device *)(uintptr_t)1};
+	rift_hmd_radio_state radio = {.ops = &rift_hmd_radio_headset_ops, .handle = (hid_device *)(uintptr_t)1};
 	cached_json = valid_json;
 	CHECK(rift_touch_get_calibration(&ctx, &radio, 1, &calibration, &state) == 0);
 	CHECK(owned == 0 && radio.device_in_progress == -1 && cache_writes == 0);
@@ -505,6 +506,7 @@ static void retry_fixture(rift_hmd_t *hmd, ohmd_context *ctx)
 	memset(hmd, 0, sizeof *hmd);
 	hmd->ctx = ctx;
 	hmd->tracker_ctx = (rift_tracker_ctx *)(uintptr_t)1;
+	hmd->radio.ops = &rift_hmd_radio_headset_ops;
 	hmd->radio.handle = (hid_device *)(uintptr_t)1;
 	hmd->touch_dev[0].base.id = 1;
 	hmd->touch_dev[0].device_num = RIFT_TOUCH_CONTROLLER_RIGHT;
@@ -545,6 +547,76 @@ static void clear_retry_fixture(rift_hmd_t *hmd)
 			CHECK(state->retry_time == 0 && state->retry_delay == 0 && state->error == 0);
 		}
 	}
+}
+/* Another radio in place of the headset's: calibration reads, haptics and the
+ * command bookkeeping reach only its ops, never the headset's HID interface. */
+static int ops_flash_reads, ops_haptics, ops_drains, ops_abandons;
+static int ops_haptic_device, ops_haptic_low_freq, ops_haptic_amplitude;
+static int fake_read_flash(rift_hmd_radio_state *radio, uint8_t device_type,
+		uint16_t offset, uint16_t length, uint8_t *data)
+{
+	CHECK(radio && device_type == RIFT_TOUCH_CONTROLLER_RIGHT && length <= 20);
+	/* each read is polled once before it ends */
+	if (ops_flash_reads++ % 2 == 0) return -EINPROGRESS;
+	size_t size = strlen(valid_json);
+	memset(data, 0, length);
+	if (offset == 0x1bf0) {
+		CHECK(length == 16);
+		memcpy(data, flash_hash, 16);
+	} else if (offset == 0) {
+		CHECK(length == 20);
+		data[0] = 1;
+		data[2] = size & 0xff;
+		data[3] = size >> 8;
+		memcpy(data + 4, valid_json, 16);
+	} else {
+		CHECK(offset >= 20 && offset - 4 + length <= size);
+		memcpy(data, valid_json + offset - 4, length);
+	}
+	return length + 7;
+}
+static int fake_send_haptics(rift_hmd_radio_state *radio, uint8_t device_type, bool low_freq, uint8_t amplitude)
+{
+	CHECK(radio);
+	ops_haptic_device = device_type; ops_haptic_low_freq = low_freq; ops_haptic_amplitude = amplitude;
+	return ops_haptics++ == 0 ? -EINPROGRESS : 0;
+}
+static int fake_drain_abandoned(ohmd_context *ctx, rift_hmd_radio_state *radio)
+{
+	CHECK(ctx && radio);
+	ops_drains++;
+	return 0;
+}
+static void fake_abandon_command(rift_hmd_radio_state *radio) { CHECK(radio); ops_abandons++; }
+static const rift_hmd_radio_ops fake_radio_ops = {
+	.read_flash = fake_read_flash,
+	.send_haptics = fake_send_haptics,
+	.drain_abandoned = fake_drain_abandoned,
+	.abandon_command = fake_abandon_command,
+};
+static void another_radio_carries_calibration_and_haptics(void)
+{
+	ohmd_context ctx = {0}; rift_hmd_t hmd; retry_fixture(&hmd, &ctx);
+	hmd.radio.ops = &fake_radio_ops;
+	hmd.radio.handle = NULL; /* any HID access fails its fake's CHECK */
+	memset(flash_hash, 0x5a, sizeof flash_hash);
+	cached_json = "{"; /* rejected: the calibration comes from the radio */
+	rift_touch_controller_t *right = &hmd.touch_dev[0];
+	int ret;
+	while ((ret = rift_touch_get_calibration(&ctx, &hmd.radio, right->device_num,
+			&right->calibration, &right->calibration_state)) == -EINPROGRESS) {}
+	CHECK(ret == 0 && right->calibration_state.have_hash && memcmp(right->calibration_state.hash, flash_hash, 16) == 0);
+	CHECK(right->calibration.joy_x_range_max == 100 && right->calibration.trigger_max_range == 100);
+	/* hash, header and the blocks after them, each polled once */
+	CHECK(ops_flash_reads == 2 * (2 + (int)((strlen(valid_json) - 16 + 19) / 20)));
+	CHECK(cache_writes == 1 && ops_drains > 0 && ops_abandons == 1); /* the end of the read */
+
+	CHECK(rift_touch_send_haptics(&ctx, &hmd.radio, RIFT_TOUCH_CONTROLLER_LEFT, true, 99) == -EINPROGRESS);
+	CHECK(rift_touch_send_haptics(&ctx, &hmd.radio, RIFT_TOUCH_CONTROLLER_LEFT, true, 99) == 0);
+	CHECK(ops_haptics == 2 && ops_haptic_device == RIFT_TOUCH_CONTROLLER_LEFT && ops_haptic_low_freq && ops_haptic_amplitude == 99);
+	CHECK(hid_sends == 0 && status_reads == 0 && data_fetches == 0);
+	cached_json = NULL;
+	clear_retry_fixture(&hmd);
 }
 static void flash_allocation_failure_keeps_the_previous_buffer(void)
 {
@@ -1743,8 +1815,10 @@ int main(int argc, char **argv)
 	      strcmp(argv[1], "optional") == 0 ||
 	      strcmp(argv[1], "diagnostics") == 0 ||
 	      strcmp(argv[1], "drain") == 0 || strcmp(argv[1], "drain_slow") == 0 || strcmp(argv[1], "drain_notice") == 0 ||
-	      strcmp(argv[1], "wake") == 0 || strcmp(argv[1], "wake_reason") == 0);
+	      strcmp(argv[1], "wake") == 0 || strcmp(argv[1], "wake_reason") == 0 ||
+	      strcmp(argv[1], "ops") == 0);
 	if (argc == 1 || strcmp(argv[1], "haptics") == 0) haptics_confirm_only_the_wanted_state();
+	if (argc == 1 || strcmp(argv[1], "ops") == 0) another_radio_carries_calibration_and_haptics();
 	puts("test_touch_calibration: ok");
 	return 0;
 }

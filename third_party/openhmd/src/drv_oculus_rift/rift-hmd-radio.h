@@ -11,6 +11,7 @@
 #include "rift.h"
 
 typedef struct rift_hmd_radio_state rift_hmd_radio_state;
+typedef struct rift_hmd_radio_ops rift_hmd_radio_ops;
 
 enum rift_radio_cmd_state {
 	RIFT_RADIO_CMD_NONE = 0,
@@ -20,8 +21,29 @@ enum rift_radio_cmd_state {
 	RIFT_RADIO_WRITE_CMD_HAPTICS,
 };
 
+/* What carries the controllers' radio. Commands are polled: -EINPROGRESS asks the
+ * caller to call again with the same arguments until the command ends. */
+struct rift_hmd_radio_ops {
+	/* The next controller report into buf (its size), 0 if none came within wait_ms. */
+	int (*read_report)(rift_hmd_radio_state *radio, unsigned char *buf, int size, int wait_ms);
+	/* length bytes of a controller's flash at offset */
+	int (*read_flash)(rift_hmd_radio_state *radio, uint8_t device_type,
+			uint16_t offset, uint16_t length, uint8_t *data);
+	int (*send_haptics)(rift_hmd_radio_state *radio, uint8_t device_type, bool low_freq, uint8_t amplitude);
+	/* 0 once no abandoned command can answer a new one, -EBUSY while one still may */
+	int (*drain_abandoned)(ohmd_context *ctx, rift_hmd_radio_state *radio);
+	/* give up on the command in progress */
+	void (*abandon_command)(rift_hmd_radio_state *radio);
+	/* the address the sensors synchronise to */
+	bool (*get_address)(rift_hmd_radio_state *radio, uint8_t address[5]);
+};
+
+extern const rift_hmd_radio_ops rift_hmd_radio_headset_ops;
+
 struct rift_hmd_radio_state {
-	hid_device *handle;
+	const rift_hmd_radio_ops *ops;
+	hid_device *handle; /* the headset's radio interface: reports and commands */
+	hid_device *hmd_handle; /* the headset's own interface: the radio address */
 
 	enum rift_radio_cmd_state cur_read_cmd; /* Which radio read/write command is in progress */
 	bool discard_reply; /* drain an abandoned command before submitting another */
@@ -40,14 +62,13 @@ struct rift_hmd_radio_state {
 	uint8_t calibration_hash[16];
 };
 
-void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle);
+void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_device *hmd_handle);
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio);
 int rift_touch_get_calibration(ohmd_context* ctx,
 		rift_hmd_radio_state *radio,
 		int device_id,
 		rift_touch_calibration *calibration, rift_touch_calibration_state *state);
 void rift_touch_clear_calibration(rift_touch_calibration *calibration);
-bool rift_hmd_radio_get_address(hid_device *handle, uint8_t address[5]);
 int rift_touch_send_haptics(ohmd_context *ctx, rift_hmd_radio_state *radio, int device_id, bool low_freq, uint8_t amplitude);
 void rift_touch_cancel_in_progress(rift_hmd_radio_state *radio, int device_id);
 
