@@ -67,7 +67,7 @@ fn human_action(message: &str) {
 /// Every command by its first word, with its usage. `cv1touch help expert`
 /// lists them all and `cv1touch COMMAND --help` shows one command's lines.
 const COMMANDS: &[(&str, &str)] = &[
-    ("setup", "setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset] | setup --check [--json]"),
+    ("setup", "setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset [--quick]] | setup --check [--json]"),
     ("doctor", "doctor [--json]"),
     ("status", "status [--shm NAME] | status --json"),
     ("input-test", "input-test"),
@@ -4907,12 +4907,25 @@ fn register_follow(
     reference: Option<&str>,
     tracking_base: Option<&str>,
 ) -> i32 {
-    register_from_capture_with(base, write, reference, true, true, tracking_base)
+    register_from_capture_with(base, write, reference, true, true, tracking_base, &COMMAND)
 }
 
 fn register_from_capture(base: &Path, write: bool, reference: Option<&str>, follow: bool) -> i32 {
-    register_from_capture_with(base, write, reference, follow, true, None)
+    register_from_capture_with(base, write, reference, follow, true, None, &COMMAND)
 }
+
+/// What writes a registration, for its line in the alignment history, and where the line
+/// saying how far it moves the controllers goes: the headset stage of `cv1touch setup` shows it
+/// while the fit's own output goes to the stage's log.
+struct Writer<'a> {
+    stage: &'static str,
+    say: &'a dyn Fn(&str),
+}
+
+const COMMAND: Writer = Writer {
+    stage: "register",
+    say: &|line| println!("{line}"),
+};
 
 fn registration_seed(
     path: &Path,
@@ -4937,6 +4950,7 @@ fn register_from_capture_with(
     follow: bool,
     reuse: bool,
     tracking_base: Option<&str>,
+    writer: &Writer,
 ) -> i32 {
     let run = || -> Result<(), String> {
         let truth_path = base.with_extension("truth.json");
@@ -4976,19 +4990,27 @@ fn register_from_capture_with(
             .count()
             + usize::from(history.record(tf.universe_id, captured_at, &stations));
         let layouts = history.of(tf.universe_id);
-        let by_base = tracking_base
-            .as_deref()
-            .and_then(|b| reg.follow_base(b, &stations, &reg.station_map(&layouts)));
-        let x0 = match (by_base, reg.follow(&stations)) {
-            (Some(f), _) => f.now_from_then * reg.lighthouse_from_world.iso(),
-            (None, Some(shift)) => {
-                let s = shift.now_from_then;
-                let play = reg.play_area_point();
-                println!("the universe had moved {:.1} mm, {:.2} deg in the play area since the installed registration (stations disagreeing there by {:.1} mm rms)", (s * play - play).norm() * 1e3, s.rotation.angle().to_degrees(), shift.residual_m * 1e3);
-                s * reg.lighthouse_from_world.iso()
+        // a registration as the daemon applies it now: followed through any re-solve of the
+        // universe since it was made
+        let applied = |r: &align::Registration| {
+            let by_base = tracking_base
+                .as_deref()
+                .and_then(|b| r.follow_base(b, &stations, &r.station_map(&layouts)));
+            match (by_base, r.follow(&stations)) {
+                (Some(f), _) => (f.now_from_then * r.lighthouse_from_world.iso(), None),
+                (None, Some(shift)) => (
+                    shift.now_from_then * r.lighthouse_from_world.iso(),
+                    Some(shift),
+                ),
+                (None, None) => (r.lighthouse_from_world.iso(), None),
             }
-            (None, None) => reg.lighthouse_from_world.iso(),
         };
+        let (x0, shift) = applied(&reg);
+        if let Some(shift) = shift {
+            let s = shift.now_from_then;
+            let play = reg.play_area_point();
+            println!("the universe had moved {:.1} mm, {:.2} deg in the play area since the installed registration (stations disagreeing there by {:.1} mm rms)", (s * play - play).norm() * 1e3, s.rotation.angle().to_degrees(), shift.residual_m * 1e3);
+        }
         let mut fits = Vec::new();
         let mut held_pairs = Vec::new();
         let min_pairs = if follow { 500 } else { 12 };
@@ -5212,6 +5234,20 @@ fn register_from_capture_with(
             println!("(not written: run with --write)");
             return Ok(());
         }
+        // where the person stood: how far this moves the controllers there, from the alignment
+        // it replaces as the daemon applies it now
+        let play_area = mean_position(held_pairs.iter().flatten().map(|p| &p.0));
+        let moved = align::load_registration(&reg_path)
+            .ok()
+            .zip(play_area)
+            .map(|(old, at)| align::moved_at(&applied(&old).0, &x, &at.into()));
+        if let Some((m, a)) = moved {
+            (writer.say)(&format!(
+                "The new alignment moves the controllers {:.0} mm and {:.1}° where you play.",
+                m * 1e3,
+                a.to_degrees()
+            ));
+        }
         reg.lighthouse_from_world = align::PoseEntry::from_iso(&x);
         reg.created_unix_s = unix_now();
         reg.universe_id = tf.universe_id;
@@ -5231,7 +5267,7 @@ fn register_from_capture_with(
             base.display()
         );
         // the universe the holds were measured in: the stations as the capture saw them
-        reg.play_area = mean_position(held_pairs.iter().flatten().map(|p| &p.0));
+        reg.play_area = play_area;
         reg.stations = preview.stations;
         reg.tracking_base = measured_now.map(|m| m.serial);
         reg.measured = measured;
@@ -5268,6 +5304,21 @@ fn register_from_capture_with(
             reg_path.display(),
             b
         );
+        let record = align::AlignmentRecord {
+            unix_s: reg.created_unix_s,
+            stage: writer.stage.into(),
+            reference: reg.reference.clone(),
+            tracking_system: reg.reference_system.clone(),
+            universe_id: reg.universe_id,
+            pairs: reg.pairs,
+            pos_rms_mm: reg.pos_rms_mm,
+            rot_rms_deg: reg.rot_rms_deg,
+            moved_mm: moved.map(|m| m.0 * 1e3),
+            moved_deg: moved.map(|m| m.1.to_degrees()),
+        };
+        if let Err(e) = align::append_history(&align::history_path(), &record) {
+            println!("  ({e}: this alignment is not in the history)");
+        }
         Ok(())
     };
     match run() {
@@ -6685,11 +6736,22 @@ fn main() {
     }
     let code = match words.as_slice() {
         ["setup"] => guided_setup::run(false, false, None),
-        ["setup", "--redo", stage] | ["setup", "--redo", stage, "--no-slip-check"] | ["setup", "--no-slip-check", "--redo", stage] => {
+        ["setup", "--redo", stage, flags @ ..] | ["setup", "--no-slip-check", "--redo", stage, flags @ ..]
+            if flags.iter().all(|f| matches!(*f, "--no-slip-check" | "--quick")) =>
+        {
             if args.iter().any(|a| a == "--no-slip-check") {
                 guided_setup::SLIP_CHECK.store(false, Ordering::Relaxed);
             }
+            let quick = flags.contains(&"--quick");
             match cv1touch::setup::Stage::from_redo_name(stage) {
+                Some(s @ cv1touch::setup::Stage::Registration) => {
+                    guided_setup::QUICK.store(quick, Ordering::Relaxed);
+                    guided_setup::run(false, false, Some(s))
+                }
+                Some(_) if quick => {
+                    eprintln!("cv1touch: --quick goes with --redo headset");
+                    2
+                }
                 Some(s) => guided_setup::run(false, false, Some(s)),
                 None => {
                     eprintln!("cv1touch: --redo takes sensors, floor, model, buttons or headset");

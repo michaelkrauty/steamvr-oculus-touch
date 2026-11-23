@@ -157,7 +157,7 @@ def main(installer, work):
                          "Send a cv1touch report", "Start cv1touch", "Stop cv1touch"):
                 shortcut(shortcuts, name)
             line_up = shortcut(shortcuts, "Line up the controllers with your headset")["arguments"]
-            assert line_up.endswith('cv1touch.exe" setup --redo headset"'), line_up
+            assert line_up.endswith('cv1touch.exe" setup --redo headset --quick"'), line_up
             check = run_shortcut(shortcut(shortcuts, "Check cv1touch"), expected=1)
             assert "FAIL" in check and "sensor" in check
             repair = run_shortcut(shortcut(shortcuts, "Finish setting up cv1touch"), expected=1)

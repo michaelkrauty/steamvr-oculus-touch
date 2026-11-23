@@ -639,6 +639,52 @@ pub fn layouts_path() -> PathBuf {
         .join("station-layouts.json")
 }
 
+/// One line of `alignment-history.jsonl` per headset registration written. Lines are only
+/// added, so the file shows whether the headset's space stayed put from one alignment to the
+/// next: a few millimetres moved means it had.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlignmentRecord {
+    pub unix_s: u64,
+    /// "full" or "quick" (the headset stage of `cv1touch setup`), or "register"
+    /// (`cv1touch register`).
+    pub stage: String,
+    /// The headset's serial, tracking system and universe id as SteamVR gave them.
+    pub reference: String,
+    pub tracking_system: String,
+    pub universe_id: u64,
+    pub pairs: usize,
+    pub pos_rms_mm: f64,
+    pub rot_rms_deg: f64,
+    /// How far it moved the controllers at the play area from the alignment it replaced
+    /// (`moved_at`); none for the first.
+    pub moved_mm: Option<f64>,
+    pub moved_deg: Option<f64>,
+}
+
+pub fn history_path() -> PathBuf {
+    crate::platform::dirs::get()
+        .state
+        .join("alignment-history.jsonl")
+}
+
+pub fn append_history(path: &Path, record: &AlignmentRecord) -> Result<(), String> {
+    use std::io::Write;
+    let line = serde_json::to_string(record).map_err(|e| e.to_string())? + "\n";
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    crate::platform::fs::append_private(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How far replacing the alignment `old` (raw <- world) by `new` moves a controller shown at
+/// `at` in raw space: metres, and radians of turn.
+pub fn moved_at(old: &Isometry3<f64>, new: &Isometry3<f64>, at: &Point3<f64>) -> (f64, f64) {
+    let d = new * old.inverse();
+    ((d * at - at).norm(), d.rotation.angle())
+}
+
 /// The layouts on file (none when there is no file); an error when it cannot be read or is not
 /// a layouts file this version reads.
 pub fn read_layouts(path: &Path) -> Result<Layouts, String> {
@@ -1687,5 +1733,70 @@ mod tests {
         wrong.hands[0].hand = "middle".into();
         save(&rpath, &wrong).unwrap();
         assert!(load_render(&rpath).unwrap_err().contains("hand"));
+    }
+
+    #[test]
+    fn an_alignment_moves_a_controller_by_where_each_shows_it() {
+        let world = |x: f64, y: f64, z: f64, r: Vector3<f64>| {
+            Isometry3::from_parts(
+                Translation3::new(x, y, z),
+                UnitQuaternion::from_scaled_axis(r),
+            )
+        };
+        let old = world(0.4, -0.2, 1.1, Vector3::new(0.1, 0.9, -0.2));
+        // the new one turned 2 degrees about the vertical through a point 3 m off, and shifted
+        let new = world(0.0, 0.01, 0.0, Vector3::zeros())
+            * world(3.0, 0.0, 0.0, Vector3::y() * 2f64.to_radians())
+            * world(-3.0, 0.0, 0.0, Vector3::zeros())
+            * old;
+        for at in [Point3::new(0.0, 1.0, 0.0), Point3::new(3.0, 1.5, 0.0)] {
+            // the controller the old alignment shows at `at`, where the new one shows it
+            let touch = old.inverse() * at;
+            let (m, a) = moved_at(&old, &new, &at);
+            assert!((m - (new * touch - at).norm()).abs() < 1e-12, "{m}");
+            assert!((a.to_degrees() - 2.0).abs() < 1e-9, "{a}");
+        }
+        // about 105 mm out at the play area 3 m from the turn, 10 mm at the turn's axis
+        let (far, _) = moved_at(&old, &new, &Point3::new(0.0, 1.0, 0.0));
+        let (near, _) = moved_at(&old, &new, &Point3::new(3.0, 1.5, 0.0));
+        assert!(
+            (far - 0.1052).abs() < 1e-3 && (near - 0.010).abs() < 1e-6,
+            "{far} {near}"
+        );
+        assert!(moved_at(&old, &old, &Point3::origin()).0 < 1e-12);
+    }
+
+    #[test]
+    fn the_alignment_history_gains_one_line_per_alignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join("alignment-history.jsonl");
+        let first = AlignmentRecord {
+            unix_s: 1_800_000_000,
+            stage: "full".into(),
+            reference: "HMD-TEST".into(),
+            tracking_system: "oculus".into(),
+            universe_id: 7,
+            pairs: 2400,
+            pos_rms_mm: 2.1,
+            rot_rms_deg: 0.9,
+            moved_mm: None,
+            moved_deg: None,
+        };
+        let second = AlignmentRecord {
+            unix_s: 1_800_086_400,
+            stage: "quick".into(),
+            moved_mm: Some(2.5),
+            moved_deg: Some(0.2),
+            ..first.clone()
+        };
+        append_history(&path, &first).unwrap();
+        append_history(&path, &second).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<AlignmentRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines, [first, second]);
+        assert!(text.lines().next().unwrap().contains("\"moved_mm\":null"));
     }
 }

@@ -202,10 +202,19 @@ impl RigidWatch {
 /// each side of level (a nod up and a nod down; a tilt toward each shoulder).
 pub const TURN_DEG: f64 = 660.0;
 pub const NOD_DEG: f64 = 30.0;
+/// The quick capture's turn each way: a look over each shoulder. With the nod and tilt it turns
+/// the headset about all three axes, which the fit needs; it needs no more turning than that.
+pub const QUICK_TURN_DEG: f64 = 90.0;
+/// The shortest capture that can end. The fit takes 500 pairs of headset and controller poses
+/// (one in ten of a controller's published motion samples), which come at 41 to 46 a second in
+/// recorded headset captures, so 11 to 12 s held; the stretch it finds as held loses a little at
+/// each end, and the shortest piece of those captures it accepted was 12.2 s long.
+pub const MIN_CAPTURE_NS: u64 = 15_000_000_000;
 
 /// How far the headset has turned each way and nodded and tilted (SteamVR: +Y up, -Z forward).
-#[derive(Default)]
 pub struct TurnCoverage {
+    /// How far (degrees) to turn each way.
+    turn_deg: f64,
     yaw: Option<f64>,
     left_deg: f64,
     right_deg: f64,
@@ -225,6 +234,17 @@ fn widen(range: &mut Option<(f64, f64)>, v: f64) {
 }
 
 impl TurnCoverage {
+    pub fn new(turn_deg: f64) -> TurnCoverage {
+        TurnCoverage {
+            turn_deg,
+            yaw: None,
+            left_deg: 0.0,
+            right_deg: 0.0,
+            pitch: None,
+            roll: None,
+        }
+    }
+
     pub fn push(&mut self, hmd: UnitQuaternion<f64>) {
         let forward = hmd * Vector3::new(0.0, 0.0, -1.0);
         let right = hmd * Vector3::x();
@@ -251,7 +271,7 @@ impl TurnCoverage {
     }
 
     pub fn turns_done(&self) -> bool {
-        self.left_deg >= TURN_DEG && self.right_deg >= TURN_DEG
+        self.left_deg >= self.turn_deg && self.right_deg >= self.turn_deg
     }
 
     pub fn done(&self) -> bool {
@@ -277,16 +297,21 @@ pub enum Cue {
 pub struct HeadsetCapture {
     watch: Option<[RigidWatch; 2]>,
     coverage: TurnCoverage,
+    /// The first and the latest sample's time.
+    span_ns: Option<(u64, u64)>,
     turned: bool,
     slipped: Option<(usize, f64)>,
 }
 
 impl HeadsetCapture {
-    pub fn new(slip_check: bool) -> HeadsetCapture {
+    /// `quick`: a look over each shoulder for the turns, given in any order, so no cue between
+    /// them and the nods.
+    pub fn new(slip_check: bool, quick: bool) -> HeadsetCapture {
         HeadsetCapture {
             watch: slip_check.then(Default::default),
-            coverage: TurnCoverage::default(),
-            turned: false,
+            coverage: TurnCoverage::new(if quick { QUICK_TURN_DEG } else { TURN_DEG }),
+            span_ns: None,
+            turned: quick,
             slipped: None,
         }
     }
@@ -299,6 +324,7 @@ impl HeadsetCapture {
         touch: [Option<UnitQuaternion<f64>>; 2],
     ) {
         self.coverage.push(hmd);
+        self.span_ns = Some((self.span_ns.map_or(t_ns, |s| s.0), t_ns));
         let Some(watch) = self.watch.as_mut() else {
             return;
         };
@@ -309,13 +335,17 @@ impl HeadsetCapture {
         }
     }
 
-    /// The cue for now: a slip first, then done (once no shift is pending), then (once) turned.
+    /// The cue for now: a slip first, then done (once no shift is pending and the capture is long
+    /// enough for the fit), then (once) turned.
     pub fn cue(&mut self) -> Cue {
         if let Some((hand, deg)) = self.slipped {
             return Cue::Slipped(hand, deg);
         }
         let unsettled = self.watch.iter().flatten().any(RigidWatch::unsettled);
-        if self.coverage.done() && !unsettled {
+        let long_enough = self
+            .span_ns
+            .is_some_and(|(first, last)| last.saturating_sub(first) >= MIN_CAPTURE_NS);
+        if self.coverage.done() && !unsettled && long_enough {
             return Cue::Done;
         }
         if !self.turned && self.coverage.turns_done() {
@@ -370,7 +400,7 @@ mod tests {
     #[test]
     fn one_sided_nods_or_tilts_do_not_finish_the_capture() {
         for (one_sided_nod, sign) in [(true, 1.0), (true, -1.0), (false, 1.0), (false, -1.0)] {
-            let mut c = TurnCoverage::default();
+            let mut c = TurnCoverage::new(TURN_DEG);
             let turning = 720.0 / 45.0;
             let mut t = 0.0;
             while t < 2.0 * turning + 20.0 {
@@ -394,7 +424,7 @@ mod tests {
             assert!(!c.done(), "one_sided_nod {one_sided_nod} sign {sign}");
         }
         // both ways each: done
-        let mut c = TurnCoverage::default();
+        let mut c = TurnCoverage::new(TURN_DEG);
         let mut t = 0.0;
         while t < 2.0 * 720.0 / 45.0 + 20.0 {
             c.push(head_with(t, 45.0, 0.0, 20.0));
@@ -581,12 +611,23 @@ mod tests {
         secs: f64,
         slip: impl Fn(f64) -> [UnitQuaternion<f64>; 2],
     ) -> Vec<(f64, Cue)> {
+        cues_of(false, head, slip_check, secs, slip)
+    }
+
+    /// As `cues`, for the head's motion `head` in a full or quick capture.
+    fn cues_of(
+        quick: bool,
+        head: impl Fn(f64) -> UnitQuaternion<f64>,
+        slip_check: bool,
+        secs: f64,
+        slip: impl Fn(f64) -> [UnitQuaternion<f64>; 2],
+    ) -> Vec<(f64, Cue)> {
         let world = rot(Vector3::new(0.3, 1.0, -0.2), 25.0);
         let offsets = [
             rot(Vector3::new(1.0, 0.2, 0.5), 70.0),
             rot(Vector3::new(-1.0, 0.3, 0.5), 80.0),
         ];
-        let mut capture = HeadsetCapture::new(slip_check);
+        let mut capture = HeadsetCapture::new(slip_check, quick);
         let mut out = Vec::new();
         let mut i = 0u64;
         while (i as f64) / 500.0 < secs {
@@ -667,7 +708,7 @@ mod tests {
 
     #[test]
     fn coverage_needs_two_turns_each_way_then_a_nod_and_a_tilt() {
-        let mut c = TurnCoverage::default();
+        let mut c = TurnCoverage::new(TURN_DEG);
         let mut t = 0.0;
         while t < 16.0 {
             c.push(head(t));
@@ -687,5 +728,56 @@ mod tests {
             t += 0.01;
         }
         assert!(c.done());
+    }
+
+    /// The quick capture's motion, `speed` times as fast as a calm one: looking down and up and
+    /// tilting toward each shoulder by 20 degrees (4 s), then looking over each shoulder, 100
+    /// degrees each way (6 s), then still.
+    fn quick_head(t: f64, speed: f64) -> UnitQuaternion<f64> {
+        let t = t * speed;
+        let (mut nod, mut tilt, mut yaw) = (0.0, 0.0, 0.0);
+        if t < 2.0 {
+            nod = 20.0 * (std::f64::consts::PI * t).sin();
+        } else if t < 4.0 {
+            tilt = 20.0 * (std::f64::consts::PI * (t - 2.0)).sin();
+        } else if t < 10.0 {
+            yaw = 100.0 * (std::f64::consts::PI * (t - 4.0) / 3.0).sin();
+        }
+        rot(Vector3::y(), yaw) * rot(Vector3::x(), nod) * rot(Vector3::z(), tilt)
+    }
+
+    #[test]
+    fn a_quick_capture_ends_after_a_nod_a_tilt_and_a_look_over_each_shoulder() {
+        let id = UnitQuaternion::identity();
+        // calm: done once the second look ends, with no cue between the nods and the turns
+        let calm = cues_of(true, |t| quick_head(t / 2.4, 1.0), true, 30.0, |_| [id, id]);
+        assert_eq!(calm.len(), 1, "{calm:?}");
+        assert_eq!(calm[0].1, Cue::Done);
+        assert!((16.3..16.9).contains(&calm[0].0), "{calm:?}");
+        // brisk: the motion is over in 5 s, but the fit needs longer
+        let brisk = cues_of(true, |t| quick_head(t, 2.0), true, 30.0, |_| [id, id]);
+        assert_eq!(brisk.len(), 1, "{brisk:?}");
+        assert_eq!(brisk[0].1, Cue::Done);
+        let min_s = MIN_CAPTURE_NS as f64 * 1e-9;
+        assert!(
+            (min_s - 0.01..min_s + 0.1).contains(&brisk[0].0),
+            "{brisk:?}"
+        );
+        // the full capture asks two turns each way of the same motion: it keeps recording
+        assert!(cues_of(false, |t| quick_head(t, 1.0), true, 30.0, |_| [id, id]).is_empty());
+        // without the looks over the shoulders the quick capture does not end either
+        let nods_only = |t: f64| quick_head(t.min(4.0), 1.0);
+        assert!(cues_of(true, nods_only, true, 30.0, |_| [id, id]).is_empty());
+    }
+
+    #[test]
+    fn a_quick_capture_names_the_controller_that_slipped() {
+        let id = UnitQuaternion::identity();
+        let slip = |t: f64| [if t >= 6.0 { rot(Vector3::x(), 6.0) } else { id }, id];
+        let got = cues_of(true, |t| quick_head(t / 1.4, 1.0), true, 30.0, slip);
+        assert!(
+            matches!(got.last().unwrap().1, Cue::Slipped(0, _)),
+            "{got:?}"
+        );
     }
 }

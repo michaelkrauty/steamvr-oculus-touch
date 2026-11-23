@@ -4,7 +4,8 @@
 //! `cv1touch report`: one zip file with what it takes to see what went wrong on someone else's
 //! computer. A summary (version, system, `doctor`'s checks, the Oculus USB devices and the
 //! drivers they run with, which programs run, the daemon's status, setup's state), the daemon's
-//! and SteamVR's logs (their ends), cv1touch's settings and calibration, and the radio's traffic
+//! and SteamVR's logs (their ends), cv1touch's settings and calibration with its record of headset
+//! alignments, and the radio's traffic
 //! around the controllers' last dropouts (`cv1touch::flight`). Nothing else: no other recordings,
 //! nothing outside cv1touch's and SteamVR's files (SteamVR's log names the other VR devices, the
 //! user's folder and the network addresses: `CONTENTS` says so).
@@ -311,6 +312,24 @@ fn journal(report: &mut Report) {
 #[cfg(windows)]
 fn journal(_report: &mut Report) {}
 
+/// The settings and calibration cv1touch keeps, which are small, by the folder they go in; not
+/// its recordings.
+fn kept() -> [(&'static str, PathBuf); 9] {
+    [
+        ("config", file::default_path()),
+        ("config", align::registration_path()),
+        ("config", align::render_path()),
+        ("config", cv1touch::input_calibration::default_path()),
+        ("config", cv1touch::settings::default_path()),
+        ("config", cv1touch::track::landmarks::default_path()),
+        ("state", cv1touch::track::biases::default_path()),
+        ("state", guided_setup::journal_path()),
+        // how far each headset alignment moved the controllers: whether the headset's space
+        // stays put from one session to the next
+        ("state", align::history_path()),
+    ]
+}
+
 /// Everything but the summary.
 fn collect() -> Report {
     let mut report = Report {
@@ -345,18 +364,7 @@ fn collect() -> Report {
         &steamvr.join("vrserver.previous.txt"),
         false,
     );
-    // the settings and calibration cv1touch keeps, which are small; not its recordings
-    let kept = [
-        ("config", file::default_path()),
-        ("config", align::registration_path()),
-        ("config", align::render_path()),
-        ("config", cv1touch::input_calibration::default_path()),
-        ("config", cv1touch::settings::default_path()),
-        ("config", cv1touch::track::landmarks::default_path()),
-        ("state", cv1touch::track::biases::default_path()),
-        ("state", guided_setup::journal_path()),
-    ];
-    for (prefix, path) in kept {
+    for (prefix, path) in kept() {
         let name = format!("{prefix}/{}", path.file_name().unwrap().to_string_lossy());
         report.log(&name, &path, false);
     }
@@ -435,8 +443,8 @@ fn default_name(created: SystemTime) -> String {
 /// What the report holds, for the person sending it.
 const CONTENTS: &str = concat!(
     "It holds:\n",
-    "- cv1touch's logs, settings and calibration (the calibration says where your sensors ",
-    "stand in your room);\n",
+    "- cv1touch's logs, settings and calibration, and its record of headset alignments (the ",
+    "calibration says where your sensors stand in your room);\n",
     "- SteamVR's log, which also names your other VR devices, your user folder and your ",
     "network addresses;\n",
     "- the Oculus devices plugged in, and your system's version;\n",
@@ -695,6 +703,13 @@ mod tests {
             usb_lines(&[node]),
             ["  2833:0211  interface 00 (video)  (driver: none, Windows problem code 28)  1-2:1.0"]
         );
+    }
+
+    #[test]
+    fn the_alignment_history_is_in_the_report() {
+        assert!(kept()
+            .iter()
+            .any(|(prefix, p)| *prefix == "state" && p.ends_with("alignment-history.jsonl")));
     }
 
     #[test]

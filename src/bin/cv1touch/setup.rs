@@ -9,6 +9,7 @@ use cv1touch::setup::{self, Artifact, Checkpoint, Snapshot, Stage, State};
 use cv1touch::steamvr_log;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 
@@ -457,25 +458,39 @@ fn choice(prompt: &str, allowed: &[&str], hint: &str) -> Result<String, String> 
 /// at it.
 struct StageLog {
     path: PathBuf,
+    /// Output going to the log, while `quiet` runs.
+    to_log: RefCell<Option<console::OutputRedirect>>,
 }
 
 impl StageLog {
     fn new(stage: Stage) -> StageLog {
         StageLog {
             path: absolute(&state_dir().join(format!("setup-{stage:?}-{}.log", shm::now_ns()))),
+            to_log: RefCell::new(None),
         }
+    }
+
+    fn redirect(&self) -> Option<console::OutputRedirect> {
+        let log = platform::fs::append_private(&self.path).ok()?;
+        console::redirect_output(&log).ok()
     }
 
     /// Runs `f` (which must not prompt) with stdout and stderr appended to the log; both are
     /// restored afterwards, also if the log cannot be opened (then `f` prints as usual).
     fn quiet<T>(&self, f: impl FnOnce() -> T) -> T {
-        let Ok(log) = platform::fs::append_private(&self.path) else {
-            return f();
-        };
-        let Ok(_to_log) = console::redirect_output(&log) else {
-            return f();
-        };
-        f()
+        *self.to_log.borrow_mut() = self.redirect();
+        let out = f();
+        self.to_log.borrow_mut().take();
+        out
+    }
+
+    /// Prints `line` on the terminal, also from within `quiet`.
+    fn say(&self, line: &str) {
+        let quiet = self.to_log.borrow_mut().take().is_some();
+        let _ = writeln!(io::stdout(), "{line}");
+        if quiet {
+            *self.to_log.borrow_mut() = self.redirect();
+        }
     }
 
     /// The last error the stage reported, for the one-line failure.
@@ -1032,6 +1047,29 @@ headset, you pressed B, or something else went wrong): take off the headset and 
 screen. B on the right controller cancels at any time. What you see in the headset during this
 step doesn't matter.";
 
+const QUICK_PREPARATION: &str =
+    "Quick headset alignment: this lines up the controllers' tracking with the headset's again, so
+in VR the controllers appear exactly where your hands are. You'll wear the headset and hold both
+controllers against it while you move your head, for about 15 seconds.
+Read all of this now: you won't see this screen with the headset on.
+  1. Put on the headset (SteamVR running).
+  2. Press the real controllers firmly against the outside of the headset, anywhere on it: one
+     on each side is easiest. Keep your hands off the controllers' rings and the headset's
+     sensors. From now until the end, the controllers must not slide or twist on the headset:
+     if one does, the calibration fails and you start this step again.
+  3. Press A on the right controller with your thumb. You'll feel a 10-second countdown via
+     controller haptic pulses, one a second. Nothing is recorded yet: use the 10 seconds to
+     press both controllers firmly back into place, in case pressing A moved them.
+  4. Two quick pulses: recording starts. Look down and up, tilt your head toward each shoulder,
+     then look over your left shoulder and over your right shoulder (turn your body too if
+     that is easier), as far as is comfortable, until you feel one long pulse: done. Take off
+     the headset. Going on longer does no harm.
+If you feel three quick pulses instead, the recording stopped early (a controller slid on the
+headset, you pressed B, or something else went wrong): take off the headset and read this
+screen. If the result is refused, the next try is the full alignment, about a minute long.
+B on the right controller cancels at any time. What you see in the headset during this
+step doesn't matter.";
+
 /// The controllers' raw inputs, with the daemon, its camera world and sensor placement checked
 /// unchanged since `before`; the samples themselves are not judged here.
 fn registration_context(before: &Inspection) -> Result<RawInputs, String> {
@@ -1245,6 +1283,8 @@ fn registration_countdown(before: &Inspection) -> Result<(), String> {
 pub(super) static SLIP_CHECK: AtomicBool = AtomicBool::new(true);
 /// Set when the last headset alignment stopped because a controller slipped.
 static SLIPPED: AtomicBool = AtomicBool::new(false);
+/// `setup --redo headset --quick`: the short headset alignment, until a fit of it is refused.
+pub(super) static QUICK: AtomicBool = AtomicBool::new(false);
 
 /// `pulses` buzzes of `seconds` in both controllers, 0.1 s apart.
 fn registration_buzz(
@@ -1276,11 +1316,11 @@ struct RegistrationFeedback<'a> {
 }
 
 impl<'a> RegistrationFeedback<'a> {
-    fn new(before: &'a Inspection, slip_check: bool) -> Self {
+    fn new(before: &'a Inspection, slip_check: bool, quick: bool) -> Self {
         Self {
             before,
             edges: ButtonEdges::new(shm::now_ns()),
-            capture: HeadsetCapture::new(slip_check),
+            capture: HeadsetCapture::new(slip_check, quick),
             error: None,
         }
     }
@@ -1386,6 +1426,16 @@ fn registration_capture_after_preparation<T>(
     capture(checkpoint)
 }
 
+/// The error for a fit that was refused; after a quick headset alignment, the next try is the
+/// full one, which moves the head further and longer.
+fn refused(stage: Stage, failure: String) -> String {
+    if stage == Stage::Registration && QUICK.swap(false, Ordering::Relaxed) {
+        format!("{failure}; the next try is the full headset alignment, about a minute")
+    } else {
+        failure
+    }
+}
+
 fn run_stage(
     stage: Stage,
     inspection: &Inspection,
@@ -1468,6 +1518,7 @@ fn run_stage(
             log.quiet(|| fit_render(Some(&rec)))
         }
         Stage::Registration => {
+            let quick = QUICK.load(Ordering::Relaxed);
             // the station this recording will measure, as SteamVR's log names it now
             let reg = align::load_registration(&align::registration_path()).ok();
             let mut steamvr = steamvr_log::Watch::new(&steamvr_log::server_log());
@@ -1496,7 +1547,11 @@ fn run_stage(
                         |hand, button, name| wait_preparation_press(inspection, hand, button, name),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
                     )?;
-                    human_action(REGISTRATION_PREPARATION);
+                    human_action(if quick {
+                        QUICK_PREPARATION
+                    } else {
+                        REGISTRATION_PREPARATION
+                    });
                     wait_preparation_press(
                         inspection,
                         HAND_RIGHT,
@@ -1528,11 +1583,18 @@ fn run_stage(
                         return Err("setup interrupted; nothing was recorded".into());
                     }
                     print!("\r                            \r");
-                    let mut feedback =
-                        RegistrationFeedback::new(inspection, SLIP_CHECK.load(Ordering::Relaxed));
+                    let mut feedback = RegistrationFeedback::new(
+                        inspection,
+                        SLIP_CHECK.load(Ordering::Relaxed),
+                        quick,
+                    );
                     let captured = capture_free_named_with_feedback(
-                        150,
-                        "Recording: two circles left, two right; after the single pulse, look up and down and tilt your head until the long pulse. B cancels.",
+                        if quick { 60 } else { 150 },
+                        if quick {
+                            "Recording: look down and up, tilt your head, then look over each shoulder, until the long pulse. B cancels."
+                        } else {
+                            "Recording: two circles left, two right; after the single pulse, look up and down and tilt your head until the long pulse. B cancels."
+                        },
                         false,
                         Some(&base),
                         Some(&mut feedback),
@@ -1549,8 +1611,13 @@ fn run_stage(
             recordings.push(rec);
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
-            let code = log
-                .quiet(|| register_from_capture_with(&base, true, Some("hmd"), true, false, None));
+            let writer = Writer {
+                stage: if quick { "quick" } else { "full" },
+                say: &|line| log.say(line),
+            };
+            let code = log.quiet(|| {
+                register_from_capture_with(&base, true, Some("hmd"), true, false, None, &writer)
+            });
             if code != 0 {
                 code
             } else {
@@ -1575,7 +1642,10 @@ fn run_stage(
         return Err("interrupted; your previous calibration is unchanged".into());
     }
     if code != 0 {
-        return Err(log.failure("the calibration failed; your previous calibration is unchanged"));
+        return Err(refused(
+            stage,
+            log.failure("the calibration failed; your previous calibration is unchanged"),
+        ));
     }
     if matches!(stage, Stage::Camera | Stage::Gravity) {
         wait_reload(inspection, "calibrated")?;
@@ -2180,6 +2250,79 @@ mod tests {
         assert!(!REGISTRATION_PREPARATION.contains("to finish"));
         // its cues are the controllers' haptics: buzzes; beeps are the speakers
         assert!(!REGISTRATION_PREPARATION.contains("beep"));
+    }
+
+    #[test]
+    fn the_quick_headset_instructions_say_everything_before_the_headset_goes_on() {
+        let text = one_line(QUICK_PREPARATION);
+        for needed in [
+            "won't see this screen",
+            "in VR the controllers appear exactly where your hands are",
+            "about 15 seconds",
+            "real controllers",
+            "anywhere on it",
+            "the calibration fails",
+            "10-second countdown via controller haptic pulses",
+            "Nothing is recorded yet",
+            "Two quick pulses: recording starts",
+            "Look down and up",
+            "tilt your head toward each shoulder",
+            "look over your left shoulder and over your right shoulder",
+            "one long pulse: done",
+            "three quick pulses",
+            "If the result is refused, the next try is the full alignment",
+            "cancels at any time",
+            "What you see in the headset during this step doesn't matter",
+        ] {
+            assert!(text.contains(needed), "{needed}");
+        }
+        for vague in [
+            "fit",
+            "settle",
+            "grip",
+            "still",
+            "buzz",
+            "beep",
+            "to finish",
+            "circle",
+        ] {
+            assert!(!QUICK_PREPARATION.contains(vague), "{vague}");
+        }
+    }
+
+    #[test]
+    fn a_stage_says_its_line_on_the_terminal_and_logs_the_rest() {
+        // written to the process's output itself: the test harness captures `println!` apart
+        let tmp = tempfile::tempdir().unwrap();
+        let log = StageLog {
+            path: tmp.path().join("stage.log"),
+            to_log: RefCell::new(None),
+        };
+        log.quiet(|| {
+            let _ = writeln!(io::stdout(), "solver output");
+            log.say("The new alignment moves the controllers 3 mm and 0.2° where you play.");
+            let _ = writeln!(io::stdout(), "more solver output");
+        });
+        // the log has the whole process's output meanwhile, so the harness's line for another
+        // test can land in it
+        let text = std::fs::read_to_string(&log.path).unwrap();
+        let first = text.find("solver output\n");
+        let second = text.find("more solver output\n");
+        assert!(first.is_some() && first < second, "{text}");
+        assert!(!text.contains("moves the controllers"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_quick_alignment_makes_the_next_try_the_full_one() {
+        QUICK.store(true, Ordering::Relaxed);
+        assert_eq!(refused(Stage::Render, "no".into()), "no");
+        assert!(QUICK.load(Ordering::Relaxed), "another stage leaves it");
+        assert_eq!(
+            refused(Stage::Registration, "no".into()),
+            "no; the next try is the full headset alignment, about a minute"
+        );
+        assert!(!QUICK.load(Ordering::Relaxed));
+        assert_eq!(refused(Stage::Registration, "no".into()), "no");
     }
 
     #[test]
