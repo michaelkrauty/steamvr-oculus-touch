@@ -33,6 +33,8 @@ pub struct Options {
     pub min_axis_ratio: f64,
     /// Relative rotations used by the hand-eye solve are at least this large.
     pub min_relative_rad: f64,
+    /// What to do when the rotations are almost all about one axis.
+    pub turn_more: &'static str,
     pub max_iterations: usize,
 }
 
@@ -44,7 +46,21 @@ impl Default for Options {
             min_pairs: 1000,
             min_axis_ratio: 0.25,
             min_relative_rad: 0.35,
+            turn_more: "turn the pair more: roll, pitch and yaw your wrist",
             max_iterations: 50,
+        }
+    }
+}
+
+impl Options {
+    /// A capture of Touches held to the headset: turning in place and nodding turn mostly about
+    /// one axis, but over a far wider range than a hand-held registration needs.
+    pub fn headset() -> Options {
+        Options {
+            min_pairs: 500,
+            min_axis_ratio: 0.1,
+            turn_more: "look further down and up, and tilt your head further toward each shoulder",
+            ..Options::default()
         }
     }
 }
@@ -250,24 +266,89 @@ pub fn load_session(path: &Path) -> Result<(String, u64, Vec<Sample>), String> {
     Ok((f.reference, f.universe_id, samples))
 }
 
+/// A relative rotation is looked for among this many pairs from where it starts.
+const LOOK_AHEAD: usize = 200;
+
+/// The relative rotations of the hand-eye solve, gathered pair by pair: from each pair, the first
+/// of the next `LOOK_AHEAD - 1` whose Touch has turned `min_relative_rad` from it, and on from
+/// there; a pair with none is passed over. Their sum, angle times axis(C_i^-1 C_j) times
+/// axis(L_i^-1 L_j)^T, gives R_Y and the axis ratio. A guide can keep one as a capture is
+/// recorded and ask what the fit would make of the capture so far.
+#[derive(Debug, Clone)]
+pub struct RelativeTurns {
+    min_relative_rad: f64,
+    sum: Matrix3<f64>,
+    /// The reference's and the Touch's rotation from the pair the next relative rotation starts
+    /// at onwards, fewer than `LOOK_AHEAD` (the first is passed over once that many are in); the
+    /// `compared` after the first have turned too little from it.
+    rest: Vec<(UnitQuaternion<f64>, UnitQuaternion<f64>)>,
+    compared: usize,
+}
+
+impl RelativeTurns {
+    pub fn new(min_relative_rad: f64) -> RelativeTurns {
+        RelativeTurns {
+            min_relative_rad,
+            sum: Matrix3::zeros(),
+            rest: Vec::new(),
+            compared: 0,
+        }
+    }
+
+    /// The next pair's rotations: the reference's and the Touch's.
+    pub fn push(&mut self, reference: UnitQuaternion<f64>, touch: UnitQuaternion<f64>) {
+        self.rest.push((reference, touch));
+        self.advance(false);
+    }
+
+    /// Takes in every relative rotation the pairs so far settle. `ended`: no pair follows, so a
+    /// pair that none after it has turned far enough from is passed over now.
+    fn advance(&mut self, ended: bool) {
+        loop {
+            let next = self.compared + 1;
+            if next < self.rest.len() {
+                let ((l0, c0), (l1, c1)) = (self.rest[0], self.rest[next]);
+                if c0.angle_to(&c1) < self.min_relative_rad {
+                    self.compared = next;
+                    continue;
+                }
+                let (a, b) = (l0.inverse() * l1, c0.inverse() * c1);
+                if let (Some(aa), Some(ba)) = (a.axis(), b.axis()) {
+                    self.sum += ba.into_inner() * aa.into_inner().transpose() * b.angle();
+                }
+                self.rest.drain(..next);
+            } else if next == LOOK_AHEAD || (ended && self.rest.len() > 1) {
+                self.rest.remove(0);
+            } else {
+                return;
+            }
+            self.compared = 0;
+        }
+    }
+
+    /// R_Y and the axis ratio, from the pairs so far as if the capture ended here.
+    fn solve(&self) -> (UnitQuaternion<f64>, f64) {
+        let mut ended = self.clone();
+        ended.advance(true);
+        rotation_and_ratio(&ended.sum)
+    }
+
+    /// The axis ratio the fit would find in the pairs so far.
+    pub fn axis_ratio(&self) -> f64 {
+        self.solve().1
+    }
+}
+
 /// R_Y from relative motions (axis(L_i^-1 L_j) = R_Y axis(C_i^-1 C_j)), and the axis ratio.
 fn hand_eye(pairs: &[(Isometry3<f64>, Isometry3<f64>)], o: &Options) -> (UnitQuaternion<f64>, f64) {
-    let mut h = Matrix3::zeros();
-    let mut i = 0;
-    while i + 1 < pairs.len() {
-        let next = (i + 1..pairs.len().min(i + 200))
-            .find(|&j| pairs[i].1.rotation.angle_to(&pairs[j].1.rotation) >= o.min_relative_rad);
-        let Some(j) = next else {
-            i += 1;
-            continue;
-        };
-        let a = pairs[i].0.rotation.inverse() * pairs[j].0.rotation;
-        let b = pairs[i].1.rotation.inverse() * pairs[j].1.rotation;
-        if let (Some(aa), Some(ba)) = (a.axis(), b.axis()) {
-            h += ba.into_inner() * aa.into_inner().transpose() * b.angle();
-        }
-        i = j;
+    let mut turns = RelativeTurns::new(o.min_relative_rad);
+    for (l, c) in pairs {
+        turns.push(l.rotation, c.rotation);
     }
+    turns.solve()
+}
+
+fn rotation_and_ratio(h: &Matrix3<f64>) -> (UnitQuaternion<f64>, f64) {
     let svd = h.svd(true, true);
     let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
     let mut d = Matrix3::identity();
@@ -436,8 +517,8 @@ fn solve_turned(
     let (ry, axis_ratio) = hand_eye(turned, o);
     if axis_ratio < o.min_axis_ratio {
         return Err(format!(
-            "turn the pair more: the rotations so far are almost all about one axis (ratio {axis_ratio:.2} < {:.2}); roll, pitch and yaw your wrist",
-            o.min_axis_ratio
+            "the rotations so far are almost all about one axis (ratio {axis_ratio:.2} < {:.2}); {}",
+            o.min_axis_ratio, o.turn_more
         ));
     }
     let rx = chordal_mean(
@@ -585,51 +666,69 @@ pub fn rigid_span(
         .map(|(_, r)| r)
 }
 
+/// `bootstrap_span` fits windows of this long a capture...
+pub const SEED_WINDOW_NS: u64 = 25_000_000_000;
+/// ...starting this far apart...
+pub const SEED_EVERY_NS: u64 = 5_000_000_000;
+/// ...from where at least this many of the capture's pairs are left.
+pub const SEED_MIN_PAIRS: usize = 500;
+
 /// Find an attached, turning span without a previously registered coordinate frame.
 /// Short hand-eye fits supply candidate frames; a full-span rigidity check rejects unrelated
 /// motion and desk holds. A fresh capture may include picking up and putting down the Touches.
 /// Each short fit is thinned to about 200 pairs, except for its rotations' test and hand-eye
-/// rotation, which see all the window's pairs as the final fit would.
+/// rotation, which see all the window's pairs as the final fit would. Err(Some(refusal)) when
+/// that test refused every window: the pair turned too little about a second axis for any frame
+/// to be found.
 pub fn bootstrap_span(
     pairs: &[(u64, Isometry3<f64>, Isometry3<f64>)],
-) -> Option<std::ops::Range<usize>> {
-    if pairs.len() < 500 {
-        return None;
-    }
+) -> Result<std::ops::Range<usize>, Option<String>> {
     let mut best = None;
     let mut best_turn = 0.0;
+    // the first refusal, while every window so far was refused
+    let mut refusal = None;
+    let mut seeded = false;
     let mut start = 0;
-    while start + 500 <= pairs.len() {
-        let end = pairs.partition_point(|p| p.0 <= pairs[start].0 + 25_000_000_000);
+    while start + SEED_MIN_PAIRS <= pairs.len() {
+        let end = pairs.partition_point(|p| p.0 <= pairs[start].0 + SEED_WINDOW_NS);
         let step = ((end - start) / 200).max(1);
         let window: Vec<_> = pairs[start..end].iter().map(|p| (p.1, p.2)).collect();
         let seed: Vec<_> = window.iter().step_by(step).copied().collect();
         let opts = Options {
             min_pairs: 100,
-            min_axis_ratio: 0.1,
             max_iterations: 20,
-            ..Options::default()
+            ..Options::headset()
         };
-        if let Ok(sol) = solve_turned(&seed, &window, &opts) {
-            if sol.inliers * 5 >= sol.pairs * 4 && sol.pos_rms_m <= 0.010 && sol.rot_rms_deg <= 3.0
-            {
-                if let Some(r) = rigid_span(pairs, &sol.lighthouse_from_world, &Rigid::default()) {
-                    let turn: f64 = pairs[r.clone()]
-                        .windows(2)
-                        .map(|w| w[0].1.rotation.angle_to(&w[1].1.rotation))
-                        .sum();
-                    if r.len() >= 500 && turn > best_turn {
-                        best_turn = turn;
-                        best = Some(r);
+        match solve_turned(&seed, &window, &opts) {
+            Err(e) => {
+                refusal.get_or_insert(e);
+            }
+            Ok(sol) => {
+                seeded = true;
+                if sol.inliers * 5 >= sol.pairs * 4
+                    && sol.pos_rms_m <= 0.010
+                    && sol.rot_rms_deg <= 3.0
+                {
+                    if let Some(r) =
+                        rigid_span(pairs, &sol.lighthouse_from_world, &Rigid::default())
+                    {
+                        let turn: f64 = pairs[r.clone()]
+                            .windows(2)
+                            .map(|w| w[0].1.rotation.angle_to(&w[1].1.rotation))
+                            .sum();
+                        if r.len() >= 500 && turn > best_turn {
+                            best_turn = turn;
+                            best = Some(r);
+                        }
                     }
                 }
             }
         }
         start = pairs
-            .partition_point(|p| p.0 < pairs[start].0 + 5_000_000_000)
+            .partition_point(|p| p.0 < pairs[start].0 + SEED_EVERY_NS)
             .max(start + 1);
     }
-    best
+    best.ok_or(refusal.filter(|_| !seeded))
 }
 
 /// The stir: how far a Touch held fixed to the headset seems to circle about its place as the
@@ -796,7 +895,87 @@ mod tests {
             &Options::default(),
         )
         .unwrap_err();
-        assert!(err.contains("turn the pair"), "{err}");
+        assert!(err.contains("roll, pitch and yaw your wrist"), "{err}");
+    }
+
+    #[test]
+    fn a_headset_capture_turning_about_one_axis_is_told_to_nod_and_tilt() {
+        let ps = pairs(&path(30.0, one_axis), 0.0, 0.0, false, 0.0);
+        let err = solve(&ps, &Options::headset()).unwrap_err();
+        assert!(
+            err.contains("tilt your head") && !err.contains("wrist"),
+            "{err}"
+        );
+        // the stretch search, which runs first, gives the same refusal
+        let timed: Vec<_> = ps
+            .iter()
+            .enumerate()
+            .map(|(k, (l, c))| (k as u64 * 10_000_000, *l, *c))
+            .collect();
+        assert_eq!(bootstrap_span(&timed), Err(Some(err)));
+    }
+
+    #[test]
+    fn relative_turns_gathered_one_by_one_chain_as_the_whole_capture_does() {
+        // the chaining over a whole capture at once, as the fit had it
+        let whole = |pairs: &[(Isometry3<f64>, Isometry3<f64>)], min_rad: f64| {
+            let mut h = Matrix3::zeros();
+            let mut i = 0;
+            while i + 1 < pairs.len() {
+                let next = (i + 1..pairs.len().min(i + 200))
+                    .find(|&j| pairs[i].1.rotation.angle_to(&pairs[j].1.rotation) >= min_rad);
+                let Some(j) = next else {
+                    i += 1;
+                    continue;
+                };
+                let a = pairs[i].0.rotation.inverse() * pairs[j].0.rotation;
+                let b = pairs[i].1.rotation.inverse() * pairs[j].1.rotation;
+                h += b.axis().unwrap().into_inner()
+                    * a.axis().unwrap().into_inner().transpose()
+                    * b.angle();
+                i = j;
+            }
+            h
+        };
+        let gathered = |turns: &RelativeTurns| {
+            let mut ended = turns.clone();
+            ended.advance(true);
+            ended.sum
+        };
+        let check = |ps: &[(Isometry3<f64>, Isometry3<f64>)], every: usize| {
+            let min_rad = Options::default().min_relative_rad;
+            let mut turns = RelativeTurns::new(min_rad);
+            for (k, (l, c)) in ps.iter().enumerate() {
+                turns.push(l.rotation, c.rotation);
+                if k % every == 0 || k + 1 == ps.len() {
+                    let want = whole(&ps[..=k], min_rad);
+                    assert!((gathered(&turns) - want).norm() < 1e-9, "{k}: {want}");
+                }
+            }
+        };
+        // turning, still for longer than a relative rotation is looked for, turning again
+        let pauses = |t: f64| {
+            if (10.0..15.0).contains(&t) {
+                Vector3::zeros()
+            } else {
+                all_axes(t)
+            }
+        };
+        check(&pairs(&path(30.0, pauses), 0.001, 0.002, false, 0.0), 97);
+        // a creep too slow for a relative rotation, then a jump just past the look-ahead from
+        // the first pair and within it from the second; then a turn found only from the last
+        // pair but one, as the capture ends
+        let deg = |x: f64, y: f64, z: f64| {
+            Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::from_euler_angles(x.to_radians(), y.to_radians(), z.to_radians()),
+            )
+        };
+        let mut touch: Vec<_> = (0..200).map(|k| deg(0.0, 0.05 * k as f64, 0.0)).collect();
+        touch.push(deg(30.0, 10.0, 0.0));
+        touch.push(deg(30.0, 10.0, -10.0));
+        touch.extend((0..40).map(|k| deg(30.0, 10.0, -10.0 + 0.55 * k as f64)));
+        check(&pairs(&touch, 0.0, 0.0, false, 0.0), 1);
     }
 
     #[test]
@@ -968,15 +1147,7 @@ mod tests {
         let r = bootstrap_span(&timed).expect("finds the on-headset span without a registration");
         assert!(r.start >= 900 && r.end <= 5100, "{r:?}");
         let ps: Vec<_> = timed[r].iter().map(|p| (p.1, p.2)).collect();
-        let sol = solve(
-            &ps,
-            &Options {
-                min_pairs: 500,
-                min_axis_ratio: 0.1,
-                ..Options::default()
-            },
-        )
-        .unwrap();
+        let sol = solve(&ps, &Options::headset()).unwrap();
         assert_close(&sol.lighthouse_from_world, &x_true(), 0.002, 0.2);
     }
 
@@ -1007,11 +1178,7 @@ mod tests {
 
     #[test]
     fn the_stretch_search_tests_the_rotations_as_the_fit_does() {
-        let headset = Options {
-            min_pairs: 500,
-            min_axis_ratio: 0.1,
-            ..Options::default()
-        };
+        let headset = Options::headset();
         // nods and tilts of 20 degrees from level, which the fit accepts: thinned, the
         // rotations' test looked further ahead, passed over them to the looks and refused
         let timed = nod_tilt_then_look(20.0, 15.0);
@@ -1023,7 +1190,7 @@ mod tests {
         let timed = nod_tilt_then_look(0.0, 15.0);
         let pairs: Vec<_> = timed.iter().map(|p| (p.1, p.2)).collect();
         assert!(solve(&pairs, &headset).is_err());
-        assert!(bootstrap_span(&timed).is_none());
+        assert!(bootstrap_span(&timed).is_err());
     }
 
     #[test]
@@ -1038,7 +1205,7 @@ mod tests {
             .enumerate()
             .map(|(k, (l, c))| (k as u64 * 10_000_000, *l, c))
             .collect();
-        assert!(bootstrap_span(&timed).is_none());
+        assert_eq!(bootstrap_span(&timed), Err(None));
     }
 
     #[test]

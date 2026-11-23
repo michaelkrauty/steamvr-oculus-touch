@@ -1068,7 +1068,8 @@ Read all of this now: you won't see this screen with the headset on.
   4. Two quick pulses: recording starts. Look down and up, tilt your head toward each shoulder,
      then look over your left shoulder and over your right shoulder (turn your body too if
      that is easier), as far as is comfortable, until you feel one long pulse: done. Take off
-     the headset. Going on longer does no harm.
+     the headset. Going on longer does no harm. If no long pulse comes, look further down and
+     up and tilt your head further.
 If you feel three quick pulses instead, the recording stopped early (a controller slid on the
 headset, you pressed B, or something else went wrong): take off the headset and read this
 screen. If the result is refused, the next try is the full alignment, about a minute long.
@@ -2321,6 +2322,7 @@ mod tests {
             "tilt your head toward each shoulder",
             "look over your left shoulder and over your right shoulder",
             "one long pulse: done",
+            "If no long pulse comes, look further down and up and tilt your head further",
             "three quick pulses",
             "If the result is refused, the next try is the full alignment",
             "cancels at any time",

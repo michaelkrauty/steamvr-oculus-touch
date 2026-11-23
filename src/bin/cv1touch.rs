@@ -5037,13 +5037,15 @@ fn register_from_capture_with(
         }
         let mut fits = Vec::new();
         let mut held_pairs = Vec::new();
-        let min_pairs = if follow { 500 } else { 12 };
-        // turning in place and nodding: mostly about one axis, but over a far wider range than a
-        // hand-held registration needs
-        let min_axis_ratio = if follow {
-            0.1
+        // the fit's rotation test, when it is why no stretch on the reference was found
+        let mut turned_too_little = None;
+        let options = if follow {
+            register::Options::headset()
         } else {
-            register::Options::default().min_axis_ratio
+            register::Options {
+                min_pairs: 12,
+                ..register::Options::default()
+            }
         };
         for (h, pubs) in published.iter().enumerate() {
             let pairs: Vec<_> = if follow {
@@ -5061,27 +5063,30 @@ fn register_from_capture_with(
                     register::rigid_span(&timed, x, o)
                 };
                 let first_span = if had_registration {
-                    span(&x0, &register::Rigid::default())
+                    span(&x0, &register::Rigid::default()).ok_or(None)
                 } else {
                     register::bootstrap_span(&timed)
                 };
-                let Some(first) = first_span else {
-                    println!(
-                        "Touch {}: never moved with the reference",
-                        ["left", "right"][h]
-                    );
-                    continue;
+                let first = match first_span {
+                    Ok(first) => first,
+                    Err(refusal) => {
+                        println!(
+                            "Touch {}: {}",
+                            ["left", "right"][h],
+                            refusal
+                                .as_deref()
+                                .unwrap_or("never moved with the reference")
+                        );
+                        turned_too_little = turned_too_little.or(refusal);
+                        continue;
+                    }
                 };
                 let rough = register::solve(
                     &timed[first.clone()]
                         .iter()
                         .map(|p| (p.1, p.2))
                         .collect::<Vec<_>>(),
-                    &register::Options {
-                        min_pairs,
-                        min_axis_ratio,
-                        ..register::Options::default()
-                    },
+                    &options,
                 )?;
                 // the two streams' stamps lined up: the shift that holds the offset steadiest
                 let at = |lag_ns: i64| -> Vec<(u64, nalgebra::Isometry3<f64>, nalgebra::Isometry3<f64>)> {
@@ -5125,17 +5130,10 @@ fn register_from_capture_with(
                     .filter_map(|&(a, b, l)| Some((l, mean_pose(pubs, a, b)?)))
                     .collect()
             };
-            if pairs.len() < min_pairs {
+            if pairs.len() < options.min_pairs {
                 continue;
             }
-            let sol = register::solve(
-                &pairs,
-                &register::Options {
-                    min_pairs,
-                    min_axis_ratio,
-                    ..register::Options::default()
-                },
-            )?;
+            let sol = register::solve(&pairs, &options)?;
             if sol.inliers * 5 < sol.pairs * 4 || sol.pos_rms_m > 0.010 || sol.rot_rms_deg > 3.0 {
                 return Err(format!("Touch {}: registration rejected ({:.1} mm, {:.2} deg, {} of {} inliers); hold firmly and repeat", ["left", "right"][h], sol.pos_rms_m * 1e3, sol.rot_rms_deg, sol.inliers, sol.pairs));
             }
@@ -5173,10 +5171,12 @@ fn register_from_capture_with(
             held_pairs.push(pairs);
         }
         let Some(first) = fits.first() else {
-            return Err(format!(
-                "no Touch tracked through enough {}",
-                if follow { "of the capture" } else { "holds" }
-            ));
+            return Err(turned_too_little.unwrap_or_else(|| {
+                format!(
+                    "no Touch tracked through enough {}",
+                    if follow { "of the capture" } else { "holds" }
+                )
+            }));
         };
         let x = if let [a, b] = fits.as_slice() {
             let d = a.0.inverse() * b.0;
@@ -9459,15 +9459,7 @@ mod tests {
             .collect();
         let range = register::bootstrap_span(&timed).unwrap();
         let pairs: Vec<_> = timed[range].iter().map(|p| (p.1, p.2)).collect();
-        let fit = register::solve(
-            &pairs,
-            &register::Options {
-                min_pairs: 500,
-                min_axis_ratio: 0.1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let fit = register::solve(&pairs, &register::Options::headset()).unwrap();
         let error = fit.lighthouse_from_world.inverse() * world;
         assert!(error.translation.vector.norm() < 0.001);
         assert!(error.rotation.angle() < 0.001);

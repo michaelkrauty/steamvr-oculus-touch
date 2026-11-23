@@ -13,6 +13,8 @@ use std::collections::VecDeque;
 
 use nalgebra::{Matrix4, Quaternion, SymmetricEigen, UnitQuaternion, Vector3, Vector4};
 
+use crate::register::{Options, RelativeTurns, SEED_EVERY_NS, SEED_MIN_PAIRS, SEED_WINDOW_NS};
+
 /// A controller that shifts against the headset by more than this (degrees of rotation) has
 /// slipped: well above tracking noise and the timing mismatch of two devices at a person's turning
 /// speed (about a degree together), well below what spoils a fit.
@@ -210,6 +212,86 @@ pub const QUICK_TURN_DEG: f64 = 90.0;
 /// recorded headset captures, so 11 to 12 s held; the stretch it finds as held loses a little at
 /// each end, and the shortest piece of those captures it accepted was 12.2 s long.
 pub const MIN_CAPTURE_NS: u64 = 15_000_000_000;
+/// How often the quick capture takes the headset's rotation for the fit's rotation test: the
+/// fit's pairs are one in ten of a controller's published motion samples, which come at 41 to 46
+/// a second in recorded headset captures.
+const PAIR_NS: u64 = 23_000_000;
+/// How often the quick capture runs the fit's rotation test once its other targets are met.
+const TEST_NS: u64 = 250_000_000;
+
+/// The rotations a headset capture has given the fit so far, and whether the fit's rotation test
+/// passes on them. The fit tests twice: the search for the stretch on the headset fits windows of
+/// the capture (`register::bootstrap_span`), one of which must pass, and the final fit tests the
+/// whole stretch, about the whole capture when the controllers stay on the headset.
+///
+/// The headset's rotation stands in for each controller's: a controller held to the headset
+/// turns by the headset's relative rotations seen through its hold (b = Y⁻¹·a·Y), by the same
+/// angles about axes turned by one fixed Y, which leaves the fit's axis ratio as it is; and the
+/// headset is tracked throughout.
+struct FitRotations {
+    pairs: usize,
+    last_ns: Option<u64>,
+    all: RelativeTurns,
+    /// The search's windows: where each starts (ns, pairs before it) and its rotations so far.
+    windows: Vec<(u64, usize, RelativeTurns)>,
+    /// When the test last ran, and its result.
+    tested: Option<(u64, bool)>,
+}
+
+impl FitRotations {
+    fn new() -> FitRotations {
+        FitRotations {
+            pairs: 0,
+            last_ns: None,
+            all: turns(),
+            windows: Vec::new(),
+            tested: None,
+        }
+    }
+
+    fn push(&mut self, t_ns: u64, hmd: UnitQuaternion<f64>) {
+        if self.last_ns.is_some_and(|last| t_ns < last + PAIR_NS) {
+            return;
+        }
+        self.last_ns = Some(t_ns);
+        if self
+            .windows
+            .last()
+            .is_none_or(|(start, ..)| t_ns >= start + SEED_EVERY_NS)
+        {
+            self.windows.push((t_ns, self.pairs, turns()));
+        }
+        for (start, _, window) in &mut self.windows {
+            if t_ns <= *start + SEED_WINDOW_NS {
+                window.push(hmd, hmd);
+            }
+        }
+        self.all.push(hmd, hmd);
+        self.pairs += 1;
+    }
+
+    /// Whether the fit's rotation test passes on the rotations so far, run at most every
+    /// `TEST_NS`.
+    fn pass(&mut self) -> bool {
+        let now = self.last_ns.unwrap_or(0);
+        if let Some((_, pass)) = self.tested.filter(|(at, _)| now < at + TEST_NS) {
+            return pass;
+        }
+        let enough =
+            |turns: &RelativeTurns| turns.axis_ratio() >= Options::headset().min_axis_ratio;
+        let pass = enough(&self.all)
+            && self
+                .windows
+                .iter()
+                .any(|(_, before, window)| before + SEED_MIN_PAIRS <= self.pairs && enough(window));
+        self.tested = Some((now, pass));
+        pass
+    }
+}
+
+fn turns() -> RelativeTurns {
+    RelativeTurns::new(Options::headset().min_relative_rad)
+}
 
 /// How far the headset has turned each way and nodded and tilted (SteamVR: +Y up, -Z forward).
 pub struct TurnCoverage {
@@ -297,6 +379,8 @@ pub enum Cue {
 pub struct HeadsetCapture {
     watch: Option<[RigidWatch; 2]>,
     coverage: TurnCoverage,
+    /// The quick capture's rotations, for the fit's rotation test.
+    fit: Option<FitRotations>,
     /// The first and the latest sample's time.
     span_ns: Option<(u64, u64)>,
     turned: bool,
@@ -305,11 +389,12 @@ pub struct HeadsetCapture {
 
 impl HeadsetCapture {
     /// `quick`: a look over each shoulder for the turns, given in any order, so no cue between
-    /// them and the nods.
+    /// them and the nods; the fit's own rotation test decides when the nods and tilts are enough.
     pub fn new(slip_check: bool, quick: bool) -> HeadsetCapture {
         HeadsetCapture {
             watch: slip_check.then(Default::default),
             coverage: TurnCoverage::new(if quick { QUICK_TURN_DEG } else { TURN_DEG }),
+            fit: quick.then(FitRotations::new),
             span_ns: None,
             turned: quick,
             slipped: None,
@@ -325,6 +410,9 @@ impl HeadsetCapture {
     ) {
         self.coverage.push(hmd);
         self.span_ns = Some((self.span_ns.map_or(t_ns, |s| s.0), t_ns));
+        if let Some(fit) = self.fit.as_mut() {
+            fit.push(t_ns, hmd);
+        }
         let Some(watch) = self.watch.as_mut() else {
             return;
         };
@@ -335,8 +423,9 @@ impl HeadsetCapture {
         }
     }
 
-    /// The cue for now: a slip first, then done (once no shift is pending and the capture is long
-    /// enough for the fit), then (once) turned.
+    /// The cue for now: a slip first, then done (once no shift is pending, the capture is long
+    /// enough for the fit and, quick, turned enough for the fit's rotation test), then (once)
+    /// turned.
     pub fn cue(&mut self) -> Cue {
         if let Some((hand, deg)) = self.slipped {
             return Cue::Slipped(hand, deg);
@@ -345,7 +434,11 @@ impl HeadsetCapture {
         let long_enough = self
             .span_ns
             .is_some_and(|(first, last)| last.saturating_sub(first) >= MIN_CAPTURE_NS);
-        if self.coverage.done() && !unsettled && long_enough {
+        if self.coverage.done()
+            && !unsettled
+            && long_enough
+            && self.fit.as_mut().is_none_or(FitRotations::pass)
+        {
             return Cue::Done;
         }
         if !self.turned && self.coverage.turns_done() {
@@ -731,19 +824,150 @@ mod tests {
     }
 
     /// The quick capture's motion, `speed` times as fast as a calm one: looking down and up and
-    /// tilting toward each shoulder by 20 degrees (4 s), then looking over each shoulder, 100
+    /// tilting toward each shoulder by `deg` degrees (4 s), then looking over each shoulder, 100
     /// degrees each way (6 s), then still.
-    fn quick_head(t: f64, speed: f64) -> UnitQuaternion<f64> {
+    fn quick_head_by(t: f64, speed: f64, deg: f64) -> UnitQuaternion<f64> {
         let t = t * speed;
         let (mut nod, mut tilt, mut yaw) = (0.0, 0.0, 0.0);
         if t < 2.0 {
-            nod = 20.0 * (std::f64::consts::PI * t).sin();
+            nod = deg * (std::f64::consts::PI * t).sin();
         } else if t < 4.0 {
-            tilt = 20.0 * (std::f64::consts::PI * (t - 2.0)).sin();
+            tilt = deg * (std::f64::consts::PI * (t - 2.0)).sin();
         } else if t < 10.0 {
             yaw = 100.0 * (std::f64::consts::PI * (t - 4.0) / 3.0).sin();
         }
         rot(Vector3::y(), yaw) * rot(Vector3::x(), nod) * rot(Vector3::z(), tilt)
+    }
+
+    fn quick_head(t: f64, speed: f64) -> UnitQuaternion<f64> {
+        quick_head_by(t, speed, 20.0)
+    }
+
+    /// What the fit makes of `secs` of the head's motion, paired as the fit pairs a headset
+    /// capture: the headset's pose and a controller's held to it, one in ten of the controller's
+    /// samples, 43 a second; the stretch on the headset is searched for first, as setup does.
+    fn fit_rotation_test(
+        head: impl Fn(f64) -> UnitQuaternion<f64>,
+        secs: f64,
+    ) -> Result<(), String> {
+        use crate::register::{bootstrap_span, solve};
+        let iso = |x: f64, y: f64, z: f64, r: UnitQuaternion<f64>| {
+            nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(x, y, z), r)
+        };
+        let world = iso(0.3, -0.2, 0.5, rot(Vector3::new(0.3, 1.0, -0.2), 25.0));
+        let hold = iso(0.08, 0.02, -0.05, rot(Vector3::new(1.0, 0.2, 0.5), 70.0));
+        let timed: Vec<_> = (0..)
+            .map(|k| k as f64 / 43.0)
+            .take_while(|&t| t < secs)
+            .map(|t| {
+                let headset = iso(0.0, 1.7, 0.0, head(t));
+                ((t * 1e9) as u64, headset, world.inverse() * headset * hold)
+            })
+            .collect();
+        let span = bootstrap_span(&timed).map_err(|e| e.unwrap_or("no stretch found".into()))?;
+        let pairs: Vec<_> = timed[span].iter().map(|p| (p.1, p.2)).collect();
+        solve(&pairs, &Options::headset()).map(|_| ())
+    }
+
+    #[test]
+    fn a_quick_capture_ends_only_on_rotations_the_fit_accepts() {
+        let id = UnitQuaternion::identity();
+        // nods and tilts of 16 or 20 degrees, a second each way, turn the fit's chain of
+        // relative rotations of 20 degrees about the vertical only
+        for (deg, speed, ends) in [
+            (16.0, 1.0, false),
+            (20.0, 1.0, false),
+            (20.0, 0.6, true),
+            (30.0, 1.0, true),
+            (30.0, 2.0, true),
+        ] {
+            let head = move |t: f64| quick_head_by(t, speed, deg);
+            let got = cues_of(true, head, true, 60.0, |_| [id, id]);
+            if ends {
+                let &(t, cue) = got.last().unwrap();
+                assert_eq!(cue, Cue::Done, "{deg} deg at {speed}: {got:?}");
+                let fit = fit_rotation_test(head, t);
+                assert!(
+                    fit.is_ok(),
+                    "{deg} deg at {speed}: done at {t} s, then {fit:?}"
+                );
+            } else {
+                assert!(got.is_empty(), "{deg} deg at {speed}: {got:?}");
+                assert!(
+                    fit_rotation_test(head, 60.0).is_err(),
+                    "{deg} deg at {speed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_quick_capture_needs_the_rotations_within_one_window_of_the_fits_search() {
+        let id = UnitQuaternion::identity();
+        // a small nod and tilt, the looks over each shoulder, and only half a minute later a
+        // deep nod: the whole capture turns about two axes, no 25 s of it does
+        let head = |t: f64| {
+            let swing = |from: f64, deg: f64| {
+                if (from..from + 1.0).contains(&t) {
+                    deg * (2.0 * std::f64::consts::PI * (t - from)).sin()
+                } else {
+                    0.0
+                }
+            };
+            let yaw = if (2.0..8.0).contains(&t) {
+                100.0 * (std::f64::consts::PI * (t - 2.0) / 3.0).sin()
+            } else {
+                0.0
+            };
+            rot(Vector3::y(), yaw)
+                * rot(Vector3::x(), swing(0.0, 16.0) + swing(32.0, 40.0))
+                * rot(Vector3::z(), swing(1.0, 16.0))
+        };
+        assert!(fit_rotation_test(head, 60.0).is_err());
+        assert!(cues_of(true, head, true, 60.0, |_| [id, id]).is_empty());
+    }
+
+    #[test]
+    fn a_quick_capture_needs_the_rotations_over_the_whole_capture() {
+        let id = UnitQuaternion::identity();
+        // looking over each shoulder again and again for 40 s, then nodding and tilting: the
+        // last 25 s turn about all three axes, the whole capture about the vertical almost only
+        let head = |t: f64| {
+            if t < 40.0 {
+                rot(Vector3::y(), 100.0 * (std::f64::consts::PI * t / 3.0).sin())
+            } else {
+                quick_head_by(t - 40.0, 1.0, 25.0)
+            }
+        };
+        assert!(fit_rotation_test(head, 60.0).is_err());
+        assert!(cues_of(true, head, true, 60.0, |_| [id, id]).is_empty());
+    }
+
+    #[test]
+    fn a_quick_capture_ends_soon_after_the_fit_would_accept_it() {
+        let id = UnitQuaternion::identity();
+        // nods and tilts too small and brisk for the fit, then at 20 s a deeper nod
+        let head = |t: f64| {
+            let deeper = if (20.0..22.0).contains(&t) {
+                30.0 * (std::f64::consts::PI * (t - 20.0)).sin()
+            } else {
+                0.0
+            };
+            rot(Vector3::x(), deeper) * quick_head(t, 1.0)
+        };
+        let accepted = (0..)
+            .map(|k| k as f64 * 0.05)
+            .find(|&t| t > 60.0 || fit_rotation_test(head, t).is_ok())
+            .unwrap();
+        assert!((20.0..22.0).contains(&accepted), "{accepted}");
+        let got = cues_of(true, head, true, 60.0, |_| [id, id]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1, Cue::Done);
+        assert!(
+            (accepted - 0.1..accepted + 0.5).contains(&got[0].0),
+            "done at {} s, the fit accepts from {accepted} s",
+            got[0].0
+        );
     }
 
     #[test]
@@ -754,8 +978,14 @@ mod tests {
         assert_eq!(calm.len(), 1, "{calm:?}");
         assert_eq!(calm[0].1, Cue::Done);
         assert!((16.3..16.9).contains(&calm[0].0), "{calm:?}");
-        // brisk: the motion is over in 5 s, but the fit needs longer
-        let brisk = cues_of(true, |t| quick_head(t, 2.0), true, 30.0, |_| [id, id]);
+        // brisk and deeper: the motion is over in 5 s, but the fit needs longer
+        let brisk = cues_of(
+            true,
+            |t| quick_head_by(t, 2.0, 30.0),
+            true,
+            30.0,
+            |_| [id, id],
+        );
         assert_eq!(brisk.len(), 1, "{brisk:?}");
         assert_eq!(brisk[0].1, Cue::Done);
         let min_s = MIN_CAPTURE_NS as f64 * 1e-9;
