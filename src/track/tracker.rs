@@ -92,7 +92,8 @@ pub struct Params {
     /// tracker's own (shift-search) association to re-lock without the engine.
     pub relock_ns: u64,
     /// A wrong lock (a pose that fits the LEDs but is turned from the truth) leaks gravity into the
-    /// filter, which drives the accelerometer bias off: beyond this (m/s^2) the track is dropped.
+    /// filter, which drives the accelerometer bias off: beyond this (m/s^2) the track is dropped,
+    /// and no track starts from such a bias.
     /// Tested on the state that holds all of an exposure's fixes, once a later exposure's frame
     /// comes (or the IMU passes the exposure's last possible frame): between two sensors' fixes
     /// of one exposure the bias swings with the order they arrive in.
@@ -957,10 +958,15 @@ impl Tracker {
         if self
             .history
             .back()
-            .is_some_and(|&(_, f)| f.x.ba.norm() > self.params.max_accel_bias)
+            .is_some_and(|(_, f)| self.bias_ran_off(f))
         {
             self.drop_wrong_lock();
         }
+    }
+
+    /// Whether `f`'s accelerometer bias is beyond `Params::max_accel_bias`: a wrong lock's.
+    fn bias_ran_off(&self, f: &Filter) -> bool {
+        f.x.ba.norm() > self.params.max_accel_bias
     }
 
     /// Drops the track as a wrong lock: the biases go back to what it started from, the
@@ -1476,6 +1482,20 @@ impl Tracker {
                 return Outcome::TooOld;
             }
         };
+        // A bias the wrong-lock test rejects is no start for a track: it would be dropped at its
+        // next exposure and the next track restored to the same bias, for as long as the
+        // controller is in view. A state can come by one without a wrong lock: a zero-velocity
+        // update on a state dead-reckoned for seconds out of view. It is learned afresh.
+        let carried = carried.map(|mut f| {
+            if self.bias_ran_off(&f) {
+                let sd = self.params.acquire_sd[4];
+                f.x.ba = Vector3::zeros();
+                f.cov.fixed_rows_mut::<3>(BA).fill(0.0);
+                f.cov.fixed_columns_mut::<3>(BA).fill(0.0);
+                f.cov.fixed_view_mut::<3, 3>(BA, BA).fill_diagonal(sd * sd);
+            }
+            f
+        });
         let memory = carried.filter(|_| remembered);
         // the alias taken in place of the engine's pose, if one was
         let mut turned_by = None;
@@ -4714,6 +4734,35 @@ mod tests {
         assert!(tr.tracking());
         let ba = tr.history.back().unwrap().1.x.ba;
         assert!((ba - w.ba).norm() < 0.1, "ba {ba:?}, true {:?}", w.ba);
+    }
+
+    /// A track does not start from an accelerometer bias the wrong-lock test rejects, however the
+    /// state it starts from came by it (a zero-velocity update on a state dead-reckoned for seconds
+    /// out of view can leave one), and a drop does not restore it: each track would be dropped at
+    /// its next exposure and the next one restored to the same bias, for as long as the controller
+    /// is in view.
+    #[test]
+    fn a_track_never_starts_from_a_bias_the_wrong_lock_test_rejects() {
+        let w = world(5);
+        let ran_off = Run {
+            seed: Some((w.bg, Vector3::new(1.3, 0.0, 0.0))),
+            ..Run::default()
+        };
+        let (tr, _) = run_with(&w, 6.0, 0.3, &ran_off);
+        assert_eq!(tr.stats.wrong_locks, 0, "{:?}", tr.stats);
+        assert_eq!(tr.stats.acquisitions, 1, "{:?}", tr.stats);
+        assert!(tr.tracking());
+        let ba = tr.history.back().unwrap().1.x.ba;
+        assert!((ba - w.ba).norm() < 0.1, "ba {ba:?}, true {:?}", w.ba);
+        // a drop goes back to the bias the track started from: the fresh one
+        let dropped = Run {
+            drop_at: Some(2.0),
+            ..ran_off
+        };
+        let (tr, _) = run_with(&w, 6.0, 0.3, &dropped);
+        assert_eq!(tr.stats.wrong_locks, 1, "{:?}", tr.stats);
+        assert!(!tr.bias_ran_off(&tr.saved_bias.unwrap()));
+        assert!(tr.tracking(), "{:?}", tr.stats);
     }
 
     /// After a wrong lock the engine tends to offer the same wrong pose again: poses agreeing with
