@@ -450,9 +450,11 @@ fn state_text(s: &ControllerState) -> &'static str {
 }
 
 /// The battery level the controller sent last, while it is on: the radio carries it only from an
-/// awake controller, so the level of one asleep or out of range would be old news.
+/// awake controller, so the level of one asleep or out of range would be old news. A controller
+/// that has just fallen asleep stays connected while its pose is held, so both flags are read.
 pub fn battery_percent(s: &ControllerState) -> Option<i32> {
-    (s.flags & FLAG_CONNECTED != 0 && s.battery_percent >= 0).then_some(s.battery_percent)
+    let on = s.flags & (FLAG_CONNECTED | FLAG_ASLEEP) == FLAG_CONNECTED;
+    (on && s.battery_percent >= 0).then_some(s.battery_percent)
 }
 
 fn battery_text(s: &ControllerState) -> String {
@@ -834,6 +836,17 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[2], " left: 6DoF");
         assert_eq!(lines[3], "right: 6DoF, battery 0 %");
+    }
+
+    #[test]
+    fn battery_is_not_reported_during_the_sleep_hold() {
+        let held = || ControllerState {
+            battery_percent: 50,
+            ..state(FLAG_CALIBRATED | FLAG_CONNECTED | FLAG_RADIO_GAP | FLAG_ASLEEP)
+        };
+        assert_eq!(battery_percent(&held()), None);
+        let text = render(&[held(), held()], &[], &HashMap::new(), 0.0);
+        assert!(!text.contains("battery"), "{text}");
     }
 
     #[test]
