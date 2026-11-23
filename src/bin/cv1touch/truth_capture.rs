@@ -25,6 +25,7 @@ pub(super) struct Frame {
 pub(super) struct Sampler {
     pub tracks: BTreeMap<String, Vec<[f64; 8]>>,
     pub kinds: BTreeMap<String, String>,
+    pub systems: BTreeMap<String, String>,
     pub hmd_index: Option<usize>,
     slots: [Slot; vr::MAX_DEVICES],
     next_index: usize,
@@ -36,6 +37,7 @@ impl Default for Sampler {
         Self {
             tracks: BTreeMap::new(),
             kinds: BTreeMap::new(),
+            systems: BTreeMap::new(),
             hmd_index: None,
             slots: std::array::from_fn(|_| Slot::default()),
             next_index: 0,
@@ -88,6 +90,8 @@ impl Sampler {
                 _ => "other",
             };
             self.kinds.insert(d.serial.clone(), kind.into());
+            self.systems
+                .insert(d.serial.clone(), d.tracking_system.clone());
         }
         self.hmd_index = self.slots.iter().position(|slot| {
             slot.device

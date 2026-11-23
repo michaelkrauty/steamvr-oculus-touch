@@ -59,6 +59,10 @@ pub struct Registration {
     /// The Touch that was held ("left"/"right") and the reference controller's serial.
     pub touch: String,
     pub reference: String,
+    /// The reference's `Prop_TrackingSystemName_String`; empty in files from before it was
+    /// recorded (see `lighthouse_tracked`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reference_system: String,
     pub pairs: usize,
     pub pos_rms_mm: f64,
     pub rot_rms_deg: f64,
@@ -77,6 +81,16 @@ pub struct Registration {
     /// tracking base, and those earlier registrations against the same calibration measured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub measured: Vec<MeasuredStation>,
+}
+
+/// Whether base stations track a device, by its tracking system, or by its serial (as
+/// `steamvr_log` tells Lighthouse devices apart) where the system was not recorded.
+pub fn lighthouse_tracked(system: &str, serial: &str) -> bool {
+    if system.is_empty() {
+        serial.starts_with("LHR-")
+    } else {
+        system == "lighthouse"
+    }
 }
 
 /// A base station's pose in the cv1touch world, measured by a registration: SteamVR tracked the
@@ -1378,6 +1392,7 @@ mod tests {
             universe_id: 1_634_567_890_123,
             touch: "left".into(),
             reference: "LHR-TEST-HMD".into(),
+            reference_system: String::new(),
             pairs: 5400,
             pos_rms_mm: 3.1,
             rot_rms_deg: 0.4,
@@ -1525,6 +1540,38 @@ mod tests {
             assert!(error.contains("LHB-BAD"), "{error}");
             assert!(error.contains("quaternion"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_registration_says_whether_base_stations_tracked_its_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("registration.json");
+        let tracked =
+            |reg: &Registration| lighthouse_tracked(&reg.reference_system, &reg.reference);
+        // files from before the field: by the reference's serial
+        save(&path, &registration()).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("reference_system"));
+        assert!(tracked(&load_registration(&path).unwrap()));
+        let other = Registration {
+            reference: "HMD-TEST".into(),
+            ..registration()
+        };
+        save(&path, &other).unwrap();
+        assert!(!tracked(&load_registration(&path).unwrap()));
+        // the recorded system decides
+        let inside_out = Registration {
+            reference_system: "oculus".into(),
+            ..registration()
+        };
+        save(&path, &inside_out).unwrap();
+        assert_eq!(load_registration(&path).unwrap(), inside_out);
+        assert!(!tracked(&inside_out));
+        assert!(tracked(&Registration {
+            reference_system: "lighthouse".into(),
+            ..other
+        }));
     }
 
     #[test]

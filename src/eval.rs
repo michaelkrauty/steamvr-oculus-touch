@@ -394,6 +394,10 @@ pub struct TruthFile {
     /// device when SteamVR's log could not be read, is not in it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tracking_bases: std::collections::BTreeMap<String, String>,
+    /// Each device's `Prop_TrackingSystemName_String`, by serial; empty in captures from before
+    /// it was recorded (see `align::lighthouse_tracked`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tracking_systems: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

@@ -1745,6 +1745,8 @@ fn register_solve(
         universe_id: universe,
         touch: name.into(),
         reference: reference.to_string(),
+        // an Index controller (`vr::find_reference`)
+        reference_system: "lighthouse".into(),
         pairs: sol.pairs,
         pos_rms_mm: sol.pos_rms_m * 1e3,
         rot_rms_deg: sol.rot_rms_deg,
@@ -2005,6 +2007,7 @@ fn paced_truth_file(
     sampled: TruthSampler,
     tracking_bases: BTreeMap<String, String>,
 ) -> eval::TruthFile {
+    let tracking_systems = sampled.systems.clone();
     let (samples, others) = sampled.into_paced_tracks(&reference);
     eval::TruthFile {
         format: eval::TRUTH_FORMAT.into(),
@@ -2015,6 +2018,7 @@ fn paced_truth_file(
         samples,
         others,
         tracking_bases,
+        tracking_systems,
     }
 }
 
@@ -3451,14 +3455,9 @@ fn capture_free_named_with_feedback(
         }
     };
     let devices = client.devices();
-    let universe = devices
-        .iter()
-        .find_map(|d| {
-            client
-                .uint64_property(d.index, vr::PROP_CURRENT_UNIVERSE_ID)
-                .filter(|&u| u != 0)
-        })
-        .unwrap_or(0);
+    let universe = capture_universe(&devices, |d| {
+        client.uint64_property(d.index, vr::PROP_CURRENT_UNIVERSE_ID)
+    });
     let base = base
         .map(Path::to_path_buf)
         .unwrap_or_else(|| state_dir().join(format!("eval-{}", unix_now())));
@@ -3521,7 +3520,7 @@ fn capture_free_named_with_feedback(
                 std::thread::sleep(Duration::from_millis(2));
             }
             let sampled = sampled.finish(|i| client.device(i));
-            (sampled.tracks, sampled.kinds)
+            (sampled.tracks, sampled.kinds, sampled.systems)
         })
     };
     // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
@@ -3571,7 +3570,7 @@ fn capture_free_named_with_feedback(
     }
     let end = shm::now_ns();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (tracks, kinds) = sampler.join().unwrap_or_default();
+    let (tracks, kinds, tracking_systems) = sampler.join().unwrap_or_default();
     let tracking_bases = bases.finish();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
@@ -3640,6 +3639,7 @@ fn capture_free_named_with_feedback(
         samples,
         others,
         tracking_bases,
+        tracking_systems,
     };
     let truth_path = base.with_extension("truth.json");
     if let Err(e) = std::fs::write(
@@ -3667,6 +3667,17 @@ fn capture_free_named_with_feedback(
 }
 
 type PoseTrack = (String, Vec<[f64; 8]>);
+
+/// The universe a capture is in: the headset's, which SteamVR goes by when several tracking
+/// systems are present and the driver gives the Touches; any device's when the headset has none.
+fn capture_universe(devices: &[vr::Device], universe: impl Fn(&vr::Device) -> Option<u64>) -> u64 {
+    devices
+        .iter()
+        .filter(|d| d.class == vr::CLASS_HMD)
+        .chain(devices)
+        .find_map(|d| universe(d).filter(|&u| u != 0))
+        .unwrap_or(0)
+}
 
 /// A capture's reference and the other tracks: a Lighthouse controller when one was tracked (the
 /// one with the most poses), else the headset; never our own Touches, which SteamVR shows too.
@@ -4791,6 +4802,10 @@ fn capture_measurements(
     previous: &[align::MeasuredStation],
     calibration_unix_s: u64,
 ) -> Result<(Option<align::MeasuredStation>, Vec<align::MeasuredStation>), String> {
+    if !tracked_by_stations(tf, reference) {
+        println!("base stations do not track {reference}: no station measured");
+        return Ok((None, Vec::new()));
+    }
     let track = |serial: &str| {
         let o = tf
             .others
@@ -4823,6 +4838,22 @@ fn capture_measurements(
     Ok((None, Vec::new()))
 }
 
+/// Whether base stations tracked a device of the capture (`align::lighthouse_tracked`).
+fn tracked_by_stations(tf: &eval::TruthFile, serial: &str) -> bool {
+    let system = tf.tracking_systems.get(serial).map_or("", String::as_str);
+    align::lighthouse_tracked(system, serial)
+}
+
+/// The base stations of a capture whose reference they tracked: none for a reference another
+/// tracking system tracked, even with stations in the room tracking other devices.
+fn capture_stations(tf: &eval::TruthFile, reference: &str) -> align::Stations {
+    if tracked_by_stations(tf, reference) {
+        truth_stations(tf)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Registration from a capture in which the Touches moved rigidly with the reference (pressed to
 /// the headset while the wearer turns, looks up and down and tilts): every 20 ms a pair.
 fn initial_registration(universe_id: u64) -> align::Registration {
@@ -4834,6 +4865,7 @@ fn initial_registration(universe_id: u64) -> align::Registration {
         universe_id,
         touch: String::new(),
         reference: String::new(),
+        reference_system: String::new(),
         pairs: 0,
         pos_rms_mm: 0.0,
         rot_rms_deg: 0.0,
@@ -4910,20 +4942,22 @@ fn register_from_capture_with(
         let (had_registration, mut reg) = registration_seed(&reg_path, tf.universe_id, reuse)?;
         let (ref_serial, ref_samples) = truth_track(&tf, reference)?;
         println!("reference {ref_serial}");
+        let lighthouse = tracked_by_stations(&tf, &ref_serial);
         let tracking_base = capture_tracking_base(&tf, tracking_base, &ref_serial)?;
         let holds = calib::rig::holds(&ref_samples, 1_500_000_000);
         let published = capture_poses(base)?;
         // the registration as the daemon applied it during the capture: followed through any
         // re-solve of the universe since it was made
-        let stations = truth_stations(&tf);
+        let stations = capture_stations(&tf, &ref_serial);
         // SteamVR's layouts so far, with those earlier captures and this one saw: they place the
         // stations no registration measured
         let mut history = align::load_layouts(&align::layouts_path());
-        let earlier = if history.of(tf.universe_id).len() < LAYOUTS_FROM_CAPTURES_BELOW {
-            capture_layouts(tf.universe_id)
-        } else {
-            Vec::new()
-        };
+        let earlier =
+            if lighthouse && history.of(tf.universe_id).len() < LAYOUTS_FROM_CAPTURES_BELOW {
+                capture_layouts(tf.universe_id)
+            } else {
+                Vec::new()
+            };
         let captured_at = std::fs::metadata(&truth_path)
             .and_then(|m| m.modified())
             .ok()
@@ -5147,6 +5181,10 @@ fn register_from_capture_with(
                     let d = m.world_from_station.iso().inverse() * n.world_from_station.iso();
                     println!("  replaces the measurement of {} from the registration of {when} ({:.1} mm, {:.2} deg from it)", m.serial, d.translation.vector.norm() * 1e3, d.rotation.angle().to_degrees());
                 }
+                _ if !lighthouse => println!(
+                    "  drops the measurement of {} from the registration of {when}",
+                    m.serial
+                ),
                 _ => println!("  drops the measurement of {} from the registration of {when}: it was against another calibration", m.serial),
             }
         }
@@ -5171,6 +5209,11 @@ fn register_from_capture_with(
         reg.created_unix_s = unix_now();
         reg.universe_id = tf.universe_id;
         reg.reference = ref_serial.clone();
+        reg.reference_system = tf
+            .tracking_systems
+            .get(&ref_serial)
+            .cloned()
+            .unwrap_or_default();
         reg.touch = format!(
             "{} of {}",
             if follow {
@@ -5182,18 +5225,7 @@ fn register_from_capture_with(
         );
         // the universe the holds were measured in: the stations as the capture saw them
         reg.play_area = mean_position(held_pairs.iter().flatten().map(|p| &p.0));
-        reg.stations = tf
-            .others
-            .iter()
-            .filter(|o| o.kind == "base")
-            .filter_map(|o| {
-                let s = eval::truth_samples(&o.samples);
-                Some(align::StationPose {
-                    serial: o.serial.clone(),
-                    pose: align::PoseEntry::from_iso(&s.get(s.len() / 2)?.pose),
-                })
-            })
-            .collect();
+        reg.stations = preview.stations;
         reg.tracking_base = measured_now.map(|m| m.serial);
         reg.measured = measured;
         if added > 0 {
@@ -7367,13 +7399,15 @@ mod tests {
 
     #[test]
     fn capture_review_paced_truth_file_round_trips_into_registration_readers() {
-        let devices = vec![
+        let mut devices = vec![
             capture_device(0, vr::CLASS_HMD, "HEADSET"),
             capture_device(1, vr::CLASS_CONTROLLER, "INDEX-REFERENCE"),
             capture_device(2, vr::CLASS_CONTROLLER, "OTHER-CONTROLLER"),
             capture_device(3, vr::CLASS_TRACKING_REFERENCE, "BASE-A"),
             capture_device(4, vr::CLASS_TRACKING_REFERENCE, "BASE-OFFLINE"),
         ];
+        // a headset of another tracking system, beside Lighthouse devices
+        devices[0].tracking_system = "oculus".into();
         let mut sampled = TruthSampler::new(devices.clone());
         let polls = std::cell::Cell::new(0);
         let scans = std::cell::Cell::new(0);
@@ -7443,6 +7477,33 @@ mod tests {
         assert_eq!(stations.len(), 1);
         assert_eq!(stations[0].0, "BASE-A");
         assert_eq!(stations[0].1.translation.vector.y, 2.);
+        assert_eq!(decoded.tracking_systems["HEADSET"], "oculus");
+        assert_eq!(decoded.tracking_systems["INDEX-REFERENCE"], "lighthouse");
+        assert_eq!(capture_stations(&decoded, "INDEX-REFERENCE"), stations);
+        assert!(capture_stations(&decoded, "HEADSET").is_empty());
+    }
+
+    #[test]
+    fn a_capture_is_in_the_headset_universe() {
+        let devices = [
+            capture_device(0, vr::CLASS_TRACKING_REFERENCE, "BASE-A"),
+            capture_device(1, vr::CLASS_CONTROLLER, "INDEX"),
+            capture_device(2, vr::CLASS_HMD, "HEADSET"),
+        ];
+        let universe = |headset: Option<u64>| {
+            capture_universe(&devices, |d| {
+                if d.class == vr::CLASS_HMD {
+                    headset
+                } else {
+                    Some(7)
+                }
+            })
+        };
+        assert_eq!(universe(Some(9)), 9);
+        // a headset without one: any device's
+        assert_eq!(universe(Some(0)), 7);
+        assert_eq!(universe(None), 7);
+        assert_eq!(capture_universe(&devices, |_| None), 0);
     }
 
     #[test]
@@ -9115,6 +9176,42 @@ mod tests {
         assert_eq!(now.as_ref().map(|m| m.serial.as_str()), Some("LHB-TEST-A"));
         assert_eq!(kept.len(), 2);
         assert!(kept.contains(&earlier[0]));
+    }
+
+    #[test]
+    fn a_headset_base_stations_do_not_track_measures_no_station_and_is_not_refused() {
+        let x = nalgebra::Isometry3::identity();
+        let earlier = [align::MeasuredStation::from_fit(
+            "LHB-TEST-B",
+            &x,
+            &x,
+            5,
+            100,
+        )];
+        // the stations in the room tracked other devices, not this headset
+        let mut tf = tracked_capture(false);
+        tf.reference = "HMD-TEST".into();
+        tf.tracking_systems
+            .insert("HMD-TEST".into(), "oculus".into());
+        for base in [None, Some("LHB-TEST-A")] {
+            assert_eq!(
+                capture_measurements(&tf, base, "HMD-TEST", &x, &earlier, 100),
+                Ok((None, vec![]))
+            );
+        }
+        assert!(capture_stations(&tf, "HMD-TEST").is_empty());
+        // a capture from before the system was recorded: by the serial
+        tf.tracking_systems.clear();
+        assert_eq!(
+            capture_measurements(&tf, None, "HMD-TEST", &x, &earlier, 100),
+            Ok((None, vec![]))
+        );
+        assert!(capture_measurements(&tf, None, "LHR-TEST", &x, &earlier, 100).is_err());
+        // a Lighthouse headset: refused as before
+        tf.tracking_systems
+            .insert("LHR-TEST".into(), "lighthouse".into());
+        assert!(capture_measurements(&tf, None, "LHR-TEST", &x, &earlier, 100).is_err());
+        assert_eq!(capture_stations(&tf, "LHR-TEST").len(), 2);
     }
 
     #[test]
