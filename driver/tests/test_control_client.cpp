@@ -212,6 +212,24 @@ static void a_failed_acknowledgement_does_not_resend_the_request()
 	}
 }
 
+/* The reply comes back to a caller that asks for it (the base-station pin's answer). */
+static void the_reply_is_returned_when_asked_for()
+{
+	Paths p;
+	Server legacy(p.legacy);
+	ControlClient c(p.legacy, {}, kControlTestTimeoutMs);
+	std::string got = "stale";
+	auto reply = legacy.reply("ok 1 2 3\n", "pin 0 0 0\n");
+	assert(c.send("pin 0 0 0\n", &got));
+	reply.join();
+	assert(got == "ok 1 2 3\n");
+	reply = legacy.reply("err no\n", "pin 0 0 0\n");
+	got = "kept";
+	assert(!c.send("pin 0 0 0\n", &got));
+	reply.join();
+	assert(got == "kept");
+}
+
 static void the_shared_socket_requires_a_private_real_directory()
 {
 	Paths p;
@@ -291,6 +309,7 @@ int main(int argc, char **argv)
 	other_connection_errors_do_not_fall_back();
 	a_failed_acknowledgement_does_not_resend_the_request();
 	the_shared_socket_requires_a_private_real_directory();
+	the_reply_is_returned_when_asked_for();
 	the_haptic_worker_uses_and_remembers_the_same_fallback();
 	default_constructors_reach_the_shared_socket(false);
 	default_constructors_reach_the_shared_socket(true);

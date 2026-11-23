@@ -3,6 +3,7 @@
 
 #include "stations.h"
 
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 
@@ -44,6 +45,33 @@ std::string stations_line(const std::vector<StationPose> &stations)
 		line += buf;
 	}
 	return line + "\n";
+}
+
+std::string pin_line(const PinKeys &k, bool quit)
+{
+	char buf[64];
+	std::snprintf(buf, sizeof buf, "pin %d %d %d%s\n", static_cast<int>(k.pin), static_cast<int>(k.ours), static_cast<int>(k.unpinned), quit ? " quit" : "");
+	return buf;
+}
+
+bool pin_reply(const std::string &reply, PinKeys *want)
+{
+	if (reply.rfind("ok ", 0) != 0 || reply.back() != '\n')
+		return false;
+	const char *p = reply.data() + 3, *const end = reply.data() + reply.size() - 1;
+	int32_t v[3];
+	for (int i = 0; i < 3; i++) {
+		if (i && (p == end || *p++ != ' '))
+			return false;
+		const auto [next, error] = std::from_chars(p, end, v[i]);
+		if (error != std::errc())
+			return false;
+		p = next;
+	}
+	if (p != end)
+		return false;
+	*want = {v[0], v[1], v[2]};
+	return true;
 }
 
 static bool same_pose(const StationPose &a, const StationPose &b)

@@ -241,7 +241,7 @@ static bool owned_by_this_user(HANDLE pipe)
 }
 
 /* One request, one reply line; the 100 ms default keeps a stuck daemon from piling commands up. */
-bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms)
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms, std::string *reply_out)
 {
 	const std::wstring name = control_pipe_name(path);
 	if (name.empty() || !timeout_ms)
@@ -269,6 +269,8 @@ bool send_control_line(const std::string &path, const std::string &line, uint32_
 	if (ok) {
 		char reply[256];
 		ok = pipe_io(pipe, event, false, reply, sizeof reply - 1, &moved, timeout_ms) && moved >= 2 && std::strncmp(reply, "ok", 2) == 0;
+		if (ok && reply_out)
+			reply_out->assign(reply, moved);
 	}
 	if (event)
 		CloseHandle(event);
@@ -322,30 +324,32 @@ static int connect_control_socket(const std::string &path, int *connect_error, u
 }
 
 /* One request, one reply line; the 100 ms default keeps a stuck daemon from piling commands up. */
-static bool exchange_control_line(int fd, const std::string &line)
+static bool exchange_control_line(int fd, const std::string &line, std::string *reply_out)
 {
 	bool ok = send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size());
 	if (ok) {
 		char reply[256];
 		const ssize_t n = read(fd, reply, sizeof reply - 1);
 		ok = n >= 2 && std::strncmp(reply, "ok", 2) == 0;
+		if (ok && reply_out)
+			reply_out->assign(reply, static_cast<size_t>(n));
 	}
 	close(fd);
 	return ok;
 }
 
-bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms)
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms, std::string *reply)
 {
 	int error = 0;
 	const int fd = connect_control_socket(path, &error, timeout_ms);
-	return fd >= 0 && exchange_control_line(fd, line);
+	return fd >= 0 && exchange_control_line(fd, line, reply);
 }
 #endif
 
-bool ControlClient::send(const std::string &line)
+bool ControlClient::send(const std::string &line, std::string *reply)
 {
 #ifdef _WIN32
-	return send_control_line(paths_[0], line, timeout_ms_);
+	return send_control_line(paths_[0], line, timeout_ms_, reply);
 #else
 	path_too_long_ = false;
 	for (unsigned attempt = 0; attempt < 2; attempt++) {
@@ -373,7 +377,7 @@ bool ControlClient::send(const std::string &line)
 		}
 		if (fd >= 0) {
 			last_ = which;
-			return exchange_control_line(fd, line);
+			return exchange_control_line(fd, line, reply);
 		}
 		if (error != ENOENT && error != ECONNREFUSED)
 			return false;

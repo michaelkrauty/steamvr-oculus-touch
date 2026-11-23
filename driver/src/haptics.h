@@ -21,9 +21,10 @@ HapticCommand clamp_haptic(int hand, float duration_s, float frequency_hz, float
 /* "haptic left|right <s> <hz> <amp>\n" */
 std::string haptic_line(const HapticCommand &c);
 
-/* One request line to the daemon's control socket, one reply line back ("ok..." is success);
- * Defaults to 100 ms; socket fixtures can allow more time for their peer to be scheduled. */
-bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms = 100);
+/* One request line to the daemon's control socket, one reply line back ("ok..." is success, kept
+ * in `reply` when given); Defaults to 100 ms; socket fixtures can allow more time for their peer
+ * to be scheduled. */
+bool send_control_line(const std::string &path, const std::string &line, uint32_t timeout_ms = 100, std::string *reply = nullptr);
 #ifndef _WIN32
 /* The same UID-scoped path and private-directory policy as src/platform/unix.rs. */
 std::string container_socket_path(uint32_t uid);
@@ -36,7 +37,8 @@ class ControlClient {
 public:
 	explicit ControlClient(uint32_t timeout_ms = 100);
 	explicit ControlClient(std::string path, std::string fallback = {}, uint32_t timeout_ms = 100);
-	bool send(const std::string &line);
+	/* Success is an "ok..." reply, kept in `reply` when given. */
+	bool send(const std::string &line, std::string *reply = nullptr);
 	const std::string &path() const { return paths_[last_]; }
 #ifndef _WIN32
 	/* The last send rejected an overlong address and already logged its cause. */

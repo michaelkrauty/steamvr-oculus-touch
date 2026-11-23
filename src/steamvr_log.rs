@@ -20,8 +20,17 @@ use crate::log_lines::{LineBuffer, READ_BYTES};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// `device` is tracked from base station `base` (OpenVR serial) from now on; `headset` when
-    /// SteamVR logs the device as the headset.
+    /// SteamVR logs the device as the headset, `preferred` when SteamVR started from `base`
+    /// because its settings name it (`base_pin`) rather than by its own choice.
     Bootstrapped {
+        device: String,
+        headset: bool,
+        base: String,
+        preferred: bool,
+    },
+    /// SteamVR waits for base station `base`, which its settings name, before it tracks
+    /// `device` (`base_pin`).
+    Waiting {
         device: String,
         headset: bool,
         base: String,
@@ -30,6 +39,9 @@ pub enum Event {
     Lost { device: String },
     /// Every device lost its tracking: the universe was dropped, or the Lighthouse driver started.
     AllLost,
+    /// The Lighthouse driver started (`lighthouse: version X`): a new SteamVR session, in which
+    /// nothing is tracked yet. SteamVR appends several sessions to one log.
+    Started,
     /// Log input or event history was discarded; earlier bases cannot be trusted.
     Skipped,
 }
@@ -37,19 +49,25 @@ pub enum Event {
 impl Event {
     fn device(&self) -> Option<&str> {
         match self {
-            Event::Bootstrapped { device, .. } | Event::Lost { device } => Some(device),
-            Event::AllLost | Event::Skipped => None,
+            Event::Bootstrapped { device, .. }
+            | Event::Waiting { device, .. }
+            | Event::Lost { device } => Some(device),
+            Event::AllLost | Event::Started | Event::Skipped => None,
         }
     }
 }
 
 /// The log line's event, if it is one: the Lighthouse driver's
 /// `lighthouse: LHR-XXXXXXXX H: ----- BOOTSTRAPPED base 2B1973A2 (best) ...`,
+/// `... H: Saw 4 bases and none are the preferred base 2B1973A2`,
 /// `... H: Resetting tracking: ...`, `... H: Calibration failed: ...`,
 /// `lighthouse: Stopped tracking with universe N` and `lighthouse: version X`.
 pub fn parse_line(line: &str) -> Option<Event> {
     let (_, rest) = line.split_once("lighthouse: ")?;
-    if rest.starts_with("Stopped tracking with universe") || rest.starts_with("version ") {
+    if rest.starts_with("version ") {
+        return Some(Event::Started);
+    }
+    if rest.starts_with("Stopped tracking with universe") {
         return Some(Event::AllLost);
     }
     let (who, what) = rest.split_once(": ")?;
@@ -60,15 +78,28 @@ pub fn parse_line(line: &str) -> Option<Event> {
         (Some(tag), None) => tag == "H",
         (Some(_), Some(_)) => return None,
     };
-    if let Some(after) = what.strip_prefix("----- BOOTSTRAPPED base ") {
+    let station = |after: &str| {
         let hex = after.get(..8)?;
-        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) || !after[8..].starts_with(' ') {
-            return None;
-        }
+        (hex.bytes().all(|b| b.is_ascii_hexdigit())
+            && matches!(after[8..].bytes().next(), None | Some(b' ')))
+        .then(|| format!("LHB-{}", hex.to_ascii_uppercase()))
+    };
+    if let Some(after) = what.strip_prefix("----- BOOTSTRAPPED base ") {
         return Some(Event::Bootstrapped {
             device,
             headset,
-            base: format!("LHB-{}", hex.to_ascii_uppercase()),
+            base: station(after)?,
+            preferred: after[8..].starts_with(" (preferred)"),
+        });
+    }
+    if let Some((_, after)) = what
+        .strip_prefix("Saw ")
+        .and_then(|w| w.split_once(" bases and none are the preferred base "))
+    {
+        return Some(Event::Waiting {
+            device,
+            headset,
+            base: station(after)?,
         });
     }
     if what.starts_with("Resetting tracking") || what.starts_with("Calibration failed") {
@@ -87,6 +118,14 @@ pub struct Bases {
     /// Device serial -> the base station it last bootstrapped from, kept while it is without
     /// tracking (until SteamVR starts a new log or input is skipped).
     pub last: BTreeMap<String, String>,
+    /// Whether the headset's latest bootstrap was from the station SteamVR's settings name.
+    pub headset_preferred: bool,
+    /// The station SteamVR's settings name and it waits for before it tracks the headset, until
+    /// the headset bootstraps.
+    pub waiting_for: Option<String>,
+    /// Whether the headset has bootstrapped since the Lighthouse driver last started, or input
+    /// was skipped since then, which may have held its bootstrap.
+    tracked: bool,
     /// Skipped history makes an unnamed headset base unknown, rather than known to be lost.
     skipped: bool,
 }
@@ -98,20 +137,40 @@ impl Bases {
                 device,
                 headset,
                 base,
+                preferred,
             } => {
                 if *headset {
                     self.headset = Some(device.clone());
+                    self.headset_preferred = *preferred;
+                    self.waiting_for = None;
+                    self.tracked = true;
                 }
                 self.by_device.insert(device.clone(), base.clone());
                 self.last.insert(device.clone(), base.clone());
             }
+            Event::Waiting {
+                headset: true,
+                base,
+                ..
+            } => self.waiting_for = Some(base.clone()),
+            Event::Waiting { .. } => {}
             Event::Lost { device } => {
                 self.by_device.remove(device);
             }
-            Event::AllLost => self.by_device.clear(),
+            Event::AllLost => {
+                self.by_device.clear();
+                self.waiting_for = None;
+            }
+            Event::Started => {
+                self.by_device.clear();
+                self.waiting_for = None;
+                self.tracked = false;
+            }
             Event::Skipped => {
                 self.by_device.clear();
                 self.last.clear();
+                self.waiting_for = None;
+                self.tracked = true;
                 self.skipped = true;
             }
         }
@@ -120,6 +179,13 @@ impl Bases {
     /// Whether skipped input left the headset's base unknown. A later bootstrap names it again.
     pub fn tracking_unknown(&self, reference: &str) -> bool {
         self.skipped && self.last_of_headset(reference).is_none()
+    }
+
+    /// Whether SteamVR has tracked the headset at all in this session (since the Lighthouse
+    /// driver last started, or in this log when it names no start); skipped input, which may
+    /// have held its bootstrap, counts as tracked until the next start.
+    pub fn headset_tracked(&self) -> bool {
+        self.tracked
     }
 
     /// The base station `device` is tracked from now.
@@ -148,7 +214,10 @@ impl Bases {
 /// The devices whose tracking base was the same from `start` to `end` with nothing in `events`
 /// (what the log said in between) touching it: device serial -> base.
 pub fn steady(start: &Bases, end: &Bases, events: &[Event]) -> BTreeMap<String, String> {
-    if events.contains(&Event::AllLost) || events.contains(&Event::Skipped) {
+    if events
+        .iter()
+        .any(|e| matches!(e, Event::AllLost | Event::Started | Event::Skipped))
+    {
         return BTreeMap::new();
     }
     let touched: BTreeSet<&str> = events.iter().filter_map(Event::device).collect();
@@ -609,7 +678,8 @@ mod tests {
             Some(Event::Bootstrapped {
                 device: "LHR-D6E2112A".into(),
                 headset: true,
-                base: "LHB-2B1973A2".into()
+                base: "LHB-2B1973A2".into(),
+                preferred: false
             })
         );
         assert_eq!(
@@ -617,7 +687,8 @@ mod tests {
             Some(Event::Bootstrapped {
                 device: "LHR-D6E2112A".into(),
                 headset: true,
-                base: "LHB-C1E62875".into()
+                base: "LHB-C1E62875".into(),
+                preferred: false
             })
         );
         // a controller: no headset tag
@@ -626,7 +697,25 @@ mod tests {
             Some(Event::Bootstrapped {
                 device: "LHR-9A21C00A".into(),
                 headset: false,
-                base: "LHB-FB22E36C".into()
+                base: "LHB-FB22E36C".into(),
+                preferred: false
+            })
+        );
+        assert_eq!(
+            parse_line("x [Info] - lighthouse: LHR-D6E2112A H: ----- BOOTSTRAPPED base 2B1973A2 (preferred) distance 3.31m velocity 0.21m/s -----"),
+            Some(Event::Bootstrapped {
+                device: "LHR-D6E2112A".into(),
+                headset: true,
+                base: "LHB-2B1973A2".into(),
+                preferred: true
+            })
+        );
+        assert_eq!(
+            parse_line("x [Info] - lighthouse: LHR-D6E2112A H: Saw 4 bases and none are the preferred base 12345678"),
+            Some(Event::Waiting {
+                device: "LHR-D6E2112A".into(),
+                headset: true,
+                base: "LHB-12345678".into()
             })
         );
         assert_eq!(
@@ -647,13 +736,16 @@ mod tests {
         );
         assert_eq!(
             parse_line("x [Info] - lighthouse: version 2.17.10"),
-            Some(Event::AllLost)
+            Some(Event::Started)
         );
         for other in [
             "x [Info] - lighthouse: LHR-D6E2112A H: ----- SECONDARY base 2B1973A2 distance 3.25m -----",
             "x [Info] - lighthouse: Moving base 2B1973A2 88mm and 1.6 deg because of relationship with FB22E36C, which is closer to the origin",
             "x [Info] - lighthouse: LHR-D6E2112A H: ----- BOOTSTRAPPED base 2B19 (best) -----",
             "x [Info] - lighthouse: LHR-D6E2112A H: ----- BOOTSTRAPPED base 2B1973A2X (best) -----",
+            "x [Info] - lighthouse: LHR-D6E2112A H: Saw 4 bases and none are the preferred base 1234",
+            "x [Info] - lighthouse: LHR-D6E2112A H: Source: auto disambiguator (right sync) -- Preferred basestation 2B1973A2",
+            "x [Info] - lighthouse: LHR-D6E2112A H: Trying to start tracking from base FB22E36C: Not the preferred basestation",
             "x [Info] - lighthouse: 80CFF8E11C-RYB: Triggered keepalive (succeeded)",
             "x [Info] - New Connect message from /x/vrstartup",
         ] {
@@ -666,7 +758,33 @@ mod tests {
             device: device.into(),
             headset,
             base: base.into(),
+            preferred: false,
         }
+    }
+
+    /// SteamVR appends its sessions to one log: the Lighthouse driver's start line begins a
+    /// session in which the headset has not been tracked yet, whatever came before it.
+    #[test]
+    fn a_new_session_in_the_same_log_has_not_tracked_the_headset() {
+        let line = |s: &str| parse_line(s).unwrap();
+        let mut b = Bases::default();
+        assert!(!b.headset_tracked());
+        b.apply(&line(
+            "x lighthouse: LHR-EXAMPLE H: ----- BOOTSTRAPPED base 1234ABCD (best) distance 3m",
+        ));
+        assert!(b.headset_tracked());
+        b.apply(&line("x lighthouse: Stopped tracking with universe 1"));
+        assert!(b.headset_tracked(), "the session goes on");
+        b.apply(&line("x lighthouse: version 2.18.4"));
+        assert!(!b.headset_tracked());
+        assert_eq!(b.of_headset(), None);
+        b.apply(&Event::Skipped);
+        assert!(
+            b.headset_tracked(),
+            "skipped input may have held a bootstrap"
+        );
+        b.apply(&line("x lighthouse: version 2.18.4"));
+        assert!(!b.headset_tracked(), "the skip was the last session's");
     }
 
     #[test]

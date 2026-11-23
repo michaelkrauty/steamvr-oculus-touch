@@ -2,10 +2,12 @@
 // Copyright 2026 michaelkrauty
 
 //! Settings changed while the daemon runs that outlast it: the pitch the controllers are shown
-//! with (`cv1touch tilt`). The daemon saves them on every change and reads them when it starts;
-//! without a usable file it goes on with the defaults. Fields of older versions (the prediction
-//! percents and the latency adjustment) are ignored; the position percent is still written, as
-//! 100, because 0.4.3 and earlier refuse a file without it.
+//! with (`cv1touch tilt`), and whether SteamVR is kept starting from a measured base station
+//! (`pin_base_station`, set by hand; the daemon reads it again when the file changes). The
+//! daemon saves them on every change and reads them when it starts; without a usable file it
+//! goes on with the defaults. Fields of older versions (the prediction percents and the latency
+//! adjustment) are ignored; the position percent is still written, as 100, because 0.4.3 and
+//! earlier refuse a file without it.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,10 +32,22 @@ pub struct Settings {
     /// fixed angle). Within +-`MAX_TILT_DEG`; left out when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tilt_deg: Option<f64>,
+    /// Whether the SteamVR driver keeps SteamVR starting from a base station a headset
+    /// registration measured (`base_pin`); left out when on.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub pin_base_station: bool,
 }
 
 fn full_prediction() -> u32 {
     100
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(v: &bool) -> bool {
+    *v
 }
 
 /// The largest tilt accepted, degrees, either way.
@@ -53,6 +67,7 @@ impl Default for Settings {
             version: 1,
             prediction_percent: full_prediction(),
             tilt_deg: None,
+            pin_base_station: true,
         }
     }
 }
@@ -211,6 +226,27 @@ mod tests {
         assert_eq!(Settings::default().tilt_deg(), 0.0);
         save(&path, &Settings::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("tilt_deg"));
+    }
+
+    /// Base-station pinning is on unless the file turns it off, and written only when off.
+    #[test]
+    fn pinning_is_on_unless_turned_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
+        save(&path, &Settings::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("pin_base_station"));
+        assert!(load(&path).unwrap().pin_base_station);
+        std::fs::write(
+            &path,
+            r#"{"format":"cv1touch-settings","version":1,"pin_base_station":false}"#,
+        )
+        .unwrap();
+        let s = load(&path).unwrap();
+        assert!(!s.pin_base_station);
+        save(&path, &s).unwrap();
+        assert_eq!(load(&path), Ok(s));
     }
 
     /// A file from an older version keeps its tilt; its prediction percents and latency

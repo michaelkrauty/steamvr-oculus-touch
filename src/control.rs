@@ -40,6 +40,10 @@ pub enum Command {
     /// The base stations' raw poses, as the SteamVR driver sees them from inside vrserver:
     /// (serial, [x, y, z, qx, qy, qz, qw]).
     Stations(Vec<(String, [f64; 7])>),
+    /// SteamVR's base-station setting and cv1touch's records of it, as the SteamVR driver reads
+    /// them (`base_pin`), and whether it is the last report, as SteamVR quits (`quit`); the reply
+    /// says what to write, if anything.
+    Pin(crate::base_pin::Keys, bool),
     /// Turn the universe watch on or off (None shows it).
     UniverseWatch(Option<bool>),
     /// Degrees the controllers are shown pitched from their tracked pose, positive with the
@@ -234,6 +238,18 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 .collect::<Result<Vec<_>, String>>()
                 .map(Command::Stations)
         }
+        ["pin", pin, ours, unpinned, rest @ ..] if matches!(rest, [] | ["quit"]) => {
+            let v = |w: &str| w.parse::<i32>().map_err(|_| format!("pin: {w} is not a 32-bit integer"));
+            Ok(Command::Pin(
+                crate::base_pin::Keys {
+                    pin: v(pin)?,
+                    ours: v(ours)?,
+                    unpinned: v(unpinned)?,
+                },
+                !rest.is_empty(),
+            ))
+        }
+        ["pin", ..] => Err("usage: pin <setting> <ours> <unpinned> [quit]".into()),
         ["tilt"] => Ok(Command::Tilt(None)),
         ["tilt", deg] => deg
             .parse::<f64>()
@@ -887,6 +903,38 @@ mod tests {
             parse("stations LHB-1 1 2 3 0 0 0 0").is_err(),
             "a zero quaternion is no orientation"
         );
+        assert_eq!(
+            parse("pin 723088290 723088290 -1041880971"),
+            Ok(Command::Pin(
+                crate::base_pin::Keys {
+                    pin: 723088290,
+                    ours: 723088290,
+                    unpinned: -1041880971
+                },
+                false
+            ))
+        );
+        assert_eq!(
+            parse("pin 1 1 0 quit"),
+            Ok(Command::Pin(
+                crate::base_pin::Keys {
+                    pin: 1,
+                    ours: 1,
+                    unpinned: 0
+                },
+                true
+            ))
+        );
+        for bad in [
+            "pin",
+            "pin 1 2",
+            "pin 1 2 3 4",
+            "pin 1 2 3 stop",
+            "pin 1 2 3 quit quit",
+            "pin 1 2 2147483648",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         assert_eq!(parse("universe-watch"), Ok(Command::UniverseWatch(None)));
         assert_eq!(
             parse("universe-watch off"),

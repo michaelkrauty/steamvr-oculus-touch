@@ -10,6 +10,52 @@
 
 namespace cv1t {
 
+/* SteamVR's base-station setting and cv1touch's records of it (PinKeys), through SteamVR's own
+ * settings interface: SteamVR saves a change at once, and its Lighthouse driver reads the setting
+ * when SteamVR starts. */
+static const char *const kPinKeys[3][2] = {
+	{"driver_lighthouse", "primarybasestation"}, {"driver_cv1touch", "pinned_base"}, {"driver_cv1touch", "unpinned_base"}};
+
+static PinKeys read_pin()
+{
+	int32_t v[3];
+	for (int i = 0; i < 3; i++) {
+		vr::EVRSettingsError e = vr::VRSettingsError_None;
+		v[i] = vr::VRSettings()->GetInt32(kPinKeys[i][0], kPinKeys[i][1], &e);
+		if (e != vr::VRSettingsError_None)
+			v[i] = 0;
+	}
+	return {v[0], v[1], v[2]};
+}
+
+static void write_pin(const PinKeys &from, const PinKeys &to)
+{
+	const int32_t a[3] = {from.pin, from.ours, from.unpinned}, b[3] = {to.pin, to.ours, to.unpinned};
+	for (int i = 0; i < 3; i++) {
+		if (a[i] == b[i])
+			continue;
+		if (b[i])
+			vr::VRSettings()->SetInt32(kPinKeys[i][0], kPinKeys[i][1], b[i]);
+		else
+			vr::VRSettings()->RemoveKeyInSection(kPinKeys[i][0], kPinKeys[i][1]);
+	}
+	if (to.pin != from.pin && to.pin)
+		cv1t_log("cv1touch: base-station pin: %s.%s set to LHB-%08X for SteamVR's next start", kPinKeys[0][0], kPinKeys[0][1], static_cast<unsigned>(to.pin));
+	else if (to.pin != from.pin)
+		cv1t_log("cv1touch: base-station pin: %s.%s removed for SteamVR's next start", kPinKeys[0][0], kPinKeys[0][1]);
+}
+
+/* Reports the pin (the last report when `quit`) and writes what the daemon answers, only if no
+ * one changed it since it was read. */
+static void exchange_pin(ControlClient &control, bool quit)
+{
+	const PinKeys was = read_pin();
+	std::string reply;
+	PinKeys want;
+	if (control.send(pin_line(was, quit), &reply) && pin_reply(reply, &want) && want != was && read_pin() == was)
+		write_pin(was, want);
+}
+
 vr::EVRInitError Provider::Init(vr::IVRDriverContext *ctx)
 {
 	VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
@@ -53,6 +99,10 @@ void Provider::Cleanup()
 	running_ = false;
 	if (station_thread_.joinable())
 		station_thread_.join();
+	// the last base-station pin report, so that a pin SteamVR is still waiting for goes with
+	// this session (src/base_pin.rs, at_quit)
+	ControlClient control;
+	exchange_pin(control, true);
 	if (pose_thread_.joinable())
 		pose_thread_.join();
 	haptics_.stop();
@@ -76,11 +126,12 @@ void Provider::RunFrame()
  * read here inside vrserver, so the daemon needs no SteamVR connection of its own (each one costs
  * vrserver an app connect, binding load and disconnect). Looked at every 100 ms and sent when
  * they change, so a move SteamVR makes is followed at once, and every 2 s besides
- * (StationReports). */
+ * (StationReports). And every 2 s, the base-station pin (PinKeys). */
 void Provider::station_loop()
 {
 	ControlClient control;
 	StationReports reports;
+	uint64_t pin_ns = 0;
 	while (running_) {
 		vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 		vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.0f, poses, vr::k_unMaxTrackedDeviceCount);
@@ -95,8 +146,14 @@ void Provider::station_loop()
 				continue;
 			stations.push_back(station_pose(props->GetStringProperty(c, vr::Prop_SerialNumber_String), poses[i].mDeviceToAbsoluteTracking));
 		}
-		if (!stations.empty() && reports.due(stations, cv1t_now_ns()))
+		const uint64_t now = cv1t_now_ns();
+		if (!stations.empty() && reports.due(stations, now))
 			control.send(stations_line(stations));
+		// the base-station pin, every 2 s
+		if (now - pin_ns >= StationReports::KEEP_ALIVE_NS) {
+			pin_ns = now;
+			exchange_pin(control, false);
+		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
 }

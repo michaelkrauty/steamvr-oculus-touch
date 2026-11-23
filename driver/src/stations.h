@@ -23,6 +23,21 @@ StationPose station_pose(const std::string &serial, const vr::HmdMatrix34_t &m);
  * serial would split the line are left out). */
 std::string stations_line(const std::vector<StationPose> &stations);
 
+/* SteamVR's base-station setting (driver_lighthouse.primarybasestation) and cv1touch's records of
+ * it in its own section, 0 when not set: the driver reports them to the daemon every 2 s and
+ * writes what the daemon answers (src/base_pin.rs decides). */
+struct PinKeys {
+	int32_t pin = 0, ours = 0, unpinned = 0;
+	bool operator==(const PinKeys &) const = default;
+};
+
+/* "pin PIN OURS UNPINNED\n" for the daemon's control socket, with " quit" before the newline for
+ * the last report, as SteamVR quits. */
+std::string pin_line(const PinKeys &k, bool quit = false);
+/* The values the daemon's reply asks for ("ok PIN OURS UNPINNED"); false for a plain "ok", which
+ * leaves them as they are, and for anything else. */
+bool pin_reply(const std::string &reply, PinKeys *want);
+
 /* When the station thread, looking every 100 ms, sends the stations to the daemon: at once when
  * the set of stations or a pose changed since the last report, and otherwise every 2 s, which
  * keeps the daemon's copy fresh (it trusts one for 10 s). Two poses within 0.1 mm and 0.01 deg

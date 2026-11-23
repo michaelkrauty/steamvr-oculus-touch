@@ -1475,7 +1475,16 @@ fn run_stage(
             let tracked_from = tracked
                 .then(|| steamvr.bases.last_of_headset(reference))
                 .flatten();
-            println!("{}", ui::headset_base_plan(tracked_from, reg.as_ref()));
+            // a headset SteamVR tracks without base stations (Rift S, Quest) has none to measure
+            let lighthouse = vr::Client::connect().map_or(true, |c| {
+                c.devices()
+                    .iter()
+                    .all(|d| d.class != vr::CLASS_HMD || d.tracking_system == "lighthouse")
+            });
+            println!(
+                "{}",
+                ui::headset_base_plan(tracked_from, reg.as_ref(), lighthouse)
+            );
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
@@ -1544,11 +1553,15 @@ fn run_stage(
             if code != 0 {
                 code
             } else {
-                if let Ok(reg) = align::load_registration(&align::registration_path()) {
+                let reg = align::load_registration(&align::registration_path());
+                if let Some(reg) = reg.as_ref().ok().filter(|_| lighthouse) {
                     let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
-                    println!("{}", ui::station_summary(&reg, &reg.station_map(&layouts)));
-                    if let Some(left) = ui::stations_to_measure(&reg) {
-                        println!("{left}");
+                    println!("{}", ui::station_summary(reg, &reg.station_map(&layouts)));
+                    let enabled = cv1touch::settings::load(&cv1touch::settings::default_path())
+                        .map_or(true, |s| s.pin_base_station);
+                    let keys = steamvr::pin_keys(&steamvr::vrsettings_path());
+                    if let Some(plan) = ui::pin_plan(reg, keys, enabled) {
+                        println!("{plan}");
                     }
                 }
                 log.quiet(|| send_quiet("alignment reload"))

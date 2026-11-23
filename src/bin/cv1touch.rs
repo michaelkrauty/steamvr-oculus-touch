@@ -505,8 +505,8 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
 }
 
 /// The checks `doctor` makes from the daemon's status: the sensors' poses, their hot-plug
-/// state (less the sensors the video check `explained`), and a warning while SteamVR tracks the
-/// headset from a base station no registration measured.
+/// state (less the sensors the video check `explained`), and warnings while SteamVR tracks the
+/// headset from a base station no registration measured or waits for the one its settings name.
 fn daemon_checks(
     status: &serde_json::Value,
     explained: &std::collections::BTreeSet<String>,
@@ -518,6 +518,9 @@ fn daemon_checks(
     }
     if let Some(note) = status::unmeasured_base_note(status) {
         checks.push(("headset_alignment", true, format!("warning: {note}")));
+    }
+    if let Some(note) = status::base_pin_note(status) {
+        checks.push(("base_station_pin", true, format!("warning: {note}")));
     }
     checks
 }
@@ -934,6 +937,9 @@ fn status_board(shm_name: &str) -> i32 {
             push_line(&mut frame, &note);
         }
         if let Some(note) = complete.as_ref().and_then(status::unmeasured_base_note) {
+            push_line(&mut frame, &note);
+        }
+        if let Some(note) = complete.as_ref().and_then(status::base_pin_note) {
             push_line(&mut frame, &note);
         }
         redraw(&frame);
@@ -1941,6 +1947,10 @@ fn steamvr_install(legacy: Option<(&Path, &Path)>) -> i32 {
 }
 
 fn steamvr_uninstall() -> i32 {
+    // its settings, which hold cv1touch's base-station pin, are rewritten when it quits
+    if steamvr_stopped() != 0 {
+        return 1;
+    }
     if let Err(e) = steamvr_owned(None) {
         eprintln!("cv1touch: {e}");
         return 1;
@@ -1959,6 +1969,14 @@ fn steamvr_uninstall() -> i32 {
                 "unregistered and removed {} (activateMultipleDrivers left as is)",
                 steamvr::driver_dir().display()
             );
+            match steamvr::remove_own_pin(&steamvr::vrsettings_path()) {
+                Ok(true) => println!("removed cv1touch's base-station pin: SteamVR chooses the base station it starts from again"),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("cv1touch: unregistered, but cv1touch's base-station pin is still in SteamVR's settings: {e}");
+                    return 1;
+                }
+            }
             0
         }
         Ok(s) => {
@@ -7859,6 +7877,20 @@ mod tests {
                 true,
                 "warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-X".to_string()
             )
+        );
+        let mut waiting = status(None);
+        waiting["alignment"]["base_pin"] =
+            serde_json::json!({"base": null, "owner": null, "waiting_for": "LHB-0000000A"});
+        let checks = daemon_checks(&waiting, &none);
+        assert_eq!(
+            names(&checks),
+            ["sensor_poses", "sensor_hotplug", "base_station_pin"]
+        );
+        assert!(
+            checks[2].1
+                && checks[2]
+                    .2
+                    .starts_with("warning: SteamVR is waiting to see base station LHB-0000000A")
         );
     }
 

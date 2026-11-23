@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use cv1touch::base_pin;
 use cv1touch::control::{self, Command};
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::flight::{self, FlightRecorder};
@@ -93,6 +94,16 @@ struct Haptic {
 
 type StationPoses = Vec<(String, nalgebra::Isometry3<f64>)>;
 type TimedStationPoses = (u64, StationPoses);
+
+/// The base-station pin (`base_pin`): SteamVR's setting and cv1touch's records as the driver
+/// last reported them, with when (shm clock); the last change the daemon asked for, logged once;
+/// and what `universe_watch` follows for the decision.
+#[derive(Debug, Default)]
+struct BasePin {
+    reported: Option<(u64, base_pin::Keys)>,
+    asked: Option<base_pin::Keys>,
+    watch: base_pin::Watch,
+}
 
 /// Latest factory-normalized input samples. Keep these before output correction so a second
 /// calibration measures the hardware rather than the result of the first calibration.
@@ -243,6 +254,8 @@ struct Daemon {
     /// While SteamVR tracks the headset from a base station no registration measured, its serial
     /// (`align::Registration::unmeasured_base`), for `status`.
     universe_unmeasured: Mutex<Option<String>>,
+    /// The base-station pin (see `BasePin`).
+    base_pin: Mutex<BasePin>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
     /// `publish_alignment`).
     alignment_publish: Mutex<()>,
@@ -1059,6 +1072,75 @@ fn calibrated_pipeline(opts: &EngineOptions, sensors: &[engine::Sensor]) -> Pipe
     p
 }
 
+/// The driver's report of SteamVR's base-station setting and cv1touch's records (`keys`): "ok"
+/// when they are as they should be, else "ok PIN OURS UNPINNED", what to write (`base_pin`). The
+/// last report, as SteamVR quits (`quit`), is answered by `base_pin::at_quit`, and SteamVR is not
+/// running after it.
+fn pin_reply(d: &Daemon, keys: base_pin::Keys, quit: bool) -> String {
+    let now = shm::now_ns();
+    let stations: Vec<String> = match &*d.driver_stations.lock().unwrap() {
+        Some((at, v)) if now.saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS => {
+            v.iter().map(|(s, _)| s.clone()).collect()
+        }
+        _ => Vec::new(),
+    };
+    let mut p = d.base_pin.lock().unwrap();
+    p.reported = (!quit).then_some((now, keys));
+    let seen = p.watch.seen(&stations, std::time::Instant::now());
+    let want = if quit {
+        base_pin::at_quit(keys, &seen)
+    } else {
+        base_pin::decide(keys, &seen)
+    };
+    if want == keys {
+        p.asked = None;
+        return "ok".into();
+    }
+    if p.asked != Some(want) {
+        p.asked = Some(want);
+        let was = base_pin::serial(keys.pin);
+        if quit {
+            log!("base-station pin: SteamVR was closed while it waited to see base station {was}, without having tracked the headset; pin removed, so that SteamVR picks a station itself when it next starts");
+        } else if want.pin != 0 && want.pin != keys.pin {
+            log!(
+                "base-station pin: from its next start, SteamVR tracks the headset from base station {}, which a headset registration measured",
+                base_pin::serial(want.pin)
+            );
+        } else if want.pin == 0 && keys.pin != 0 {
+            let why = if p.watch.enabled {
+                "SteamVR sees no base station a headset registration measured"
+            } else {
+                "pinning is turned off in the settings"
+            };
+            log!("base-station pin: pin on base station {was} removed: {why}");
+        }
+    }
+    format!("ok {} {} {}", want.pin, want.ours, want.unpinned)
+}
+
+/// The base-station pin for `status`: the station SteamVR's setting names and whose value it is,
+/// and the station SteamVR has waited for at least `base_pin::NOTE_AFTER` with the headset untracked;
+/// all null without a fresh report from the driver (SteamVR not running).
+fn base_pin_status(d: &Daemon) -> serde_json::Value {
+    let p = d.base_pin.lock().unwrap();
+    let fresh = p
+        .reported
+        .filter(|(at, _)| shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS)
+        .map(|(_, k)| k);
+    let pinned = fresh.filter(|k| k.pin != 0);
+    let waiting = fresh.and(
+        p.watch
+            .waited(std::time::Instant::now())
+            .filter(|(_, w)| *w >= base_pin::NOTE_AFTER)
+            .map(|(s, _)| s.to_string()),
+    );
+    serde_json::json!({
+        "base": pinned.map(|k| base_pin::serial(k.pin)),
+        "owner": pinned.map(|k| if k.users() { "user" } else { "cv1touch" }),
+        "waiting_for": waiting,
+    })
+}
+
 /// The saved tilt in thousandths of a degree.
 fn start_tilt_mdeg(settings: &settings::Settings) -> i32 {
     (settings.tilt_deg() * 1000.0).round() as i32
@@ -1074,6 +1156,7 @@ fn current_settings(d: &Daemon) -> settings::Settings {
     let tilt_mdeg = d.tilt_mdeg.load(Ordering::Acquire);
     settings::Settings {
         tilt_deg: (tilt_mdeg != 0).then(|| tilt_mdeg as f64 / 1000.0),
+        pin_base_station: d.base_pin.lock().unwrap().watch.enabled,
         ..settings::Settings::default()
     }
 }
@@ -1403,6 +1486,7 @@ fn universe_watch(d: Arc<Daemon>) {
     let modified = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut layouts_at = modified(&layouts_path);
     let mut layouts = align::load_layouts(&layouts_path);
+    let mut settings_at = modified(&d.settings_path);
     let mut settling = align::Settling::default();
     let mut following: Option<align::Follow> = None;
     // since when the base station is placed but SteamVR does not report it, and whether it was said
@@ -1418,6 +1502,13 @@ fn universe_watch(d: Arc<Daemon>) {
         if !d.universe_watch_on.load(Ordering::Acquire) {
             say(String::new());
             unmeasured(None);
+            // nothing known of SteamVR's log: the pin is neither set nor removed meanwhile
+            let none = cv1touch::steamvr_log::Bases::default();
+            d.base_pin
+                .lock()
+                .unwrap()
+                .watch
+                .see(&none, std::time::Instant::now());
             continue;
         }
         match steamvr_log.poll() {
@@ -1437,7 +1528,24 @@ fn universe_watch(d: Arc<Daemon>) {
                 }
             }
         }
-        let Ok(reg) = align::load_registration(&align::registration_path()) else {
+        // pinning turned on or off in the settings file
+        let at = modified(&d.settings_path);
+        if at != settings_at {
+            settings_at = at;
+            match settings::load(&d.settings_path) {
+                Ok(s) => d.base_pin.lock().unwrap().watch.enabled = s.pin_base_station,
+                Err(e) => log!("settings: {e}; base-station pinning left as it was"),
+            }
+        }
+        let reg = align::load_registration(&align::registration_path());
+        {
+            let mut pin = d.base_pin.lock().unwrap();
+            pin.watch.see(&steamvr_log.bases, std::time::Instant::now());
+            pin.watch.measured = reg
+                .as_ref()
+                .map_or_else(|_| Vec::new(), |r| base_pin::measured(&r.measured));
+        }
+        let Ok(reg) = reg else {
             unmeasured(None);
             continue;
         };
@@ -5642,7 +5750,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -5655,6 +5763,7 @@ fn status_json(d: &Daemon) -> String {
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
         al.universe_id,
         serde_json::to_string(&*d.universe_unmeasured.lock().unwrap()).unwrap(),
+        base_pin_status(d),
         recording_json,
         recording.state == recorder::State::Recording,
         st.records,
@@ -5781,6 +5890,7 @@ fn handle(d: &Daemon, line: &str) -> String {
             d.wake_sleepers();
             "ok".into()
         }
+        Ok(Command::Pin(keys, quit)) => pin_reply(d, keys, quit),
         Ok(Command::TestInject(on)) => {
             let now = shm::now_ns();
             match on {
@@ -6778,6 +6888,10 @@ fn main() {
         universe_watch_on: AtomicBool::new(true),
         universe_following: Mutex::new(String::new()),
         universe_unmeasured: Mutex::new(None),
+        base_pin: Mutex::new(BasePin {
+            watch: base_pin::Watch::new(settings.pin_base_station),
+            ..Default::default()
+        }),
         alignment_publish: Mutex::new(()),
         settings_path,
         tilt_mdeg: std::sync::atomic::AtomicI32::new(start_tilt_mdeg(&settings)),
@@ -8493,6 +8607,71 @@ mod tests {
         assert_eq!(alignment(&d), "LHB-X");
     }
 
+    /// The driver's `pin` report gets what to write, at most once per change, and `status` shows
+    /// the setting and whose it is while the driver reports it.
+    #[test]
+    fn the_driver_is_told_what_to_pin_and_status_shows_it() {
+        let d = status_daemon();
+        let pin = |d: &Daemon| {
+            let value: serde_json::Value =
+                serde_json::from_str(status_json(d).strip_prefix("ok ").unwrap()).unwrap();
+            value["alignment"]["base_pin"].clone()
+        };
+        assert_eq!(
+            pin(&d),
+            serde_json::json!({"base": null, "owner": null, "waiting_for": null})
+        );
+        assert_eq!(
+            handle(
+                &d,
+                "stations LHB-0000000A 1 2 3 0 0 0 1 LHB-0000000B 1 2 4 0 0 0 1"
+            ),
+            "ok"
+        );
+        {
+            let mut p = d.base_pin.lock().unwrap();
+            p.watch.enabled = true;
+            p.watch.measured = vec!["LHB-0000000A".into()];
+            let mut bases = cv1touch::steamvr_log::Bases::default();
+            bases.apply(
+                &cv1touch::steamvr_log::parse_line(
+                    "x lighthouse: LHR-HEADSET H: ----- BOOTSTRAPPED base 0000000A (best) distance 2m",
+                )
+                .unwrap(),
+            );
+            p.watch.see(&bases, std::time::Instant::now());
+        }
+        assert_eq!(handle(&d, "pin 0 0 0"), "ok 10 10 0");
+        assert_eq!(handle(&d, "pin 10 10 0"), "ok");
+        assert_eq!(
+            pin(&d),
+            serde_json::json!({"base": "LHB-0000000A", "owner": "cv1touch", "waiting_for": null})
+        );
+        assert_eq!(handle(&d, "pin 11 0 0"), "ok");
+        assert_eq!(pin(&d)["owner"], "user");
+        assert!(handle(&d, "pin 1 2").starts_with("err"));
+        // a session that never tracked the headset, waiting for our pin: kept until SteamVR quits,
+        // then removed and remembered at once
+        {
+            let mut p = d.base_pin.lock().unwrap();
+            let mut bases = cv1touch::steamvr_log::Bases::default();
+            bases.apply(
+                &cv1touch::steamvr_log::parse_line(
+                    "x lighthouse: LHR-HEADSET H: Saw 2 bases and none are the preferred base 0000000A",
+                )
+                .unwrap(),
+            );
+            p.watch.see(&bases, std::time::Instant::now());
+        }
+        assert_eq!(handle(&d, "pin 10 10 0"), "ok");
+        assert_eq!(handle(&d, "pin 11 0 0 quit"), "ok");
+        assert_eq!(handle(&d, "pin 10 10 0 quit"), "ok 0 0 10");
+        assert_eq!(
+            pin(&d),
+            serde_json::json!({"base": null, "owner": null, "waiting_for": null})
+        );
+    }
+
     #[test]
     fn status_reports_each_hands_radio_loss_or_null() {
         let d = status_daemon();
@@ -8684,6 +8863,7 @@ mod tests {
             universe_watch_on: AtomicBool::new(true),
             universe_following: Mutex::new(String::new()),
             universe_unmeasured: Mutex::new(None),
+            base_pin: Mutex::new(BasePin::default()),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
                 .join(format!(

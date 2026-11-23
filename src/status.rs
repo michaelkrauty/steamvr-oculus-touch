@@ -339,10 +339,29 @@ pub fn sensor_hotplug_note(
 }
 
 /// While SteamVR tracks the headset from a base station no headset registration measured
-/// (`alignment.unmeasured_base`), what doctor and the status board say about it.
+/// (`alignment.unmeasured_base`), what doctor and the status board say about it: restarting
+/// SteamVR fixes it when cv1touch has pinned a measured station for its next start
+/// (`alignment.base_pin`), else a new headset recording does.
 pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
     let b = value["alignment"]["unmeasured_base"].as_str()?;
-    Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from {b}"))
+    let pin = &value["alignment"]["base_pin"];
+    match pin["base"].as_str() {
+        Some(p) if p != b && pin["owner"] == "cv1touch" => Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: restart SteamVR to fix it (it then starts from base station {p}, which is measured)")),
+        _ => Some(format!("SteamVR tracks the headset from base station {b}, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from {b}")),
+    }
+}
+
+/// While SteamVR waits for the base station its settings name before it tracks the headset
+/// (`alignment.base_pin.waiting_for`), what doctor and the status board say about it. cv1touch
+/// removes its own pin then (`base_pin::decide`), so a restart lets SteamVR pick another station;
+/// a value the user set stays until they remove it.
+pub fn base_pin_note(value: &serde_json::Value) -> Option<String> {
+    let pin = &value["alignment"]["base_pin"];
+    let p = pin["waiting_for"].as_str()?;
+    if pin["base"] == p && pin["owner"] == "user" {
+        return Some(format!("SteamVR is waiting to see base station {p} before it tracks the headset, because your SteamVR settings tell it to start from that one. If {p} is switched off, quit SteamVR, delete \"primarybasestation\" from the \"driver_lighthouse\" section of steamvr.vrsettings in Steam's config folder, and start SteamVR again"));
+    }
+    Some(format!("SteamVR is waiting to see base station {p} before it tracks the headset. If {p} is switched off, restart SteamVR: it then picks another base station"))
 }
 
 /// The doctor's `sensor_hotplug` check: whether it passes, and the note. A sensor the engine is
@@ -585,6 +604,53 @@ impl RateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What doctor and the status board say about the base-station pin: the unmeasured base's
+    /// remedy is a restart once cv1touch pinned a measured station, and a wait for the pinned
+    /// station says how to get out of it, differently for the user's own value.
+    #[test]
+    fn the_base_station_notes() {
+        let status = |unmeasured: Option<&str>, pin: serde_json::Value| serde_json::json!({"alignment": {"unmeasured_base": unmeasured, "base_pin": pin}});
+        let pin = |base: Option<&str>, owner: Option<&str>, waiting: Option<&str>| serde_json::json!({"base": base, "owner": owner, "waiting_for": waiting});
+        let redo = "SteamVR tracks the headset from base station LHB-C, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-C";
+        for p in [
+            pin(None, None, None),
+            pin(Some("LHB-A"), Some("user"), None),
+            pin(Some("LHB-C"), Some("cv1touch"), None),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                unmeasured_base_note(&status(Some("LHB-C"), p)).as_deref(),
+                Some(redo)
+            );
+        }
+        assert_eq!(
+            unmeasured_base_note(&status(Some("LHB-C"), pin(Some("LHB-A"), Some("cv1touch"), None))).as_deref(),
+            Some("SteamVR tracks the headset from base station LHB-C, which no headset registration measured, so the controllers can be shown centimetres off: restart SteamVR to fix it (it then starts from base station LHB-A, which is measured)")
+        );
+        assert_eq!(
+            unmeasured_base_note(&status(None, pin(Some("LHB-A"), Some("cv1touch"), None))),
+            None
+        );
+        assert_eq!(
+            base_pin_note(&status(None, pin(Some("LHB-A"), Some("cv1touch"), None))),
+            None
+        );
+        for p in [
+            pin(Some("LHB-A"), Some("cv1touch"), Some("LHB-A")),
+            pin(None, None, Some("LHB-A")),
+            pin(Some("LHB-B"), Some("user"), Some("LHB-A")),
+        ] {
+            assert_eq!(
+                base_pin_note(&status(None, p)).as_deref(),
+                Some("SteamVR is waiting to see base station LHB-A before it tracks the headset. If LHB-A is switched off, restart SteamVR: it then picks another base station")
+            );
+        }
+        assert_eq!(
+            base_pin_note(&status(None, pin(Some("LHB-A"), Some("user"), Some("LHB-A")))).as_deref(),
+            Some("SteamVR is waiting to see base station LHB-A before it tracks the headset, because your SteamVR settings tell it to start from that one. If LHB-A is switched off, quit SteamVR, delete \"primarybasestation\" from the \"driver_lighthouse\" section of steamvr.vrsettings in Steam's config folder, and start SteamVR again")
+        );
+    }
     use crate::hand::{BTN_A, FLAG_CALIBRATED, FLAG_CONNECTED, FLAG_POSITION, TOUCH_TRIGGER};
 
     #[test]

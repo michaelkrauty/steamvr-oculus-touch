@@ -78,11 +78,29 @@ static void reports_a_change_at_once_and_keeps_the_report_fresh()
 	assert(!r.due({turned, c}, t += 100 * ms));
 }
 
+/* The pin report and the daemon's answer (src/control.rs parses the one, base_pin.rs makes the
+ * other). */
+static void reports_the_pin_and_reads_the_answer()
+{
+	assert(pin_line({723088290, 723088290, -1041880971}) == "pin 723088290 723088290 -1041880971\n");
+	assert(pin_line({}) == "pin 0 0 0\n");
+	assert(pin_line({1, 1, 0}, true) == "pin 1 1 0 quit\n");
+	PinKeys want{1, 2, 3};
+	assert(pin_reply("ok -1041880971 -1041880971 0\n", &want));
+	assert((want == PinKeys{-1041880971, -1041880971, 0}));
+	for (const char *other : {"ok\n", "ok", "ok 1 2\n", "ok 1 2 3", "ok 1 2 3 4\n", "ok 1 2 2147483648\n", "err no\n", ""}) {
+		PinKeys kept{7, 7, 7};
+		assert(!pin_reply(other, &kept));
+		assert((kept == PinKeys{7, 7, 7}));
+	}
+}
+
 int main()
 {
 	reads_a_pose_matrix();
 	formats_the_line_the_daemon_reads();
 	reports_a_change_at_once_and_keeps_the_report_fresh();
+	reports_the_pin_and_reads_the_answer();
 	std::puts("test_stations: ok");
 	return 0;
 }

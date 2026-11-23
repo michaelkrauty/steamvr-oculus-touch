@@ -985,6 +985,16 @@ pub fn enable_multiple_drivers(path: &Path) -> Result<Option<PathBuf>, String> {
         .as_object_mut()
         .ok_or(format!("{}: \"steamvr\" is not an object", path.display()))?
         .insert("activateMultipleDrivers".into(), true.into());
+    write_vrsettings(path, &v, existing)
+}
+
+/// Writes `v` to steamvr.vrsettings at `path` through a temporary file, the file as it was
+/// (`existing`) kept beside it first.
+fn write_vrsettings(
+    path: &Path,
+    v: &serde_json::Value,
+    existing: Option<String>,
+) -> Result<Option<PathBuf>, String> {
     let backup = match existing {
         Some(t) => {
             let now = std::time::SystemTime::now()
@@ -1007,6 +1017,56 @@ pub fn enable_multiple_drivers(path: &Path) -> Result<Option<PathBuf>, String> {
     .map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(backup)
+}
+
+/// SteamVR's base-station setting and cv1touch's records in steamvr.vrsettings at `path`
+/// (`base_pin`); none set when the file cannot be read.
+pub fn pin_keys(path: &Path) -> crate::base_pin::Keys {
+    use crate::base_pin::{Keys, KEY, OURS_KEY, OWN_SECTION, SECTION, UNPINNED_KEY};
+    let v: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let int = |section: &str, key: &str| {
+        v[section][key]
+            .as_i64()
+            .and_then(|x| i32::try_from(x).ok())
+            .unwrap_or(0)
+    };
+    Keys {
+        pin: int(SECTION, KEY),
+        ours: int(OWN_SECTION, OURS_KEY),
+        unpinned: int(OWN_SECTION, UNPINNED_KEY),
+    }
+}
+
+/// Removes cv1touch's base-station pin from steamvr.vrsettings (`base_pin`): the setting while it
+/// holds the value cv1touch recorded, and cv1touch's records. A value someone else set stays.
+/// Whether the file changed; a file without them is left as it is.
+pub fn remove_own_pin(path: &Path) -> Result<bool, String> {
+    use crate::base_pin::{KEY, OURS_KEY, OWN_SECTION, SECTION, UNPINNED_KEY};
+    let existing = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut v: serde_json::Value = serde_json::from_str(&existing)
+        .map_err(|e| format!("{}: {e} (not touching it)", path.display()))?;
+    let ours = v[OWN_SECTION][OURS_KEY].as_i64();
+    let mut changed = false;
+    if let Some(own) = v.get_mut(OWN_SECTION).and_then(|s| s.as_object_mut()) {
+        changed |= own.remove(OURS_KEY).is_some();
+        changed |= own.remove(UNPINNED_KEY).is_some();
+    }
+    if let Some(lighthouse) = v.get_mut(SECTION).and_then(|s| s.as_object_mut()) {
+        if ours.is_some() && lighthouse.get(KEY).and_then(|k| k.as_i64()) == ours {
+            lighthouse.remove(KEY);
+        }
+    }
+    if changed {
+        write_vrsettings(path, &v, Some(existing))?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1035,6 +1095,44 @@ mod tests {
             installed_assets(Path::new("/opt/moved/bin/cv1touch")),
             Path::new("/opt/moved/bin/../lib/cv1touch")
         );
+    }
+
+    /// Uninstalling removes cv1touch's base-station pin and its records, and nothing else: a value
+    /// the user set stays, and a file without them is not rewritten.
+    #[test]
+    fn removes_only_its_own_base_station_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("steamvr.vrsettings");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        assert_eq!(remove_own_pin(&path), Ok(false), "no file");
+        std::fs::write(&path, r#"{"driver_lighthouse":{"primarybasestation":723088290,"other":1},"driver_cv1touch":{"pinned_base":723088290,"unpinned_base":5,"enable":true}}"#).unwrap();
+        assert_eq!(remove_own_pin(&path), Ok(true));
+        assert_eq!(
+            read(),
+            serde_json::json!({"driver_lighthouse":{"other":1},"driver_cv1touch":{"enable":true}})
+        );
+        let user = r#"{"driver_lighthouse":{"primarybasestation":12},"driver_cv1touch":{"pinned_base":723088290}}"#;
+        std::fs::write(&path, user).unwrap();
+        assert_eq!(remove_own_pin(&path), Ok(true));
+        assert_eq!(
+            read(),
+            serde_json::json!({"driver_lighthouse":{"primarybasestation":12},"driver_cv1touch":{}})
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(remove_own_pin(&path), Ok(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            pin_keys(&path),
+            crate::base_pin::Keys {
+                pin: 12,
+                ..Default::default()
+            }
+        );
+        std::fs::write(&path, "not json").unwrap();
+        assert!(remove_own_pin(&path).is_err());
+        assert_eq!(pin_keys(&path), crate::base_pin::Keys::default());
     }
 
     #[test]

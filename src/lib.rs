@@ -8,6 +8,7 @@
 mod socket_dir;
 
 pub mod align;
+pub mod base_pin;
 pub mod calendar;
 pub mod calib;
 pub mod clock_map;

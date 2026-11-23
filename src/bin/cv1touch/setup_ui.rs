@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cv1touch::align::{Placement, Registration, StationWorld};
+use cv1touch::base_pin;
 use cv1touch::setup::{Stage, StageReport, State};
 
 /// Marks for the checklist and results; ASCII on a dumb terminal.
@@ -292,9 +293,17 @@ pub(super) fn result_summary(stage: Stage, installed: Option<&serde_json::Value>
 
 /// Before a headset recording: the base station SteamVR tracks the headset from (`base`, as its
 /// log says), whether the registration on disk (`reg`) measured it, and that the recording
-/// measures it.
-pub(super) fn headset_base_plan(base: Option<&str>, reg: Option<&Registration>) -> String {
+/// measures it; for a headset SteamVR does not track with base stations (`lighthouse` false),
+/// only that.
+pub(super) fn headset_base_plan(
+    base: Option<&str>,
+    reg: Option<&Registration>,
+    lighthouse: bool,
+) -> String {
     let measured = |b: &str| reg.is_some_and(|r| r.measured.iter().any(|m| m.serial == b));
+    if !lighthouse {
+        return "Your headset is not tracked by base stations, so there is none to measure.".into();
+    }
     match base {
         Some(b) if measured(b) => format!("SteamVR tracks the headset from base station {b}, which an earlier recording measured.\nThis recording measures it again."),
         Some(b) => format!("SteamVR tracks the headset from base station {b}, which no recording has measured yet.\nThis recording measures it."),
@@ -302,21 +311,34 @@ pub(super) fn headset_base_plan(base: Option<&str>, reg: Option<&Registration>) 
     }
 }
 
-/// After a headset registration `reg` is written: the stations its recording saw that no
-/// recording measured yet, and how to measure one; None when every one is measured.
-pub(super) fn stations_to_measure(reg: &Registration) -> Option<String> {
-    let left: Vec<&str> = reg
-        .stations
-        .iter()
-        .map(|s| s.serial.as_str())
-        .filter(|s| !reg.measured.iter().any(|m| m.serial == *s))
-        .collect();
-    (!left.is_empty()).then(|| {
-        format!(
-            "Not measured yet: {}. To measure one, run `cv1touch setup --redo headset` while SteamVR\ntracks the headset from it (`cv1touch universe` names the station it tracks the headset from).",
-            left.join(", ")
-        )
-    })
+/// After a headset registration `reg` is written: the base station SteamVR will start from, if
+/// the driver pins one now (`base_pin::decide`, as it runs while SteamVR tracks the headset from
+/// the station the recording measured and sees the stations it saw), given SteamVR's setting and
+/// cv1touch's records (`keys`) and whether pinning is on (`enabled`).
+pub(super) fn pin_plan(reg: &Registration, keys: base_pin::Keys, enabled: bool) -> Option<String> {
+    let stations: Vec<String> = reg.stations.iter().map(|s| s.serial.clone()).collect();
+    let measured = base_pin::measured(&reg.measured);
+    let want = base_pin::decide(
+        keys,
+        &base_pin::Seen {
+            enabled,
+            stations: &stations,
+            measured: &measured,
+            headset_base: reg.tracking_base.as_deref(),
+            chosen: false,
+            waited: None,
+        },
+    );
+    if want.pin == 0 || want.users() {
+        return None;
+    }
+    let b = base_pin::serial(want.pin);
+    let which = if reg.tracking_base.as_deref() == Some(b.as_str()) {
+        "this recording"
+    } else {
+        "an earlier recording"
+    };
+    Some(format!("From its next start, SteamVR tracks your headset from base station {b}, which {which} measured.\nIf that base station is ever off, `cv1touch status` says what to do."))
 }
 
 /// After a headset registration `reg` is written: the base station its recording measured, and
@@ -641,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn the_headset_stage_names_the_station_it_measures_and_those_left() {
+    fn the_headset_stage_names_the_station_it_measures() {
         use cv1touch::align::{MeasuredStation, PoseEntry, StationPose};
         let pose = PoseEntry::from_iso(&nalgebra::Isometry3::identity());
         let mut reg = crate::initial_registration(7);
@@ -658,24 +680,55 @@ mod tests {
             calibration_unix_s: 1,
         }];
         assert_eq!(
-            headset_base_plan(Some("LHB-A"), Some(&reg)),
+            headset_base_plan(Some("LHB-A"), Some(&reg), true),
             "SteamVR tracks the headset from base station LHB-A, which an earlier recording measured.\nThis recording measures it again."
         );
         for plan in [
-            headset_base_plan(Some("LHB-B"), Some(&reg)),
-            headset_base_plan(Some("LHB-B"), None),
+            headset_base_plan(Some("LHB-B"), Some(&reg), true),
+            headset_base_plan(Some("LHB-B"), None, true),
         ] {
             assert_eq!(plan, "SteamVR tracks the headset from base station LHB-B, which no recording has measured yet.\nThis recording measures it.");
         }
         assert_eq!(
-            headset_base_plan(None, Some(&reg)),
+            headset_base_plan(None, Some(&reg), true),
             "SteamVR's log names no base station it tracks the headset from, so this recording may measure none."
         );
+        for base in [None, Some("LHB-A")] {
+            assert_eq!(
+                headset_base_plan(base, Some(&reg), false),
+                "Your headset is not tracked by base stations, so there is none to measure."
+            );
+        }
+    }
+
+    /// After the headset stage: the station SteamVR will start from, as the driver pins it.
+    #[test]
+    fn the_headset_stage_says_which_station_steamvr_will_start_from() {
+        use cv1touch::align::{MeasuredStation, PoseEntry, StationPose};
+        let pose = PoseEntry::from_iso(&nalgebra::Isometry3::identity());
+        let mut reg = crate::initial_registration(7);
+        reg.stations = ["LHB-0000000A", "LHB-0000000B"]
+            .map(|serial| StationPose {
+                serial: serial.into(),
+                pose,
+            })
+            .into();
+        reg.tracking_base = Some("LHB-0000000A".into());
+        reg.measured = vec![MeasuredStation {
+            serial: "LHB-0000000A".into(),
+            world_from_station: pose,
+            registered_unix_s: 1,
+            calibration_unix_s: 1,
+        }];
+        let none = base_pin::Keys::default();
         assert_eq!(
-            stations_to_measure(&reg).as_deref(),
-            Some("Not measured yet: LHB-B, LHB-C. To measure one, run `cv1touch setup --redo headset` while SteamVR\ntracks the headset from it (`cv1touch universe` names the station it tracks the headset from).")
+            pin_plan(&reg, none, true).as_deref(),
+            Some("From its next start, SteamVR tracks your headset from base station LHB-0000000A, which this recording measured.\nIf that base station is ever off, `cv1touch status` says what to do.")
         );
+        assert_eq!(pin_plan(&reg, none, false), None, "turned off");
+        let users = base_pin::Keys { pin: 11, ..none };
+        assert_eq!(pin_plan(&reg, users, true), None, "the user's own value");
         reg.stations.truncate(1);
-        assert_eq!(stations_to_measure(&reg), None);
+        assert_eq!(pin_plan(&reg, none, true), None, "one station");
     }
 }
