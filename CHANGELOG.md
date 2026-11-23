@@ -4,22 +4,12 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.5.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) - 2026-11-23
+
 ### Added
 
 - The headset stage of `cv1touch setup` now names the base station SteamVR tracks the headset from and whether a recording measured it, and afterwards lists the stations not measured yet with how to measure one. Each base station the headset is tracked from needs its own recording.
 - While SteamVR runs, `cv1touch doctor` and `cv1touch status` warn when SteamVR tracks the headset from a base station that no headset registration measured (`unmeasured_base` in `status --json`), since the controllers can then be shown centimetres off. The warning names the station and says to run `cv1touch setup --redo headset` while SteamVR tracks the headset from it.
-
-### Fixed
-
-- When SteamVR moves its base stations, the controllers now follow within about 0.1 s instead of up to 3 s. The SteamVR driver looks at the stations every 100 ms and reports a change at once, and the daemon follows each report as it arrives.
-- A headset registration whose recording measures no base station, for example because SteamVR moved the station it tracked the headset from, no longer drops the stations measured before: it changes nothing and asks to record again. After writing a registration, `cv1touch setup` now says which station the recording measured and how each base station is placed.
-- A recording now carries a controller's LED model from the moment its tracker gets the controller, instead of up to 250 ms later, so a replay starts that controller's tracker where the daemon did and can reproduce a first lock made in between.
-
-### Changed
-
-- The position and orientation uncertainties published with the tracker's pose are now the tracker's own instead of OpenHMD's. The SteamVR driver does not use them.
-
-## [0.5.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) - 2026-11-22
 
 ### Fixed
 
@@ -30,10 +20,14 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - A controller in fast motion could be shown running off, or lose its position, after its motion samples dropped out over the radio for a few tens of milliseconds. The tracker now bridges such a gap with the samples on either side of it and allows for what the gap may have hidden.
 - A controller woken, picked up or held next to the other could be shown at the other's position, or running off from there; the tracker no longer takes LEDs that the other controller's own track accounts for.
 - When a tracking thread fails and the daemon restarts, the log now always says why; on a busy machine the reason could be missing.
+- When SteamVR moves its base stations, the controllers now follow within about 0.1 s instead of up to 3 s. The SteamVR driver looks at the stations every 100 ms and reports a change at once, and the daemon follows each report as it arrives.
+- A headset registration whose recording measures no base station, for example because SteamVR moved the station it tracked the headset from, no longer drops the stations measured before: it changes nothing and asks to record again. After writing a registration, `cv1touch setup` now says which station the recording measured and how each base station is placed.
+- A recording now carries a controller's LED model from the moment its tracker gets the controller, instead of up to 250 ms later, so a replay starts that controller's tracker where the daemon did and can reproduce a first lock made in between.
 
 ### Changed
 
 - A controller not seen since the daemon started is republished every 20 ms until it sends new data, as an asleep controller already was, instead of about 440 times a second, and the SteamVR driver is woken that much less often.
+- The position and orientation uncertainties published with the tracker's pose are now the tracker's own instead of OpenHMD's. The SteamVR driver does not use them.
 
 ## [0.5.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.0) - 2026-11-20
 
