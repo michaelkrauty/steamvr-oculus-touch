@@ -93,6 +93,16 @@ pub fn lighthouse_tracked(system: &str, serial: &str) -> bool {
     }
 }
 
+/// SteamVR's headset, as the cv1touch SteamVR driver reports it from inside SteamVR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Headset {
+    pub serial: String,
+    /// Its `Prop_TrackingSystemName_String`.
+    pub system: String,
+    /// Its `Prop_CurrentUniverseId_Uint64`.
+    pub universe_id: u64,
+}
+
 /// A base station's pose in the cv1touch world, measured by a registration: SteamVR tracked the
 /// reference from that station during the capture, so the fit put the station where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -342,6 +352,28 @@ impl Registration {
             return None;
         }
         Some(b)
+    }
+
+    /// Whether SteamVR's headset now is another than the one this registration lined the
+    /// controllers up with. After a reference base stations tracked, any headset they track shares
+    /// its space, so only one they do not track is another; after any other reference, a headset
+    /// with another serial is.
+    pub fn other_headset(&self, headset: &Headset) -> bool {
+        if lighthouse_tracked(&self.reference_system, &self.reference) {
+            !lighthouse_tracked(&headset.system, &headset.serial)
+        } else {
+            headset.serial != self.reference
+        }
+    }
+
+    /// Whether the universe watch follows the base stations: only those of a registration whose
+    /// reference they tracked (an older file can list stations that tracked other devices), and
+    /// not while SteamVR's headset is one they do not track. `None`: no report of the headset (an
+    /// older driver, or SteamVR not running), followed as before.
+    pub fn follows_stations(&self, headset: Option<&Headset>) -> bool {
+        !self.stations.is_empty()
+            && lighthouse_tracked(&self.reference_system, &self.reference)
+            && headset.is_none_or(|h| lighthouse_tracked(&h.system, &h.serial))
     }
 }
 
@@ -1572,6 +1604,58 @@ mod tests {
             reference_system: "lighthouse".into(),
             ..other
         }));
+    }
+
+    /// The headset SteamVR shows against the registration's reference (design table): another
+    /// headset is noted, and the base stations are followed only while they track both.
+    #[test]
+    fn another_headset_is_noted_and_stations_follow_only_a_lighthouse_headset() {
+        let headset = |serial: &str, system: &str| Headset {
+            serial: serial.into(),
+            system: system.into(),
+            universe_id: 7,
+        };
+        let station = StationPose {
+            serial: "LHB-TEST-A".into(),
+            pose: PoseEntry::from_iso(&pose(0.1)),
+        };
+        let lighthouse = Registration {
+            stations: vec![station.clone()],
+            ..registration()
+        };
+        let inside_out = Registration {
+            reference: "HMD-TEST".into(),
+            reference_system: "oculus".into(),
+            ..registration()
+        };
+        // an older file made with a headset the stations did not track, in a room where they
+        // tracked other devices
+        let mixed = Registration {
+            reference: "HMD-TEST".into(),
+            stations: vec![station],
+            ..registration()
+        };
+        let index = headset("LHR-TEST-OTHER", "lighthouse");
+        let rift_s = headset("HMD-TEST", "oculus");
+        let quest = headset("HMD-TEST-2", "oculus");
+        // a Lighthouse registration, a Lighthouse headset (even another one): followed, no note
+        assert!(!lighthouse.other_headset(&index));
+        assert!(lighthouse.follows_stations(Some(&index)));
+        // the same, now with a headset base stations do not track: noted, not followed
+        assert!(lighthouse.other_headset(&rift_s));
+        assert!(!lighthouse.follows_stations(Some(&rift_s)));
+        // no report (an older driver or SteamVR not running): followed as before
+        assert!(lighthouse.follows_stations(None));
+        // another registration: the same headset is not noted, another serial is
+        assert!(!inside_out.other_headset(&rift_s));
+        assert!(inside_out.other_headset(&quest));
+        assert!(inside_out.other_headset(&index));
+        // the stations of a registration whose reference they did not track are never followed
+        assert!(!mixed.follows_stations(None));
+        assert!(!mixed.follows_stations(Some(&index)));
+        assert!(!mixed.other_headset(&rift_s));
+        // no stations: nothing to follow
+        assert!(!registration().follows_stations(None));
     }
 
     #[test]

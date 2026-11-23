@@ -36,6 +36,7 @@ After setup, play: the controllers appear in SteamVR as soon as they are awake. 
 
 - **Check cv1touch** in the Start menu lists what cv1touch needs and whether it is in place: SteamVR, the sensors and their driver, the daemon.
 - **Send a cv1touch report** saves one zip file on your desktop and opens the folder. Send that file to the person helping you, together with what you were doing and a screenshot of the error. It includes installer/repair logs, daemon and SteamVR logs, and settings/calibration. **Review it before posting publicly:** calibration describes your room layout; logs can contain device serial numbers, your user-folder name and network addresses. Share it privately with your tester contact if preferred. Creating a report uploads nothing.
+- **Line up the controllers with your headset** does the headset step of setup again. Choose it after you change headsets, or when the controllers appear away from your hands, and follow the steps in its window. **Check cv1touch** says when SteamVR's headset is not the one the controllers were lined up with.
 - **Finish setting up cv1touch** gives the sensors their driver and registers with SteamVR again, for when the installer could not, or when **Check cv1touch** says the input profile is out of date after a SteamVR update.
 - **Stop cv1touch** and **Start cv1touch** stop and start the daemon by hand, and say when it is stopped or running. It otherwise starts at logon.
 

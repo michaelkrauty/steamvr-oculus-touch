@@ -351,6 +351,22 @@ pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// While SteamVR's headset is another than the one the controllers were lined up with
+/// (`alignment.headset`, `align::Registration::other_headset`), what doctor and the status board
+/// say about it, with the way to line them up with this one.
+pub fn other_headset_note(value: &serde_json::Value) -> Option<String> {
+    (value["alignment"]["headset"] == "other").then(|| {
+        format!(
+            "SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, {}, and follow its steps",
+            if cfg!(windows) {
+                "choose Line up the controllers with your headset in the Start menu"
+            } else {
+                "run `cv1touch setup --redo headset`"
+            }
+        )
+    })
+}
+
 /// While SteamVR waits for the base station its settings name before it tracks the headset
 /// (`alignment.base_pin.waiting_for`), what doctor and the status board say about it. cv1touch
 /// removes its own pin then (`base_pin::decide`), so a restart lets SteamVR pick another station;
@@ -650,6 +666,26 @@ mod tests {
             base_pin_note(&status(None, pin(Some("LHB-A"), Some("user"), Some("LHB-A")))).as_deref(),
             Some("SteamVR is waiting to see base station LHB-A before it tracks the headset, because your SteamVR settings tell it to start from that one. If LHB-A is switched off, quit SteamVR, delete \"primarybasestation\" from the \"driver_lighthouse\" section of steamvr.vrsettings in Steam's config folder, and start SteamVR again")
         );
+    }
+
+    /// The note for another headset, only while the daemon says so; its way out is the Start-menu
+    /// entry on Windows and the command it runs elsewhere.
+    #[test]
+    fn the_other_headset_note() {
+        let status =
+            |headset: serde_json::Value| serde_json::json!({"alignment": {"headset": headset}});
+        assert_eq!(other_headset_note(&status(serde_json::Value::Null)), None);
+        assert_eq!(
+            other_headset_note(&serde_json::json!({"alignment": {}})),
+            None
+        );
+        let note = other_headset_note(&status("other".into())).unwrap();
+        assert!(note.starts_with("SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, "));
+        assert!(note.ends_with(if cfg!(windows) {
+            "choose Line up the controllers with your headset in the Start menu, and follow its steps"
+        } else {
+            "run `cv1touch setup --redo headset`, and follow its steps"
+        }));
     }
     use crate::hand::{BTN_A, FLAG_CALIBRATED, FLAG_CONNECTED, FLAG_POSITION, TOUCH_TRIGGER};
 

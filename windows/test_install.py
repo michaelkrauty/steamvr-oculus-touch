@@ -152,9 +152,12 @@ def main(installer, work):
             assert "Setup is incomplete:" in install_log and "- The sensors did not get their driver." in install_log
 
             # Check the actual Start-menu command quoting, not a hand-recreated CLI command.
-            for name in ("Set up cv1touch", "Check cv1touch", "Finish setting up cv1touch",
+            for name in ("Set up cv1touch", "Line up the controllers with your headset",
+                         "Check cv1touch", "Finish setting up cv1touch",
                          "Send a cv1touch report", "Start cv1touch", "Stop cv1touch"):
                 shortcut(shortcuts, name)
+            line_up = shortcut(shortcuts, "Line up the controllers with your headset")["arguments"]
+            assert line_up.endswith('cv1touch.exe" setup --redo headset"'), line_up
             check = run_shortcut(shortcut(shortcuts, "Check cv1touch"), expected=1)
             assert "FAIL" in check and "sensor" in check
             repair = run_shortcut(shortcut(shortcuts, "Finish setting up cv1touch"), expected=1)

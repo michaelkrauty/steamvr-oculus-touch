@@ -254,6 +254,12 @@ struct Daemon {
     /// While SteamVR tracks the headset from a base station no registration measured, its serial
     /// (`align::Registration::unmeasured_base`), for `status`.
     universe_unmeasured: Mutex<Option<String>>,
+    /// SteamVR's headset as the SteamVR driver last reported it (`headset`), with when it arrived
+    /// (shm clock).
+    driver_headset: Mutex<Option<(u64, align::Headset)>>,
+    /// Whether that headset is another than the registration's
+    /// (`align::Registration::other_headset`), for `status`.
+    other_headset: AtomicBool,
     /// The base-station pin (see `BasePin`).
     base_pin: Mutex<BasePin>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
@@ -1311,7 +1317,8 @@ const UNIVERSE_PROCESS_CHECK_MS: u64 = 10_000;
 /// otherwise every 2 s.
 const UNIVERSE_TICK_MS: u64 = 1_000;
 /// The driver's report counts as current this long; past it, the watch connects to SteamVR itself
-/// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS` while connected.
+/// (an older driver that does not report), at most every `UNIVERSE_CHECK_MS` while connected. Its
+/// report of the headset likewise, past which SteamVR counts as closed.
 const DRIVER_STATIONS_FRESH_NS: u64 = 10_000_000_000;
 
 #[derive(Default)]
@@ -1464,6 +1471,44 @@ impl UniverseConnection {
     }
 }
 
+/// Keeps the driver's report of SteamVR's headset, and gives the log line for it at each SteamVR
+/// start (the driver marks the first report of a start) and each change: what the headset's
+/// universe id does from one start to the next is known only from such lines.
+fn headset_report(d: &Daemon, headset: align::Headset, start: bool) -> Option<String> {
+    let mut last = d.driver_headset.lock().unwrap();
+    let line = (start || last.as_ref().is_none_or(|(_, h)| *h != headset)).then(|| {
+        format!(
+            "SteamVR's headset: {}, tracking system {}, universe id {}",
+            headset.serial,
+            if headset.system.is_empty() {
+                "none"
+            } else {
+                &headset.system
+            },
+            headset.universe_id
+        )
+    });
+    *last = Some((shm::now_ns(), headset));
+    line
+}
+
+/// SteamVR's headset, while the driver's report of it is fresh; none from a driver that does not
+/// report it, or with SteamVR closed. Notes for `status` whether it is another than `reg`'s.
+fn reported_headset(d: &Daemon, reg: Option<&align::Registration>) -> Option<align::Headset> {
+    let headset = d
+        .driver_headset
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|(at, _)| shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS)
+        .map(|(_, h)| h);
+    let other = reg
+        .zip(headset.as_ref())
+        .is_some_and(|(r, h)| r.other_headset(h));
+    d.other_headset.store(other, Ordering::Release);
+    headset
+}
+
 /// Keeps the registration on the headset as SteamVR tracks it. SteamVR tracks the headset in the
 /// frame of the base station it bootstrapped from, and re-solves the stations' poses relative to
 /// each other by centimetres and differently each session (one station by 110 and then 120 mm
@@ -1505,6 +1550,7 @@ fn universe_watch(d: Arc<Daemon>) {
         if !d.universe_watch_on.load(Ordering::Acquire) {
             say(String::new());
             unmeasured(None);
+            d.other_headset.store(false, Ordering::Release);
             // nothing known of SteamVR's log: the pin is neither set nor removed meanwhile
             let none = cv1touch::steamvr_log::Bases::default();
             d.base_pin
@@ -1548,12 +1594,17 @@ fn universe_watch(d: Arc<Daemon>) {
                 .as_ref()
                 .map_or_else(|_| Vec::new(), |r| base_pin::measured(&r.measured));
         }
+        let headset = reported_headset(&d, reg.as_ref().ok());
         let Ok(reg) = reg else {
             unmeasured(None);
             continue;
         };
-        if reg.stations.is_empty() {
-            say(NO_STATIONS_FOLLOWED.into());
+        if !reg.follows_stations(headset.as_ref()) {
+            say(if reg.stations.is_empty() {
+                NO_STATIONS_FOLLOWED.into()
+            } else {
+                String::new()
+            });
             unmeasured(None);
             continue;
         }
@@ -5758,7 +5809,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -5771,6 +5822,11 @@ fn status_json(d: &Daemon) -> String {
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
         al.universe_id,
         serde_json::to_string(&*d.universe_unmeasured.lock().unwrap()).unwrap(),
+        if d.other_headset.load(Ordering::Acquire) {
+            "\"other\""
+        } else {
+            "null"
+        },
         base_pin_status(d),
         recording_json,
         recording.state == recorder::State::Recording,
@@ -5899,6 +5955,12 @@ fn handle(d: &Daemon, line: &str) -> String {
             "ok".into()
         }
         Ok(Command::Pin(keys, quit)) => pin_reply(d, keys, quit),
+        Ok(Command::Headset { headset, start }) => {
+            if let Some(line) = headset_report(d, headset, start) {
+                log(line);
+            }
+            "ok".into()
+        }
         Ok(Command::TestInject(on)) => {
             let now = shm::now_ns();
             match on {
@@ -6896,6 +6958,8 @@ fn main() {
         universe_watch_on: AtomicBool::new(true),
         universe_following: Mutex::new(String::new()),
         universe_unmeasured: Mutex::new(None),
+        driver_headset: Mutex::new(None),
+        other_headset: AtomicBool::new(false),
         base_pin: Mutex::new(BasePin {
             watch: base_pin::Watch::new(settings.pin_base_station),
             ..Default::default()
@@ -8623,6 +8687,84 @@ mod tests {
         assert_eq!(alignment(&d), "LHB-X");
     }
 
+    /// The driver's `headset` report: a log line at each SteamVR start and each change, and
+    /// `status` says \"other\" while the report is fresh and the headset is another than the
+    /// registration's. Without a report (a driver from before it, or SteamVR closed): no note.
+    #[test]
+    fn a_headset_other_than_the_registrations_is_logged_and_noted() {
+        let d = status_daemon();
+        let note = |d: &Daemon| {
+            let value: serde_json::Value =
+                serde_json::from_str(status_json(d).strip_prefix("ok ").unwrap()).unwrap();
+            value["alignment"]["headset"].clone()
+        };
+        let reg: align::Registration = serde_json::from_value(serde_json::json!({
+            "format": align::REGISTRATION_FORMAT, "version": align::VERSION, "created_unix_s": 1,
+            "lighthouse_from_world": {"orient_xyzw": [0, 0, 0, 1], "pos": [0, 0, 0]},
+            "universe_id": 7, "touch": "left", "reference": "LHR-TEST-HMD", "pairs": 1,
+            "pos_rms_mm": 1, "rot_rms_deg": 1,
+            "stations": [{"serial": "LHB-TEST-A", "pose": {"orient_xyzw": [0, 0, 0, 1], "pos": [1, 2, 3]}}],
+        }))
+        .unwrap();
+        // a daemon that never gets the line: no headset, no note, the stations followed as before
+        assert_eq!(reported_headset(&d, Some(&reg)), None);
+        assert_eq!(note(&d), serde_json::Value::Null);
+        assert!(reg.follows_stations(None));
+        let line = "SteamVR's headset: HMD TEST, tracking system oculus, universe id 0";
+        let Command::Headset { headset, start } =
+            control::parse("headset start 0 oculus HMD TEST").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(headset_report(&d, headset, start).as_deref(), Some(line));
+        assert_eq!(handle(&d, "headset 0 oculus HMD TEST"), "ok");
+        // the same again: no line; the next start, or a change: a line
+        let Command::Headset { headset, .. } = control::parse("headset 0 oculus HMD TEST").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(headset_report(&d, headset.clone(), false), None);
+        assert_eq!(
+            headset_report(&d, headset.clone(), true).as_deref(),
+            Some(line)
+        );
+        let moved = align::Headset {
+            universe_id: 9,
+            ..headset.clone()
+        };
+        assert_eq!(
+            headset_report(&d, moved, false).as_deref(),
+            Some("SteamVR's headset: HMD TEST, tracking system oculus, universe id 9")
+        );
+        assert_eq!(handle(&d, "headset 0 oculus HMD TEST"), "ok");
+        let reported = reported_headset(&d, Some(&reg));
+        assert_eq!(reported.as_ref(), Some(&headset));
+        assert_eq!(note(&d), "other");
+        assert!(!reg.follows_stations(reported.as_ref()));
+        // no registration: no note
+        reported_headset(&d, None);
+        assert_eq!(note(&d), serde_json::Value::Null);
+        // a Lighthouse headset with a Lighthouse registration: no note
+        assert_eq!(handle(&d, "headset 7 lighthouse LHR-TEST-OTHER"), "ok");
+        reported_headset(&d, Some(&reg));
+        assert_eq!(note(&d), serde_json::Value::Null);
+        // SteamVR's null driver, which names no tracking system: another headset
+        let null = "SteamVR's headset: Null Serial Number, tracking system none, universe id 0";
+        let Command::Headset { headset, start } =
+            control::parse("headset start 0 - Null Serial Number").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(headset_report(&d, headset, start).as_deref(), Some(null));
+        reported_headset(&d, Some(&reg));
+        assert_eq!(note(&d), "other");
+        // a report older than 10 s: SteamVR closed, no note
+        assert_eq!(handle(&d, "headset 0 oculus HMD TEST"), "ok");
+        d.driver_headset.lock().unwrap().as_mut().unwrap().0 -= DRIVER_STATIONS_FRESH_NS;
+        assert_eq!(reported_headset(&d, Some(&reg)), None);
+        assert_eq!(note(&d), serde_json::Value::Null);
+    }
+
     /// The driver's `pin` report gets what to write, at most once per change, and `status` shows
     /// the setting and whose it is while the driver reports it.
     #[test]
@@ -8879,6 +9021,8 @@ mod tests {
             universe_watch_on: AtomicBool::new(true),
             universe_following: Mutex::new(String::new()),
             universe_unmeasured: Mutex::new(None),
+            driver_headset: Mutex::new(None),
+            other_headset: AtomicBool::new(false),
             base_pin: Mutex::new(BasePin::default()),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()

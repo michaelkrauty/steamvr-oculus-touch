@@ -23,6 +23,12 @@ StationPose station_pose(const std::string &serial, const vr::HmdMatrix34_t &m);
  * serial would split the line are left out). */
 std::string stations_line(const std::vector<StationPose> &stations);
 
+/* "headset [start] UNIVERSE SYSTEM SERIAL\n": SteamVR's headset for the daemon's control socket,
+ * the serial last since it may hold spaces; "start" until the daemon has taken one in this
+ * SteamVR start; "-" for a headset without a tracking system (SteamVR's null driver sets none).
+ * Empty for a tracking system that would split the line or a serial that would end it. */
+std::string headset_line(const std::string &serial, const std::string &system, uint64_t universe, bool start);
+
 /* SteamVR's base-station setting (driver_lighthouse.primarybasestation) and cv1touch's records of
  * it in its own section, 0 when not set: the driver reports them to the daemon every 2 s and
  * writes what the daemon answers (src/base_pin.rs decides). */

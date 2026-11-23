@@ -40,6 +40,12 @@ pub enum Command {
     /// The base stations' raw poses, as the SteamVR driver sees them from inside vrserver:
     /// (serial, [x, y, z, qx, qy, qz, qw]).
     Stations(Vec<(String, [f64; 7])>),
+    /// SteamVR's headset, as the SteamVR driver sees it from inside vrserver; `start` until the
+    /// daemon has taken one report in that SteamVR start.
+    Headset {
+        headset: crate::align::Headset,
+        start: bool,
+    },
     /// SteamVR's base-station setting and cv1touch's records of it, as the SteamVR driver reads
     /// them (`base_pin`), and whether it is the last report, as SteamVR quits (`quit`); the reply
     /// says what to write, if anything.
@@ -189,7 +195,37 @@ pub fn record_stop_if_line(path: &Path) -> Result<String, String> {
     Ok(format!("record stop-if {}", quoted_path(path)?))
 }
 
+/// `headset [start] UNIVERSE SYSTEM SERIAL`, the serial last since it may hold spaces, and "-" for
+/// a headset without a tracking system.
+fn headset(args: &str) -> Result<Command, String> {
+    const USAGE: &str = "usage: headset [start] <universe id> <tracking system> <serial>";
+    let (first, rest) = word(args).ok_or(USAGE)?;
+    let (start, (universe, rest)) = match first {
+        "start" => (true, word(rest).ok_or(USAGE)?),
+        _ => (false, (first, rest)),
+    };
+    let universe_id = universe
+        .parse::<u64>()
+        .map_err(|_| format!("headset: {universe} is not a universe id"))?;
+    let (system, serial) = word(rest).ok_or(USAGE)?;
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(USAGE.into());
+    }
+    Ok(Command::Headset {
+        headset: crate::align::Headset {
+            serial: serial.into(),
+            system: if system == "-" { "" } else { system }.into(),
+            universe_id,
+        },
+        start,
+    })
+}
+
 pub fn parse(line: &str) -> Result<Command, String> {
+    if let Some(("headset", args)) = word(line) {
+        return headset(args);
+    }
     if let Some((verb, rest)) = word(line) {
         if let Some((subcommand, args)) = word(rest) {
             match (verb, subcommand) {
@@ -880,6 +916,41 @@ mod tests {
         assert!(parse("haptic right 0.2 160").is_err());
         assert!(parse("haptic right 0.2 160 1 extra").is_err());
         assert!(parse("haptic right 0.2x 160 1").is_err());
+    }
+
+    /// The driver reports SteamVR's headset (`driver/src/stations.cpp` headset_line): universe
+    /// id, tracking system ("-" for none) and the serial last, spaces and all.
+    #[test]
+    fn parse_the_headset() {
+        let headset = |serial: &str, system: &str, universe_id| crate::align::Headset {
+            serial: serial.into(),
+            system: system.into(),
+            universe_id,
+        };
+        assert_eq!(
+            parse("headset start 1634567890123 oculus HMD-TEST\n"),
+            Ok(Command::Headset {
+                headset: headset("HMD-TEST", "oculus", 1_634_567_890_123),
+                start: true
+            })
+        );
+        assert_eq!(
+            parse("headset 0 - Null Serial Number"),
+            Ok(Command::Headset {
+                headset: headset("Null Serial Number", "", 0),
+                start: false
+            })
+        );
+        for bad in [
+            "headset",
+            "headset start",
+            "headset 1 oculus",
+            "headset start 1 oculus  ",
+            "headset -1 oculus HMD-TEST",
+            "headset x oculus HMD-TEST",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     /// The driver reports the base stations' raw poses from inside SteamVR; serial, position (m),

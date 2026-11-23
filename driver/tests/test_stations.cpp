@@ -43,6 +43,16 @@ static void formats_the_line_the_daemon_reads()
 	assert(stations_line({bad, b}).rfind("stations LHB-TEST-B ", 0) == 0);
 }
 
+/* What the daemon parses (src/control.rs): the serial last, spaces and all. */
+static void formats_the_headset_line()
+{
+	assert(headset_line("HMD-TEST", "oculus", 1634567890123, true) == "headset start 1634567890123 oculus HMD-TEST\n");
+	assert(headset_line("Null Serial Number", "", 0, false) == "headset 0 - Null Serial Number\n");
+	assert(headset_line("", "oculus", 1, false).empty());
+	assert(headset_line("HMD-TEST", "two words", 1, false).empty());
+	assert(headset_line("HMD\nTEST", "oculus", 1, false).empty());
+}
+
 /* Sent at once on a change of the set or of a pose beyond 0.1 mm or 0.01 deg, else every 2 s. */
 static void reports_a_change_at_once_and_keeps_the_report_fresh()
 {
@@ -99,6 +109,7 @@ int main()
 {
 	reads_a_pose_matrix();
 	formats_the_line_the_daemon_reads();
+	formats_the_headset_line();
 	reports_a_change_at_once_and_keeps_the_report_fresh();
 	reports_the_pin_and_reads_the_answer();
 	std::puts("test_stations: ok");

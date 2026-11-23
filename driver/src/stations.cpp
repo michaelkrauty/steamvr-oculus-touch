@@ -47,6 +47,13 @@ std::string stations_line(const std::vector<StationPose> &stations)
 	return line + "\n";
 }
 
+std::string headset_line(const std::string &serial, const std::string &system, uint64_t universe, bool start)
+{
+	if (serial.empty() || serial.find_first_of("\r\n") != std::string::npos || system.find_first_of(" \t\r\n") != std::string::npos)
+		return {};
+	return std::string("headset ") + (start ? "start " : "") + std::to_string(universe) + " " + (system.empty() ? "-" : system) + " " + serial + "\n";
+}
+
 std::string pin_line(const PinKeys &k, bool quit)
 {
 	char buf[64];

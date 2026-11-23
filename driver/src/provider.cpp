@@ -126,12 +126,16 @@ void Provider::RunFrame()
  * read here inside vrserver, so the daemon needs no SteamVR connection of its own (each one costs
  * vrserver an app connect, binding load and disconnect). Looked at every 100 ms and sent when
  * they change, so a move SteamVR makes is followed at once, and every 2 s besides
- * (StationReports). And every 2 s, the base-station pin (PinKeys). */
+ * (StationReports). SteamVR's headset likewise, for the daemon to tell whether it is the one the
+ * controllers were lined up with. And every 2 s, the base-station pin (PinKeys). */
 void Provider::station_loop()
 {
 	ControlClient control;
 	StationReports reports;
 	uint64_t pin_ns = 0;
+	std::string headset_sent;
+	uint64_t headset_ns = 0;
+	bool headset_taken = false;
 	while (running_) {
 		vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
 		vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.0f, poses, vr::k_unMaxTrackedDeviceCount);
@@ -147,6 +151,19 @@ void Provider::station_loop()
 			stations.push_back(station_pose(props->GetStringProperty(c, vr::Prop_SerialNumber_String), poses[i].mDeviceToAbsoluteTracking));
 		}
 		const uint64_t now = cv1t_now_ns();
+		// SteamVR's headset, always device 0; before the stations, whose report wakes the daemon's
+		// universe watch, so that the watch knows the headset by then
+		const vr::PropertyContainerHandle_t hmd = props->TrackedDeviceToPropertyContainer(vr::k_unTrackedDeviceIndex_Hmd);
+		if (props->GetInt32Property(hmd, vr::Prop_DeviceClass_Int32) == vr::TrackedDeviceClass_HMD) {
+			const std::string line = headset_line(props->GetStringProperty(hmd, vr::Prop_SerialNumber_String),
+			                                      props->GetStringProperty(hmd, vr::Prop_TrackingSystemName_String),
+			                                      props->GetUint64Property(hmd, vr::Prop_CurrentUniverseId_Uint64), !headset_taken);
+			if (!line.empty() && (line != headset_sent || now - headset_ns >= StationReports::KEEP_ALIVE_NS)) {
+				headset_sent = line;
+				headset_ns = now;
+				headset_taken = control.send(line) || headset_taken;
+			}
+		}
 		if (!stations.empty() && reports.due(stations, now))
 			control.send(stations_line(stations));
 		// the base-station pin, every 2 s

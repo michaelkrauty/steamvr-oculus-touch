@@ -505,8 +505,9 @@ fn doctor_checks() -> (Vec<DoctorCheck>, Option<serde_json::Value>) {
 }
 
 /// The checks `doctor` makes from the daemon's status: the sensors' poses, their hot-plug
-/// state (less the sensors the video check `explained`), and warnings while SteamVR tracks the
-/// headset from a base station no registration measured or waits for the one its settings name.
+/// state (less the sensors the video check `explained`), and warnings while SteamVR's headset is
+/// another than the registration's, tracks the headset from a base station no registration
+/// measured, or waits for the one its settings name.
 fn daemon_checks(
     status: &serde_json::Value,
     explained: &std::collections::BTreeSet<String>,
@@ -515,6 +516,9 @@ fn daemon_checks(
     let mut checks = vec![("sensor_poses", ok, detail)];
     if let Some((ok, note)) = status::sensor_hotplug_check(status, explained) {
         checks.push(("sensor_hotplug", ok, note));
+    }
+    if let Some(note) = status::other_headset_note(status) {
+        checks.push(("headset", true, format!("warning: {note}")));
     }
     if let Some(note) = status::unmeasured_base_note(status) {
         checks.push(("headset_alignment", true, format!("warning: {note}")));
@@ -934,6 +938,9 @@ fn status_board(shm_name: &str) -> i32 {
             .as_ref()
             .and_then(|v| status::sensor_hotplug_note(v, &stream_explained))
         {
+            push_line(&mut frame, &note);
+        }
+        if let Some(note) = complete.as_ref().and_then(status::other_headset_note) {
             push_line(&mut frame, &note);
         }
         if let Some(note) = complete.as_ref().and_then(status::unmeasured_base_note) {
@@ -7961,6 +7968,19 @@ mod tests {
                 true,
                 "warning: SteamVR tracks the headset from base station LHB-X, which no headset registration measured, so the controllers can be shown centimetres off: run `cv1touch setup --redo headset` while SteamVR tracks the headset from LHB-X".to_string()
             )
+        );
+        let mut other = status(None);
+        other["alignment"]["headset"] = "other".into();
+        let checks = daemon_checks(&other, &none);
+        assert_eq!(
+            names(&checks),
+            ["sensor_poses", "sensor_hotplug", "headset"]
+        );
+        assert!(
+            checks[2].1
+                && checks[2]
+                    .2
+                    .starts_with("warning: SteamVR's headset is not the one")
         );
         let mut waiting = status(None);
         waiting["alignment"]["base_pin"] =
