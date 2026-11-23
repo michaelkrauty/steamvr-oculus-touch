@@ -415,6 +415,17 @@ fn refine(
 }
 
 pub fn solve(pairs: &[(Isometry3<f64>, Isometry3<f64>)], o: &Options) -> Result<Solution, String> {
+    solve_turned(pairs, pairs, o)
+}
+
+/// As `solve`, with the rotations' test and the hand-eye rotation taken from `turned`, a denser
+/// sampling of the same motion than `pairs`: the test chains relative rotations found within a
+/// number of pairs, so thinning the pairs changes what it sees.
+fn solve_turned(
+    pairs: &[(Isometry3<f64>, Isometry3<f64>)],
+    turned: &[(Isometry3<f64>, Isometry3<f64>)],
+    o: &Options,
+) -> Result<Solution, String> {
     if pairs.len() < o.min_pairs {
         return Err(format!(
             "only {} paired samples (need {}): keep the Touch and the reference controller tracked (sensors and base stations) while moving",
@@ -422,7 +433,7 @@ pub fn solve(pairs: &[(Isometry3<f64>, Isometry3<f64>)], o: &Options) -> Result<
             o.min_pairs
         ));
     }
-    let (ry, axis_ratio) = hand_eye(pairs, o);
+    let (ry, axis_ratio) = hand_eye(turned, o);
     if axis_ratio < o.min_axis_ratio {
         return Err(format!(
             "turn the pair more: the rotations so far are almost all about one axis (ratio {axis_ratio:.2} < {:.2}); roll, pitch and yaw your wrist",
@@ -577,6 +588,8 @@ pub fn rigid_span(
 /// Find an attached, turning span without a previously registered coordinate frame.
 /// Short hand-eye fits supply candidate frames; a full-span rigidity check rejects unrelated
 /// motion and desk holds. A fresh capture may include picking up and putting down the Touches.
+/// Each short fit is thinned to about 200 pairs, except for its rotations' test and hand-eye
+/// rotation, which see all the window's pairs as the final fit would.
 pub fn bootstrap_span(
     pairs: &[(u64, Isometry3<f64>, Isometry3<f64>)],
 ) -> Option<std::ops::Range<usize>> {
@@ -589,18 +602,15 @@ pub fn bootstrap_span(
     while start + 500 <= pairs.len() {
         let end = pairs.partition_point(|p| p.0 <= pairs[start].0 + 25_000_000_000);
         let step = ((end - start) / 200).max(1);
-        let seed: Vec<_> = pairs[start..end]
-            .iter()
-            .step_by(step)
-            .map(|p| (p.1, p.2))
-            .collect();
+        let window: Vec<_> = pairs[start..end].iter().map(|p| (p.1, p.2)).collect();
+        let seed: Vec<_> = window.iter().step_by(step).copied().collect();
         let opts = Options {
             min_pairs: 100,
             min_axis_ratio: 0.1,
             max_iterations: 20,
             ..Options::default()
         };
-        if let Ok(sol) = solve(&seed, &opts) {
+        if let Ok(sol) = solve_turned(&seed, &window, &opts) {
             if sol.inliers * 5 >= sol.pairs * 4 && sol.pos_rms_m <= 0.010 && sol.rot_rms_deg <= 3.0
             {
                 if let Some(r) = rigid_span(pairs, &sol.lighthouse_from_world, &Rigid::default()) {
@@ -968,6 +978,52 @@ mod tests {
         )
         .unwrap();
         assert_close(&sol.lighthouse_from_world, &x_true(), 0.002, 0.2);
+    }
+
+    /// A short headset capture, 43 pairs a second: looking down and up and tilting toward each
+    /// shoulder by `deg` degrees from level (3.3 s each), then over each shoulder (10 s).
+    fn nod_tilt_then_look(deg: f64, secs: f64) -> Vec<(u64, Isometry3<f64>, Isometry3<f64>)> {
+        let rot = |axis: Vector3<f64>, deg: f64| {
+            UnitQuaternion::from_scaled_axis(axis * deg.to_radians())
+        };
+        let swing = |t: f64, from: f64, secs: f64| {
+            if (from..from + secs).contains(&t) {
+                (2.0 * std::f64::consts::PI * (t - from) / secs).sin()
+            } else {
+                0.0
+            }
+        };
+        (0..(secs * 43.0) as u64)
+            .map(|k| {
+                let t = k as f64 / 43.0;
+                let head = rot(Vector3::y(), 100.0 * swing(t, 6.7, 10.0))
+                    * rot(Vector3::x(), deg * swing(t, 0.0, 3.3))
+                    * rot(Vector3::z(), deg * swing(t, 3.3, 3.3));
+                let l = Isometry3::from_parts(Translation3::new(0.1, 1.7, -0.2), head);
+                ((t * 1e9) as u64, l, x_true().inverse() * l * y_true())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_stretch_search_tests_the_rotations_as_the_fit_does() {
+        let headset = Options {
+            min_pairs: 500,
+            min_axis_ratio: 0.1,
+            ..Options::default()
+        };
+        // nods and tilts of 20 degrees from level, which the fit accepts: thinned, the
+        // rotations' test looked further ahead, passed over them to the looks and refused
+        let timed = nod_tilt_then_look(20.0, 15.0);
+        let pairs: Vec<_> = timed.iter().map(|p| (p.1, p.2)).collect();
+        assert!(solve(&pairs, &headset).is_ok());
+        let span = bootstrap_span(&timed).expect("the stretch search finds what the fit accepts");
+        assert!(span.len() * 10 >= timed.len() * 9, "{span:?}");
+        // and refuses with the fit what turns about one axis
+        let timed = nod_tilt_then_look(0.0, 15.0);
+        let pairs: Vec<_> = timed.iter().map(|p| (p.1, p.2)).collect();
+        assert!(solve(&pairs, &headset).is_err());
+        assert!(bootstrap_span(&timed).is_none());
     }
 
     #[test]
