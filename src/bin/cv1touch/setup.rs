@@ -80,7 +80,7 @@ fn moved_sensors(status: &serde_json::Value) -> (Vec<String>, Vec<String>) {
         }
     }
     if status["sensors_unsure"] == true {
-        settling.push(track::repose::UNSURE_ADVICE.into());
+        settling.push(track::repose::unsure_advice());
     }
     (left_out, settling)
 }
@@ -427,7 +427,8 @@ fn print_report(inspection: &Inspection, checkpoint: &Checkpoint, json: bool) ->
     ready
 }
 
-fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
+/// Reads one of the `allowed` answers at `prompt`, saying `hint` after anything else.
+fn choice(prompt: &str, allowed: &[&str], hint: &str) -> Result<String, String> {
     // not flushed: a stray Enter here only advances to a step that itself waits for a deliberate
     // start (go_signal, input_gate and the recordings discard typed-ahead input)
     human_action(prompt);
@@ -445,7 +446,7 @@ fn choice(prompt: &str, allowed: &[&str]) -> Result<String, String> {
                 if allowed.contains(&answer.as_str()) {
                     return Ok(answer);
                 }
-                human_action(&ui::hint(allowed));
+                human_action(hint);
             }
             Line::NotYet => {}
         }
@@ -541,7 +542,7 @@ fn installed(stage: Stage) -> Option<serde_json::Value> {
 /// Asks at a prompt for one of the `offered` answers.
 fn ask(prompt: &str, offered: &[ui::Answer]) -> Result<ui::Answer, String> {
     let keys: Vec<&str> = offered.iter().flat_map(|a| a.words()).copied().collect();
-    let line = choice(prompt, &keys)?;
+    let line = choice(prompt, &keys, &ui::hint(&keys))?;
     ui::answer(&line, offered).ok_or_else(|| "unrecognised answer".to_string())
 }
 
@@ -1611,6 +1612,14 @@ fn run_stage(
     persist(checkpoint)
 }
 
+/// Offers a finished `stage` again (redo, or keep): pending outranks a result that still
+/// validates, as for the buttons stage. In memory only: the journal is written when the stage
+/// starts or is kept, so quitting at its prompt changes nothing on disk.
+fn offer_again(stage: Stage, checkpoint: &mut Checkpoint) {
+    checkpoint.completed.remove(&stage);
+    checkpoint.pending.insert(stage);
+}
+
 pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
     if !check_only && !io::stdin().is_terminal() {
         eprintln!("cv1touch: setup needs an interactive terminal. Use setup --check [--json] for a read-only report.");
@@ -1655,11 +1664,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
             .map_err(|e| format!("setup journal: {e}"))?
             .unwrap_or_default();
         if let Some(stage) = redo {
-            // offered again (redo, or keep): pending outranks a result that still validates, as
-            // for the buttons stage. In memory only: the journal is written when the stage starts
-            // or is kept, so quitting at the prompt changes nothing on disk.
-            checkpoint.completed.remove(&stage);
-            checkpoint.pending.insert(stage);
+            offer_again(stage, &mut checkpoint);
         }
         let g = glyphs();
         let mut shown_checks = String::new();
@@ -1668,6 +1673,9 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
         let mut show_list = true;
         // a stage the person chose to try again starts without asking twice
         let mut retry = None;
+        // a guide that finds nothing to do lists the stages to redo; one that did a stage, or was
+        // asked for one with --redo, ends when it is done
+        let mut menu = redo.is_none();
         loop {
             let inspection = inspect(&checkpoint);
             let views = check_views(&inspection);
@@ -1677,15 +1685,24 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 shown_checks = check_text;
             }
             let stage_reports = reports(&inspection, &checkpoint);
-            if std::mem::take(&mut show_list) && !ui::daemon_down(&views) {
-                println!("\n{}\n", ui::checklist(&stage_reports, &g));
+            let unloaded = inspection
+                .checks
+                .iter()
+                .find(|c| c.name == "tracking_configuration" && !c.ok);
+            let show_menu = menu
+                && stage_reports.iter().all(|r| r.state == State::Ready)
+                && unloaded.is_none()
+                && inspection.moved.0.is_empty();
+            if (std::mem::take(&mut show_list) || show_menu) && !ui::daemon_down(&views) {
+                let list = if show_menu {
+                    ui::redo_menu(&stage_reports, &g)
+                } else {
+                    ui::checklist(&stage_reports, &g)
+                };
+                println!("\n{list}\n");
             }
             let Some(report) = stage_reports.iter().find(|r| r.state != State::Ready) else {
-                if let Some(c) = inspection
-                    .checks
-                    .iter()
-                    .find(|c| c.name == "tracking_configuration" && !c.ok)
-                {
+                if let Some(c) = unloaded {
                     println!(
                         "{} The daemon is not using the saved setup yet: {}",
                         g.fail, c.detail
@@ -1714,13 +1731,26 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                     {
                         return Ok(());
                     }
-                    checkpoint.completed.remove(&Stage::Camera);
-                    checkpoint.pending.insert(Stage::Camera);
+                    offer_again(Stage::Camera, &mut checkpoint);
                     retry = Some(Stage::Camera);
                     continue;
                 }
                 human_action("Saved setup is complete. Check both hands in SteamVR: position, buttons and haptics.");
-                return Ok(());
+                if !show_menu {
+                    return Ok(());
+                }
+                // a stage chosen here is offered as `--redo` offers it, with its own prompt
+                let keys: Vec<String> = (1..=stage_reports.len()).map(|i| i.to_string()).collect();
+                let mut allowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+                allowed.push("");
+                allowed.extend(ui::Answer::Quit.words());
+                let prompt = ui::redo_prompt(stage_reports.len());
+                let line = choice(&prompt, &allowed, &prompt)?;
+                let Some(stage) = ui::redo_choice(&line, &stage_reports) else {
+                    return Ok(());
+                };
+                offer_again(stage, &mut checkpoint);
+                continue;
             };
             if !ui::checks_pass(&views) || report.state == State::Blocked {
                 if report.state == State::Blocked && !ui::daemon_down(&views) {
@@ -1741,6 +1771,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 }
                 continue;
             }
+            menu = false;
             let can_adopt = matches!(report.state, State::Unknown | State::Stale)
                 && inspection.unplaced.is_empty()
                 && matches!(

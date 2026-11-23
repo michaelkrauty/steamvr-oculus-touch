@@ -242,6 +242,15 @@ pub fn begin_stage(stage: Stage, checkpoint: &mut Checkpoint) {
         }
     }
 }
+/// The stages left to do again after `stage` is redone on a finished setup: a full camera solve
+/// measures the floor with the same recording but moves the world the headset alignment was
+/// measured in, and a gravity solve carries the alignment with it.
+pub fn redone_after(stage: Stage) -> &'static [Stage] {
+    match stage {
+        Stage::Camera => &[Stage::Registration],
+        _ => &[],
+    }
+}
 /// Remember an exact successful capture before running its solver. Saving this
 /// checkpoint does not claim that calibration succeeded.
 pub fn record_capture(
@@ -770,6 +779,51 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    /// What redoing each stage of a finished setup leaves to do, as the guide's own steps leave
+    /// it: a full camera solve, a gravity solve that carries the alignment, or the stage alone.
+    #[test]
+    fn redoing_a_finished_stage_leaves_what_redone_after_says() {
+        let temp = Temp::new();
+        let capture = temp.0.join("capture.jsonl");
+        for stage in [
+            Stage::Camera,
+            Stage::Gravity,
+            Stage::Render,
+            Stage::Inputs,
+            Stage::Registration,
+        ] {
+            let (old, mut c) = complete();
+            let mut s = old.clone();
+            s.recordings.insert(capture.clone());
+            match stage {
+                Stage::Camera => {
+                    s.camera = Artifact::Valid(hash('f'));
+                    begin_stage(stage, &mut c);
+                    record_full_camera_success(&s, &mut c, &hash('f'), vec![capture.clone()])
+                        .unwrap();
+                }
+                Stage::Gravity => {
+                    s.camera = Artifact::Valid(hash('f'));
+                    s.registration = Artifact::Valid(hash('9'));
+                    let mut carried = c.clone();
+                    begin_stage(stage, &mut c);
+                    preserve_camera_update(&old, &s, &mut carried, true).unwrap();
+                    c = carried;
+                    record_success(stage, &s, &mut c, vec![capture.clone()]).unwrap();
+                }
+                _ => {
+                    begin_stage(stage, &mut c);
+                    record_success(stage, &s, &mut c, vec![capture.clone()]).unwrap();
+                }
+            }
+            let left: Vec<Stage> = plan(&s, &c)
+                .into_iter()
+                .filter(|r| r.state != State::Ready)
+                .map(|r| r.stage)
+                .collect();
+            assert_eq!(left, redone_after(stage), "{stage:?}");
         }
     }
     #[test]

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cv1touch::align::{Placement, Registration, StationWorld};
 use cv1touch::base_pin;
-use cv1touch::setup::{Stage, StageReport, State};
+use cv1touch::setup::{self, Stage, StageReport, State};
 
 /// Marks for the checklist and results; ASCII on a dumb terminal.
 pub(super) struct Glyphs {
@@ -101,6 +101,39 @@ pub(super) fn checklist(reports: &[StageReport], g: &Glyphs) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The finished checklist, each stage with the number that redoes it and what that costs: how
+/// long it takes, and the stages left to do again after it.
+pub(super) fn redo_menu(reports: &[StageReport], g: &Glyphs) -> String {
+    checklist(reports, g)
+        .lines()
+        .zip(reports)
+        .enumerate()
+        .map(|(i, (line, r))| {
+            let mut after = String::new();
+            for &s in setup::redone_after(r.stage) {
+                after += &format!(", then {} {}", stage_name(s), stage_minutes(s));
+            }
+            format!(
+                "{line}   {}: redo ({}{after})",
+                i + 1,
+                stage_minutes(r.stage)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The prompt under the redo menu of `stages` stages.
+pub(super) fn redo_prompt(stages: usize) -> String {
+    format!("1-{stages}: redo that stage   Enter: finish")
+}
+
+/// The stage a number typed at the redo menu picks; None for anything else.
+pub(super) fn redo_choice(line: &str, reports: &[StageReport]) -> Option<Stage> {
+    let number: usize = line.trim().parse().ok()?;
+    reports.get(number.checked_sub(1)?).map(|r| r.stage)
 }
 
 /// One check as the guide sees it.
@@ -471,6 +504,37 @@ mod tests {
             changed,
             "  ● Sensor positions  needs redoing (its result or an earlier step changed)\n  ✗ Floor level       saved file unusable: redo it"
         );
+    }
+
+    /// A finished setup lists its stages with the number that redoes each, how long that takes
+    /// and what has to be done again after it; a number picks its stage, anything else none.
+    #[test]
+    fn a_finished_checklist_offers_each_stage_again_by_number() {
+        let done: Vec<StageReport> = [
+            Stage::Camera,
+            Stage::Gravity,
+            Stage::Render,
+            Stage::Inputs,
+            Stage::Registration,
+        ]
+        .into_iter()
+        .map(|s| report(s, State::Ready, ""))
+        .collect();
+        assert_eq!(
+            redo_menu(&done, &Glyphs::for_terminal(false)),
+            "  ✓ Sensor positions    done   1: redo (~2 min, then Headset alignment ~3 min)\n  \
+             ✓ Floor level         done   2: redo (~2 min)\n  \
+             ✓ Controller model    done   3: redo (~1 min)\n  \
+             ✓ Buttons and sticks  done   4: redo (~1 min)\n  \
+             ✓ Headset alignment   done   5: redo (~3 min)"
+        );
+        assert_eq!(redo_prompt(5), "1-5: redo that stage   Enter: finish");
+        assert_eq!(redo_choice("1", &done), Some(Stage::Camera));
+        assert_eq!(redo_choice(" 4\n", &done), Some(Stage::Inputs));
+        assert_eq!(redo_choice("5", &done), Some(Stage::Registration));
+        for other in ["", "q", "0", "6", "k"] {
+            assert_eq!(redo_choice(other, &done), None, "{other:?}");
+        }
     }
 
     #[test]

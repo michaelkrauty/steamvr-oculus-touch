@@ -565,7 +565,7 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
                     serde_json::from_value(pose["cause"].clone()).unwrap_or(GaveUpOn::NoPose);
                 given_up.push(format!(
                     "sensor {serial} {}",
-                    cause.advice("run cv1touch setup --redo sensors")
+                    cause.advice(track::repose::REDO_SENSORS)
                 ));
             }
             Some("placed") => placed.push(serial),
@@ -584,7 +584,7 @@ fn sensor_poses_check(status: &serde_json::Value) -> (bool, String) {
         }
     }
     if status["sensors_unsure"].as_bool() == Some(true) {
-        return (false, track::repose::UNSURE_ADVICE.to_string());
+        return (false, track::repose::unsure_advice());
     }
     if !given_up.is_empty() {
         return (false, given_up.join("; "));
@@ -8135,9 +8135,10 @@ mod tests {
         let (ok, detail) = sensor_poses_check(&status(true, &[Some("given_up")]));
         assert!(
             !ok && detail.starts_with("cv1touch is still checking whether a sensor moved")
-                && detail.ends_with(
-                    "if it stays unsure for several minutes, run cv1touch setup --redo sensors"
-                ),
+                && detail.ends_with(&format!(
+                    "if it stays unsure for several minutes, {}",
+                    track::repose::REDO_SENSORS
+                )),
             "{detail}"
         );
     }
@@ -8167,7 +8168,10 @@ mod tests {
             "{detail}"
         );
         assert!(
-            detail.contains("run cv1touch setup --redo sensors"),
+            detail.contains(&format!(
+                "If that does not place it, {};",
+                track::repose::REDO_SENSORS
+            )),
             "{detail}"
         );
         assert!(
@@ -8205,7 +8209,7 @@ mod tests {
             serde_json::json!({"state": "given_up", "cause": "keeps_moving"}),
         ));
         assert!(
-            !ok && detail == "sensor S0 moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then run cv1touch setup --redo sensors",
+            !ok && detail == format!("sensor S0 moved three times in half an hour, so it is left out of tracking: fix it in place so that it cannot shift, then {}", track::repose::REDO_SENSORS),
             "{detail}"
         );
     }

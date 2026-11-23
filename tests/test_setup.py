@@ -301,7 +301,7 @@ class SetupTests(unittest.TestCase):
         result = self.cli("--check", "--json")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(json.loads(result.stdout)["ready"])
-        self.assertIn("Saved setup is complete", self.terminal_guide())
+        self.assertIn("Saved setup is complete", self.terminal_guide("\n"))
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
 
@@ -330,7 +330,7 @@ class SetupTests(unittest.TestCase):
         report = json.loads(self.cli("--check", "--json").stdout)
         self.assertEqual([r["state"] for r in report["stages"]], ["ready"] * 5)
         self.assertFalse(report["ready"])
-        self.assertIn("Saved setup is complete", self.terminal_guide())
+        self.assertIn("Saved setup is complete", self.terminal_guide("\n"))
         self.assertEqual((directory / "input-calibration.json").read_bytes(), inputs)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
@@ -432,11 +432,60 @@ class SetupTests(unittest.TestCase):
         for pose, unsure, said in [({"state": "moved"}, False, "Sensor CAMTEST moved and cv1touch is placing it again"),
                                    (None, True, "still checking whether a sensor moved")]:
             self.pose, self.unsure = pose, unsure
-            output = self.terminal_guide()
+            output = self.terminal_guide("\n")
             self.assertIn(said, output)
             self.assertIn("Saved setup is complete", output)
             self.assertNotIn("Enter: start", output)
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+
+    def test_finished_setup_lists_each_stage_to_redo_and_finishing_changes_nothing(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        for answers in ["\n", "q\n", "x\n\n"]:
+            output = self.terminal_guide(answers)
+            self.assertIn("Sensor positions    done   1: redo (~2 min, then Headset alignment ~3 min)", output)
+            self.assertIn("Headset alignment   done   5: redo (~3 min)", output)
+            self.assertIn("Saved setup is complete", output)
+            # a wrong key repeats what can be typed
+            self.assertEqual(output.count("1-5: redo that stage   Enter: finish"), 1 + answers.startswith("x"))
+            self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
+        # --redo, and a guide that did a stage, end as before
+        output = self.terminal_guide("k\n", args=("--redo", "model"))
+        self.assertIn("Saved setup is complete", output)
+        self.assertNotIn("1: redo", output)
+
+    def test_a_stage_chosen_from_the_finished_list_is_offered_as_redo_offers_it(self):
+        directory = self.fixtures()
+        self.terminal_guide("keep\n" * 4)
+        before = {p: p.read_bytes() for p in directory.iterdir()}
+        journal = self.root / "state/cv1touch/setup.json"
+        checkpoint = journal.read_bytes()
+        prompt = lambda output: [line for line in output.splitlines() if "q: quit" in line][-1]
+        for number, name in enumerate(["sensors", "floor", "model", "buttons", "headset"], 1):
+            chosen = self.terminal_guide(f"{number}\nq\n", expected_code=1)
+            redo = self.terminal_guide("q\n", expected_code=1, args=("--redo", name))
+            self.assertEqual(prompt(chosen), prompt(redo), name)
+            self.assertEqual(journal.read_bytes(), checkpoint)
+        self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
+        self.assertEqual(self.mutation_checkpoints, [])
+        # Enter at its prompt starts the stage, with the same stages pending as --redo
+        started = []
+        for answers, args in [("1\n\nq\n", ()), ("\nq\n", ("--redo", "sensors"))]:
+            journal.write_bytes(checkpoint)
+            self.commands.clear()
+            self.mutation_checkpoints.clear()
+            self.terminal_guide(answers, expected_code=1, args=args)
+            started.append(([c for c in self.commands if c not in ("status", "inputs")],
+                            self.mutation_checkpoints[0]))
+        self.maxDiff = None
+        self.assertEqual(started[0], started[1])
+        self.assertIn("calibration capture", started[0][0])
+        self.assertEqual(set(started[0][1]["pending"]), {"camera", "gravity", "registration"})
 
     def test_pending_engine_reload_blocks_capture_despite_advancing_old_streams(self):
         directory = self.fixtures()
@@ -489,10 +538,10 @@ class SetupTests(unittest.TestCase):
         self.assertIn("\x1b[1mSensor positions (~2 min)", output)
         self.assertIn("Sensor positions    saved earlier, not verified", output)
         self.env["NO_COLOR"] = "1"
-        self.assertNotIn("\x1b", self.terminal_guide())
+        self.assertNotIn("\x1b", self.terminal_guide("\n"))
         self.env.pop("NO_COLOR")
         self.env["TERM"] = "dumb"
-        self.assertNotIn("\x1b", self.terminal_guide())
+        self.assertNotIn("\x1b", self.terminal_guide("\n"))
 
     def test_malformed_journal_is_read_only_and_never_contacts_daemon(self):
         journal = self.root / "state/cv1touch/setup.json"

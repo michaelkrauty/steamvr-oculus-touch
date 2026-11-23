@@ -60,9 +60,24 @@ pub const INSPECTION_NS: u64 = 30_000_000_000;
 /// sensor's long search no more than an ordinary cooldown does.
 pub const STARVED_RETRY_NS: u64 = 60_000_000_000;
 
+/// How the daemon's log and `cv1touch doctor` send a person back to the sensor stage: through
+/// setup's list of finished stages, which the Start menu's Set up cv1touch shows as well.
+pub const REDO_SENSORS: &str = redo_sensors(cfg!(windows));
+
+/// `REDO_SENSORS` on Windows (`windows`) or elsewhere.
+pub const fn redo_sensors(windows: bool) -> &'static str {
+    if windows {
+        "redo Sensor positions in Set up cv1touch"
+    } else {
+        "redo Sensor positions in cv1touch setup"
+    }
+}
+
 /// The advice while fewer than two sensors agree with each other (`Change::Unsure`), for the
 /// daemon's log and `cv1touch doctor` alike.
-pub const UNSURE_ADVICE: &str = "cv1touch is still checking whether a sensor moved: fewer than two sensors agree on where the controllers are. Keep the controllers where the sensors can see them; if it stays unsure for several minutes, run cv1touch setup --redo sensors";
+pub fn unsure_advice() -> String {
+    format!("cv1touch is still checking whether a sensor moved: fewer than two sensors agree on where the controllers are. Keep the controllers where the sensors can see them; if it stays unsure for several minutes, {REDO_SENSORS}")
+}
 
 /// Why a sensor judged moved went back into tracking as calibrated (`status`: `pose.cause`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -101,7 +116,7 @@ impl LetGo {
             LetGo::FalseAlarm => ("looked as if it had moved, but it stands where it was calibrated: nothing to do".into(), false),
             LetGo::Unseen => ("looked as if it had moved, but no controller came into its view for 30 seconds to check, so it is used as calibrated again: nothing to do".into(), false),
             LetGo::Starved => (format!("may have moved, but the controllers in its view did not turn enough on their own to tell which is which, so it is used as calibrated for now. cv1touch checks it again {when}: then turn each controller on its own in front of it"), true),
-            LetGo::TimedOut => (format!("looks moved, but no new position for it was found in 3 minutes, so it is used as calibrated again and the controllers can look off where it sees them. cv1touch checks it again {when}: then move the controllers around in front of it. If that does not place it, run cv1touch setup --redo sensors"), true),
+            LetGo::TimedOut => (format!("looks moved, but no new position for it was found in 3 minutes, so it is used as calibrated again and the controllers can look off where it sees them. cv1touch checks it again {when}: then move the controllers around in front of it. If that does not place it, {REDO_SENSORS}"), true),
         }
     }
 }
@@ -1213,6 +1228,24 @@ pub fn solve(
 mod tests {
     use super::*;
     use nalgebra::Vector2;
+
+    /// The way back to the sensor stage names what each platform's user opens: the command in a
+    /// terminal, the Start menu's shortcut on Windows. Both reach setup's menu of finished stages.
+    #[test]
+    fn the_advice_to_redo_the_sensors_names_what_the_user_opens() {
+        assert_eq!(
+            redo_sensors(false),
+            "redo Sensor positions in cv1touch setup"
+        );
+        assert_eq!(
+            redo_sensors(true),
+            "redo Sensor positions in Set up cv1touch"
+        );
+        assert_eq!(REDO_SENSORS, redo_sensors(cfg!(windows)));
+        assert!(unsure_advice().ends_with(&format!("for several minutes, {REDO_SENSORS}")));
+        let (timed_out, _) = LetGo::TimedOut.advice(None);
+        assert!(timed_out.ends_with(&format!("If that does not place it, {REDO_SENSORS}")));
+    }
 
     fn sensor(
         serial: &str,

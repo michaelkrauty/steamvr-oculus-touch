@@ -3182,7 +3182,7 @@ impl Reposing {
                     self.unsure_until = now + 2 * repose::WINDOW_NS;
                     if now.saturating_sub(self.unsure_logged) >= UNSURE_LOG_NS {
                         self.unsure_logged = now;
-                        say(repose::UNSURE_ADVICE.to_string());
+                        say(repose::unsure_advice());
                     }
                 }
             }
