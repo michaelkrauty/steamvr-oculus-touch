@@ -286,8 +286,8 @@ fn journal_output(command: &mut Command) -> io::Result<(process::ExitStatus, Vec
 fn journal(report: &mut Report) {
     let output = journal_output(Command::new("journalctl").args([
         "--user",
-        "-u",
-        "cv1touchd",
+        // Not `-u cv1touchd`: journald files many of the daemon's lines under another scope.
+        "_COMM=cv1touchd",
         "-b",
         "--no-pager",
         "-o",

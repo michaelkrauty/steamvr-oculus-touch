@@ -24,6 +24,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- On Linux, `cv1touch report` now collects all of the daemon's journal lines for this boot. It filtered by the systemd unit, which leaves out lines journald files under another scope.
 - The build no longer fails on Fedora and other distributions whose compiler does not build position-independent executables by default, where three of the native test programs failed to link. The setup guide now lists the Fedora packages.
 - `cv1touch doctor` said "judged moved by mistake and let go" for every sensor the daemon put back into tracking as calibrated, also when no new position for it was found in time. It now says what happened and what to do in each case, including when cv1touch checks the sensor again. `status --json` gives the reason as `pose.cause` and the time of that check as `pose.next_check_ns`.
 - The daemon's log no longer fills with battery lines when a controller's battery reading alternates between two neighbouring percentages, which could write thousands of lines a day. A change is logged once; going back to the previous percentage is not logged again. `cv1touch status` still shows the newest reading.

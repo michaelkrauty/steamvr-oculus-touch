@@ -180,7 +180,7 @@ class ReportTests(unittest.TestCase):
                 out = self.root / f"journal-{index}.zip"
                 self.report(out)
                 called = json.loads(invocation.read_text())
-                self.assertEqual(called["argv"], ["--user", "-u", "cv1touchd", "-b",
+                self.assertEqual(called["argv"], ["--user", "_COMM=cv1touchd", "-b",
                                                  "--no-pager", "-o", "short-iso-precise"])
                 self.assertTrue(finished.exists(), "the entire producer must be drained")
                 with self.assertRaises(ProcessLookupError):
