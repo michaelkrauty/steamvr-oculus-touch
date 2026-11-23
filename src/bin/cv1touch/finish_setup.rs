@@ -14,21 +14,49 @@ enum Step {
     Start,
 }
 
+/// Printed before the reasons setup is incomplete; the installer shows the lines after it.
 #[cfg(any(windows, test))]
-fn prepare(mut run: impl FnMut(Step) -> i32) -> i32 {
+const INCOMPLETE: &str = "Setup is incomplete:";
+
+/// The exit code, and one line per step that did not finish saying what to do about it.
+#[cfg(any(windows, test))]
+fn prepare(mut run: impl FnMut(Step) -> i32) -> (i32, Vec<&'static str>) {
     // Refuse before stopping tracking if SteamVR is open or its state is unknown.
-    if run(Step::SteamVrStopped) != 0 || !matches!(run(Step::Stop), 0 | 1) {
-        return 1;
+    if run(Step::SteamVrStopped) != 0 {
+        return (1, vec!["Quit SteamVR, then try again."]);
+    }
+    if !matches!(run(Step::Stop), 0 | 1) {
+        return (
+            1,
+            vec!["cv1touch could not stop. Restart Windows, then try again."],
+        );
     }
     let sensors = run(Step::Sensors);
     let steamvr = run(Step::SteamVr);
     let start = run(Step::Start);
+    let mut left = Vec::new();
+    match sensors {
+        0 => {}
+        3 => left.push("Restart Windows to finish giving the sensors their driver."),
+        _ => left.push(
+            "The sensors did not get their driver. Plug in every sensor and allow Windows' permission prompt.",
+        ),
+    }
+    if steamvr != 0 {
+        left.push(
+            "cv1touch could not add itself to SteamVR. Install SteamVR, start it once with your headset, then quit it.",
+        );
+    }
+    if start != 0 {
+        left.push("cv1touch could not start. Restart Windows: it starts when you log in.");
+    }
     // Partial failure must not look successful just because the last command succeeded.
-    if steamvr != 0 || start != 0 || !matches!(sensors, 0 | 3) {
+    let code = if steamvr != 0 || start != 0 || !matches!(sensors, 0 | 3) {
         1
     } else {
         sensors // 3: Windows asked for a restart, not ready for calibration yet.
-    }
+    };
+    (code, left)
 }
 
 #[cfg(windows)]
@@ -58,7 +86,7 @@ pub(super) fn run() -> i32 {
         .map_err(|e| e.to_string())?;
         let tool = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut log_error = false;
-        let code = prepare(|step| {
+        let (code, left) = prepare(|step| {
             let (program, args): (_, &[&str]) = match step {
                 Step::SteamVrStopped => (tool.clone(), &["steamvr", "check-stopped"]),
                 Step::Stop => (tool.clone(), &["stop"]),
@@ -102,10 +130,16 @@ pub(super) fn run() -> i32 {
         if log_error {
             return Err("Could not save all setup diagnostics; check free disk space.".into());
         }
+        if !left.is_empty() {
+            println!("\n{INCOMPLETE}");
+            for line in &left {
+                println!("- {line}");
+            }
+        }
         println!("\n{}", match code {
             0 => "Driver setup finished. Choose Set up cv1touch in the Start menu to calibrate.",
-            3 => "Restart Windows, then choose Set up cv1touch in the Start menu.",
-            _ => "Setup is incomplete. Fix the messages above, then run Finish setting up cv1touch again. For help, choose Send a cv1touch report in the Start menu.",
+            3 => "Then choose Set up cv1touch in the Start menu.",
+            _ => "Then run Finish setting up cv1touch again. For help, choose Send a cv1touch report in the Start menu.",
         });
         Ok(code)
     };
@@ -142,12 +176,19 @@ mod tests {
                     } else {
                         0
                     }
-                }),
+                })
+                .0,
                 1
             );
             assert_eq!(called.last(), Some(&failed));
             assert!(!called.contains(&Step::Sensors));
         }
+    }
+
+    #[test]
+    fn the_installer_shows_the_reasons() {
+        let installer = include_str!("../../../windows/installer/cv1touch.iss");
+        assert!(installer.contains(&format!("if S = '{INCOMPLETE}' then")));
     }
 
     #[test]
@@ -157,7 +198,7 @@ mod tests {
             for driver in [0, 1] {
                 for start in [0, 1] {
                     let mut called = Vec::new();
-                    let code = prepare(|step| {
+                    let (code, left) = prepare(|step| {
                         called.push(step);
                         match step {
                             Step::Sensors => sensor,
@@ -185,6 +226,9 @@ mod tests {
                             sensor
                         }
                     );
+                    // One reason per step that did not finish, a restart included.
+                    let failed = [sensor != 0, driver != 0, start != 0];
+                    assert_eq!(left.len(), failed.iter().filter(|f| **f).count());
                 }
             }
         }

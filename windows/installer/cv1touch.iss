@@ -5,7 +5,7 @@
 ; starts at logon without a window (cv1touchd-quiet). After the files are in place it gives the
 ; sensors Windows' own WinUSB driver (cv1touch sensors install, which asks for permission once),
 ; registers the SteamVR driver (cv1touch steamvr install) and starts the daemon; a step that does
-; not finish (no sensor plugged in, SteamVR running or missing) is said in a message box, and the
+; not finish is said in a message box, in finish-setup's own words, and the
 ; Start menu's "Finish setting up cv1touch" runs both again. The uninstaller stops the daemon,
 ; unregisters the driver and takes the sensors' driver off again;
 ; settings and calibration under %LOCALAPPDATA%\cv1touch stay, so that installing again finds them.
@@ -70,7 +70,7 @@ Name: "{group}\Set up cv1touch"; Filename: "{cmd}"; Parameters: "/k """"{app}\bi
 Name: "{group}\Check cv1touch"; Filename: "{cmd}"; Parameters: "/k """"{app}\bin\cv1touch.exe"" doctor"""; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch.exe"; Comment: "Whether everything cv1touch needs is in place"
 Name: "{group}\Finish setting up cv1touch"; Filename: "{cmd}"; Parameters: "/d /k """"{app}\bin\cv1touch.exe"" finish-setup"""; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch.exe"; Comment: "The sensors' driver and the SteamVR registration, for when the installer could not do them"
 Name: "{group}\Send a cv1touch report"; Filename: "{cmd}"; Parameters: "/k """"{app}\bin\cv1touch.exe"" report"""; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch.exe"; Comment: "One file with the logs and settings, for someone helping you"
-Name: "{group}\Start cv1touch"; Filename: "{app}\bin\cv1touchd-quiet.exe"; Comment: "Starts the daemon, which normally starts at logon"
+Name: "{group}\Start cv1touch"; Filename: "{cmd}"; Parameters: "/d /k ""start """" /wait ""{app}\bin\cv1touchd-quiet.exe"" && echo cv1touch is running. It also starts by itself when you log in."""; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch.exe"; Comment: "Starts the daemon, which normally starts at logon"
 Name: "{group}\Stop cv1touch"; Filename: "{cmd}"; Parameters: "/k """"{app}\bin\cv1touch.exe"" stop"""; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch.exe"; Comment: "Stops the daemon until the next logon or Start cv1touch"
 
 [Registry]
@@ -78,7 +78,7 @@ Name: "{group}\Stop cv1touch"; Filename: "{cmd}"; Parameters: "/k """"{app}\bin\
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "cv1touch"; ValueData: """{app}\bin\cv1touchd-quiet.exe"""; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{cmd}"; Parameters: "/d /k """"{app}\bin\cv1touch.exe"" setup"""; WorkingDir: "{app}\bin"; Description: "Set up cv1touch now (plug in the sensors and the headset first)"; Flags: postinstall nowait skipifsilent; Check: ReadyForCalibration
+Filename: "{cmd}"; Parameters: "/d /k """"{app}\bin\cv1touch.exe"" setup"""; WorkingDir: "{app}\bin"; Description: "Set up cv1touch now (wake both controllers and start SteamVR first)"; Flags: postinstall nowait skipifsilent; Check: ReadyForCalibration
 
 [Code]
 var
@@ -177,37 +177,40 @@ begin
     SuppressibleMsgBox('Windows did not finish removing the sensor driver. Restart Windows if requested. To retry, reinstall cv1touch, plug in all sensors, then uninstall again and allow the permission prompt.', mbInformation, MB_OK, IDOK);
 end;
 
-// Runs the tool with Arguments, Doing shown on the progress page meanwhile, and says, as a line
-// for the message box, what to do when it did not finish; '' when it did. The [Run] section would
-// not look at exit codes.
-function Step(Tool, Arguments, Doing, Advice: String): String;
 var
-  Code: Integer;
+  Reasons: String;
+  InReasons: Boolean;
+
+// finish-setup ends, when a step did not finish, with the line 'Setup is incomplete:' and one
+// '- ' line per such step saying what to do (src/bin/cv1touch/finish_setup.rs): keep those. With
+// a callback, ExecAndLogOutput no longer logs the output itself.
+procedure KeepReason(const S: String; const Error, FirstLine: Boolean);
 begin
-  Result := '';
-  WizardForm.StatusLabel.Caption := Doing;
-  if not ExecAndLogOutput(Tool, Arguments, '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code, nil) then
-    Code := -1;
-  Log(Format('cv1touch %s: exit code %d', [Arguments, Code]));
-  if Code = 3 then
-    Result := '- Restart Windows to finish giving the sensors their driver.' + #13#10
-  else if Code <> 0 then
-    Result := '- ' + Advice + #13#10;
+  Log(S);
+  if S = 'Setup is incomplete:' then
+    InReasons := True
+  else if InReasons and (Copy(S, 1, 2) = '- ') then
+    Reasons := Reasons + S + #13#10;
 end;
 
 // After the files are in place: the sensors' driver, the SteamVR registration, and the daemon.
+// The [Run] section would not look at exit codes.
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Tool, Left: String;
+  Code: Integer;
 begin
   if CurStep <> ssPostInstall then
     exit;
-  Tool := ExpandConstant('{app}\bin\cv1touch.exe');
-  Left := Step(Tool, 'finish-setup', 'Preparing the sensors and SteamVR (Windows may ask for permission)...',
-    'Driver setup did not finish. Plug in the sensors, allow the permission prompt, and ensure SteamVR is installed and has been started once, then closed.');
-  SetupReady := Left = '';
-  if (Left <> '') and not WizardSilent then
-    MsgBox('cv1touch is installed, but not everything is set up yet:' + #13#10 + #13#10 + Left + #13#10 +
+  WizardForm.StatusLabel.Caption := 'Preparing the sensors and SteamVR (Windows may ask for permission)...';
+  if not ExecAndLogOutput(ExpandConstant('{app}\bin\cv1touch.exe'), 'finish-setup', '', SW_SHOWNORMAL,
+    ewWaitUntilTerminated, Code, @KeepReason) then
+    Code := -1;
+  Log(Format('cv1touch finish-setup: exit code %d', [Code]));
+  SetupReady := Code = 0;
+  if not SetupReady and (Reasons = '') then
+    Reasons := '- cv1touch could not run its setup. Restart Windows, then try again.' + #13#10;
+  if not SetupReady and not WizardSilent then
+    MsgBox('cv1touch is installed, but not everything is set up yet:' + #13#10 + #13#10 + Reasons + #13#10 +
       'When that is done, choose "Finish setting up cv1touch" in the Start menu: it runs these steps again and says what it finds.',
       mbInformation, MB_OK);
 end;

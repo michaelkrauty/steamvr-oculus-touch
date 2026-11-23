@@ -147,7 +147,9 @@ def main(installer, work):
             assert settings.read_bytes() == saved
             assert (logs / "finish-setup.log").is_file()
             assert (logs / "installer.log").is_file()
-            assert "Setup is incomplete" in (work / f"install-{cycle}.log").read_text(encoding="utf-8-sig")
+            # The runner has no sensors: the installer's log keeps finish-setup's reason for it.
+            install_log = (work / f"install-{cycle}.log").read_text(encoding="utf-8-sig")
+            assert "Setup is incomplete:" in install_log and "- The sensors did not get their driver." in install_log
 
             # Check the actual Start-menu command quoting, not a hand-recreated CLI command.
             for name in ("Set up cv1touch", "Check cv1touch", "Finish setting up cv1touch",
@@ -156,7 +158,7 @@ def main(installer, work):
             check = run_shortcut(shortcut(shortcuts, "Check cv1touch"), expected=1)
             assert "FAIL" in check and "sensor" in check
             repair = run_shortcut(shortcut(shortcuts, "Finish setting up cv1touch"), expected=1)
-            assert "Setup is incomplete" in repair, repair
+            assert "Setup is incomplete:" in repair and "- The sensors did not get their driver." in repair, repair
             until(lambda: status(tool) is not None, "repair did not restart the daemon")
             assert (logs / "finish-setup.previous.log").is_file()
 
@@ -167,8 +169,9 @@ def main(installer, work):
             assert status(tool)["generation"] == generation
             run_shortcut(shortcut(shortcuts, "Stop cv1touch"))
             until(lambda: status(tool) is None, "Stop shortcut did not stop the daemon")
-            start(quiet)
-            until(lambda: status(tool) is not None, "Start did not restart the daemon")
+            started = run_shortcut(shortcut(shortcuts, "Start cv1touch"))
+            assert "cv1touch is running." in started, started
+            until(lambda: status(tool) is not None, "Start shortcut did not restart the daemon")
 
             setup = json.loads(run([tool, "setup", "--check", "--json"], expected=1))
             assert setup, "missing setup diagnostic JSON"

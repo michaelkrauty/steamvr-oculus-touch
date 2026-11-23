@@ -4,6 +4,12 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Changed
+
+- On Windows, when the installer cannot finish setting up, it now says which step did not finish and what to do about it (plug in a sensor, allow Windows' prompt, quit SteamVR, restart Windows), instead of one general message. **Finish setting up cv1touch** ends with the same lines.
+- The Windows Start menu's **Start cv1touch** now opens a window that says when cv1touch is running, and the installer's last page asks you to wake both controllers and start SteamVR before setup.
+- The Windows guide and the first-test checklist point to the installer on the latest release, and the checklist asks testers only for the report and a few words on what did not work.
+
 ### Fixed
 
 - The build no longer fails on Fedora and other distributions whose compiler does not build position-independent executables by default, where three of the native test programs failed to link. The setup guide now lists the Fedora packages.
