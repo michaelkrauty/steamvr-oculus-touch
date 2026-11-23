@@ -259,6 +259,9 @@ struct Daemon {
     classification: [PublishedClassification; 2],
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
+    /// Per hand: the last two battery percentages logged, newest first, -1 before any. A reading
+    /// on a step boundary alternates between two neighbours, so either is old news.
+    battery_logged: Mutex<[[i32; 2]; 2]>,
     /// Wakes the radio thread: new camera frames or bodies, or time to stop. It lives as long as
     /// the daemon, so a sensor thread never signals a closed (or reused) handle.
     radio_wake: hid::Waker,
@@ -703,10 +706,11 @@ impl EngineSink for Daemon {
         }
         if source == 1 {
             for (hand, pct) in cv1touch::hand::battery_from_radio(data) {
-                // logged when it changes: it read 100 for hours on fresh cells, and the first
-                // drop will show what the channel really is
-                let was = self.battery[hand].swap(pct, Ordering::Relaxed);
-                if was != pct {
+                self.battery[hand].store(pct, Ordering::Relaxed);
+                let mut logged = self.battery_logged.lock().unwrap();
+                let [was, before] = logged[hand];
+                if pct != was && pct != before {
+                    logged[hand] = [pct, was];
                     log!(
                         "{} Touch battery {pct}%{}",
                         ["left", "right"][hand],
@@ -6767,6 +6771,7 @@ fn main() {
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
         ],
+        battery_logged: Mutex::new([[-1; 2]; 2]),
         radio_wake: hid::Waker::new().expect("radio waker"),
         radio_on: AtomicBool::new(false),
         inject: Injection::default(),
@@ -8652,6 +8657,7 @@ mod tests {
                 std::sync::atomic::AtomicI32::new(-1),
                 std::sync::atomic::AtomicI32::new(-1),
             ],
+            battery_logged: Mutex::new([[-1; 2]; 2]),
             radio_wake: hid::Waker::new().unwrap(),
             radio_on: AtomicBool::new(false),
             inject: Injection::default(),
@@ -13230,9 +13236,14 @@ mod tests {
                 send([(2, 87), (3, 50)], [87, 50]);
                 send([(2, 86), (2, 85)], [85, 50]);
                 send([(3, 65535), (2, 0)], [0, 100]);
+                // a reading on a step boundary alternates; only a third value is news
+                send([(2, 1), (2, 0)], [0, 100]);
+                send([(2, 1), (3, 99)], [1, 99]);
+                send([(3, 100), (3, 99)], [1, 99]);
+                send([(2, 2), (3, 98)], [2, 98]);
                 assert_eq!(
                     d.battery.each_ref().map(|b| b.load(Ordering::Relaxed)),
-                    [0, 100]
+                    [2, 98]
                 );
             });
             assert_eq!(
@@ -13244,6 +13255,10 @@ mod tests {
                     "left Touch battery 85% (was 86%)",
                     "right Touch battery 100% (was 50%)",
                     "left Touch battery 0% (was 85%)",
+                    "left Touch battery 1% (was 0%)",
+                    "right Touch battery 99% (was 100%)",
+                    "left Touch battery 2% (was 1%)",
+                    "right Touch battery 98% (was 99%)",
                 ]
             );
         }
