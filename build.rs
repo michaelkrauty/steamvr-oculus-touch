@@ -73,6 +73,13 @@ fn build_engine(root: &Path, out: &Path) {
         meson.arg("--reconfigure");
     }
     let deps = windows.then(|| windows_deps(&mut meson));
+    if !windows {
+        // Position-independent executables whatever the compiler's default (Fedora's GCC builds
+        // non-PIE), also in a build directory configured before. The native tests that build the
+        // engine's sources in one unit link only because --gc-sections drops the code they never
+        // call; non-PIE code shares constant pools between functions and keeps that code.
+        meson.arg("-Db_pie=true");
+    }
     run(meson.arg("--wrap-mode=nodownload").arg(&native).arg(root));
     let jobs = env::var("CARGO_BUILD_JOBS")
         .ok()

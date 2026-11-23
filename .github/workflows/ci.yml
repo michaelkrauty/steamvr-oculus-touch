@@ -74,3 +74,25 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Build and test
         run: scripts/check.sh
+
+  check-fedora:
+    # The Fedora build from the setup guide. Fedora's GCC does not build position-independent
+    # executables by default; the compilers of the other jobs do, so only this job fails when
+    # the native build depends on that default.
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: Install git for the checkout
+        run: dnf -y install git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the packages the setup guide lists
+        run: dnf -y install gcc-c++ libstdc++-static cargo meson ninja-build clang hidapi-devel libusb1-devel libjpeg-turbo-devel pipewire-devel libubsan python3 procps-ng
+      - name: Build and run the native tests
+        run: |
+          cargo build --locked --release
+          meson test -C "$(cat target/release/cv1touch-native-dir)" --no-rebuild --print-errorlogs

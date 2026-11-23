@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Fixed
+
+- The build no longer fails on Fedora and other distributions whose compiler does not build position-independent executables by default, where three of the native test programs failed to link. The setup guide now lists the Fedora packages.
+
 ## [0.5.1](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) - 2026-11-23
 
 ### Added

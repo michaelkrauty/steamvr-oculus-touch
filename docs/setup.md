@@ -16,7 +16,13 @@ On Arch Linux:
 sudo pacman -S --needed base-devel rust meson ninja clang hidapi libusb libjpeg-turbo pipewire glib2 gstreamer gst-plugins-base python procps-ng
 ```
 
-Hosted CI builds on Ubuntu 24.04; this identifies the build environment, not a SteamVR runtime compatibility guarantee. Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.
+On Fedora:
+
+```sh
+sudo dnf install gcc-c++ libstdc++-static cargo meson ninja-build clang hidapi-devel libusb1-devel libjpeg-turbo-devel pipewire-devel libubsan python3 procps-ng
+```
+
+Hosted CI builds on Ubuntu 24.04 and Fedora 44; this identifies the build environments, not a SteamVR runtime compatibility guarantee. Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.
 
 ## Device access
 
