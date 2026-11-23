@@ -104,10 +104,11 @@ Camera calibration estimates the sensors' poses in a shared world. Registration 
 3. Level the world with gravity. Start a recording, then hold each controller still for at least 2 seconds in **at least 12 substantially different orientations**, including upside down and sideways. Move gently between holds, keeping optical visibility. A minute or two is usually enough. Each recording needs a file name not used before; the commands below keep it in cv1touch's state folder, `$XDG_STATE_HOME/cv1touch` (by default `~/.local/state/cv1touch`), where setup keeps its own recordings:
 
    ```sh
-   cv1touch record start ~/.local/state/cv1touch/manual-gravity.rec
+   dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"; mkdir -p "$dir"
+   cv1touch record start "$dir/manual-gravity.rec"
    # Make the static holds, then:
    cv1touch record stop
-   cv1touch calibrate gravity ~/.local/state/cv1touch/manual-gravity.rec --write
+   cv1touch calibrate gravity "$dir/manual-gravity.rec" --write
    systemctl --user restart cv1touchd
    ```
 
@@ -155,10 +156,11 @@ Connect or unplug sensors while the daemon runs. The daemon normally notices a s
 For a fresh layout, repeat camera calibration, gravity levelling, and SteamVR registration as above. A sensor that merely moved needs nothing: the daemon places it again from the others (above). To add a new sensor while retaining an existing calibrated room, capture both controllers moving in the new sensor's view while the calibrated sensors also see them:
 
 ```sh
-cv1touch record start ~/.local/state/cv1touch/manual-add-sensor.rec
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"; mkdir -p "$dir"
+cv1touch record start "$dir/manual-add-sensor.rec"
 # Move both controllers with varied orientations in overlapping views, then:
 cv1touch record stop
-cv1touch calibrate place SERIAL ~/.local/state/cv1touch/manual-add-sensor.rec
+cv1touch calibrate place SERIAL "$dir/manual-add-sensor.rec"
 ```
 
 Replace `SERIAL` with the new sensor's value from status. Inspect the fit first; repeat with `--write` only when the fit succeeds, then restart the daemon. This adds the sensor in the existing coordinate frame and preserves the other camera poses. Keep the capture and inspect tracking after the change. Removing a temporary sensor does not require deleting its calibration; disconnected entries remain available if you reconnect it. Reconnecting it reuses its saved calibration as soon as the daemon has opened it.
