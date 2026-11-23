@@ -879,6 +879,12 @@ fn status_board(shm_name: &str) -> i32 {
             "\x1b[H\x1b[2J{}",
             status::render(&hands, &sensors, &rates, age)
         );
+        if let Some(note) = complete
+            .as_ref()
+            .and_then(|v| status::radio_loss_note(v, &hands))
+        {
+            println!("{note}");
+        }
         if !sensor_note.is_empty() {
             println!("{sensor_note}");
         }

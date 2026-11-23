@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- `cv1touch status` now shows, for each controller that is on, the share of its motion reports lost over the radio in the last minute, for example `radio: left 7 %, right 8 % of motion reports lost in the last minute (normal is under 20 %)`. `status --json` gives it as `radio_lost_percent` for each hand, or null when the controller sent nothing in that minute.
+
 ### Changed
 
 - On Windows, when the installer cannot finish setting up, it now says which step did not finish and what to do about it (plug in a sensor, allow Windows' prompt, quit SteamVR, restart Windows), instead of one general message. **Finish setting up cv1touch** ends with the same lines.

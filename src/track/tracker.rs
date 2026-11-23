@@ -183,6 +183,10 @@ pub struct Stats {
     pub too_old: u64,
     /// IMU discontinuities (sleep, dropout) that reset the state.
     pub imu_gaps: u64,
+    /// IMU samples received, and those the radio lost between two received ones less than
+    /// `max_imu_gap_ns` apart (a longer silence is counted in `imu_gaps`).
+    pub imu_samples: u64,
+    pub imu_lost: u64,
     /// Re-locks after the position was lost, by the tracker's own association.
     pub relocks: u64,
     /// Tracks dropped for a runaway accelerometer bias.
@@ -451,6 +455,12 @@ const IMU_PERIOD_NS: u64 = 2_000_000;
 /// missing. A lone 3 ms step is stamp jitter, paired with a 1 ms one, not a loss.
 const HOLE_MIN_NS: u64 = 2 * IMU_PERIOD_NS - IMU_PERIOD_NS / 4;
 
+/// The samples missing from an interval between two received IMU samples, by `HOLE_MIN_NS`'s
+/// rule: a 3 ms step is jitter, a 4 ms one has lost a sample.
+pub fn samples_lost_in(interval_ns: u64) -> u64 {
+    ((interval_ns + IMU_PERIOD_NS / 4) / IMU_PERIOD_NS).saturating_sub(1)
+}
+
 /// What a stretch of lost IMU samples hides once it is bridged by the straight line between the
 /// samples on either side: the measured p95 of the velocity (m/s) and rotation (rad) the lost
 /// samples would have added beyond that line, by the stretch's length T (s) and by the rate of
@@ -647,6 +657,10 @@ impl Tracker {
             .imu
             .back()
             .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns);
+        self.stats.imu_samples += 1;
+        if let Some(l) = self.imu.back().filter(|_| !gap) {
+            self.stats.imu_lost += samples_lost_in(s.t - l.t);
+        }
         // past `history_ns` no frame of the pending exposure can come any more
         if self
             .bias_pending
@@ -3156,6 +3170,26 @@ mod tests {
         assert!(f.cov.iter().all(|c| c.is_finite()) && f.x.p.iter().all(|c| c.is_finite()));
         let (vel, rot) = hole_variance(Some(&rail), &prev, &s);
         assert!(vel.is_finite() && rot.is_finite() && vel > 0.0 && rot > 0.0);
+    }
+
+    #[test]
+    fn imu_samples_lost_over_the_radio_are_counted_but_not_jitter_or_a_long_silence() {
+        let w = world(8);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        // 3 ms and 1 ms is stamp jitter; 4 ms loses one sample, 10 ms four; 150 ms is a gap
+        let mut ms = 0;
+        tr.imu(imu(&w, 0.0));
+        for step in [2, 2, 3, 1, 2, 4, 2, 10, 2, 150, 2, 2] {
+            ms += step;
+            tr.imu(imu(&w, f64::from(ms) * 1e-3));
+        }
+        assert_eq!(
+            (tr.stats.imu_samples, tr.stats.imu_lost),
+            (13, 5),
+            "{:?}",
+            tr.stats
+        );
+        assert_eq!(tr.stats.imu_gaps, 1);
     }
 
     /// The radio drops for 400 ms (an IMU reset) while the sensors keep exposing. The frames of

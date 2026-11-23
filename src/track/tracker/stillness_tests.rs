@@ -134,6 +134,10 @@ impl Tracker {
             .imu
             .back()
             .is_some_and(|l| s.t - l.t > self.params.max_imu_gap_ns);
+        self.stats.imu_samples += 1;
+        if let Some(l) = self.imu.back().filter(|_| !gap) {
+            self.stats.imu_lost += samples_lost_in(s.t - l.t);
+        }
         // past `history_ns` no frame of the pending exposure can come any more
         if self
             .bias_pending

@@ -210,6 +210,8 @@ struct Daemon {
     sensor_video: Mutex<Vec<engine::SensorVideo>>,
     sensor_video_quality: Mutex<Vec<engine::SensorVideoQuality>>,
     track_stats: Mutex<[(Stats, bool); 2]>,
+    /// Per hand, the percentage of IMU samples the radio lost over the last minute.
+    radio_lost_percent: Mutex<[Option<f64>; 2]>,
     pending_frames_dropped: std::sync::atomic::AtomicU64,
     /// Per sensor serial: its landmarks' newest shift (px) and how many were measured.
     landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
@@ -4114,6 +4116,7 @@ fn radio_main(
     let mut search_skip = SearchSkip::default();
     let mut image_demand = None;
     let mut next_stats = 0u64;
+    let mut radio_loss: [cv1touch::status::RadioLoss; 2] = Default::default();
     let mut clocks = Vec::new();
     let mut radio_failed = false;
     let mut rest = Rest::new();
@@ -4260,12 +4263,17 @@ fn radio_main(
         if now >= next_stats {
             d.pending_frames_dropped
                 .store(pipe.frames_dropped, Ordering::Relaxed);
-            *d.track_stats.lock().unwrap() = [HAND_LEFT, HAND_RIGHT].map(|h| {
+            let stats = [HAND_LEFT, HAND_RIGHT].map(|h| {
                 (
                     pipe.stats(h),
                     pipe.latest(h).is_some_and(|s| s.output.tracking),
                 )
             });
+            *d.radio_lost_percent.lock().unwrap() = [HAND_LEFT, HAND_RIGHT].map(|h| {
+                let s = stats[h].0;
+                radio_loss[h].update(now, [s.imu_samples, s.imu_lost])
+            });
+            *d.track_stats.lock().unwrap() = stats;
             next_stats = now + SENSOR_PUBLISH_NS;
         }
     }
@@ -4423,6 +4431,12 @@ impl Drop for RadioExit<'_> {
     fn drop(&mut self) {
         self.link.hands.radio_exit();
         self.d.radio_on.store(false, Ordering::Release);
+        // a share of the last minute's reports: none arrive once this thread is gone
+        *self
+            .d
+            .radio_lost_percent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = [None; 2];
         if !self.link.stop.load(Ordering::Acquire) {
             self.d.reopen.store(true, Ordering::Release);
         }
@@ -5554,14 +5568,16 @@ fn status_json(d: &Daemon) -> String {
     recording_json["message"] = serde_json::json!(recording.message());
     let al = d.shm.alignment().unwrap_or_default();
     let shared = status_shared(d);
+    let radio_lost = *d.radio_lost_percent.lock().unwrap();
     let hands_json: Vec<String> = hands
         .iter()
         .zip(["left", "right"])
         .zip(shared.track_stats.iter())
-        .map(|((s, name), (t, tracking))| {
+        .zip(radio_lost)
+        .map(|(((s, name), (t, tracking)), radio_lost)| {
             format!(
-                "{{\"hand\":\"{name}\",\"flags\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
-                s.flags, t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
+                "{{\"hand\":\"{name}\",\"flags\":{},\"radio_lost_percent\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
+                s.flags, serde_json::json!(radio_lost), t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
             )
         })
         .collect();
@@ -6747,6 +6763,7 @@ fn main() {
         sensor_video: Mutex::new(Vec::new()),
         sensor_video_quality: Mutex::new(Vec::new()),
         track_stats: Mutex::new([(Stats::default(), false); 2]),
+        radio_lost_percent: Mutex::new([None; 2]),
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
         sensor_poses: Mutex::new(Default::default()),
@@ -8477,6 +8494,30 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_each_hands_radio_loss_or_null() {
+        let d = status_daemon();
+        *d.radio_lost_percent.lock().unwrap() = [Some(7.5), None];
+        let value: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(value["hands"][0]["radio_lost_percent"], 7.5);
+        assert_eq!(
+            value["hands"][1]["radio_lost_percent"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn the_radio_loss_share_goes_when_the_radio_thread_exits() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let mut watch = None;
+        let session = RadioSession::begin(&d, &link, &mut watch);
+        *d.radio_lost_percent.lock().unwrap() = [Some(7.5), Some(12.0)];
+        drop(session);
+        assert_eq!(*d.radio_lost_percent.lock().unwrap(), [None; 2]);
+    }
+
+    #[test]
     fn mixed_case_landmark_status_and_forget_join_device_and_file_names() {
         let d = status_daemon();
         let mut sensor = SensorStatus::default();
@@ -8628,6 +8669,7 @@ mod tests {
             sensor_video: Mutex::new(Vec::new()),
             sensor_video_quality: Mutex::new(Vec::new()),
             track_stats: Mutex::new([(Stats::default(), false); 2]),
+            radio_lost_percent: Mutex::new([None; 2]),
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
             sensor_poses: Mutex::new(Default::default()),

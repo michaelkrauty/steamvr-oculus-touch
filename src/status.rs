@@ -486,6 +486,60 @@ pub fn render(
     lines.join("\n")
 }
 
+/// The minute `RadioLoss` looks back over.
+pub const RADIO_LOSS_WINDOW_NS: u64 = 60_000_000_000;
+
+/// Of 276 full awake minutes of recorded play, 274 lost at most 17.2 % of their motion reports
+/// (median 7.7 %); the other two lost 29 and 45 %.
+const RADIO_LOSS_NORMAL_PERCENT: f64 = 20.0;
+
+/// The share of a controller's motion reports (IMU samples) the radio lost over the last minute,
+/// from the tracker's running counts of samples received and lost.
+#[derive(Default)]
+pub struct RadioLoss {
+    counts: std::collections::VecDeque<(u64, [u64; 2])>,
+}
+
+impl RadioLoss {
+    /// Records the counts `[received, lost]` seen at `now_ns`; returns the percentage lost since
+    /// a minute ago, or None when no sample arrived in that time (the controller was asleep).
+    pub fn update(&mut self, now_ns: u64, counts: [u64; 2]) -> Option<f64> {
+        // a new tracker counts from zero
+        if self
+            .counts
+            .back()
+            .is_some_and(|(_, c)| counts[0] < c[0] || counts[1] < c[1])
+        {
+            self.counts.clear();
+        }
+        self.counts.push_back((now_ns, counts));
+        while self.counts.len() > 2 && self.counts[1].0 + RADIO_LOSS_WINDOW_NS <= now_ns {
+            self.counts.pop_front();
+        }
+        let ([r0, l0], [r1, l1]) = (self.counts[0].1, counts);
+        let (received, lost) = (r1 - r0, l1 - l0);
+        (received > 0).then(|| lost as f64 * 100.0 / (received + lost) as f64)
+    }
+}
+
+/// The status board's radio line for the controllers that are on, from the status reply's
+/// `radio_lost_percent`.
+pub fn radio_loss_note(value: &serde_json::Value, hands: &[ControllerState; 2]) -> Option<String> {
+    let parts: Vec<String> = (0..2)
+        .filter(|&h| hands[h].flags & FLAG_CONNECTED != 0)
+        .filter_map(|h| {
+            let percent = value["hands"][h]["radio_lost_percent"].as_f64()?;
+            Some(format!("{} {percent:.0} %", HAND_NAMES[h]))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "radio: {} of motion reports lost in the last minute (normal is under {RADIO_LOSS_NORMAL_PERCENT:.0} %)",
+            parts.join(", ")
+        )
+    })
+}
+
 /// Per-second rates of monotonically increasing counters (frames, fixes) for the status board.
 /// The daemon publishes sensor counters in 250 ms steps while the board samples faster, so rates
 /// are measured between the times counter changes were first observed, over at least `window_ns`.
@@ -608,6 +662,39 @@ mod tests {
         assert!(text.contains("+100.0") && text.contains("-200.0"));
         assert!(text.contains("buttons A") && text.contains("touch trigger"));
         assert!(text.contains("CAMERA1: placed") && text.contains("R  48.5"));
+    }
+
+    #[test]
+    fn radio_loss_is_the_share_lost_in_the_last_minute() {
+        const S: u64 = 1_000_000_000;
+        let mut loss = RadioLoss::default();
+        assert_eq!(loss.update(0, [0, 0]), None);
+        // 30 s at 500 samples/s with 10 % lost, then 30 s with 20 % lost
+        assert_eq!(loss.update(30 * S, [13_500, 1_500]), Some(10.0));
+        assert_eq!(loss.update(60 * S, [25_500, 4_500]), Some(15.0));
+        // the first half minute has left the window
+        assert_eq!(loss.update(90 * S, [37_500, 7_500]), Some(20.0));
+        // asleep for a minute: no samples, no figure
+        assert_eq!(loss.update(150 * S, [37_500, 7_500]), None);
+        // a new tracker counts from zero
+        assert_eq!(loss.update(152 * S, [100, 0]), None);
+        assert_eq!(loss.update(153 * S, [500, 100]), Some(20.0));
+    }
+
+    #[test]
+    fn radio_loss_note_names_only_controllers_that_are_on() {
+        let value = serde_json::json!({"hands": [
+            {"radio_lost_percent": 7.4}, {"radio_lost_percent": 12.6}
+        ]});
+        let on = state(FLAG_CALIBRATED | FLAG_CONNECTED);
+        assert_eq!(
+            radio_loss_note(&value, &[on, on]).unwrap(),
+            "radio: left 7 %, right 13 % of motion reports lost in the last minute (normal is under 20 %)"
+        );
+        let note = radio_loss_note(&value, &[state(FLAG_CALIBRATED | FLAG_ASLEEP), on]).unwrap();
+        assert!(note.starts_with("radio: right 13 % of"), "{note}");
+        let unknown = serde_json::json!({"hands": [{"radio_lost_percent": null}, {}]});
+        assert_eq!(radio_loss_note(&unknown, &[on, on]), None);
     }
 
     #[test]
