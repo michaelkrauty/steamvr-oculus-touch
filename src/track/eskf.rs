@@ -221,25 +221,42 @@ impl Filter {
     }
 
     /// Takes on the turn that gyro readings at their rails may hide over the `dt` seconds just
-    /// propagated: white turn rate of density `rot` (rad^2/s, body frame), integrated through the
-    /// dynamics as `add_white` does, with `f` the specific force less its bias.
-    pub fn add_hidden_turn(&mut self, rot: &Matrix3<f64>, f: &Vector3<f64>, dt: f64) {
+    /// propagated, `rates` holding per gyro axis the turn rate its reading may miss (rad/s, body
+    /// frame; zero off the rail). The missed turn has one sign, so the standard deviation of the
+    /// rotation about that direction grows by all of it from what the filter holds now, up to
+    /// half a turn, beyond which an orientation about it is unknown. A fix in between has
+    /// shrunk that deviation, and the growth starts again from there. The growth is taken on as
+    /// white turn rate over `dt`, integrated through the dynamics as `add_white` does, with `f`
+    /// the specific force less its bias.
+    pub fn add_hidden_turn(&mut self, rates: &Matrix3<f64>, f: &Vector3<f64>, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
         let rf = self.x.q.to_rotation_matrix().into_inner() * skew(f);
         let (t2, t3) = (dt * dt, dt * dt * dt);
-        let leak = rf * rot * rf.transpose();
-        for (row, col, block) in [
-            (ROT, ROT, rot * dt),
-            (VEL, ROT, -rf * rot * (t2 / 2.0)),
-            (POS, ROT, -rf * rot * (t3 / 6.0)),
-            (VEL, VEL, leak * (t3 / 3.0)),
-            (POS, VEL, leak * (t2 * t2 / 8.0)),
-            (POS, POS, leak * (t2 * t3 / 20.0)),
-        ] {
-            let mut at = self.cov.fixed_view_mut::<3, 3>(row, col);
-            at += block;
-            if row != col {
-                let mut at = self.cov.fixed_view_mut::<3, 3>(col, row);
-                at += block.transpose();
+        for rate in rates.column_iter().filter(|r| *r != Vector3::zeros()) {
+            let axis = rate.normalize();
+            let held = (axis.transpose() * self.cov.fixed_view::<3, 3>(ROT, ROT) * axis)[0];
+            let sd = (held.sqrt() + rate.norm() * dt).min(std::f64::consts::PI);
+            if sd * sd <= held {
+                continue;
+            }
+            let rot = axis * axis.transpose() * ((sd * sd - held) / dt);
+            let leak = rf * rot * rf.transpose();
+            for (row, col, block) in [
+                (ROT, ROT, rot * dt),
+                (VEL, ROT, -rf * rot * (t2 / 2.0)),
+                (POS, ROT, -rf * rot * (t3 / 6.0)),
+                (VEL, VEL, leak * (t3 / 3.0)),
+                (POS, VEL, leak * (t2 * t2 / 8.0)),
+                (POS, POS, leak * (t2 * t3 / 20.0)),
+            ] {
+                let mut at = self.cov.fixed_view_mut::<3, 3>(row, col);
+                at += block;
+                if row != col {
+                    let mut at = self.cov.fixed_view_mut::<3, 3>(col, row);
+                    at += block.transpose();
+                }
             }
         }
     }
@@ -462,6 +479,36 @@ mod tests {
             f.x.p,
             f.x.v
         );
+    }
+
+    /// A turn a gyro's rail hides widens the rotation about that direction by all of the turn,
+    /// from what the filter holds: after a fix has narrowed it, from there. Never past half a
+    /// turn, and not about any other direction.
+    #[test]
+    fn a_hidden_turn_widens_the_rotation_from_what_the_filter_holds() {
+        let dt = 0.002;
+        let mut rates = Matrix3::zeros();
+        rates.set_column(1, &Vector3::new(6.0, 8.0, 0.0));
+        let (along, across) = (Vector3::new(0.6, 0.8, 0.0), Vector3::new(-0.8, 0.6, 0.0));
+        let sd = |f: &Filter, a: &Vector3<f64>| {
+            (a.transpose() * f.cov.fixed_view::<3, 3>(ROT, ROT) * a)[0].sqrt()
+        };
+        let mut f = at_rest();
+        let force = Vector3::new(0.0, 9.80665, 0.0);
+        f.add_hidden_turn(&rates, &force, dt);
+        assert!((sd(&f, &along) - (0.01 + 10.0 * dt)).abs() < 1e-12);
+        assert!((sd(&f, &across) - 0.01).abs() < 1e-12);
+        assert!((sd(&f, &Vector3::z()) - 0.01).abs() < 1e-12);
+        // a fix narrows it; the turn hidden after it widens it from there
+        f.cov
+            .fixed_view_mut::<3, 3>(ROT, ROT)
+            .copy_from(&(Matrix3::identity() * 0.005f64.powi(2)));
+        f.add_hidden_turn(&rates, &force, dt);
+        assert!((sd(&f, &along) - (0.005 + 10.0 * dt)).abs() < 1e-12);
+        f.add_hidden_turn(&(rates * 1e4), &force, dt);
+        assert!((sd(&f, &along) - std::f64::consts::PI).abs() < 1e-12);
+        f.add_hidden_turn(&rates, &force, dt);
+        assert!((sd(&f, &along) - std::f64::consts::PI).abs() < 1e-12);
     }
 
     /// Direct observations of position (as if pixels were metres): the update pulls the state to

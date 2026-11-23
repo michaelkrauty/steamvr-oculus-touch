@@ -320,8 +320,8 @@ pub struct Motion {
     centre: Vector3<f64>,
     pos: [[(f64, f64, f64); 2]; 3],
     ang: [[(f64, f64, f64); 2]; 3],
-    /// (start, span, peak rate) of a flick on top (see `with_flick`).
-    flick: Option<(f64, f64, f64)>,
+    /// (start, span, hold, peak rate) of a flick on top (see `with_flick`).
+    flick: Option<(f64, f64, f64, f64)>,
 }
 
 fn sines(terms: &[(f64, f64, f64); 2], t: f64) -> (f64, f64) {
@@ -439,19 +439,28 @@ impl Motion {
             + Vector3::new(dg, 0.0, 0.0)
     }
 
-    /// This motion with a flick from `at` lasting `span` seconds: a turn about the controller's x
-    /// axis whose rate rises and falls as one raised cosine of peak `rate` rad/s.
-    pub fn with_flick(self, at: f64, span: f64, rate: f64) -> Motion {
+    /// This motion with a flick from `at`: a turn about the controller's x axis whose rate rises
+    /// and falls as one raised cosine of peak `rate` rad/s over `span` seconds, held at its peak
+    /// for `hold` seconds halfway.
+    pub fn with_flick(self, at: f64, span: f64, hold: f64, rate: f64) -> Motion {
         Motion {
-            flick: Some((at, span, rate)),
+            flick: Some((at, span, hold, rate)),
             ..self
         }
     }
 
     /// The flick's turn rate and angle about the x axis at `t`.
     fn flick_at(&self, t: f64) -> (f64, f64) {
-        self.flick.map_or((0.0, 0.0), |(at, span, rate)| {
-            let (value, once) = pulse(t - at, span);
+        self.flick.map_or((0.0, 0.0), |(at, span, hold, rate)| {
+            let u = t - at;
+            let (value, once) = match u - span / 2.0 {
+                d if d <= 0.0 => pulse(u, span),
+                d if d < hold => (1.0, pulse(span / 2.0, span).1 + d),
+                _ => {
+                    let (value, once) = pulse(u - hold, span);
+                    (value, once + hold)
+                }
+            };
             (rate * value, rate * once)
         })
     }

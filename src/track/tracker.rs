@@ -43,20 +43,18 @@ pub struct ImuSample {
     /// Body rate, rad/s, and specific force, m/s^2, factory-calibrated.
     pub gyro: Vector3<f64>,
     pub accel: Vector3<f64>,
-    /// The density (rad^2/s, body frame) of the turn rate that gyro axes at their rails may
-    /// hide over the interval this sample ends, set by `Tracker::imu` (see
-    /// `Tracker::own_rail`): none while no axis reads at its rail.
+    /// Per gyro axis, the turn rate (rad/s, body frame) its reading at its rail may miss over
+    /// the interval this sample ends, set by `Tracker::imu` (see `Tracker::own_rail`): none
+    /// while no axis reads at its rail.
     pub hidden: Option<Matrix3<f64>>,
 }
 
 /// A gyro axis reading at its rail. Its reading approached the rail at `slope` counts/s and
-/// crossed it at `crossed` (controller time, s), and the true rate is taken to rise on as fast:
-/// `hidden` (count seconds) bounds the turn the reading has missed since.
+/// crossed it at `crossed` (controller time, s), and the true rate is taken to rise on as fast.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Clip {
     crossed: f64,
     slope: f64,
-    hidden: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -532,9 +530,9 @@ fn advance(
     n: &Noise,
 ) {
     advance_readings(f, before, prev, s, t0, t1, g, n);
-    if let Some(rot) = &s.hidden {
+    if let Some(rates) = &s.hidden {
         let dt = t1.saturating_sub(t0) as f64 * 1e-9;
-        f.add_hidden_turn(rot, &(s.accel - f.x.ba), dt);
+        f.add_hidden_turn(rates, &(s.accel - f.x.ba), dt);
     }
 }
 
@@ -773,16 +771,16 @@ impl Tracker {
         self.note_held();
     }
 
-    /// `s` with the turn its gyro axes at their rails may hide (`ImuSample::hidden`). While an
-    /// axis reads at its rail, the true rate is taken to go on rising as fast as the reading
+    /// `s` with the turn rate its gyro axes at their rails may miss (`ImuSample::hidden`). While
+    /// an axis reads at its rail, the true rate is taken to go on rising as fast as the reading
     /// approached the rail over the two intervals before (with no sample before, by the whole
     /// range in one sample period, the fastest a reading can change), from where that approach
-    /// crossed the rail. Each sample is held over the interval it ends, so the turn it misses is
-    /// that excess at its time over the interval; summed, that bounds the turn the reading has
-    /// missed since it reached the rail, up to half a turn, beyond which the orientation about
-    /// that axis is unknown. The filter takes on the bound's growth as variance on the rotation
-    /// about that axis, so after the stretch its uncertainty there is the most the rail can have
-    /// hidden, and the next fix corrects it at once. With no axis at its rail, nothing changes.
+    /// crossed the rail. Each sample is held over the interval it ends, so the rate it misses is
+    /// that excess at its time, along that axis's calibrated direction. The filter widens its
+    /// rotation about that direction by the turn it hides (`Filter::add_hidden_turn`), so its
+    /// uncertainty there is the most the rail can have hidden since the filter last knew the
+    /// orientation, and the next fix corrects it at once. With no axis at its rail, nothing
+    /// changes.
     fn own_rail(&mut self, mut s: ImuSample) -> ImuSample {
         let Some(gyro) = self.gyro_range else {
             return s;
@@ -796,7 +794,7 @@ impl Tracker {
             prev.map(|p| gyro.counts(&p.gyro)),
             before.map(|b| gyro.counts(&b.gyro)),
         );
-        let mut q = Matrix3::zeros();
+        let mut rates = Matrix3::zeros();
         for k in 0..3 {
             let clip = &mut self.clips[k];
             let Some(end) = Gyro::rail(now[k]) else {
@@ -809,7 +807,6 @@ impl Tracker {
                     return Clip {
                         crossed: s.t as f64 * 1e-9,
                         slope: 65536.0 / (IMU_PERIOD_NS as f64 * 1e-9),
-                        hidden: 0.0,
                     };
                 };
                 let last = toward * (end - p[k]) / dt;
@@ -819,16 +816,12 @@ impl Tracker {
                 Clip {
                     crossed: prev.t as f64 * 1e-9 + toward * (end - p[k]) / slope,
                     slope,
-                    hidden: 0.0,
                 }
             });
-            let axis = gyro.matrix.column(k) * GYRO_PER_COUNT;
-            let was = c.hidden;
             let excess = c.slope * (s.t as f64 * 1e-9 - c.crossed);
-            c.hidden = (was + excess * dt).min(std::f64::consts::PI / axis.norm());
-            q += axis * axis.transpose() * ((c.hidden * c.hidden - was * was) / dt);
+            rates.set_column(k, &(gyro.matrix.column(k) * (excess * GYRO_PER_COUNT)));
         }
-        s.hidden = (q != Matrix3::zeros()).then_some(q);
+        s.hidden = (rates != Matrix3::zeros()).then_some(rates);
         s
     }
 
@@ -3342,7 +3335,8 @@ mod tests {
     /// past the flick on, with the tracker told where the gyro's readings end and not told.
     fn after_a_flick(after: f64) -> [Vec<f64>; 2] {
         let mut w = world(3);
-        w.motion = Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.0; 3]).with_flick(2.0, 0.04, 50.0);
+        w.motion =
+            Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.0; 3]).with_flick(2.0, 0.04, 0.0, 50.0);
         [true, false].map(|told| {
             let (tr, errors) = run_with(
                 &w,
@@ -3380,6 +3374,34 @@ mod tests {
         assert!(best > 4.0, "{best:.2} deg");
     }
 
+    /// A spin held at 37 rad/s for 0.2 s, just past the gyro's rail of 34.9 rad/s, while fixes
+    /// keep landing: each fix leaves the filter sure of the orientation, and the turn the rail
+    /// hides after it is unknown again, so the uncertainty is taken on from the fix, not from
+    /// where the reading reached the rail. Within a degree of the truth from 50 ms after the
+    /// spin; if the uncertainty stopped growing once the rail could have hidden half a turn,
+    /// the fixes left in the spin would leave several degrees.
+    #[test]
+    fn a_long_stretch_at_the_rail_is_owned_past_every_fix() {
+        let mut w = world(3);
+        w.motion =
+            Motion::still(Vector3::new(0.0, 1.0, 0.0), [0.0; 3]).with_flick(2.0, 0.04, 0.2, 37.0);
+        let (tr, errors) = run_with(
+            &w,
+            2.6,
+            0.3,
+            &Run {
+                clipped: Some(true),
+                rotation: true,
+                measure_after: Some(2.29),
+                ..Run::default()
+            },
+        );
+        assert_eq!((tr.stats.acquisitions, tr.stats.wrong_locks), (1, 0));
+        assert!(errors.len() > 100);
+        let worst = errors.iter().fold(0.0f64, |a, &b| a.max(b)).to_degrees();
+        assert!(worst < 1.0, "{worst:.2} deg");
+    }
+
     /// While the gyro stays below its rails, telling the tracker where they are changes nothing,
     /// to the bit.
     #[test]
@@ -3404,9 +3426,9 @@ mod tests {
         super::stillness_tests::assert_state(&told, &untold);
     }
 
-    /// An axis at its rail grows the filter's uncertainty about that axis alone by the turn the
-    /// rail can have hidden: at the steeper approach over the two intervals before, from where it
-    /// crossed the rail, each sample's excess held over its interval. Leaving the rail ends it.
+    /// An axis at its rail misses, on that axis alone, a rate rising at the steeper approach
+    /// over the two intervals before, from where it crossed the rail; each sample's excess is
+    /// held over its interval. Leaving the rail ends it.
     #[test]
     fn a_reading_at_the_rail_owns_what_it_can_hide() {
         let w = world(1);
@@ -3433,18 +3455,17 @@ mod tests {
         }
         assert_eq!((hidden[0], hidden[1], hidden[5]), (None, None, None));
         // the approach: 2000 counts/ms, then 1000 to the rail, which it crossed at 11 ms; the
-        // excess 2000 counts at 12 ms held over 2 ms is 4 count seconds, 6000 at 14 ms 12 more,
-        // 14000 at 18 ms over 4 ms 56 more
-        let step = |was: f64, now: f64, dt: f64| {
-            (now * now - was * was) * GYRO_PER_COUNT * GYRO_PER_COUNT / dt
-        };
-        for (h, was, now, dt) in [
-            (hidden[2], 0.0, 4.0, 0.002),
-            (hidden[3], 4.0, 16.0, 0.002),
-            (hidden[4], 16.0, 72.0, 0.004),
+        // excess is 2000 counts at 12 ms, 6000 at 14 ms and 14000 at 18 ms
+        for (h, excess) in [
+            (hidden[2], 2000.0),
+            (hidden[3], 6000.0),
+            (hidden[4], 14000.0),
         ] {
             let h = h.unwrap();
-            assert!((h[(0, 0)] / step(was, now, dt) - 1.0).abs() < 1e-9, "{h}");
+            assert!(
+                (h[(0, 0)] / (excess * GYRO_PER_COUNT) - 1.0).abs() < 1e-9,
+                "{h}"
+            );
             assert_eq!(h.iter().filter(|&&v| v != 0.0).count(), 1);
         }
     }
