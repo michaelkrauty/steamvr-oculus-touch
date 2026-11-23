@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -45,11 +46,28 @@ if args[1] == "install":
     (driver / "driver_cv1touch.so").write_bytes(b"independent driver copy")
     (driver / ".cv1touch-owned.json").write_text("fake independent ownership record")
     (root / "registration").write_text(str(driver))
+    if os.environ.get("FAKE_ENABLED"):
+        print(f"activateMultipleDrivers enabled (previous settings kept as {os.environ['FAKE_ENABLED']})")
+    else:
+        print("activateMultipleDrivers already enabled")
 elif args[1] == "uninstall":
     shutil.rmtree(driver)
     (root / "registration").unlink()
 else:
     assert args[1] == "check", sys.argv
+    if os.environ.get("FAKE_CHECK_ERROR"):
+        sys.exit(os.environ["FAKE_CHECK_ERROR"])
+'''
+
+FAKE_CARGO = r'''
+import json
+import os
+import sys
+if sys.argv[1] == "metadata":
+    print(json.dumps({"target_directory": os.environ["FAKE_TARGET"]}))
+    sys.exit(0)
+print("error: could not find system library 'libusb-1.0'", file=sys.stderr)
+sys.exit(101)
 '''
 
 
@@ -70,6 +88,7 @@ class InstallTests(unittest.TestCase):
             elif action == "uninstall":
                 registration.unlink()
                 driver.unlink()
+            return ""
 
         original = INSTALLER.atomic_copy
 
@@ -152,7 +171,7 @@ class InstallTests(unittest.TestCase):
                          no_service=True, no_steamvr=False)
         for failure in ("cli", "publication"):
             with self.subTest(failure=failure), mock.patch.dict(os.environ, self.env), \
-                    mock.patch.object(INSTALLER, "run") as run, \
+                    mock.patch.object(INSTALLER, "run", return_value="") as run, \
                     mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)):
                 INSTALLER.install(args)
                 self.assertTrue(INSTALLER.read_manifest(self.prefix)["steamvr"])
@@ -274,6 +293,21 @@ class InstallTests(unittest.TestCase):
         for path in (unit, self.root / "enabled", self.root / "registration", self.root / "registered-driver"):
             self.assertFalse(path.exists(), str(path))
 
+    def test_install_says_when_it_turned_on_multiple_drivers(self):
+        # the fake CLI prints what the real one does: the installer reads that line
+        self.assertIn(INSTALLER.ENABLED_MULTIPLE_DRIVERS + "{})", (INSTALLER.ROOT / "src/bin/cv1touch.rs").read_text())
+        self.fake_integrations()
+        kept = str(self.root / "steamvr.vrsettings.bak")
+        for enabled, expected in (("", False), (kept, True)):
+            with self.subTest(enabled=bool(enabled)):
+                self.env["FAKE_ENABLED"] = enabled
+                result = self.invoke(steamvr=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("activateMultipleDrivers setting is now on" in result.stdout, expected, result.stdout)
+                self.assertEqual(f"as they were are kept in {kept}\n" in result.stdout, expected, result.stdout)
+                self.assertNotIn("already enabled", result.stdout)
+                self.assertEqual(self.invoke("--uninstall", steamvr=True).returncode, 0)
+
     def test_uninstall_refuses_skipping_recorded_service(self):
         self.assert_skip_refused("--no-service")
 
@@ -322,6 +356,86 @@ class InstallTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(path.read_text(), "another program")
         self.assertFalse((self.prefix / "bin/cv1touchd").exists())
+        self.assertIn("failed", result.stdout)
+        self.assertIn("move it aside or delete it, then run the installer again", result.stderr)
+
+    def test_build_failure_names_its_log_instead_of_streaming_it(self):
+        fakebin = self.root / "fakebin"
+        fakebin.mkdir()
+        cargo = fakebin / "cargo"
+        cargo.write_text(f"#!{sys.executable}\n" + FAKE_CARGO)
+        cargo.chmod(0o755)
+        target = self.root / "target"
+        self.env.update(PATH=str(fakebin), FAKE_TARGET=str(target))
+        command = [sys.executable, str(SCRIPT), "--prefix", str(self.prefix), "--no-steamvr", "--no-service"]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "Building cv1touch (this takes a few minutes)... failed\n")
+        log = target / "cv1touch-install.log"
+        self.assertIn(str(log), result.stderr)
+        self.assertNotIn("libusb", result.stderr)
+        self.assertIn("could not find system library 'libusb-1.0'", log.read_text())
+        self.assertFalse(self.prefix.joinpath("bin").exists())
+
+    def test_one_line_per_stage_and_failure_shows_the_reason(self):
+        self.fake_integrations()
+        installed = self.invoke(service=True, steamvr=True)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(installed.stdout.splitlines()[:3], [
+            f"Installing in {self.prefix}... done",
+            "Registering the driver with SteamVR... done",
+            "Starting the cv1touchd service... done"])
+        self.assertEqual(installed.stderr, "")
+        self.env["FAKE_CHECK_ERROR"] = "cv1touch: SteamVR was not found"
+        failed = self.invoke(service=True, steamvr=True)
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(failed.stdout, f"Installing in {self.prefix}... failed\n")
+        self.assertEqual(failed.stderr, "cv1touch: SteamVR was not found\n")
+
+    def test_next_steps_ask_only_for_what_is_missing(self):
+        rules = self.root / "rules.d"
+        rules.mkdir()
+        binaries = str(self.prefix / "bin")
+        unusable = {"rule_dirs": [rules], "usable": lambda: False}
+        steps = "\n".join(INSTALLER.next_steps(self.prefix, False, path="/usr/bin", **unusable))
+        self.assertIn(f"export PATH={shlex.quote(binaries)}:\"$PATH\"", steps)
+        rule = INSTALLER.ROOT / "udev/70-cv1touch.rules"
+        self.assertTrue(rule.is_file())
+        self.assertIn(f"sudo install -m 0644 {shlex.quote(str(rule))} /etc/udev/rules.d/70-cv1touch.rules", steps)
+        self.assertIn("sudo udevadm control --reload-rules", steps)
+        self.assertIn("unplug the headset and the sensors", steps)
+        self.assertIn("cv1touch setup", steps)
+        self.assertNotIn("yourself", steps)
+        # a rule that names the vendor only in a comment, or for one product, opens nothing
+        (rules / "60-other.rules").write_text('# Oculus is 2833\nATTRS{idVendor}=="28de", TAG+="uaccess"\n'
+                                              'ATTRS{idVendor}=="2833", ATTRS{idProduct}=="0101", TAG+="uaccess"\n')
+        self.assertIn("udevadm", "\n".join(INSTALLER.next_steps(self.prefix, False, path="/usr/bin", **unusable)))
+        # unless the connected devices can be opened anyway
+        opened = "\n".join(INSTALLER.next_steps(self.prefix, False, path="/usr/bin", rule_dirs=[rules], usable=lambda: True))
+        self.assertNotIn("sudo", opened)
+        (rules / "69-distribution.rules").write_text("# another name and comment\n" + rule.read_text())
+        steps = "\n".join(INSTALLER.next_steps(self.prefix, True, path=f"/usr/bin:{binaries}", **unusable))
+        self.assertNotIn("PATH", steps)
+        self.assertNotIn("sudo", steps)
+        self.assertIn("Start cv1touchd yourself", steps)
+
+    def test_connected_devices_count_as_usable_only_when_all_can_be_opened(self):
+        sysfs, dev = self.root / "sys", self.root / "dev"
+        self.assertFalse(INSTALLER.devices_usable(sysfs, dev, usable=lambda node: True), "none connected")
+        for name, vendor, number in (("1-2", "2833", 5), ("1-3", "28de", 6)):
+            device = sysfs / "bus/usb/devices" / name
+            (device / f"{name}:1.0/0003:0000:0000.0001").mkdir(parents=True)
+            for attribute, value in (("idVendor", vendor), ("busnum", 1), ("devnum", number)):
+                (device / attribute).write_text(f"{value}\n")
+        for name, usb in (("hidraw3", "1-2"), ("hidraw4", "1-3")):
+            (sysfs / "class/hidraw" / name).mkdir(parents=True)
+            (sysfs / "class/hidraw" / name / "device").symlink_to(
+                sysfs / "bus/usb/devices" / usb / f"{usb}:1.0/0003:0000:0000.0001")
+        asked = []
+        self.assertTrue(INSTALLER.devices_usable(sysfs, dev, usable=lambda node: asked.append(node) or True))
+        self.assertEqual(sorted(asked), [dev / "bus/usb/001/005", dev / "hidraw3"], "only the Oculus device's nodes")
+        for closed in asked:
+            self.assertFalse(INSTALLER.devices_usable(sysfs, dev, usable=lambda node: node != closed), str(closed))
 
     def test_missing_artifact_leaves_no_partial_installation(self):
         (self.bundle / "driver_cv1touch.so").unlink()
@@ -685,6 +799,7 @@ class InstallTests(unittest.TestCase):
             else:
                 self.assertNotIn("--install-script", command)
             self.assertEqual(Path(command[4]).read_bytes(), old_driver)
+            return ""
         with mock.patch.dict(os.environ, self.env), mock.patch.object(INSTALLER.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(INSTALLER, "run", side_effect=capture):
             INSTALLER.install(args)
         self.assertEqual(len(observed), 2)
