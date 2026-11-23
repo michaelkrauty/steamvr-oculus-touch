@@ -25,15 +25,47 @@ pub use identity::ControllerIdentity;
 pub use ffi::ohmd_cv1touch_blob as Blob;
 pub use ffi::ohmd_cv1touch_controller as Controller;
 
+/// The engine's `MAX_IMU_GAP_NS` (rift-tracker.c): over a longer gap between samples it restarts
+/// a controller's motion.
+const ENGINE_MAX_IMU_GAP_NS: u64 = 100_000_000;
+
 /// A radio thread's sample (`RadioDecoder::decode`) over the engine's last view of its
 /// controller: the sample's times, IMU and inputs, with the engine's estimates as of its last update.
+/// The engine's orientations are turned on to the sample's time by the sample's rate less the
+/// engine's bias, as the engine integrates the sample when it gets it, so a controller shown with
+/// them is not a sample behind. The Touch IMU is unrotated in the controller, so the rate turns
+/// them in their own frame.
 pub fn with_radio_sample(last: &Controller, fast: &Controller) -> Controller {
+    // both clocks extend the controller's 32-bit microsecond counter
+    let ahead_us = ((fast.device_time_ns / 1000) as u32)
+        .wrapping_sub((last.device_time_ns / 1000) as u32) as i32;
+    // past its gap limit the engine restarts its motion; nothing to carry on then
+    let turn = (ahead_us > 0 && ahead_us as u64 * 1000 <= ENGINE_MAX_IMU_GAP_NS).then(|| {
+        let rate = |a: [f32; 3]| nalgebra::Vector3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+        nalgebra::UnitQuaternion::from_scaled_axis(
+            (rate(fast.imu_gyro) - rate(last.gyro_bias)) * (ahead_us as f64 * 1e-6),
+        )
+    });
+    let turned = |q: [f32; 4]| match turn {
+        Some(turn) => {
+            let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                q[3] as f64,
+                q[0] as f64,
+                q[1] as f64,
+                q[2] as f64,
+            )) * turn;
+            [q.i as f32, q.j as f32, q.k as f32, q.w as f32]
+        }
+        None => q,
+    };
     Controller {
         device_time_ns: fast.device_time_ns,
         received_host_ns: fast.received_host_ns,
         filter_ns: 0,
         imu_accel: fast.imu_accel,
         imu_gyro: fast.imu_gyro,
+        view_orient: turned(last.view_orient),
+        raw_orient: turned(last.raw_orient),
         buttons: fast.buttons,
         trigger: fast.trigger,
         grip: fast.grip,
@@ -1476,5 +1508,49 @@ mod tests {
             ([1.0, 2.0, 3.0], [0.01, 0.0, 0.0], 900)
         );
         assert!(c.calibrated);
+    }
+
+    #[test]
+    fn a_radio_sample_turns_the_engines_orientation_by_its_own_rate() {
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let last = Controller {
+            // a quarter turn about z, 1 ms before the 32-bit microsecond counter wraps
+            device_time_ns: (u32::MAX as u64 + 1 - 1000) * 1000,
+            view_orient: [0.0, 0.0, half, half],
+            raw_orient: [0.0, 0.0, 0.0, 1.0],
+            gyro_bias: [0.5, 0.0, 0.0],
+            ..Default::default()
+        };
+        let fast = Controller {
+            // 1 ms after: the radio thread's clock, started after the wrap, does not count it
+            device_time_ns: 1_000_000,
+            imu_gyro: [4.5, 0.0, 0.0],
+            ..Default::default()
+        };
+        // 2 ms at 4 rad/s about the controller's own x: 8 mrad
+        let (s, w) = (0.004f32.sin(), 0.004f32.cos());
+        let c = with_radio_sample(&last, &fast);
+        let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(close(c.raw_orient, [s, 0.0, 0.0, w]), "{:?}", c.raw_orient);
+        // body frame: x turned onto y by the quarter turn about z
+        assert!(
+            close(c.view_orient, [s * half, s * half, w * half, w * half]),
+            "{:?}",
+            c.view_orient
+        );
+        // a sample the engine already has, or one past its gap limit, turns nothing
+        for device_time_ns in [last.device_time_ns, last.device_time_ns + 100_001_000] {
+            let c = with_radio_sample(
+                &last,
+                &Controller {
+                    device_time_ns,
+                    ..fast
+                },
+            );
+            assert_eq!(
+                (c.view_orient, c.raw_orient),
+                (last.view_orient, last.raw_orient)
+            );
+        }
     }
 }
