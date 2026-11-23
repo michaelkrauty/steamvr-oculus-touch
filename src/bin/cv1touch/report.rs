@@ -184,6 +184,16 @@ fn summary(created: SystemTime, report: &mut Report) -> String {
         Ok(false) => "  SteamVR (vrserver): not running".into(),
         Err(e) => format!("  SteamVR (vrserver): cannot tell ({e})"),
     });
+    #[cfg(windows)]
+    for name in META_PROGRAMS {
+        text.push(match platform::process::running(name) {
+            Ok(running) => format!(
+                "  Meta's Oculus software ({name}): {}",
+                if running { "running" } else { "not running" }
+            ),
+            Err(e) => format!("  Meta's Oculus software ({name}): cannot tell ({e})"),
+        });
+    }
     text.push(match &daemon {
         Some(_) => format!(
             "  cv1touchd: answering at {}",
@@ -399,8 +409,14 @@ fn write(path: &Path, created: SystemTime, report: &mut Report) -> io::Result<()
     })
 }
 
-/// Where a report goes unless asked: the desktop on Windows, where people look for a file they
-/// were asked to send; the current directory on Linux. Named for when it was made, in UTC.
+/// Meta's PC software for Oculus headsets: its service and the runtime it starts. Someone with
+/// another headset may run it next to cv1touch, so a report says whether they run (Windows only).
+#[cfg(any(windows, test))]
+const META_PROGRAMS: [&str; 2] = ["OVRServiceLauncher", "OVRServer_x64"];
+
+/// Where a report goes unless asked: where people look for a file they were asked to send (the
+/// desktop, or on Linux the home directory when there is none). Named for when it was made, in
+/// UTC.
 fn default_path(created: SystemTime) -> PathBuf {
     platform::dirs::desktop()
         .filter(|d| d.is_dir())
@@ -503,6 +519,15 @@ mod tests {
         assert!(tail(&fifo, 1000).is_err());
         std::os::unix::fs::symlink("/dev/zero", dir.join("zero")).unwrap();
         assert!(tail(&dir.join("zero"), 1000).is_err());
+    }
+
+    /// Meta's program names pass the process check's name rule, or a Windows report would say
+    /// "cannot tell" about them.
+    #[test]
+    fn meta_program_names_can_be_looked_up() {
+        for name in META_PROGRAMS {
+            assert!(platform::process::running(name).is_ok(), "{name}");
+        }
     }
 
     /// A line longer than what is kept keeps its end, not nothing.

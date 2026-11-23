@@ -1546,10 +1546,6 @@ pub fn system_description() -> String {
     format!("{release}, {kernel}")
 }
 
-pub fn desktop() -> Option<std::path::PathBuf> {
-    None
-}
-
 fn udev_gives_access() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

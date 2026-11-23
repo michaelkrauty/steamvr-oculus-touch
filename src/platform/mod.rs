@@ -281,10 +281,53 @@ pub mod dirs {
         resolve(&|name| std::env::var_os(name))
     }
 
-    /// The user's desktop, where Windows users look for a file they were asked to send; None on
-    /// Linux, which has no such convention for a command-line tool.
+    /// Where a user looks for a file they were asked to send: the desktop on Windows; on Linux
+    /// the desktop folder the user's XDG user directories name, else the home directory.
+    #[cfg(windows)]
     pub fn desktop() -> Option<PathBuf> {
         super::os::desktop()
+    }
+
+    #[cfg(unix)]
+    pub fn desktop() -> Option<PathBuf> {
+        Some(desktop_in(&|name| std::env::var_os(name)))
+    }
+
+    /// The folder `XDG_DESKTOP_DIR` names in `user-dirs.dirs` (as `xdg-user-dir DESKTOP` reads
+    /// it) when that folder exists, else the home directory. The file's values are `"$HOME/..."`
+    /// or absolute paths, in double quotes with a backslash before a special character; one that is the home directory itself means the user has no desktop.
+    #[cfg(unix)]
+    pub fn desktop_in(var: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+        let home = PathBuf::from(var("HOME").unwrap_or_default());
+        let file = std::fs::read_to_string(resolve(var).config_home.join("user-dirs.dirs"));
+        file.ok()
+            .and_then(|text| {
+                let line = text
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("XDG_DESKTOP_DIR="))?;
+                let value = line.trim();
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(value);
+                let (rest, in_home) = match value.strip_prefix("$HOME") {
+                    Some(rest) => (rest, true),
+                    None => (value, false),
+                };
+                // a backslash escapes the character after it
+                let mut path = String::new();
+                let mut chars = rest.chars();
+                while let Some(c) = chars.next() {
+                    path.push(if c == '\\' { chars.next()? } else { c });
+                }
+                if in_home {
+                    Some(home.join(path.trim_start_matches('/')))
+                } else {
+                    Some(PathBuf::from(path)).filter(|p| p.is_absolute())
+                }
+            })
+            .filter(|p| p.is_dir())
+            .unwrap_or(home)
     }
 
     /// OpenHMD's cache of sensor and controller configuration, as the engine resolves it
@@ -2457,6 +2500,37 @@ mod tests {
         assert_eq!(d.state, PathBuf::from("/home/u/.local/state/cv1touch"));
         // no home: relative (the engine agrees: tests/test_config_dir.c)
         assert_eq!(resolve(&env(&[])).config_home, PathBuf::from(".config"));
+    }
+
+    /// A report goes where the user looks: the desktop their user directories name when it
+    /// exists, else the home directory, never the current directory.
+    #[cfg(unix)]
+    #[test]
+    fn linux_desktop_is_the_named_folder_or_home() {
+        use super::dirs::desktop_in;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_str().unwrap();
+        let vars = env(&[("HOME", home)]);
+        // no user-dirs.dirs
+        assert_eq!(desktop_in(&vars), tmp.path());
+        let config = tmp.path().join(".config");
+        std::fs::create_dir(&config).unwrap();
+        let names = |value: &str| {
+            let text = format!("# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"{value}\"\n");
+            std::fs::write(config.join("user-dirs.dirs"), text).unwrap();
+            desktop_in(&vars)
+        };
+        // named but not there yet
+        assert_eq!(names("$HOME/Schreibtisch"), tmp.path());
+        std::fs::create_dir(tmp.path().join("Schreibtisch")).unwrap();
+        assert_eq!(names("$HOME/Schreibtisch"), tmp.path().join("Schreibtisch"));
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(names(elsewhere.path().to_str().unwrap()), elsewhere.path());
+        // a relative value is not one the file may hold, even naming a folder here ("src")
+        assert_eq!(names("src"), tmp.path());
+        // a special character in the name is written with a backslash before it
+        std::fs::create_dir(tmp.path().join("Desk$top")).unwrap();
+        assert_eq!(names("$HOME/Desk\\$top"), tmp.path().join("Desk$top"));
     }
 
     #[cfg(windows)]
