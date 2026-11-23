@@ -1301,6 +1301,9 @@ fn measured_at(state: &mut ControllerState) {
 }
 
 const UNIVERSE_CHECK_MS: u64 = 60_000;
+/// What the universe watch follows a registration that records no base station through: nothing,
+/// as with a headset that base stations do not track.
+const NO_STATIONS_FOLLOWED: &str = "nothing: it lists no base stations";
 const UNIVERSE_RETRY_MAX_MS: u64 = 15 * 60_000;
 const UNIVERSE_PROCESS_CHECK_MS: u64 = 10_000;
 /// How often the watch reads SteamVR's log and looks at the stations the driver reports (cheap:
@@ -1550,8 +1553,12 @@ fn universe_watch(d: Arc<Daemon>) {
             continue;
         };
         if reg.stations.is_empty() {
+            say(NO_STATIONS_FOLLOWED.into());
             unmeasured(None);
             continue;
+        }
+        if *d.universe_following.lock().unwrap() == NO_STATIONS_FOLLOWED {
+            say(String::new());
         }
         // the station SteamVR tracks the headset from, or last tracked it from in this session
         let base = steamvr_log
@@ -7474,6 +7481,14 @@ mod tests {
     fn universe_watch_status_waits_for_the_first_check() {
         let d = status_daemon();
         assert!(handle(&d, "universe-watch").contains("waiting to check SteamVR"));
+    }
+
+    #[test]
+    fn universe_watch_status_says_a_registration_without_stations_follows_nothing() {
+        let d = status_daemon();
+        *d.universe_following.lock().unwrap() = NO_STATIONS_FOLLOWED.into();
+        assert!(handle(&d, "universe-watch")
+            .ends_with("; registration follows nothing: it lists no base stations"));
     }
 
     #[test]

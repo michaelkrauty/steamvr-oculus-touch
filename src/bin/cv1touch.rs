@@ -5874,14 +5874,23 @@ fn universe_headset_status(bases: &cv1touch::steamvr_log::Bases, reference: &str
     }
 }
 
+/// What `cv1touch universe` says instead for a registration `reg` that records no base station:
+/// one made with a headset that base stations do not track, which nothing follows.
+fn universe_none(reg: &align::Registration) -> Option<&'static str> {
+    reg.stations
+        .is_empty()
+        .then_some("Your headset is not tracked by base stations, so there is nothing to follow.")
+}
+
 /// How the installed registration applies now: the base station SteamVR tracks the headset from
 /// (its log), where each station is in the world and how, and how SteamVR has each since the
 /// registration (what cv1touchd's universe watch follows).
 fn universe_cmd() -> i32 {
     let run = || -> Result<(), String> {
         let reg = align::load_registration(&align::registration_path())?;
-        if reg.stations.is_empty() {
-            return Err("the installed registration records no base stations (refit it with `cv1touch register --holds BASE --write`)".into());
+        if let Some(note) = universe_none(&reg) {
+            println!("{note}");
+            return Ok(());
         }
         let client = vr::Client::connect()?;
         let now = client.stations();
@@ -7062,6 +7071,20 @@ mod tests {
         assert!(erased("abcde", Some(4)));
         assert!(erased("", Some(4)));
         assert!(erased("abcd", None));
+    }
+
+    #[test]
+    fn universe_says_a_registration_without_stations_follows_nothing() {
+        let mut reg = initial_registration(7);
+        assert_eq!(
+            universe_none(&reg),
+            Some("Your headset is not tracked by base stations, so there is nothing to follow.")
+        );
+        reg.stations = vec![align::StationPose {
+            serial: "LHB-A".into(),
+            pose: align::PoseEntry::from_iso(&nalgebra::Isometry3::identity()),
+        }];
+        assert_eq!(universe_none(&reg), None);
     }
 
     fn serial_fixture() -> (

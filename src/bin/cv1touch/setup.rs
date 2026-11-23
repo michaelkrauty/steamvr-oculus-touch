@@ -1015,9 +1015,9 @@ Read all of this now: you won't see this screen with the headset on.
   1. Put on the headset (SteamVR running).
   2. Press the real controllers firmly against the outside of the headset: the left controller
      against the left side, the right controller against the right side. Keep your hands off
-     the controllers' rings and the headset's sensors. From now until the end, the controllers
-     must not slide or twist on the headset: if one does, the calibration fails and you start
-     this step again.
+     the controllers' rings and the headset's sensors or cameras. From now until the end, the
+     controllers must not slide or twist on the headset: if one does, the calibration fails and
+     you start this step again.
   3. Press A on the right controller with your thumb. You'll feel a 10-second countdown via
      controller haptic pulses, one a second. Nothing is recorded yet: use the 10 seconds to
      press both controllers firmly back into place, in case pressing A moved them.
@@ -2118,6 +2118,7 @@ mod tests {
             "won't see this screen",
             "in VR the controllers appear exactly where your hands are",
             "real controllers",
+            "the headset's sensors or cameras",
             "the calibration fails",
             "10-second countdown via controller haptic pulses",
             "Nothing is recorded yet",
