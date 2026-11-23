@@ -178,13 +178,29 @@ pub(super) fn daemon_down(checks: &[CheckView]) -> bool {
     checks.iter().any(|c| c.name == "daemon" && !c.ok)
 }
 
-/// "Checks: daemon ✓  5 sensors ✓ …", then one line per failed check with what to do.
-pub(super) fn checks(checks: &[CheckView], sensors: usize, g: &Glyphs) -> String {
+/// The checks shown to the person: with the daemon down, only those that do not need it.
+fn visible<'a, 'b>(checks: &'a [CheckView<'b>]) -> Vec<&'a CheckView<'b>> {
     let down = daemon_down(checks);
-    let shown: Vec<&CheckView> = checks
+    checks
         .iter()
         .filter(|c| shown(c.name) && (!down || matches!(c.name, "daemon" | "steamvr_assets")))
+        .collect()
+}
+
+/// The line shown in place of checks that failed again unchanged, so that a retry is seen to
+/// have run: "Still not fixed: daemon."
+pub(super) fn still_failing(checks: &[CheckView], sensors: usize) -> String {
+    let names: Vec<String> = visible(checks)
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| check_label(c.name, sensors))
         .collect();
+    format!("Still not fixed: {}.", names.join(", "))
+}
+
+/// "Checks: daemon ✓  5 sensors ✓ …", then one line per failed check with what to do.
+pub(super) fn checks(checks: &[CheckView], sensors: usize, g: &Glyphs) -> String {
+    let shown = visible(checks);
     // the line lists what a person would check first; the rest appear only when they fail
     let core = |name: &str| {
         matches!(
@@ -624,6 +640,7 @@ mod tests {
             "Checks: daemon ✓  controllers ✗\n  ✗ controllers: Press a button on each controller."
         );
         assert!(!checks_pass(&asleep));
+        assert_eq!(still_failing(&asleep, 1), "Still not fixed: controllers.");
         let busy = [
             CheckView {
                 name: "daemon",

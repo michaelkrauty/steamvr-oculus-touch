@@ -249,7 +249,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
     let idle_detail = if starting {
         "tracking is starting up: wait a few seconds".to_string()
     } else if recording {
-        "a recording is running: wait for it to finish".to_string()
+        RECORDING_RUNNING.to_string()
     } else {
         format!("another calibration is running: finish it first; if none is, {restart}")
     };
@@ -1695,6 +1695,20 @@ fn offer_again(stage: Stage, checkpoint: &mut Checkpoint) {
     checkpoint.pending.insert(stage);
 }
 
+/// What the idle check says while a recording runs. The daemon's status does not say which client
+/// started it: a `record start` capture runs until `record stop`, while another cv1touch command's
+/// capture ends by itself and a `record stop` would cut it short.
+const RECORDING_RUNNING: &str = "a recording is running: if you started it with cv1touch record start, stop it with cv1touch record stop; if setup, calibrate, eval-capture or register is recording, wait for it to finish";
+
+/// Why the guide ended when the person quit it.
+fn stopped(checkpoint: &setup::Checkpoint) -> String {
+    if checkpoint.completed.is_empty() {
+        "setup stopped; no stage was done yet".into()
+    } else {
+        "setup stopped before finishing; completed stages are kept".into()
+    }
+}
+
 pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
     if !check_only && !io::stdin().is_terminal() {
         eprintln!("cv1touch: setup needs an interactive terminal. Use setup --check [--json] for a read-only report.");
@@ -1758,6 +1772,8 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
             if check_text != shown_checks {
                 println!("{check_text}");
                 shown_checks = check_text;
+            } else if !ui::checks_pass(&views) {
+                println!("{}", ui::still_failing(&views, inspection.sensors.len()));
             }
             let stage_reports = reports(&inspection, &checkpoint);
             let unloaded = inspection
@@ -1842,7 +1858,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                     START_OR_QUIT,
                 )? == ui::Answer::Quit
                 {
-                    return Err("setup stopped before finishing; completed stages are kept".into());
+                    return Err(stopped(&checkpoint));
                 }
                 continue;
             }
@@ -1864,9 +1880,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 ask(&ui::stage_prompt(report.stage, can_adopt), offered)?
             };
             match answer {
-                ui::Answer::Quit => {
-                    return Err("setup stopped before finishing; completed stages are kept".into())
-                }
+                ui::Answer::Quit => return Err(stopped(&checkpoint)),
                 ui::Answer::Keep => {
                     setup::adopt(report.stage, &inspection.snapshot, &mut checkpoint)?;
                     persist(&checkpoint)?;
@@ -1928,6 +1942,19 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quitting_says_whether_any_stage_was_kept() {
+        let mut checkpoint = Checkpoint::default();
+        assert_eq!(stopped(&checkpoint), "setup stopped; no stage was done yet");
+        checkpoint
+            .completed
+            .insert(Stage::Inputs, setup::Binding::default());
+        assert_eq!(
+            stopped(&checkpoint),
+            "setup stopped before finishing; completed stages are kept"
+        );
+    }
 
     #[test]
     fn steamvr_check_names_the_problem_and_its_fix() {

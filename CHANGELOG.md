@@ -37,6 +37,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ### Fixed
 
+- `cv1touch setup` told you to wait for a running recording to finish, but one started with `cv1touch record start` runs until `cv1touch record stop`. It now says to stop such a recording with `cv1touch record stop`, and to wait if setup, calibrate, eval-capture or register is recording. When you press Enter to check again and nothing has changed, setup now says `Still not fixed:` with the checks that still fail, instead of only repeating the prompt. Quitting before any stage was done now says so, instead of saying that completed stages are kept.
 - On Linux, `cv1touch report` now collects all of the daemon's journal lines for this boot. It filtered by the systemd unit, which leaves out lines journald files under another scope.
 - The build no longer fails on Fedora and other distributions whose compiler does not build position-independent executables by default, where three of the native test programs failed to link. The setup guide now lists the Fedora packages.
 - `cv1touch doctor` said "judged moved by mistake and let go" for every sensor the daemon put back into tracking as calibrated, also when no new position for it was found in time. It now says what happened and what to do in each case, including when cv1touch checks the sensor again. `status --json` gives the reason as `pose.cause` and the time of that check as `pose.next_check_ns`.

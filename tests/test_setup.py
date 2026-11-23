@@ -212,8 +212,11 @@ class SetupTests(unittest.TestCase):
 
     def test_a_daemon_that_is_not_running_is_left_to_the_guided_checks(self):
         self.stop_daemon()
-        output = self.terminal_guide("q\n", expected_code=1)
+        output = self.terminal_guide("\nq\n", expected_code=1)
         self.assertIn("start it with systemctl --user start cv1touchd", output)
+        self.assertEqual(output.count("start it with systemctl --user start cv1touchd"), 1, output)
+        self.assertIn("Still not fixed: daemon, SteamVR.", output)
+        self.assertIn("setup stopped; no stage was done yet", output)
         self.assertIn("cv1touchd isn't running", output)
         self.assertIn("press Enter to check again", output)
         self.assertNotIn("before recording", output)
@@ -222,9 +225,11 @@ class SetupTests(unittest.TestCase):
     def test_a_busy_daemon_is_left_to_the_guided_checks(self):
         self.recording = True
         output = self.terminal_guide("q\n", expected_code=1)
-        self.assertIn("a recording is running: wait for it to finish", output)
+        # the status does not say who started the recording: both ways out, record stop first
+        self.assertIn("a recording is running: if you started it with cv1touch record start, "
+                      "stop it with cv1touch record stop; if setup, calibrate, eval-capture or "
+                      "register is recording, wait for it to finish", output)
         self.assertIn("press Enter to check again", output)
-        self.assertNotIn("record stop", output)
         self.assertEqual(self.mutation_checkpoints, [])
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
 
@@ -259,7 +264,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in directory.iterdir()}, before)
         self.assertEqual(self.mutation_checkpoints, [])
         self.assertTrue(set(self.commands) <= {"status", "inputs"}, self.commands)
-        self.assertIn("a recording is running: wait for it to finish", output)
+        self.assertIn("a recording is running: if you started it with cv1touch record start", output)
         self.assertIn("press Enter to check again", output)
 
     def test_a_second_setup_names_the_running_guide_not_a_recording_to_stop(self):
