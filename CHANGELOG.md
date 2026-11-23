@@ -14,6 +14,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - `cv1touch register` and `cv1touch eval-capture` say to run `cv1touch setup` when the sensors aren't calibrated, instead of naming the daemon's mode.
 - On Linux, `cv1touch report` now saves the report in the desktop folder named by the user's XDG user directories, or in the home directory when there is none, instead of the current directory. `--out` still names any other place.
 - On Windows, the report's list of programs now says whether Meta's Oculus software (`OVRServiceLauncher`, `OVRServer_x64`) is running.
+- `cv1touch --help` lists the everyday commands with one line each and prints on standard output; `cv1touch help expert` lists every command. `cv1touch COMMAND --help` shows that command's usage, and a command given the wrong arguments shows its own usage instead of the whole list. An unknown command now says there is no such command and exits with status 2; before, it printed the full usage, and `--help` after any command did the same with status 2.
 
 ### Fixed
 

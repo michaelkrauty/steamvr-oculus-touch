@@ -64,28 +64,120 @@ fn human_action(message: &str) {
     println!("{}", human_text(message));
 }
 
-fn usage_code(code: i32) -> ! {
-    eprintln!(
-        "usage:\n  cv1touch setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset] | setup --check [--json]\n  cv1touch status [--shm NAME] | status --json\n  cv1touch stop   (stops the daemon, and its supervisor, and waits until they have ended)\n  cv1touch report [--out PATH]   (one file with the logs and settings, for someone helping you)\n  cv1touch sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)\n  cv1touch calibration capture|provisional|load PATH\n  cv1touch alignment reload\n  cv1touch haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE\n  \
-         cv1touch test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)\n  \
-         cv1touch inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)\n  \
-         cv1touch record start PATH [--frames] | record stop\n  cv1touch rec-summary PATH [--window NAME:START_NS:END_NS]...\n  \
-         cv1touch pace NAME:SECONDS...\n  cv1touch calibrate [--out PATH]\n  cv1touch calibrate inputs [--out PATH | --reset]\n  cv1touch inputs --json | inputs reload\n  \
-         cv1touch calibrate solve REC [--out PATH] [--force]\n  cv1touch consistency REC [--calibration PATH]\n  \
-         cv1touch calibrate refine REC [--calibration PATH] [--write]\n  cv1touch calibrate gravity REC [--calibration PATH] [--write]\n  cv1touch calibrate place SERIAL REC [--calibration PATH] [--write]\n  cv1touch universe | universe-watch [on|off] | tilt [DEGREES]\n  cv1touch calibrate rig BASE [--write | --out-dir DIR]\n  \
-         cv1touch fit-render [REC]\n  cv1touch steamvr install [--legacy-assets SO MANIFEST] | steamvr check [--legacy-assets SO MANIFEST] [--install-script] | steamvr uninstall\n  cv1touch vr-devices | vr-pulse INDEX [MS]\n  \
-         cv1touch register --headset\n  cv1touch doctor [--json]\n  cv1touch register [--force|--check] | register --solve FILE [--force]\n  \
-         cv1touch register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]\n  \
-         cv1touch register --follow BASE --reference SERIAL|hmd [--tracking-base LHB-SERIAL] [--write] | register --stations REC [--write | --out PATH]\n  \
-         cv1touch eval-capture [--free [SECONDS]]\n  cv1touch eval BASE | eval-rig BASE [--replay] | eval-holds BASE\n  \
-         cv1touch track BASE [--calibration PATH] [--registration PATH] [--offset-ms MS] [--set KEY=VALUE]...\n  \
-         cv1touch landmarks learn REC [--write] | landmarks check REC\n  cv1touch input-test"
-    );
-    process::exit(code);
+/// Every command by its first word, with its usage. `cv1touch help expert`
+/// lists them all and `cv1touch COMMAND --help` shows one command's lines.
+const COMMANDS: &[(&str, &str)] = &[
+    ("setup", "setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset] | setup --check [--json]"),
+    ("doctor", "doctor [--json]"),
+    ("status", "status [--shm NAME] | status --json"),
+    ("input-test", "input-test"),
+    ("tilt", "tilt [DEGREES]"),
+    ("report", "report [--out PATH]   (one file with the logs and settings, for someone helping you)"),
+    ("stop", "stop   (stops the daemon, and its supervisor, and waits until they have ended)"),
+    ("sensors", "sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)"),
+    ("finish-setup", "finish-setup   (Windows: the sensors' driver and the SteamVR registration, as the installer does them)"),
+    ("calibration", "calibration capture|provisional|load PATH"),
+    ("alignment", "alignment reload"),
+    ("haptic", "haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE"),
+    ("test-inject", "test-inject [on|off]   (input injection for automated tests: off by default, on for 10 min)"),
+    ("inject", "inject left|right x|y|a|b|system|stick|trigger|grip[,...] MS   (at most 2000 ms; needs test-inject on)"),
+    ("record", "record start PATH [--frames] | record stop"),
+    ("rec-summary", "rec-summary PATH [--window NAME:START_NS:END_NS]..."),
+    ("pace", "pace NAME:SECONDS..."),
+    ("calibrate", "calibrate [--out PATH]"),
+    ("calibrate", "calibrate inputs [--out PATH | --reset]"),
+    ("inputs", "inputs --json | inputs reload"),
+    ("calibrate", "calibrate solve REC [--out PATH] [--force]"),
+    ("consistency", "consistency REC [--calibration PATH]"),
+    ("calibrate", "calibrate refine REC [--calibration PATH] [--write]"),
+    ("calibrate", "calibrate gravity REC [--calibration PATH] [--write]"),
+    ("calibrate", "calibrate place SERIAL REC [--calibration PATH] [--write]"),
+    ("calibrate", "calibrate rig BASE [--write | --out-dir DIR]"),
+    ("universe", "universe"),
+    ("universe-watch", "universe-watch [on|off]"),
+    ("fit-render", "fit-render [REC]"),
+    ("steamvr", "steamvr install [--legacy-assets SO MANIFEST] | steamvr check [--legacy-assets SO MANIFEST] [--install-script] | steamvr uninstall"),
+    ("vr-devices", "vr-devices"),
+    ("vr-pulse", "vr-pulse INDEX [MS]"),
+    ("register", "register --headset"),
+    ("register", "register [--force|--check] | register --solve FILE [--force]"),
+    ("register", "register --jig | register --holds BASE [--reference SERIAL|hmd] [--write]"),
+    ("register", "register --follow BASE --reference SERIAL|hmd [--tracking-base LHB-SERIAL] [--write] | register --stations REC [--write | --out PATH]"),
+    ("eval-capture", "eval-capture [--free [SECONDS]]"),
+    ("eval", "eval BASE"),
+    ("eval-rig", "eval-rig BASE [--replay]"),
+    ("eval-holds", "eval-holds BASE"),
+    ("track", "track BASE [--calibration PATH] [--registration PATH] [--offset-ms MS] [--set KEY=VALUE]..."),
+    ("landmarks", "landmarks learn REC [--write] | landmarks check REC"),
+    ("help", "help [expert | COMMAND]"),
+];
+
+fn user_help() -> String {
+    let sensors = if cfg!(windows) {
+        "  cv1touch sensors       show the sensors' USB driver, or install it\n"
+    } else {
+        ""
+    };
+    format!(
+        "cv1touch: Oculus Rift CV1 Touch controllers in SteamVR.\n\n\
+         \x20 cv1touch setup         set everything up, step by step; run this first\n\
+         \x20 cv1touch doctor        check the installation and say what to fix\n\
+         \x20 cv1touch status        show the sensors and controllers, updated live\n\
+         \x20 cv1touch input-test    check the buttons, triggers and sticks while SteamVR runs\n\
+         \x20 cv1touch tilt DEGREES  tilt the controllers for games that hold things at the wrong angle\n\
+         \x20 cv1touch report        save the logs and settings in one file, for someone helping you\n\
+         \x20 cv1touch stop          stop cv1touch's background program\n\
+         {sensors}\n\
+         To see how to use one of them: cv1touch COMMAND --help\n\
+         To list every command, including those for experts: cv1touch help expert\n"
+    )
 }
 
+/// The usage lines of the commands `pick` accepts, or None when it accepts none.
+fn usage_lines(pick: impl Fn(&str) -> bool) -> Option<String> {
+    let mut text = String::new();
+    for (_, usage) in COMMANDS.iter().filter(|(name, _)| pick(name)) {
+        text.push_str("  cv1touch ");
+        text.push_str(usage);
+        text.push('\n');
+    }
+    (!text.is_empty()).then(|| format!("usage:\n{text}"))
+}
+
+fn command_help(command: &str) -> Option<String> {
+    usage_lines(|name| name == command)
+}
+
+fn unknown_command(command: &str) -> String {
+    format!("cv1touch: there is no command \"{command}\". See cv1touch --help.\n")
+}
+
+/// The answer to a request for help or to an unknown command, as the exit code
+/// and the text: on stdout with code 0, on stderr otherwise. None runs the command.
+fn help(args: &[&str]) -> Option<(i32, String)> {
+    let asked = args.iter().any(|a| matches!(*a, "--help" | "-h"));
+    match args {
+        [] => Some((2, user_help())),
+        ["--help" | "-h" | "help"] => Some((0, user_help())),
+        ["help", "expert"] => usage_lines(|_| true).map(|text| (0, text)),
+        ["--version" | "-V"] => None,
+        ["help", command] | [command, ..] => match command_help(command) {
+            Some(text) if asked || args[0] == "help" => Some((0, text)),
+            Some(_) => None,
+            None => Some((2, unknown_command(command))),
+        },
+    }
+}
+
+/// The command line does not match its command's usage: show that usage.
 fn usage() -> ! {
-    usage_code(2)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let text = args
+        .first()
+        .and_then(|c| command_help(c))
+        .unwrap_or_else(user_help);
+    eprint!("{text}");
+    process::exit(2);
 }
 
 fn send_path(line: Result<String, String>) -> i32 {
@@ -6482,7 +6574,16 @@ fn consistency_cmd(rec: &Path, cal: &Path) -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Some((code, text)) = help(&words) {
+        if code == 0 {
+            print!("{text}");
+        } else {
+            eprint!("{text}");
+        }
+        process::exit(code);
+    }
+    let code = match words.as_slice() {
         ["setup"] => guided_setup::run(false, false, None),
         ["setup", "--redo", stage] | ["setup", "--redo", stage, "--no-slip-check"] | ["setup", "--no-slip-check", "--redo", stage] => {
             if args.iter().any(|a| a == "--no-slip-check") {
@@ -6507,7 +6608,6 @@ fn main() {
         ["status", "--json"] => json_status(),
         ["inputs", "--json"] => raw_inputs_json(),
         ["inputs", "reload"] => send("inputs reload"),
-        ["--help"] | ["-h"] | ["help"] => usage_code(0),
         ["--version"] | ["-V"] => { println!("cv1touch {} (shm ABI {})", env!("CARGO_PKG_VERSION"), cv1touch::ffi::CV1T_SHM_VERSION); 0 },
         ["doctor"] => doctor(false),
         ["doctor", "--json"] => doctor(true),
@@ -6673,6 +6773,118 @@ fn main() {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn help_lists_the_user_commands_and_how_to_see_the_rest() {
+        let (code, text) = super::help(&["--help"]).unwrap();
+        assert_eq!(code, 0);
+        for command in [
+            "setup",
+            "doctor",
+            "status",
+            "input-test",
+            "tilt",
+            "report",
+            "stop",
+        ] {
+            assert!(
+                text.contains(&format!("cv1touch {command} ")),
+                "{command}: {text}"
+            );
+            assert!(super::command_help(command).is_some(), "{command}");
+        }
+        assert!(
+            text.contains("cv1touch COMMAND --help") && text.contains("cv1touch help expert"),
+            "{text}"
+        );
+        for expert in [
+            "calibrate",
+            "register",
+            "track",
+            "eval",
+            "inject",
+            "record",
+            "BASE",
+            "REC",
+            "SHM",
+            "rig",
+            "jig",
+        ] {
+            assert!(!text.contains(&format!(" {expert}")), "{expert}: {text}");
+        }
+        assert_eq!(super::help(&[]).unwrap(), (2, text.clone()));
+        assert_eq!(super::help(&["help"]).unwrap(), (0, text));
+    }
+
+    #[test]
+    fn help_expert_lists_every_command_main_runs() {
+        let (code, text) = super::help(&["help", "expert"]).unwrap();
+        assert_eq!(code, 0);
+        let source = include_str!("cv1touch.rs");
+        let main =
+            &source[source.find("\nfn main()").unwrap()..source.find("\nmod tests").unwrap()];
+        let mut seen = 0;
+        for line in main.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("[\"") else {
+                continue;
+            };
+            let command = &rest[..rest.find('"').unwrap()];
+            if command.starts_with('-') {
+                continue;
+            }
+            seen += 1;
+            assert!(text.contains(&format!("  cv1touch {command}")), "{command}");
+            assert_eq!(
+                super::help(&[command, "--help"]).map(|(code, _)| code),
+                Some(0),
+                "{command}"
+            );
+        }
+        assert!(seen > 50, "{seen}");
+    }
+
+    #[test]
+    fn command_help_shows_only_that_command() {
+        for args in [
+            &["setup", "--help"][..],
+            &["setup", "-h"],
+            &["setup", "--check", "--help"],
+            &["help", "setup"],
+        ] {
+            let (code, text) = super::help(args).unwrap();
+            assert_eq!(code, 0, "{args:?}");
+            assert!(
+                text.contains("cv1touch setup [--no-slip-check]") && text.contains("setup --check"),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 2, "{text}");
+        }
+        let (_, text) = super::help(&["calibrate", "--help"]).unwrap();
+        assert!(
+            text.contains("calibrate solve REC") && !text.contains("cv1touch register"),
+            "{text}"
+        );
+        assert_eq!(super::help(&["doctor"]), None);
+        assert_eq!(super::help(&["--version"]), None);
+    }
+
+    #[test]
+    fn an_unknown_command_says_so_and_fails() {
+        for args in [
+            &["bogus"][..],
+            &["bogus", "--help"],
+            &["help", "bogus"],
+            &["--bogus"],
+        ] {
+            let (code, text) = super::help(args).unwrap();
+            assert_eq!(code, 2, "{args:?}");
+            assert!(
+                text.contains("no command \"") && text.contains("See cv1touch --help."),
+                "{text}"
+            );
+            assert!(!text.contains("usage:"), "{text}");
+        }
+    }
+
     #[test]
     fn steamvr_usage_shows_install_script_only_on_check() {
         let line = include_str!("cv1touch.rs")

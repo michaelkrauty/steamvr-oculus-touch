@@ -57,7 +57,7 @@ Until setup is complete, doctor shows it as not set up yet. Then run `cv1touch s
 - [Validation and measurement limits](docs/validation.md)
 - [Contributing](CONTRIBUTING.md)
 
-The command-line tools are named `cv1touch` and `cv1touchd`. Run `cv1touch --help` for the full command list. You can run the binaries directly, use a custom installation prefix, control the daemon over its local socket, and replay recordings offline. Service management is optional.
+The command-line tools are named `cv1touch` and `cv1touchd`. Run `cv1touch help expert` for the full command list. You can run the binaries directly, use a custom installation prefix, control the daemon over its local socket, and replay recordings offline. Service management is optional.
 
 ## Limitations
 
