@@ -976,9 +976,13 @@ impl SerialPort {
             if libc::tcsetattr(fd, libc::TCSANOW, &t) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            // A pseudo-terminal (the simulated dongle's) has no modem lines.
             let dtr: libc::c_int = libc::TIOCM_DTR;
             if libc::ioctl(fd, libc::TIOCMBIS, &dtr) != 0 {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::ENOTTY) {
+                    return Err(e);
+                }
             }
         }
         Ok(SerialPort(file))
