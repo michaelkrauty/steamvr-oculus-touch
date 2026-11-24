@@ -296,6 +296,8 @@ impl Parser {
     }
 }
 
+pub mod sim;
+
 /// Commands to the dongle, as the bytes to write to its port.
 pub mod cmd {
     /// Send the identity (status code 9) now.
