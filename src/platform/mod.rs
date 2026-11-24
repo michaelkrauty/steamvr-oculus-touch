@@ -368,6 +368,11 @@ pub mod hid {
             self.0.wake()
         }
 
+        /// Clears any pending wakeup, so a later wait does not return for one already handled.
+        pub fn clear(&self) {
+            self.0.clear()
+        }
+
         /// Waits until this waker or `other` fires, or `timeout` (None: no limit) passes: which
         /// fired, this one as `report`.
         pub fn wait_with(&self, other: &Waker, timeout: Option<Duration>) -> io::Result<Woke> {
@@ -2930,6 +2935,30 @@ mod tests {
             super::usb::instance(0x2833, Ok(r"HID\VID_1234\OTHER".into()))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_cleared_waker_does_not_wake_a_later_wait() {
+        use super::hid::{Waker, Woke};
+        use std::time::Duration;
+        let a = Waker::new().unwrap();
+        let b = Waker::new().unwrap();
+        a.wake();
+        a.clear();
+        assert_eq!(
+            a.wait_with(&b, Some(Duration::from_millis(20))).unwrap(),
+            Woke::default()
+        );
+        a.wake();
+        b.wake();
+        a.clear();
+        assert_eq!(
+            a.wait_with(&b, Some(Duration::from_secs(5))).unwrap(),
+            Woke {
+                report: false,
+                waker: true,
+            }
         );
     }
 }

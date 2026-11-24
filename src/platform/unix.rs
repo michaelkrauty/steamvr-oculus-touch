@@ -798,6 +798,10 @@ impl Waker {
         };
     }
 
+    pub fn clear(&self) {
+        self.drain();
+    }
+
     fn drain(&self) {
         use std::os::fd::AsRawFd;
         let mut v = 0u64;
