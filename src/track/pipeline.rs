@@ -2754,6 +2754,48 @@ mod tests {
         );
         assert!(!replay.hands[HAND_RIGHT].is_empty());
         let records: Vec<_> = crate::recorder::Reader::open(&path).unwrap().collect();
+        // A dongle recording carries RADIO_CLOCK instead of source-0 RAW_REPORT and must replay
+        // identically without skipping frames.
+        let dongle_path = tmp.path().join("cv1t-dongle-clock-replay.rec");
+        let dongle_rec = crate::recorder::Recorder::new(4 << 20);
+        dongle_rec.start(&dongle_path, H0).unwrap();
+        let mut clock_records = 0usize;
+        for r in &records {
+            if r.rtype == crate::recorder::RAW_REPORT {
+                if let Some((0, data)) = crate::recorder::decode_raw(&r.payload) {
+                    if let Some(us) = hmd_report_timestamp(data) {
+                        dongle_rec.write(
+                            crate::recorder::RADIO_CLOCK,
+                            r.host_ns,
+                            &[&us.to_le_bytes()],
+                        );
+                        clock_records += 1;
+                    }
+                    continue;
+                }
+            }
+            dongle_rec.write(r.rtype, r.host_ns, &[&r.payload]);
+        }
+        assert!(clock_records > 100, "expected radio clock samples");
+        let dongle_stats = dongle_rec.stop();
+        assert_eq!(dongle_stats.dropped, 0);
+        assert_eq!(dongle_stats.write_errors, 0);
+        let dongle_replay = super::super::replay::replay(
+            &dongle_path,
+            &calibration,
+            &|_| Some(Vector3::new(0.015, -0.012, 0.008).into()),
+            &p.opts,
+        )
+        .unwrap();
+        assert_eq!(dongle_replay.frames_skipped, 0);
+        assert_eq!(
+            dongle_replay.hands[HAND_RIGHT].len(),
+            replay.hands[HAND_RIGHT].len()
+        );
+        assert_eq!(
+            dongle_replay.stats[HAND_RIGHT].updates,
+            replay.stats[HAND_RIGHT].updates
+        );
         std::fs::remove_file(&path).unwrap();
         let split = records.len() * 3 / 4;
         let prefix_path = path.with_extension("prefix.rec");

@@ -17,7 +17,8 @@
 //! invalidation). ENGINE_SESSION: no payload (the engine opened; its identity epochs start over).
 //! SENSOR_ADDED = a sensor addition was accepted, serial in UTF-8 (additive to v2).
 //! IDENTITIES_RETIRED = the sensor's serial, UTF-8 (its restored pose was acknowledged and its
-//! invalidated identities retired).
+//! invalidated identities retired). RADIO_CLOCK = u32 poll_us (dongle clock sample in µs;
+//! additive to v2, older readers skip it).
 //! Tracking threads only copy into a ring under a mutex (no I/O); a writer thread does the file I/O.
 
 use std::fs::{File, OpenOptions};
@@ -58,6 +59,14 @@ pub const ENGINE_SESSION: u16 = 10;
 pub const IDENTITIES_RETIRED: u16 = 11;
 /// A live sensor addition was accepted; later frames may belong to a new object. Additive to v2.
 pub const SENSOR_ADDED: u16 = 12;
+/// A radio clock sample from a FreeTouch dongle (4-byte little-endian poll timestamp in µs), so
+/// recordings made without a headset can be replayed. Additive to v2, older readers skip it.
+pub const RADIO_CLOCK: u16 = 13;
+
+pub fn decode_radio_clock(payload: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = payload.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
 
 pub fn decode_inspection_identity(payload: &[u8]) -> Option<crate::engine::InspectionIdentity> {
     (payload.len() == size_of::<crate::engine::InspectionIdentity>())

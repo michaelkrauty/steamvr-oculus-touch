@@ -110,6 +110,11 @@ pub fn replay(
                     p.hmd_report(rec.host_ns, d);
                 }
             }
+            recorder::RADIO_CLOCK => {
+                if let Some(us) = recorder::decode_radio_clock(&rec.payload) {
+                    p.hmd_clock_sample(rec.host_ns, us);
+                }
+            }
             recorder::CONTROLLER_STATE => {
                 let Some((hand, st)) = recorder::decode_state(&rec.payload) else {
                     continue;
