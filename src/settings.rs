@@ -5,7 +5,9 @@
 //! with (`cv1touch tilt`), and whether SteamVR is kept starting from a measured base station
 //! (`pin_base_station`, set by hand; the daemon reads it again when the file changes). The
 //! daemon saves them on every change and reads them when it starts; without a usable file it
-//! goes on with the defaults. Fields of older versions (the prediction percents and the latency
+//! goes on with the defaults. The exposure offset of camera tracking timed from a FreeTouch
+//! dongle (`dongle_exposure_offset_ns`) is a calibration the daemon never changes: it writes back
+//! whatever the file holds. Fields of older versions (the prediction percents and the latency
 //! adjustment) are ignored; the position percent is still written, as 100, because 0.4.3 and
 //! earlier refuse a file without it.
 
@@ -36,6 +38,11 @@ pub struct Settings {
     /// registration measured (`base_pin`); left out when on.
     #[serde(default = "on", skip_serializing_if = "is_on")]
     pub pin_base_station: bool,
+    /// With a FreeTouch dongle: how much later than the exposure grid anchored to frame arrivals
+    /// (`track::exposure`) the sensors expose and the controllers' IMU samples are stamped, ns.
+    /// Left out at the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dongle_exposure_offset_ns: Option<i64>,
 }
 
 fn full_prediction() -> u32 {
@@ -58,6 +65,13 @@ impl Settings {
     pub fn tilt_deg(&self) -> f64 {
         self.tilt_deg.unwrap_or(0.0)
     }
+
+    /// The dongle's exposure offset, ns. The default is the headset's, since FreeTouch polls the
+    /// sensors in the headset's layout; a default, not a measurement.
+    pub fn dongle_exposure_offset_ns(&self) -> i64 {
+        self.dongle_exposure_offset_ns
+            .unwrap_or(crate::track::pipeline::DEFAULT_EXPOSURE_OFFSET_NS)
+    }
 }
 
 impl Default for Settings {
@@ -68,6 +82,7 @@ impl Default for Settings {
             prediction_percent: full_prediction(),
             tilt_deg: None,
             pin_base_station: true,
+            dongle_exposure_offset_ns: None,
         }
     }
 }
@@ -247,6 +262,22 @@ mod tests {
         assert!(!s.pin_base_station);
         save(&path, &s).unwrap();
         assert_eq!(load(&path), Ok(s));
+    }
+
+    /// The dongle's exposure offset is 4 ms unless the file holds one, and written only then.
+    #[test]
+    fn the_dongle_exposure_offset_is_kept_and_4_ms_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/settings.json");
+        save(&path, &Settings::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("dongle"));
+        assert_eq!(load(&path).unwrap().dongle_exposure_offset_ns(), 4_000_000);
+        let s = Settings {
+            dongle_exposure_offset_ns: Some(3_250_000),
+            ..Settings::default()
+        };
+        save(&path, &s).unwrap();
+        assert_eq!(load(&path).unwrap().dongle_exposure_offset_ns(), 3_250_000);
     }
 
     /// A file from an older version keeps its tilt; its prediction percents and latency
