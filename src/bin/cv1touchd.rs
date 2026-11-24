@@ -223,7 +223,7 @@ struct Daemon {
     /// Acquisition counters from the same publication, separate from released analysis buffers.
     sensor_video: Mutex<Vec<engine::SensorVideo>>,
     sensor_video_quality: Mutex<Vec<engine::SensorVideoQuality>>,
-    track_stats: Mutex<[(Stats, bool); 2]>,
+    track_stats: Mutex<[HandTrackStatus; 2]>,
     /// Per hand, the percentage of IMU samples the radio lost over the last minute.
     radio_lost_percent: Mutex<[Option<f64>; 2]>,
     pending_frames_dropped: std::sync::atomic::AtomicU64,
@@ -401,13 +401,28 @@ const LANDMARK_WINDOW_NS: u64 = 60_000_000_000;
 
 const BIAS_SAVE_NS: u64 = 30_000_000_000;
 
+/// Per-hand tracker snapshot published for `status --json`.
+#[derive(Clone, Copy, Default)]
+struct HandTrackStatus {
+    stats: Stats,
+    tracking: bool,
+    accel_bias: Option<[f64; 3]>,
+    verified_accel_bias: Option<[f64; 3]>,
+}
+
+type BiasUpdates = std::collections::BTreeMap<String, track::biases::Update>;
+
 /// Each controller's IMU biases across restarts (see `track::biases`): seeded into a new tracker,
-/// taken every 30 s while it tracks and written then and when the engine closes.
+/// merged back every 30 s while it tracks and when the engine closes so calibration and online
+/// verification persist without overwriting external `save_verified_accel` writes.
 struct BiasMemory {
     file: track::biases::BiasFile,
     keys: [Option<String>; 2],
+    saved_verified: [Option<[f64; 3]>; 2],
+    logged_verified: [Option<[f64; 3]>; 2],
+    logged_invalidated: [bool; 2],
+    pending: BiasUpdates,
     next_save: u64,
-    dirty: bool,
 }
 
 impl BiasMemory {
@@ -415,65 +430,170 @@ impl BiasMemory {
         BiasMemory {
             file: track::biases::load(&track::biases::default_path()),
             keys: [None, None],
+            saved_verified: [None, None],
+            logged_verified: [None, None],
+            logged_invalidated: [false, false],
+            pending: BiasUpdates::new(),
             next_save: 0,
-            dirty: false,
         }
     }
 
+    /// Seeds a newly added controller from its remembered biases and remembers its key for saves.
     fn seed(&mut self, p: &mut Pipeline, hand: usize, leds: &[calib::capture::Led]) {
         let key = track::biases::key(hand, leds);
+        self.saved_verified[hand] = None;
+        self.logged_verified[hand] = None;
+        self.logged_invalidated[hand] = false;
         if let Some(e) = self.file.controllers.get(&key) {
             p.seed_biases(hand, e.gyro());
             let g = e.gyro();
-            log!(
-                "{}: gyro bias from the last run ({:+.4} {:+.4} {:+.4} rad/s)",
-                ["left", "right"][hand],
-                g.x,
-                g.y,
-                g.z
-            );
+            if let Some(a) = e.verified_accel() {
+                p.seed_verified_accel(hand, a);
+                self.saved_verified[hand] = e.verified_accel;
+                self.logged_verified[hand] = e.verified_accel;
+                log!(
+                    "{}: IMU biases from earlier run (gyro {:+.4} {:+.4} {:+.4} rad/s, verified accel {:+.3} {:+.3} {:+.3} m/s^2)",
+                    ["left", "right"][hand],
+                    g.x,
+                    g.y,
+                    g.z,
+                    a.x,
+                    a.y,
+                    a.z
+                );
+            } else {
+                log!(
+                    "{}: gyro bias from the last run ({:+.4} {:+.4} {:+.4} rad/s)",
+                    ["left", "right"][hand],
+                    g.x,
+                    g.y,
+                    g.z
+                );
+            }
         }
         self.keys[hand] = Some(key);
     }
 
-    /// Every 30 s, the tracking controllers' biases: the file's new contents when they changed, for
-    /// `save_biases` (on the engine thread: no file I/O on the radio thread).
-    fn update(&mut self, p: &Pipeline, now: u64) -> Option<track::biases::BiasFile> {
+    /// Every 30 s, the tracking controllers' bias updates for `save_biases` (on the engine thread:
+    /// no file I/O on the radio thread).
+    fn update(&mut self, p: &Pipeline, now: u64) -> Option<BiasUpdates> {
+        if self.next_save == 0 {
+            self.next_save = now + BIAS_SAVE_NS;
+            return None;
+        }
         if now < self.next_save {
             return None;
         }
         self.next_save = now + BIAS_SAVE_NS;
-        for h in [HAND_LEFT, HAND_RIGHT] {
-            let (Some(key), Some(s)) = (self.keys[h].as_ref(), p.latest(h)) else {
-                continue;
-            };
-            if s.output.tracking {
-                let (g, a) = (s.output.gyro_bias, s.output.accel_bias);
-                let unix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                self.file.controllers.insert(
-                    key.clone(),
-                    track::biases::Entry {
-                        gyro: [g.x, g.y, g.z],
-                        accel: [a.x, a.y, a.z],
-                        updated_unix_s: unix,
-                    },
-                );
-                self.dirty = true;
-            }
-        }
+        self.record(p);
         self.take_changed()
     }
 
-    /// The file's contents if they changed since last taken.
-    fn take_changed(&mut self) -> Option<track::biases::BiasFile> {
-        mem::take(&mut self.dirty).then(|| self.file.clone())
+    /// Snapshots any tracking hand's current biases (and verified/invalidated accelerometer bias).
+    fn record(&mut self, p: &Pipeline) {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for h in [HAND_LEFT, HAND_RIGHT] {
+            let Some(key) = self.keys[h].as_ref() else {
+                continue;
+            };
+            let verified = p.verified_accel_bias(h).map(|v| [v.x, v.y, v.z]);
+            let invalidated = p.accel_bias_invalidated(h);
+            if let Some(v) = verified {
+                let changed_log = self.logged_verified[h].is_none_or(|prev| {
+                    (nalgebra::Vector3::from(v) - nalgebra::Vector3::from(prev)).norm() > 0.05
+                });
+                if changed_log {
+                    log!(
+                        "{}: verified accelerometer bias ({:+.3} {:+.3} {:+.3} m/s^2)",
+                        ["left", "right"][h],
+                        v[0],
+                        v[1],
+                        v[2]
+                    );
+                    self.logged_verified[h] = Some(v);
+                    self.logged_invalidated[h] = false;
+                }
+            } else if invalidated && !self.logged_invalidated[h] {
+                log!(
+                    "{}: cleared stale verified accelerometer bias",
+                    ["left", "right"][h]
+                );
+                self.logged_invalidated[h] = true;
+                self.logged_verified[h] = None;
+            }
+            let (verified_change, invalidated_from) = match verified {
+                Some(v)
+                    if self.saved_verified[h].is_none_or(|prev| {
+                        (nalgebra::Vector3::from(v) - nalgebra::Vector3::from(prev)).norm() > 0.05
+                    }) =>
+                {
+                    self.saved_verified[h] = Some(v);
+                    (Some(Some(v)), None)
+                }
+                None if invalidated && self.saved_verified[h].is_some() => {
+                    (Some(None), self.saved_verified[h].take())
+                }
+                _ => (None, None),
+            };
+            let tracking = p.latest(h).filter(|s| s.output.tracking).map(|s| {
+                let (g, a) = (s.output.gyro_bias, s.output.accel_bias);
+                ([g.x, g.y, g.z], [a.x, a.y, a.z])
+            });
+            if tracking.is_some() || verified_change.is_some() {
+                let update = track::biases::Update {
+                    tracking,
+                    verified_accel: verified_change,
+                    invalidated_from,
+                    updated_unix_s: unix,
+                };
+                match self.pending.get_mut(key) {
+                    Some(dst) => merge_queued_update(dst, update),
+                    None => {
+                        self.pending.insert(key.clone(), update);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The updates queued since last taken.
+    fn take_changed(&mut self) -> Option<BiasUpdates> {
+        (!self.pending.is_empty()).then(|| mem::take(&mut self.pending))
     }
 }
 
-fn save_biases(f: &track::biases::BiasFile) {
-    if let Err(e) = track::biases::save(&track::biases::default_path(), f) {
+fn merge_queued_update(dst: &mut track::biases::Update, src: track::biases::Update) {
+    if src.tracking.is_some() {
+        dst.tracking = src.tracking;
+    }
+    if src.verified_accel.is_some() {
+        dst.verified_accel = src.verified_accel;
+        dst.invalidated_from = src.invalidated_from;
+    }
+    dst.updated_unix_s = dst.updated_unix_s.max(src.updated_unix_s);
+}
+
+fn queue_bias_updates(link: &RadioLink, updates: BiasUpdates) {
+    let mut slot = link.biases.lock().unwrap();
+    match &mut *slot {
+        Some(existing) => {
+            for (k, u) in updates {
+                match existing.get_mut(&k) {
+                    Some(dst) => merge_queued_update(dst, u),
+                    None => {
+                        existing.insert(k, u);
+                    }
+                }
+            }
+        }
+        None => *slot = Some(updates),
+    }
+}
+
+fn save_biases(updates: &BiasUpdates) {
+    if let Err(e) = track::biases::merge_updates(&track::biases::default_path(), updates) {
         log!("IMU biases not saved: {e}");
     }
 }
@@ -2937,8 +3057,8 @@ struct RadioLink {
     hands: HandOwnership,
     /// Bodies the engine found for the radio thread to add.
     bodies: Mutex<Vec<NewBody>>,
-    /// The bias file's new contents from the radio thread, for the engine thread to write.
-    biases: Mutex<Option<track::biases::BiasFile>>,
+    /// Queued bias updates from the radio thread, for the engine thread to merge on disk.
+    biases: Mutex<Option<BiasUpdates>>,
     /// Sensor pose changes from the radio thread, for the engine thread to give the engine (and
     /// a sensor placed again to write into the calibration), each with how many times its sensor
     /// had been removed this session when it was made (`Reposing::removals`).
@@ -3897,10 +4017,10 @@ fn deliver_pose_changes(link: &RadioLink, mut handle: impl FnMut(PoseChange, u64
 /// Writes a queued bias file after `RadioLink::biases` is released. An `if let` keeps its
 /// scrutinee's temporaries through the then-body in every edition, and edition 2021 also keeps
 /// them through `else`, so locking in the scrutinee would hold the hand-off across the write.
-fn deliver_pending_biases(link: &RadioLink, save: impl FnOnce(&track::biases::BiasFile)) {
+fn deliver_pending_biases(link: &RadioLink, save: impl FnOnce(&BiasUpdates)) {
     let pending = link.biases.lock().unwrap().take();
-    if let Some(file) = pending {
-        save(&file);
+    if let Some(updates) = pending {
+        save(&updates);
     }
 }
 
@@ -3908,7 +4028,7 @@ fn deliver_pending_biases(link: &RadioLink, save: impl FnOnce(&track::biases::Bi
 /// calls this. `save` and `handle` run only after those locks are released.
 fn deliver_engine_queues(
     link: &RadioLink,
-    save: impl FnOnce(&track::biases::BiasFile),
+    save: impl FnOnce(&BiasUpdates),
     handle: impl FnMut(PoseChange, u64),
 ) {
     deliver_pending_biases(link, save);
@@ -4673,8 +4793,8 @@ fn radio_main(
                 if let Some(hands) = search_skip.changed() {
                     dec.set_search_skip(hands);
                 }
-                if let Some(f) = biases.update(pipe, now) {
-                    *link.biases.lock().unwrap() = Some(f);
+                if let Some(u) = biases.update(pipe, now) {
+                    queue_bias_updates(link, u);
                 }
                 sensors.reposing.tick(d, link, pipe, sensors.watch, now);
                 now
@@ -4688,21 +4808,28 @@ fn radio_main(
             d.pending_frames_dropped
                 .store(pipe.frames_dropped, Ordering::Relaxed);
             let stats = [HAND_LEFT, HAND_RIGHT].map(|h| {
-                (
-                    pipe.stats(h),
-                    pipe.latest(h).is_some_and(|s| s.output.tracking),
-                )
+                let latest = pipe.latest(h);
+                HandTrackStatus {
+                    stats: pipe.stats(h),
+                    tracking: latest.is_some_and(|s| s.output.tracking),
+                    accel_bias: latest.map(|s| {
+                        let a = s.output.accel_bias;
+                        [a.x, a.y, a.z]
+                    }),
+                    verified_accel_bias: pipe.verified_accel_bias(h).map(|a| [a.x, a.y, a.z]),
+                }
             });
             *d.radio_lost_percent.lock().unwrap() = [HAND_LEFT, HAND_RIGHT].map(|h| {
-                let s = stats[h].0;
+                let s = stats[h].stats;
                 radio_loss[h].update(now, [s.imu_samples, s.imu_lost])
             });
             *d.track_stats.lock().unwrap() = stats;
             next_stats = now + SENSOR_PUBLISH_NS;
         }
     }
-    if let Some(f) = biases.take_changed() {
-        *link.biases.lock().unwrap() = Some(f);
+    biases.record(pipe);
+    if let Some(u) = biases.take_changed() {
+        queue_bias_updates(link, u);
     }
 }
 
@@ -5592,11 +5719,25 @@ fn publish_radio_hand_state(
                     v(c.imu_gyro),
                     v(c.imu_accel),
                 );
-                (p.stats(h).wrong_locks, p.latest(h))
+                (p.stats(h).wrong_locks, p.last_wrong_lock_ba(h), p.latest(h))
             })
         },
         emit,
     );
+}
+
+fn wrong_lock_note(hand: usize, ba: Option<nalgebra::Vector3<f64>>) -> String {
+    let name = ["left", "right"][hand];
+    match ba {
+        Some(a) => format!(
+            "{name}: dropped a wrong lock (accelerometer bias ran off: {:+.2} {:+.2} {:+.2} m/s^2, |ba|={:.2})",
+            a.x,
+            a.y,
+            a.z,
+            a.norm()
+        ),
+        None => format!("{name}: dropped a wrong lock (accelerometer bias ran off)"),
+    }
 }
 
 /// Publishes one hand's state from `c`: the engine's controller, or the radio thread's sample over
@@ -5619,9 +5760,10 @@ fn publish_hand_state_with_log(
     pipe: Option<&mut Pipeline>,
     emit: impl FnMut(String),
 ) {
-    publish_hand_state_with_tracking(
+    publish_hand_state_for_reader(
         d,
         h,
+        engine::RadioReader::Engine,
         c,
         clock,
         || {
@@ -5634,13 +5776,14 @@ fn publish_hand_state_with_log(
                     v(c.imu_gyro),
                     v(c.imu_accel),
                 );
-                (p.stats(h).wrong_locks, p.latest(h))
+                (p.stats(h).wrong_locks, p.last_wrong_lock_ba(h), p.latest(h))
             })
         },
         emit,
     );
 }
 
+#[cfg(test)]
 fn publish_hand_state_with_tracking(
     d: &Daemon,
     h: usize,
@@ -5649,7 +5792,15 @@ fn publish_hand_state_with_tracking(
     track: impl FnOnce() -> Option<(u64, Option<Stamped>)>,
     emit: impl FnMut(String),
 ) {
-    publish_hand_state_for_reader(d, h, engine::RadioReader::Engine, c, clock, track, emit);
+    publish_hand_state_for_reader(
+        d,
+        h,
+        engine::RadioReader::Engine,
+        c,
+        clock,
+        || track().map(|(wl, latest)| (wl, None, latest)),
+        emit,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5659,7 +5810,7 @@ fn publish_hand_state_for_reader(
     reader: engine::RadioReader,
     c: &engine::Controller,
     clock: impl FnOnce() -> u64,
-    track: impl FnOnce() -> Option<(u64, Option<Stamped>)>,
+    track: impl FnOnce() -> Option<(u64, Option<nalgebra::Vector3<f64>>, Option<Stamped>)>,
     emit: impl FnMut(String),
 ) {
     // IMU processing can fit queued camera frames; no publication lock may span that work.
@@ -5702,13 +5853,10 @@ fn publish_hand_state_for_reader(
     if state.flags & ffi::CV1T_FLAG_CONNECTED != 0 {
         state.battery_percent = d.battery[h].load(Ordering::Relaxed);
     }
-    if let Some((wl, latest)) = tracked.filter(|_| !stale) {
+    if let Some((wl, wl_ba, latest)) = tracked.filter(|_| !stale) {
         if wl != memory.wrong_locks {
             memory.wrong_locks = wl;
-            notices.messages.push(format!(
-                "{}: dropped a wrong lock (accelerometer bias ran off)",
-                ["left", "right"][h]
-            ));
+            notices.messages.push(wrong_lock_note(h, wl_ba));
         }
         apply_tracker(&mut state, latest.as_ref(), memory, apply_tracked);
         let connected = state.flags & ffi::CV1T_FLAG_CONNECTED != 0;
@@ -5894,7 +6042,7 @@ fn hold_summary(hand: &str, v: &mut [HoldParts]) -> String {
 /// sensor maps are copied together so one reply still sees one moment.
 struct StatusShared {
     input_calibration: serde_json::Value,
-    track_stats: [(Stats, bool); 2],
+    track_stats: [HandTrackStatus; 2],
     shifts: std::collections::BTreeMap<String, (f64, f64, usize)>,
     poses: std::collections::BTreeMap<String, PoseNote>,
     agreements: std::collections::BTreeMap<String, track::tracker::CameraAgreement>,
@@ -5998,10 +6146,28 @@ fn status_json(d: &Daemon) -> String {
         .zip(["left", "right"])
         .zip(shared.track_stats.iter())
         .zip(radio_lost)
-        .map(|(((s, name), (t, tracking)), radio_lost)| {
+        .map(|(((s, name), ts), radio_lost)| {
+            let t = ts.stats;
+            let tracking = ts.tracking;
             format!(
-                "{{\"hand\":\"{name}\",\"flags\":{},\"radio_lost_percent\":{},\"battery_percent\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{}}}}}",
-                s.flags, serde_json::json!(radio_lost), serde_json::json!(cv1touch::status::battery_percent(s)), t.frames, t.updates, t.not_visible, t.too_few, t.rejected, t.acquisitions, t.good_acquisitions, t.searched_acquisitions, t.unconfirmed_acquisitions, t.refused_acquisitions, t.out_of_order, t.wrong_locks
+                "{{\"hand\":\"{name}\",\"flags\":{},\"radio_lost_percent\":{},\"battery_percent\":{},\"tracker\":{{\"tracking\":{tracking},\"frames\":{},\"updates\":{},\"not_visible\":{},\"too_few\":{},\"rejected\":{},\"acquisitions\":{},\"good\":{},\"searched\":{},\"unconfirmed\":{},\"refused\":{},\"out_of_order\":{},\"wrong_locks\":{},\"accel_bias\":{},\"verified_accel_bias\":{}}}}}",
+                s.flags,
+                serde_json::json!(radio_lost),
+                serde_json::json!(cv1touch::status::battery_percent(s)),
+                t.frames,
+                t.updates,
+                t.not_visible,
+                t.too_few,
+                t.rejected,
+                t.acquisitions,
+                t.good_acquisitions,
+                t.searched_acquisitions,
+                t.unconfirmed_acquisitions,
+                t.refused_acquisitions,
+                t.out_of_order,
+                t.wrong_locks,
+                serde_json::json!(ts.accel_bias),
+                serde_json::json!(ts.verified_accel_bias),
             )
         })
         .collect();
@@ -7200,7 +7366,7 @@ fn main() {
         sensor_streams: Mutex::new(Vec::new()),
         sensor_video: Mutex::new(Vec::new()),
         sensor_video_quality: Mutex::new(Vec::new()),
-        track_stats: Mutex::new([(Stats::default(), false); 2]),
+        track_stats: Mutex::new([HandTrackStatus::default(); 2]),
         radio_lost_percent: Mutex::new([None; 2]),
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
@@ -9298,7 +9464,7 @@ mod tests {
             sensor_streams: Mutex::new(Vec::new()),
             sensor_video: Mutex::new(Vec::new()),
             sensor_video_quality: Mutex::new(Vec::new()),
-            track_stats: Mutex::new([(Stats::default(), false); 2]),
+            track_stats: Mutex::new([HandTrackStatus::default(); 2]),
             radio_lost_percent: Mutex::new([None; 2]),
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
@@ -10398,11 +10564,21 @@ mod tests {
             }),
             2,
         ));
-        *link.biases.lock().unwrap() = Some(track::biases::BiasFile::default());
+        let mut updates = BiasUpdates::new();
+        updates.insert(
+            "left-1".into(),
+            track::biases::Update {
+                tracking: Some(([0.0, 0.0, 0.0], [0.0, 1.9, 0.0])),
+                verified_accel: Some(Some([0.0, 1.9, 0.0])),
+                invalidated_from: None,
+                updated_unix_s: 100,
+            },
+        );
+        queue_bias_updates(&link, updates);
         let applied = std::cell::RefCell::new(Vec::new());
         deliver_engine_queues(
             &link,
-            |file| {
+            |updates| {
                 assert!(
                     link.biases.try_lock().is_ok(),
                     "biases stays locked while the file is saved"
@@ -10411,7 +10587,7 @@ mod tests {
                     link.reposed.try_lock().is_ok(),
                     "reposed stays locked while the bias file is saved"
                 );
-                assert_eq!(file.format, track::biases::FORMAT);
+                assert!(updates.contains_key("left-1"));
                 applied.borrow_mut().push("bias".into());
             },
             |change, removals| {
@@ -21511,5 +21687,95 @@ mod tests {
             "left: IMU sample held 0.10 ms median, 0.15 p99, 4.22 max (radio arrival to driver wake-up, 100 samples); \
              p99/max in OpenHMD's IMU filter 0.01/4.00, rest of its update 0.02/0.02, reading it back 0.01/0.01, ours 0.11/0.19"
         );
+    }
+
+    #[test]
+    fn wrong_lock_note_and_status_json_report_accel_biases() {
+        let with_ba = wrong_lock_note(0, Some(nalgebra::Vector3::new(-0.04, 1.90, 0.10)));
+        assert!(with_ba.contains("-0.04 +1.90 +0.10 m/s^2"), "{with_ba}");
+        assert!(with_ba.contains("|ba|=1.90"), "{with_ba}");
+        assert_eq!(
+            wrong_lock_note(1, None),
+            "right: dropped a wrong lock (accelerometer bias ran off)"
+        );
+
+        let d = status_daemon();
+        {
+            let mut ts = d.track_stats.lock().unwrap();
+            ts[0].tracking = true;
+            ts[0].accel_bias = Some([-0.04, 1.90, 0.10]);
+            ts[0].verified_accel_bias = Some([-0.04, 1.90, 0.10]);
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(
+            status["hands"][0]["tracker"]["accel_bias"],
+            serde_json::json!([-0.04, 1.90, 0.10])
+        );
+        assert_eq!(
+            status["hands"][0]["tracker"]["verified_accel_bias"],
+            serde_json::json!([-0.04, 1.90, 0.10])
+        );
+        assert!(status["hands"][1]["tracker"]["accel_bias"].is_null());
+        assert!(status["hands"][1]["tracker"]["verified_accel_bias"].is_null());
+    }
+
+    #[test]
+    fn bias_memory_and_queue_coalesce_verified_updates_without_repeating_while_asleep() {
+        let link = RadioLink::default();
+        let mut first = BiasUpdates::new();
+        first.insert(
+            "left-1".into(),
+            track::biases::Update {
+                tracking: None,
+                verified_accel: Some(Some([0.0, 1.9, 0.0])),
+                invalidated_from: None,
+                updated_unix_s: 100,
+            },
+        );
+        queue_bias_updates(&link, first);
+        let mut second = BiasUpdates::new();
+        second.insert(
+            "left-1".into(),
+            track::biases::Update {
+                tracking: Some(([0.01, 0.0, 0.0], [0.0, 1.91, 0.0])),
+                verified_accel: None,
+                invalidated_from: None,
+                updated_unix_s: 130,
+            },
+        );
+        queue_bias_updates(&link, second);
+        let merged = link.biases.lock().unwrap().take().unwrap();
+        let u = &merged["left-1"];
+        assert_eq!(u.verified_accel, Some(Some([0.0, 1.9, 0.0])));
+        assert_eq!(u.tracking, Some(([0.01, 0.0, 0.0], [0.0, 1.91, 0.0])));
+        assert_eq!(u.updated_unix_s, 130);
+
+        let leds = vec![calib::capture::Led {
+            pos: nalgebra::Vector3::new(0.03, 0.0, 0.0),
+            dir: nalgebra::Vector3::y(),
+        }];
+        let key = track::biases::key(HAND_LEFT, &leds);
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        pipe.body(calib::DEVICE_LEFT, leds, nalgebra::Vector3::zeros());
+        pipe.seed_verified_accel(HAND_LEFT, nalgebra::Vector3::new(0.0, 1.9, 0.0));
+
+        let mut mem = BiasMemory {
+            file: track::biases::BiasFile::default(),
+            keys: [Some(key.clone()), None],
+            saved_verified: [None, None],
+            logged_verified: [None, None],
+            logged_invalidated: [false, false],
+            pending: BiasUpdates::new(),
+            next_save: 0,
+        };
+        mem.record(&pipe);
+        let emitted = mem
+            .take_changed()
+            .expect("newly verified bias must queue once");
+        assert_eq!(emitted[&key].verified_accel, Some(Some([0.0, 1.9, 0.0])));
+        // Subsequent ticks while asleep must not re-queue unchanged verified bias.
+        mem.record(&pipe);
+        assert!(mem.take_changed().is_none());
     }
 }

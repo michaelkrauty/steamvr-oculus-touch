@@ -149,18 +149,7 @@ impl Tracker {
             self.reset_imu_history();
         }
         let s = self.own_rail(s);
-        if let Some((t, q, until)) = self.wrong_lock {
-            let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
-            self.wrong_lock = (s.t < until).then(|| {
-                (
-                    s.t,
-                    q * UnitQuaternion::from_scaled_axis(
-                        (s.gyro - bg) * (s.t.saturating_sub(t) as f64 * 1e-9),
-                    ),
-                    until,
-                )
-            });
-        }
+        self.advance_wrong_lock(&s);
         let still = self.legacy_still(&s);
         self.imu.push_back(s);
         self.still.push_back(still);

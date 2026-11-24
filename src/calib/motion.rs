@@ -49,7 +49,7 @@ impl Default for MotionParams {
             sigma_m: 0.002,
             huber_m: 0.005,
             iterations: 8,
-            prior_bias: 1.0,
+            prior_bias: 3.0,
             prior_lever_m: 0.05,
         }
     }
@@ -530,5 +530,26 @@ mod tests {
             a * UnitQuaternion::from_scaled_axis(Vector3::new(-0.01, 0.0, 0.0)),
         ];
         assert!(chordal_mean(&rs).angle_to(&a) < 1e-4);
+    }
+
+    /// Controllers with large factory accelerometer bias (~2 m/s^2) still solve cleanly.
+    #[test]
+    fn recovers_large_accelerometer_bias_from_exact_motion() {
+        let p = TrajectoryParams {
+            duration_s: 30.0,
+            gravity: Vector3::new(0.3, 9.79, -0.4),
+            accel_bias: [Vector3::new(0.0, 2.0, 0.0), Vector3::new(-1.8, 0.5, -0.3)],
+            ..Default::default()
+        };
+        let tr = synth::trajectory(&p);
+        let m = estimate(
+            &tr.scene.samples,
+            &poses(&tr),
+            &tr.imu,
+            &MotionParams::default(),
+        )
+        .unwrap();
+        assert!((m.gravity - p.gravity).norm() < 5e-3, "{:?}", m.gravity);
+        check_devices(&m, &p, 1e-2, 1e-3);
     }
 }
