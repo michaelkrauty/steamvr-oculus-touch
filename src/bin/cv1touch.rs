@@ -1336,6 +1336,32 @@ fn calibrate_solve_saved(rec: &Path, out: &Path, force: bool) -> Result<String, 
                 println!("previous calibration kept as {}", b.display());
             }
             println!("installed {}", out.display());
+            if absolute(out) == absolute(&file::default_path()) {
+                let min_segs = cv1touch::calib::motion::MotionParams::default().min_segments;
+                let max_ba = cv1touch::track::tracker::Params::default().max_accel_bias_cold;
+                let verified: Vec<(String, nalgebra::Vector3<f64>)> = sol
+                    .gravity
+                    .devices
+                    .iter()
+                    .filter(|d| {
+                        d.segments >= min_segs
+                            && d.accel_bias.iter().all(|v| v.is_finite())
+                            && d.accel_bias.norm() <= max_ba
+                    })
+                    .filter_map(|d| {
+                        let hand = cv1touch::track::pipeline::device_hand(d.device)?;
+                        let leds = cap.leds.get(&d.device)?;
+                        Some((cv1touch::track::biases::key(hand, leds), d.accel_bias))
+                    })
+                    .collect();
+                if let Err(e) = cv1touch::track::biases::save_verified_accel(
+                    &cv1touch::track::biases::default_path(),
+                    &verified,
+                    f.created_unix_s,
+                ) {
+                    eprintln!("cv1touch: warning: verified IMU biases not saved: {e}");
+                }
+            }
             Ok(fingerprint)
         }
         Err(e) => {

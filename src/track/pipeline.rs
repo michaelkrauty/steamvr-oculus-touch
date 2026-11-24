@@ -92,6 +92,9 @@ pub struct Options {
     /// Per hand, a gyro bias to start each new tracker from, as the daemon does with the
     /// remembered one (see `track::biases`).
     pub seed_biases: [Option<Vector3<f64>>; 2],
+    /// Per hand, a verified constant accelerometer bias to start each new tracker from (see
+    /// `track::biases::Entry::verified_accel`).
+    pub seed_verified_accel: [Option<Vector3<f64>>; 2],
 }
 
 impl Default for Options {
@@ -103,6 +106,7 @@ impl Default for Options {
             probe_sensors: Vec::new(),
             delayed_ns: None,
             seed_biases: [None, None],
+            seed_verified_accel: [None, None],
         }
     }
 }
@@ -482,6 +486,9 @@ impl Pipeline {
             if let Some(g) = self.opts.seed_biases[hand] {
                 seed_gyro_bias(&mut tr, g);
             }
+            if let Some(a) = self.opts.seed_verified_accel[hand] {
+                tr.seed_verified_accel(a, super::biases::SEED_SD_ACCEL);
+            }
             self.trackers[hand] = Some(tr);
         }
     }
@@ -491,6 +498,34 @@ impl Pipeline {
         if let Some(tr) = self.trackers[hand].as_mut() {
             seed_gyro_bias(tr, gyro);
         }
+    }
+
+    /// Starts a hand's accelerometer bias from a verified constant offset (see `track::biases`).
+    pub fn seed_verified_accel(&mut self, hand: usize, accel: Vector3<f64>) {
+        if let Some(tr) = self.trackers[hand].as_mut() {
+            tr.seed_verified_accel(accel, super::biases::SEED_SD_ACCEL);
+        }
+    }
+
+    /// The hand's verified constant hardware accelerometer bias, if known.
+    pub fn verified_accel_bias(&self, hand: usize) -> Option<Vector3<f64>> {
+        self.trackers[hand]
+            .as_ref()
+            .and_then(Tracker::verified_accel_bias)
+    }
+
+    /// Whether a previously seeded verified accelerometer bias for `hand` was invalidated.
+    pub fn accel_bias_invalidated(&self, hand: usize) -> bool {
+        self.trackers[hand]
+            .as_ref()
+            .is_some_and(Tracker::accel_bias_invalidated)
+    }
+
+    /// The accelerometer bias that triggered a hand's most recent wrong-lock drop, if any.
+    pub fn last_wrong_lock_ba(&self, hand: usize) -> Option<Vector3<f64>> {
+        self.trackers[hand]
+            .as_ref()
+            .and_then(Tracker::last_wrong_lock_ba)
     }
 
     /// Where a controller's gyro readings end (see `Tracker::gyro_range`).

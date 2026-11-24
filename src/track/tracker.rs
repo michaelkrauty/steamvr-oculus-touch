@@ -26,6 +26,123 @@ struct Undecided {
     lead: Vec<f64>,
 }
 
+/// Minimum refused same-orientation offers during a wrong-lock memory window before concluding the
+/// controller has no other orientation and allowing a larger real hardware accelerometer bias.
+const COLD_BIAS_MIN_REFUSALS: u32 = 5;
+/// Acquisition prior std dev (m/s^2) on accelerometer bias when learning a large cold bias (> 1 m/s^2).
+const COLD_BIAS_ACQUIRE_SD: f64 = 1.5;
+/// Multi-orientation verification bounds for online accelerometer bias confirmation.
+const VERIFY_MAX_BA_SD: f64 = 0.08;
+const VERIFY_STEADY_NS: u64 = 500_000_000;
+const VERIFY_STEADY_DRIFT: f64 = 0.08;
+const VERIFY_MIN_ANGLE_RAD: f64 = 35.0 * std::f64::consts::PI / 180.0;
+const VERIFY_MAX_DIFF: f64 = 0.18;
+const VERIFY_MIN_ORIENTATIONS: usize = 3;
+
+/// Maximum distinct dropped orientations remembered within one wrong-lock refusal window.
+const WRONG_LOCK_MAX_REFUSED: usize = 4;
+
+/// Dropped wrong-lock orientations, carried on by the gyro, and how the engine behaved during
+/// their refusal window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WrongLock {
+    t: u64,
+    /// When the unresolved wrong-lock run began (preserved across immediate re-drops).
+    since: u64,
+    refused: [UnitQuaternion<f64>; WRONG_LOCK_MAX_REFUSED],
+    refused_len: usize,
+    until: u64,
+    /// Accelerometer bias magnitude that triggered this drop.
+    ba_norm: f64,
+    /// Engine poses within `wrong_lock_turn_rad` refused while waiting.
+    refused_same: u32,
+    /// How many drops occurred in this unresolved run with `ba_norm <= max_accel_bias_cold`.
+    cold_drops: u32,
+    /// Whether another orientation was acquired and sustained past a bias test while waiting.
+    alt_sustained: bool,
+}
+
+impl WrongLock {
+    fn matches(&self, q: &UnitQuaternion<f64>, turn_rad: f64) -> bool {
+        self.refused[..self.refused_len]
+            .iter()
+            .any(|r| r.angle_to(q) < turn_rad)
+    }
+
+    fn record_refused(&mut self, q: UnitQuaternion<f64>, turn_rad: f64) {
+        if self.matches(&q, turn_rad) {
+            return;
+        }
+        if self.refused_len < WRONG_LOCK_MAX_REFUSED {
+            self.refused[self.refused_len] = q;
+            self.refused_len += 1;
+        } else {
+            self.refused[WRONG_LOCK_MAX_REFUSED - 1] = q;
+        }
+    }
+}
+
+/// Online multi-orientation verifier for a controller's constant hardware accelerometer bias:
+/// records well-converged `(g_hat, ba)` checkpoints across distinct gravity directions in one
+/// continuous confirmed track. A real hardware bias is invariant as gravity rotates in body frame;
+/// a wrong lock leaks `(I - dR^T) g_body`, which rotates with gravity and breaks tracking.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BiasVerifier {
+    steady_anchor: Option<(u64, Vector3<f64>)>,
+    checkpoints: Vec<(Vector3<f64>, Vector3<f64>)>,
+}
+
+impl BiasVerifier {
+    fn clear(&mut self) {
+        self.steady_anchor = None;
+        self.checkpoints.clear();
+    }
+
+    fn observe(&mut self, t: u64, f: &Filter, max_norm: f64) -> Option<Vector3<f64>> {
+        let ba = f.x.ba;
+        if !ba.iter().all(|v| v.is_finite()) || ba.norm() > max_norm {
+            self.clear();
+            return None;
+        }
+        let max_var = (0..3)
+            .map(|i| f.cov[(BA + i, BA + i)])
+            .fold(0.0f64, f64::max);
+        if !max_var.is_finite() || max_var > VERIFY_MAX_BA_SD * VERIFY_MAX_BA_SD {
+            self.steady_anchor = None;
+            return None;
+        }
+        match self.steady_anchor {
+            Some((anchor_t, anchor_ba)) => {
+                if (ba - anchor_ba).norm() > VERIFY_STEADY_DRIFT {
+                    self.steady_anchor = Some((t, ba));
+                    self.checkpoints
+                        .retain(|(_, b)| (*b - ba).norm() <= VERIFY_MAX_DIFF);
+                    return None;
+                }
+                if t.saturating_sub(anchor_t) < VERIFY_STEADY_NS {
+                    return None;
+                }
+            }
+            None => {
+                self.steady_anchor = Some((t, ba));
+                return None;
+            }
+        }
+        let g_hat = f.x.q.inverse() * Vector3::y();
+        self.checkpoints
+            .retain(|(_, b)| (*b - ba).norm() <= VERIFY_MAX_DIFF);
+        if self
+            .checkpoints
+            .iter()
+            .all(|(g, _)| g_hat.angle(g) >= VERIFY_MIN_ANGLE_RAD)
+            && self.checkpoints.len() < 4
+        {
+            self.checkpoints.push((g_hat, ba));
+        }
+        (self.checkpoints.len() >= VERIFY_MIN_ORIENTATIONS).then_some(ba)
+    }
+}
+
 /// The two cheapest costs in total_cmp order, including signed zero and NaNs.
 fn retain_two_costs(costs: &mut [Option<f64>; 2], cost: f64) {
     if costs[0].is_none_or(|first| cost.total_cmp(&first).is_lt()) {
@@ -90,12 +207,18 @@ pub struct Params {
     /// tracker's own (shift-search) association to re-lock without the engine.
     pub relock_ns: u64,
     /// A wrong lock (a pose that fits the LEDs but is turned from the truth) leaks gravity into the
-    /// filter, which drives the accelerometer bias off: beyond this (m/s^2) the track is dropped,
-    /// and no track starts from such a bias.
+    /// filter, which drives the accelerometer bias off: beyond this (m/s^2) from the controller's
+    /// verified bias reference (or from zero on a cold first attempt) the track is dropped, and no
+    /// track starts from such a bias.
     /// Tested on the state that holds all of an exposure's fixes, once a later exposure's frame
     /// comes (or the IMU passes the exposure's last possible frame): between two sensors' fixes
     /// of one exposure the bias swings with the order they arrive in.
     pub max_accel_bias: f64,
+    /// Maximum physically plausible constant hardware accelerometer bias (m/s^2) tolerated while
+    /// learning an unverified bias from scratch (aged/shocked MPU-6500s can reach ~2 m/s^2). Once
+    /// multi-orientation tracking or camera calibration verifies the controller's true bias,
+    /// `max_accel_bias` applies tightly around that verified reference.
+    pub max_accel_bias_cold: f64,
     /// After a wrong lock, engine poses within `wrong_lock_turn_rad` of the dropped orientation
     /// (carried on by the gyro) are refused for this long: the engine tends to offer it again.
     pub wrong_lock_memory_ns: u64,
@@ -152,6 +275,7 @@ impl Default for Params {
             foreign_px: 2.0,
             relock_ns: 3_000_000_000,
             max_accel_bias: 1.0,
+            max_accel_bias_cold: 3.0,
             wrong_lock_memory_ns: 2_000_000_000,
             wrong_lock_turn_rad: 10f64.to_radians(),
             // true poses fit at ~0.1 px, ring aliases at 0.3-1 px (2026-10-08 recordings: the
@@ -425,9 +549,26 @@ pub struct Tracker {
     bias_pending: Option<u64>,
     /// The biases the current track started from, restored when it turns out a wrong lock.
     acquired_bias: Option<Filter>,
-    /// A dropped wrong lock's orientation, carried on by the gyro: (controller time, orientation,
-    /// refused until).
-    wrong_lock: Option<(u64, UnitQuaternion<f64>, u64)>,
+    /// Verified constant hardware accelerometer bias (from calibration or online multi-orientation
+    /// verification), used as the center of `bias_ran_off` and `steady_up`.
+    bias_ref: Option<Vector3<f64>>,
+    /// Whether a previously seeded `bias_ref` was invalidated by persistent same-orientation drops.
+    bias_ref_invalidated: bool,
+    /// Consecutive wrong-lock memory windows exhausted with no alternative orientation sustaining a
+    /// track while `bias_ref` is set; requires two windows before invalidating a verified reference.
+    stale_ref_windows: u32,
+    /// After a cold drop where every frame kept offering the same orientation with no lower-bias
+    /// alternative, allow `ba` up to `max_accel_bias_cold` until multi-orientation verification
+    /// locks in `bias_ref`.
+    cold_bias_tolerance: bool,
+    /// Exposure time of the current track's acquisition (0 when none).
+    track_acquired_at: u64,
+    /// Online multi-orientation verifier for the current continuous track.
+    bias_verifier: BiasVerifier,
+    /// A dropped wrong lock's orientation, carried on by the gyro.
+    wrong_lock: Option<WrongLock>,
+    /// Accelerometer bias (`ba`) that triggered the most recent wrong-lock drop, for diagnostics.
+    last_wrong_lock_ba: Option<Vector3<f64>>,
     /// The LED constellation's ring aliases, tested at acquisition.
     aliases: Vec<vision::Alias>,
     /// The last frame (sensor, exposure) that refuted the track (see `refutes`), and the fix it
@@ -595,7 +736,14 @@ impl Tracker {
             last_track: 0,
             saved_bias: None,
             acquired_bias: None,
+            bias_ref: None,
+            bias_ref_invalidated: false,
+            stale_ref_windows: 0,
+            cold_bias_tolerance: false,
+            track_acquired_at: 0,
+            bias_verifier: BiasVerifier::default(),
             wrong_lock: None,
+            last_wrong_lock_ba: None,
             aliases,
             refuted: None,
             ambiguous_since: 0,
@@ -713,18 +861,7 @@ impl Tracker {
             self.reset_imu_history();
         }
         let s = self.own_rail(s);
-        if let Some((t, q, until)) = self.wrong_lock {
-            let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
-            self.wrong_lock = (s.t < until).then(|| {
-                (
-                    s.t,
-                    q * UnitQuaternion::from_scaled_axis(
-                        (s.gyro - bg) * (s.t.saturating_sub(t) as f64 * 1e-9),
-                    ),
-                    until,
-                )
-            });
-        }
+        self.advance_wrong_lock(&s);
         let still = self.is_still(&s);
         self.imu.push_back(s);
         self.still.push_back(still);
@@ -846,6 +983,8 @@ impl Tracker {
         self.undecided = None;
         self.held = None;
         self.bias_pending = None;
+        self.track_acquired_at = 0;
+        self.bias_verifier.clear();
     }
 
     /// Host time exposed a discontinuity that the controller's elapsed time concealed.
@@ -874,7 +1013,7 @@ impl Tracker {
             .back()
             .map(|h| (h.1.x.bg, h.1.x.ba))
             .or(self.saved_bias.map(|f| (f.x.bg, f.x.ba)))
-            .unwrap_or_default();
+            .unwrap_or_else(|| (Vector3::zeros(), self.bias_ref.unwrap_or_default()));
         let from = s.t.saturating_sub(p.still_window_ns);
         let start = self.imu.partition_point(|x| x.t < from);
         let n = (self.imu.len() - start + 1) as f64;
@@ -944,6 +1083,130 @@ impl Tracker {
         self.saved_bias = Some(Filter { x, cov });
     }
 
+    /// Seeds a verified constant hardware accelerometer bias (from camera calibration or an
+    /// earlier session's multi-orientation convergence). Preserves any already-seeded gyro bias.
+    /// Only before the first fix.
+    pub fn seed_verified_accel(&mut self, accel: Vector3<f64>, sd_accel: f64) {
+        if !self.history.is_empty()
+            || !accel.iter().all(|v| v.is_finite())
+            || accel.norm() > self.params.max_accel_bias_cold
+        {
+            return;
+        }
+        self.bias_ref = Some(accel);
+        self.bias_ref_invalidated = false;
+        self.stale_ref_windows = 0;
+        self.cold_bias_tolerance = false;
+        let sd = sd_accel.max(1e-3);
+        match &mut self.saved_bias {
+            Some(f) => {
+                f.x.ba = accel;
+                f.cov.fixed_rows_mut::<3>(BA).fill(0.0);
+                f.cov.fixed_columns_mut::<3>(BA).fill(0.0);
+                f.cov.fixed_view_mut::<3, 3>(BA, BA).fill_diagonal(sd * sd);
+            }
+            None => {
+                let x = Nominal {
+                    q: UnitQuaternion::identity(),
+                    p: Vector3::zeros(),
+                    v: Vector3::zeros(),
+                    bg: Vector3::zeros(),
+                    ba: accel,
+                };
+                let mut cov = Cov::zeros();
+                let sd_gyro = self.params.acquire_sd[3];
+                for i in 0..3 {
+                    cov[(BG + i, BG + i)] = sd_gyro * sd_gyro;
+                    cov[(BA + i, BA + i)] = sd * sd;
+                }
+                self.saved_bias = Some(Filter { x, cov });
+            }
+        }
+    }
+
+    /// The controller's verified constant hardware accelerometer bias, if known.
+    pub fn verified_accel_bias(&self) -> Option<Vector3<f64>> {
+        self.bias_ref
+    }
+
+    /// Whether a previously seeded verified accelerometer bias was invalidated during this run.
+    pub fn accel_bias_invalidated(&self) -> bool {
+        self.bias_ref_invalidated
+    }
+
+    /// Accelerometer bias that triggered the most recent wrong-lock drop, if any.
+    pub fn last_wrong_lock_ba(&self) -> Option<Vector3<f64>> {
+        self.last_wrong_lock_ba
+    }
+
+    fn cold_ba_sd(&self) -> f64 {
+        if self.cold_bias_tolerance && self.bias_ref.is_none() {
+            self.params.acquire_sd[4].max(COLD_BIAS_ACQUIRE_SD)
+        } else {
+            self.params.acquire_sd[4]
+        }
+    }
+
+    /// Carries a dropped wrong lock's orientation forward on the gyro until its memory expires.
+    /// If the window ends without any other orientation acquiring and the engine kept offering the
+    /// same pose repeatedly with a physically plausible bias, allow a larger cold hardware bias.
+    fn advance_wrong_lock(&mut self, s: &ImuSample) {
+        let Some(wl) = self.wrong_lock else {
+            return;
+        };
+        if s.t < wl.until {
+            let bg = self.saved_bias.map_or(Vector3::zeros(), |f| f.x.bg);
+            let dq = UnitQuaternion::from_scaled_axis(
+                (s.gyro - bg) * (s.t.saturating_sub(wl.t) as f64 * 1e-9),
+            );
+            let mut next = wl;
+            next.t = s.t;
+            for r in &mut next.refused[..next.refused_len] {
+                *r *= dq;
+            }
+            self.wrong_lock = Some(next);
+            return;
+        }
+        self.wrong_lock = None;
+        if !wl.alt_sustained
+            && (wl.refused_same >= COLD_BIAS_MIN_REFUSALS || wl.cold_drops >= 2)
+            && wl.ba_norm <= self.params.max_accel_bias_cold
+        {
+            self.note_wrong_lock_window_exhausted();
+        }
+    }
+
+    /// Records a wrong-lock memory window that expired without another orientation sustaining a
+    /// track. Cold controllers widen immediately; a verified reference requires two consecutive
+    /// exhausted windows so one brief stuck wrong lock does not discard a valid hardware bias.
+    fn note_wrong_lock_window_exhausted(&mut self) {
+        if self.bias_ref.is_some() {
+            self.stale_ref_windows += 1;
+            if self.stale_ref_windows < 2 {
+                return;
+            }
+        }
+        self.enable_cold_bias_tolerance();
+    }
+
+    fn enable_cold_bias_tolerance(&mut self) {
+        let cleared_ref = self.bias_ref.take().is_some();
+        if cleared_ref {
+            self.bias_ref_invalidated = true;
+        }
+        self.stale_ref_windows = 0;
+        self.cold_bias_tolerance = true;
+        let sd = self.cold_ba_sd();
+        if let Some(sb) = &mut self.saved_bias {
+            if cleared_ref {
+                sb.x.ba = Vector3::zeros();
+            }
+            sb.cov.fixed_rows_mut::<3>(BA).fill(0.0);
+            sb.cov.fixed_columns_mut::<3>(BA).fill(0.0);
+            sb.cov.fixed_view_mut::<3, 3>(BA, BA).fill_diagonal(sd * sd);
+        }
+    }
+
     /// Drops the track as a wrong lock when the accelerometer bias it was left with by the pending
     /// exposure's fixes ran off (see `Params::max_accel_bias`).
     fn test_pending_bias(&mut self) {
@@ -954,12 +1217,32 @@ impl Tracker {
             .is_some_and(|(_, f)| self.bias_ran_off(f))
         {
             self.drop_wrong_lock();
+        } else if self.tracking()
+            && self.track_confirmed
+            && self.history.back().is_some_and(|&(t, _)| {
+                t.saturating_sub(self.track_acquired_at) >= self.params.max_refusing_ns
+            })
+        {
+            if let Some(wl) = &mut self.wrong_lock {
+                wl.alt_sustained = true;
+            }
+            self.stale_ref_windows = 0;
         }
     }
 
-    /// Whether `f`'s accelerometer bias is beyond `Params::max_accel_bias`: a wrong lock's.
+    /// Whether `f`'s accelerometer bias ran beyond the allowed margin: a wrong lock's.
     fn bias_ran_off(&self, f: &Filter) -> bool {
-        f.x.ba.norm() > self.params.max_accel_bias
+        match self.bias_ref {
+            Some(r) => (f.x.ba - r).norm() > self.params.max_accel_bias,
+            None => {
+                let limit = if self.cold_bias_tolerance {
+                    self.params.max_accel_bias_cold
+                } else {
+                    self.params.max_accel_bias
+                };
+                f.x.ba.norm() > limit
+            }
+        }
     }
 
     /// Drops the track as a wrong lock: the biases go back to what it started from, the
@@ -969,8 +1252,41 @@ impl Tracker {
         let Some(&(t, f)) = self.history.back() else {
             return;
         };
+        let ba_norm = f.x.ba.norm();
+        self.last_wrong_lock_ba = Some(f.x.ba);
         self.stats.wrong_locks += 1;
-        self.wrong_lock = Some((t, f.x.q, t + self.params.wrong_lock_memory_ns));
+        let prev = self.wrong_lock.filter(|wl| !wl.alt_sustained);
+        let since = prev.map_or(t, |wl| wl.since);
+        let cold_drops = prev.map_or(0, |wl| wl.cold_drops)
+            + u32::from(ba_norm <= self.params.max_accel_bias_cold);
+        let refused_same = prev.map_or(0, |wl| wl.refused_same);
+        // If we already spent the full wrong-lock memory window dropping physically plausible
+        // biases with no other orientation sustaining a track, allow the larger cold bias now
+        // rather than letting noisy frames restart the refusal timer indefinitely.
+        if cold_drops >= 2
+            && ba_norm <= self.params.max_accel_bias_cold
+            && t.saturating_sub(since) >= self.params.wrong_lock_memory_ns
+        {
+            self.wrong_lock = None;
+            self.forget_track();
+            self.note_wrong_lock_window_exhausted();
+            return;
+        }
+        let mut next = WrongLock {
+            t,
+            since,
+            refused: prev.map_or([UnitQuaternion::identity(); WRONG_LOCK_MAX_REFUSED], |wl| {
+                wl.refused
+            }),
+            refused_len: prev.map_or(0, |wl| wl.refused_len),
+            until: since + self.params.wrong_lock_memory_ns,
+            ba_norm,
+            refused_same,
+            cold_drops,
+            alt_sustained: false,
+        };
+        next.record_refused(f.x.q, self.params.wrong_lock_turn_rad);
+        self.wrong_lock = Some(next);
         self.forget_track();
     }
 
@@ -1005,6 +1321,8 @@ impl Tracker {
         self.undecided = None;
         self.held = None;
         self.bias_pending = None;
+        self.track_acquired_at = 0;
+        self.bias_verifier.clear();
     }
 
     pub fn output(&self) -> Option<Output> {
@@ -1405,6 +1723,20 @@ impl Tracker {
                     self.refusing_since = 0;
                     self.decide(t_e, cam, blobs);
                     self.bias_pending = Some(self.bias_pending.map_or(t_e, |t| t.max(t_e)));
+                    if self.tracking() && self.track_confirmed {
+                        if let Some(&(t_now, f_now)) = self.history.back() {
+                            if let Some(verified) = self.bias_verifier.observe(
+                                t_now,
+                                &f_now,
+                                self.params.max_accel_bias_cold,
+                            ) {
+                                self.bias_ref = Some(verified);
+                                self.bias_ref_invalidated = false;
+                                self.stale_ref_windows = 0;
+                                self.cold_bias_tolerance = false;
+                            }
+                        }
+                    }
                     self.note_held();
                     self.stats.updates += 1;
                     self.stats.leds_used += n as u64;
@@ -1481,8 +1813,8 @@ impl Tracker {
         // update on a state dead-reckoned for seconds out of view. It is learned afresh.
         let carried = carried.map(|mut f| {
             if self.bias_ran_off(&f) {
-                let sd = self.params.acquire_sd[4];
-                f.x.ba = Vector3::zeros();
+                let sd = self.cold_ba_sd();
+                f.x.ba = self.bias_ref.unwrap_or_default();
                 f.cov.fixed_rows_mut::<3>(BA).fill(0.0);
                 f.cov.fixed_columns_mut::<3>(BA).fill(0.0);
                 f.cov.fixed_view_mut::<3, 3>(BA, BA).fill_diagonal(sd * sd);
@@ -1525,14 +1857,15 @@ impl Tracker {
                 }
             }
         }
-        let (chosen, turned, unconfirmed) = match (engine.filter(|_| !refused), memory) {
+        let (chosen, turned, mut unconfirmed) = match (engine.filter(|_| !refused), memory) {
             (Some(e), _) => {
                 let world_from_model = e.world_from_model;
-                if self.wrong_lock.is_some_and(|(_, q, _)| {
-                    q.angle_to(&world_from_model.rotation) < self.params.wrong_lock_turn_rad
-                }) {
-                    self.stats.refused_acquisitions += 1;
-                    return Outcome::Waiting;
+                if let Some(wl) = &mut self.wrong_lock {
+                    if wl.matches(&world_from_model.rotation, self.params.wrong_lock_turn_rad) {
+                        wl.refused_same = wl.refused_same.saturating_add(1);
+                        self.stats.refused_acquisitions += 1;
+                        return Outcome::Waiting;
+                    }
                 }
                 self.refusing_since = 0;
                 let Some(mut chosen) = self.attempt(
@@ -1625,20 +1958,35 @@ impl Tracker {
         };
         self.ambiguous_since = 0;
         // lying still, the accelerometer knows which way is up
-        if let Some(up) = self.steady_up(t_e, carried.map_or(Vector3::zeros(), |f| f.x.ba)) {
-            if (chosen.0.x.q.inverse() * Vector3::y()).angle(&up) > self.params.still_max_tilt_rad {
-                self.stats.refused_acquisitions += 1;
-                return Outcome::Waiting;
+        let steady_ba = carried
+            .map(|f| f.x.ba)
+            .or(self.bias_ref)
+            .unwrap_or_default();
+        if let Some(up) = self.steady_up(t_e, steady_ba) {
+            let tilt = (chosen.0.x.q.inverse() * Vector3::y()).angle(&up);
+            if tilt > self.params.still_max_tilt_rad {
+                // Without a verified bias, a large hardware offset perpendicular to gravity tilts
+                // raw `up` by up to atan(max_accel_bias_cold / g) (~17 deg) while passing the
+                // magnitude check. Refuse tilts beyond that outright; inside the bias-tilt band,
+                // require a second sensor to confirm instead of locking out a resting biased hand.
+                let cold_max = self.params.still_max_tilt_rad
+                    + (self.params.max_accel_bias_cold / self.params.gravity).atan();
+                if self.bias_ref.is_some() || tilt > cold_max {
+                    self.stats.refused_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
+                unconfirmed = true;
             }
         }
         // a turned pose can be the orientation of a lock just dropped as wrong
-        if turned
-            && self.wrong_lock.is_some_and(|(_, q, _)| {
-                q.angle_to(&chosen.0.x.q) < self.params.wrong_lock_turn_rad
-            })
-        {
-            self.stats.refused_acquisitions += 1;
-            return Outcome::Waiting;
+        if turned {
+            if let Some(wl) = &mut self.wrong_lock {
+                if wl.matches(&chosen.0.x.q, self.params.wrong_lock_turn_rad) {
+                    wl.refused_same = wl.refused_same.saturating_add(1);
+                    self.stats.refused_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
+            }
         }
         if turned {
             self.stats.alias_turns += 1;
@@ -1693,6 +2041,8 @@ impl Tracker {
             });
             self.decide(t_e, cam, blobs);
         }
+        self.track_acquired_at = t_e;
+        self.bias_verifier.clear();
         self.note_held();
         self.stats.acquisitions += 1;
         Outcome::Acquired(n)
@@ -2105,14 +2455,15 @@ impl Tracker {
     ) -> Filter {
         let q = world_from_model.rotation;
         let p = world_from_model * nalgebra::Point3::from(self.body.imu_pos);
-        let [rot, pos, vel, bg, ba] = self.params.acquire_sd;
+        let [rot, pos, vel, bg, _] = self.params.acquire_sd;
+        let ba = self.cold_ba_sd();
         let mut cov = Cov::zeros();
         let mut x = Nominal {
             q,
             p: p.coords,
             v: Vector3::zeros(),
             bg: Vector3::zeros(),
-            ba: Vector3::zeros(),
+            ba: self.bias_ref.unwrap_or_default(),
         };
         for (block, sd) in [(ROT, rot), (POS, pos), (VEL, vel), (BG, bg), (BA, ba)] {
             for i in 0..3 {
@@ -2329,6 +2680,8 @@ mod tests {
         engine_silent_after: Option<f64>,
         /// Biases (gyro, accel) remembered from an earlier run.
         seed: Option<(Vector3<f64>, Vector3<f64>)>,
+        /// Verified constant hardware accelerometer bias seeded before acquisition.
+        seed_verified: Option<Vector3<f64>>,
         /// From this time on the accelerometer reads this much more: the filter's bias runs off
         /// the way it does under a wrong lock.
         accel_jump: Option<(f64, Vector3<f64>)>,
@@ -2474,6 +2827,9 @@ mod tests {
             .collect();
         if let Some((bg, ba)) = opts.seed {
             tr.seed_biases(bg, ba, 0.002, 0.03);
+        }
+        if let Some(ba) = opts.seed_verified {
+            tr.seed_verified_accel(ba, crate::track::biases::SEED_SD_ACCEL);
         }
         let mut rng = Rng::new(11);
         // (exposure, arrival, camera, blobs)
@@ -5529,6 +5885,320 @@ mod tests {
         assert_eq!(out, Outcome::UnknownCamera);
         assert_eq!(tr.agreement.len(), count);
         assert_eq!(tr.stats.frames, 0);
+    }
+
+    /// A controller with a ~1.9 m/s^2 factory accelerometer bias starts cold, refuses the initial
+    /// wrong-lock window until no lower-bias orientation appears, widens tolerance, tracks cleanly,
+    /// and verifies the constant hardware bias across varied orientations.
+    #[test]
+    fn a_controller_with_large_accel_bias_recovers_cold_and_verifies() {
+        let mut w = world(5);
+        w.ba = Vector3::new(-0.04, 1.90, 0.10);
+        let opts = Run {
+            measure_after: Some(5.0),
+            ..Run::default()
+        };
+        let (tr, mut errs) = run_with(&w, 16.0, 0.3, &opts);
+        assert!(tr.tracking(), "stats={:?}", tr.stats);
+        assert!(tr.stats.wrong_locks >= 1, "should test cold limit first");
+        assert!(tr.last_wrong_lock_ba().is_some());
+        errs.sort_by(f64::total_cmp);
+        let med = errs[errs.len() / 2];
+        assert!(med < 0.005, "median pos error {med:.4} m");
+        let verified = tr
+            .verified_accel_bias()
+            .expect("should verify constant bias across orientations");
+        assert!(
+            (verified - w.ba).norm() < 0.15,
+            "verified {verified:?}, true {:?}",
+            w.ba
+        );
+    }
+
+    /// Once verified, a controller with a ~1.9 m/s^2 accelerometer bias tracks immediately without
+    /// cold drops, while a wrong lock (bias running away from the verified reference) still drops.
+    #[test]
+    fn a_verified_large_accel_bias_tracks_immediately_and_still_drops_wrong_locks() {
+        let mut w = world(5);
+        w.ba = Vector3::new(-0.04, 1.90, 0.10);
+        let warm = Run {
+            seed_verified: Some(w.ba),
+            ..Run::default()
+        };
+        let (tr, mut errs) = run_with(&w, 6.0, 0.3, &warm);
+        assert_eq!(tr.stats.wrong_locks, 0, "{:?}", tr.stats);
+        assert!(tr.tracking());
+        errs.sort_by(f64::total_cmp);
+        assert!(errs[errs.len() / 2] < 0.005);
+
+        let jumped = Run {
+            seed_verified: Some(w.ba),
+            accel_jump: Some((1.5, Vector3::new(0.0, 2.5, 0.0))),
+            ..Run::default()
+        };
+        let (tr, _) = run_with(&w, 4.0, 0.3, &jumped);
+        assert!(tr.stats.wrong_locks >= 1, "{:?}", tr.stats);
+        let wl_ba = tr.last_wrong_lock_ba().expect("wrong-lock ba recorded");
+        assert!(
+            (wl_ba - w.ba).norm() > tr.params.max_accel_bias,
+            "wl_ba {wl_ba:?} vs ref {:?}",
+            w.ba
+        );
+    }
+
+    /// A stale verified accelerometer bias (e.g. a controller whose hardware offset shifted or was
+    /// mis-seeded) is invalidated instead of locking tracking out permanently, and re-verified.
+    #[test]
+    fn a_stale_verified_accel_bias_is_invalidated_and_relearned() {
+        for (true_ba, stale_ba) in [
+            (
+                Vector3::new(0.02, 0.40, -0.05),
+                Vector3::new(0.0, 1.90, 0.0),
+            ),
+            (Vector3::new(-0.04, 1.90, 0.10), Vector3::zeros()),
+        ] {
+            let mut w = world(5);
+            w.ba = true_ba;
+            let opts = Run {
+                seed_verified: Some(stale_ba),
+                measure_after: Some(6.0),
+                ..Run::default()
+            };
+            let (tr, mut errs) = run_with(&w, 18.0, 0.3, &opts);
+            assert!(
+                tr.tracking(),
+                "true={true_ba:?} stale={stale_ba:?} stats={:?}",
+                tr.stats
+            );
+            errs.sort_by(f64::total_cmp);
+            assert!(errs[errs.len() / 2] < 0.005);
+            let verified = tr
+                .verified_accel_bias()
+                .expect("should re-verify true bias");
+            assert!(
+                (verified - true_ba).norm() < 0.15,
+                "verified {verified:?}, true {true_ba:?}, stale {stale_ba:?}"
+            );
+        }
+    }
+
+    /// A wrong lock leaks `(I - dR^T) g_body` into `ba`, which rotates as gravity moves in body
+    /// frame: `BiasVerifier` rejects it across orientations while accepting a true constant bias.
+    #[test]
+    fn a_wrong_lock_is_never_verified_as_accel_bias() {
+        let mut verifier = BiasVerifier::default();
+        let wrong_rot = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 40f64.to_radians());
+        let orientations = [
+            UnitQuaternion::identity(),
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 50f64.to_radians()),
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 50f64.to_radians()),
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), -50f64.to_radians()),
+        ];
+        let mut cov = Cov::zeros();
+        for i in 0..3 {
+            cov[(BA + i, BA + i)] = 0.03 * 0.03;
+        }
+        let mut t = 1_000_000_000u64;
+        for q in orientations {
+            let g_body = q.inverse() * Vector3::new(0.0, G, 0.0);
+            let leaked_ba = g_body - wrong_rot.inverse() * g_body;
+            for _ in 0..8 {
+                let f = Filter {
+                    x: Nominal {
+                        q,
+                        p: Vector3::zeros(),
+                        v: Vector3::zeros(),
+                        bg: Vector3::zeros(),
+                        ba: leaked_ba,
+                    },
+                    cov,
+                };
+                assert!(verifier.observe(t, &f, 10.0).is_none());
+                t += 100_000_000;
+            }
+        }
+
+        // With a truly constant bias across those same orientations, it verifies cleanly.
+        let true_ba = Vector3::new(-0.04, 1.90, 0.10);
+        let mut ok = None;
+        for q in orientations {
+            for _ in 0..8 {
+                let f = Filter {
+                    x: Nominal {
+                        q,
+                        p: Vector3::zeros(),
+                        v: Vector3::zeros(),
+                        bg: Vector3::zeros(),
+                        ba: true_ba,
+                    },
+                    cov,
+                };
+                if let Some(v) = verifier.observe(t, &f, 3.0) {
+                    ok = Some(v);
+                }
+                t += 100_000_000;
+            }
+        }
+        assert_eq!(ok, Some(true_ba));
+    }
+
+    /// A cold resting controller whose large accelerometer bias is perpendicular to gravity tilts
+    /// the raw accelerometer vector by ~11 deg while passing the magnitude check. Without a
+    /// verified reference, one sensor marks it unconfirmed (preventing single-sensor 10-deg wrong
+    /// locks) and a second sensor confirms it; with a verified reference or beyond the bias-tilt
+    /// band, it is refused outright.
+    #[test]
+    fn a_sideways_resting_controller_with_large_accel_bias_acquires_with_two_sensors() {
+        let w = world(5);
+        let pose =
+            Isometry3::from_parts(Translation3::new(0.0, 1.0, 0.0), UnitQuaternion::identity());
+        let feed_still = |tr: &mut Tracker, accel: Vector3<f64>| {
+            for tick in 0..=200u64 {
+                tr.imu(ImuSample {
+                    t: 1_000_000_000 + tick * 2_000_000,
+                    hidden: None,
+                    gyro: Vector3::zeros(),
+                    accel,
+                });
+            }
+        };
+        let blobs_at = |cam: &Camera, p: &Isometry3<f64>| {
+            let mut rng = Rng::new(7);
+            sight_posed(&w, cam, p, &mut rng, 0.0)
+        };
+
+        // Part A: cold resting hand with 1.9 m/s^2 perpendicular bias (~11 deg tilt).
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        feed_still(&mut tr, Vector3::new(1.9, G, 0.0));
+        let t_e = 1_400_000_000u64;
+        let b0 = blobs_at(&w.cams[0], &pose);
+        let out0 = tr.frame(t_e, 0, &w.cams[0], &b0, Some(EnginePose::strong(pose)), &[]);
+        assert!(matches!(out0, Outcome::Acquired(_)), "got {out0:?}");
+        assert!(
+            tr.provisional.is_some(),
+            "single sensor must stay unconfirmed"
+        );
+        assert!(
+            !tr.tracking(),
+            "unconfirmed single-sensor pose must not publish"
+        );
+        assert_eq!(tr.stats.refused_acquisitions, 0);
+        let b1 = blobs_at(&w.cams[1], &pose);
+        let out1 = tr.frame(t_e, 1, &w.cams[1], &b1, Some(EnginePose::strong(pose)), &[]);
+        assert!(matches!(out1, Outcome::Updated(_)), "got {out1:?}");
+        assert!(
+            tr.tracking(),
+            "second sensor must confirm resting biased hand"
+        );
+
+        // Part B: 10-deg wrong pose at rest on 1 sensor with zero bias stays unconfirmed (not published).
+        let tilted10 = Isometry3::from_parts(
+            pose.translation,
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 10f64.to_radians()),
+        );
+        let mut tr_wrong = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        feed_still(&mut tr_wrong, Vector3::new(0.0, G, 0.0));
+        let bw = blobs_at(&w.cams[0], &tilted10);
+        let out_w = tr_wrong.frame(
+            t_e,
+            0,
+            &w.cams[0],
+            &bw,
+            Some(EnginePose::strong(tilted10)),
+            &[],
+        );
+        assert!(matches!(out_w, Outcome::Acquired(_)), "got {out_w:?}");
+        assert!(tr_wrong.provisional.is_some());
+        assert!(!tr_wrong.tracking());
+        // If no second sensor confirms within confirm_within_ns, the provisional pose is dropped.
+        let t_late = t_e + tr_wrong.params.search.confirm_within_ns + 50_000_000;
+        for tick in 1..=200u64 {
+            tr_wrong.imu(ImuSample {
+                t: t_e + tick * 2_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            });
+        }
+        let _ = tr_wrong.frame(t_late, 0, &w.cams[0], &bw, None, &[]);
+        assert_eq!(tr_wrong.stats.unconfirmed_acquisitions, 1);
+        assert!(!tr_wrong.tracking());
+
+        // Part C: verified bias (0) refuses a 10-deg tilt outright; cold refuses > cold_max (30 deg).
+        let mut tr_ver = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr_ver.seed_verified_accel(Vector3::zeros(), crate::track::biases::SEED_SD_ACCEL);
+        feed_still(&mut tr_ver, Vector3::new(0.0, G, 0.0));
+        let out_v = tr_ver.frame(
+            t_e,
+            0,
+            &w.cams[0],
+            &bw,
+            Some(EnginePose::strong(tilted10)),
+            &[],
+        );
+        assert_eq!(out_v, Outcome::Waiting);
+        assert_eq!(tr_ver.stats.refused_acquisitions, 1);
+
+        let tilted30 = Isometry3::from_parts(
+            pose.translation,
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 30f64.to_radians()),
+        );
+        let mut tr_far = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        feed_still(&mut tr_far, Vector3::new(0.0, G, 0.0));
+        let bf = blobs_at(&w.cams[0], &tilted30);
+        let out_f = tr_far.frame(
+            t_e,
+            0,
+            &w.cams[0],
+            &bf,
+            Some(EnginePose::strong(tilted30)),
+            &[],
+        );
+        assert_eq!(out_f, Outcome::Waiting);
+        assert_eq!(tr_far.stats.refused_acquisitions, 1);
+    }
+
+    /// A verified accelerometer bias survives a single exhausted wrong-lock window so one brief
+    /// stuck wrong lock cannot discard a valid hardware offset; two consecutive exhausted windows
+    /// invalidate it cleanly.
+    #[test]
+    fn a_single_wrong_lock_window_does_not_clear_verified_accel_bias() {
+        let w = world(5);
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let seed = Vector3::new(0.0, 0.2, 0.0);
+        tr.seed_verified_accel(seed, crate::track::biases::SEED_SD_ACCEL);
+        let window = |tr: &mut Tracker, t0: u64| {
+            let until = t0 + tr.params.wrong_lock_memory_ns;
+            tr.wrong_lock = Some(WrongLock {
+                t: t0,
+                since: t0,
+                refused: [UnitQuaternion::identity(); WRONG_LOCK_MAX_REFUSED],
+                refused_len: 1,
+                until,
+                ba_norm: 1.9,
+                refused_same: COLD_BIAS_MIN_REFUSALS,
+                cold_drops: 1,
+                alt_sustained: false,
+            });
+            tr.imu(ImuSample {
+                t: until + 1_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            });
+        };
+
+        window(&mut tr, 1_000_000_000);
+        assert_eq!(tr.verified_accel_bias(), Some(seed));
+        assert!(!tr.accel_bias_invalidated());
+        assert!(!tr.cold_bias_tolerance);
+        assert_eq!(tr.stale_ref_windows, 1);
+
+        window(&mut tr, 4_000_000_000);
+        assert_eq!(tr.verified_accel_bias(), None);
+        assert!(tr.accel_bias_invalidated());
+        assert!(tr.cold_bias_tolerance);
+        assert_eq!(tr.stale_ref_windows, 0);
     }
 }
 
