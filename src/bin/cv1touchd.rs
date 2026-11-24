@@ -371,6 +371,10 @@ impl Daemon {
         }
         t.newest_us = Some(us);
         drop(timing);
+        if self.rec.active() {
+            self.rec
+                .write(recorder::RADIO_CLOCK, ts, &[&us.to_le_bytes()]);
+        }
         self.radio_clock(ts, us);
     }
 
@@ -13654,6 +13658,38 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % span
         };
+        // A running recording persists the exact monotonic dongle clock samples for replay.
+        let rec_dir = socket_dir::SocketDir::new();
+        let rec_path = rec_dir.path().join("dongle-clock.rec");
+        d.rec.start(&rec_path, HOST_FROM_DEVICE_NS).unwrap();
+        d.dongle_clock(HOST_FROM_DEVICE_NS + 2_500_000, 1_100, None);
+        d.dongle_clock(HOST_FROM_DEVICE_NS + 2_600_000, 1_050, None);
+        d.dongle_clock(
+            HOST_FROM_DEVICE_NS + 3_000_000,
+            1_200,
+            Some(PERIOD_US as u32),
+        );
+        let rec_stats = d.rec.stop();
+        assert_eq!(rec_stats.dropped, 0);
+        assert_eq!(rec_stats.write_errors, 0);
+        let recorded_clocks: Vec<(u64, u32)> = recorder::Reader::open(&rec_path)
+            .unwrap()
+            .filter(|r| r.rtype == recorder::RADIO_CLOCK)
+            .map(|r| {
+                (
+                    r.host_ns,
+                    recorder::decode_radio_clock(&r.payload).expect("valid RADIO_CLOCK"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded_clocks,
+            [
+                (HOST_FROM_DEVICE_NS + 2_500_000, 1_100),
+                (HOST_FROM_DEVICE_NS + 3_000_000, 1_200),
+            ]
+        );
+
         let (mut poll_us, mut first, mut last) = (2_000u64, None, None::<dongle::Exposure>);
         for k in 0..400u64 {
             let exposure_us = 5_000 + k * PERIOD_US;
