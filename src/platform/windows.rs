@@ -130,6 +130,61 @@ pub fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
     retrying(|| std::fs::rename(from, to))
 }
 
+pub struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        // SAFETY: an open file handle owned by this guard and a zeroed OVERLAPPED struct.
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let _ = UnlockFileEx(self.0.as_raw_handle() as HANDLE, 0, 1, 0, &mut ov);
+        }
+    }
+}
+
+pub fn lock_file(path: &Path) -> io::Result<FileLock> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let file = retrying(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock path is a link",
+        ));
+    }
+    // SAFETY: an open file handle owned by `file` and a zeroed OVERLAPPED struct.
+    let ok = unsafe {
+        let mut ov: OVERLAPPED = std::mem::zeroed();
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut ov,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileLock(file))
+}
+
 pub fn swap_dir(stage: &Path, dir: &Path, exists: bool) -> io::Result<()> {
     if !exists {
         if dir.exists() {

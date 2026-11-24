@@ -44,6 +44,15 @@ const WRONG_LOCK_MAX_REFUSED: usize = 4;
 
 /// Dropped wrong-lock orientations, carried on by the gyro, and how the engine behaved during
 /// their refusal window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Provisional {
+    t: u64,
+    /// Acquired inside the cold accelerometer-bias tilt band (`steady_up`): must be confirmed by a
+    /// second sensor (`track_confirmed`), never by a repeated strong engine pose from the same
+    /// camera.
+    needs_peer: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WrongLock {
     t: u64,
@@ -530,11 +539,11 @@ pub struct Tracker {
     /// while the controller moves.
     refused_by: Vec<(usize, UnitQuaternion<f64>)>,
     /// The exposure of an acquisition no second sensor has confirmed yet, one from an engine pose
-    /// rated only good or from the tracker's own search (`search_kept`): either can fit one view
-    /// and be wrong. Until a second sensor confirms it the track takes updates but is not
-    /// published; if none has within `SearchParams::confirm_within_ns`, the track is dropped, and
-    /// with it the kept orientation.
-    provisional: Option<u64>,
+    /// rated only good or from the tracker's own search (`search_kept`), or inside the cold
+    /// accelerometer-bias tilt band: any of these can fit one view and be wrong. Until confirmed
+    /// the track takes updates but is not published; if none confirms within
+    /// `SearchParams::confirm_within_ns`, the track is dropped, and with it the kept orientation.
+    provisional: Option<Provisional>,
     /// A track acquired with no orientation to check it against, while the engine's pose or one
     /// of its ring turns still explains the frames about as well as the track: one frame can
     /// favour an alias (the engine itself locks onto one), and gravity cannot settle it while the
@@ -1544,7 +1553,7 @@ impl Tracker {
         self.stats.frames += 1;
         if self
             .provisional
-            .is_some_and(|t| t_e.saturating_sub(t) > self.params.search.confirm_within_ns)
+            .is_some_and(|p| t_e.saturating_sub(p.t) > self.params.search.confirm_within_ns)
         {
             self.stats.unconfirmed_acquisitions += 1;
             self.forget_track();
@@ -1611,7 +1620,7 @@ impl Tracker {
         // kept orientation the track was found with refuses its turn: then it is a flip
         let settling =
             engine.filter(|e| e.strong && labelled.len() >= self.params.acquire_min_leds);
-        if let (Some(_), Some(e)) = (self.provisional, settling) {
+        if let (Some(prov), Some(e)) = (self.provisional, settling) {
             if let Some((_, prior)) = self.state_at(t_e) {
                 let track = self.body.world_from_model(&prior.x);
                 let turned = track.rotation.angle_to(&e.world_from_model.rotation)
@@ -1622,7 +1631,9 @@ impl Tracker {
                 let remembered = self.last_confirmed != 0
                     && t_e.saturating_sub(self.last_confirmed) <= self.params.orientation_memory_ns;
                 if !turned && !moved {
-                    self.provisional = None;
+                    if !prov.needs_peer {
+                        self.provisional = None;
+                    }
                 } else if !(turned && remembered) {
                     self.give_up_fix();
                 }
@@ -1958,6 +1969,7 @@ impl Tracker {
         };
         self.ambiguous_since = 0;
         // lying still, the accelerometer knows which way is up
+        let mut needs_peer = false;
         let steady_ba = carried
             .map(|f| f.x.ba)
             .or(self.bias_ref)
@@ -1976,6 +1988,7 @@ impl Tracker {
                     return Outcome::Waiting;
                 }
                 unconfirmed = true;
+                needs_peer = true;
             }
         }
         // a turned pose can be the orientation of a lock just dropped as wrong
@@ -1994,7 +2007,7 @@ impl Tracker {
         if unconfirmed {
             self.refusing_since = 0;
         }
-        self.provisional = unconfirmed.then_some(t_e);
+        self.provisional = unconfirmed.then_some(Provisional { t: t_e, needs_peer });
         // labels from an engine pose turned from the track's are a flip or a mislabel
         self.engine_labels_off = turned || refused;
         let (prior, fit) = chosen;
@@ -4383,7 +4396,10 @@ mod tests {
         }
         assert!(tr.tracking() && tr.last_confirmed != 0);
         // as if the track were an unconfirmed one, 30 cm off
-        tr.provisional = Some(tr.last_fix);
+        tr.provisional = Some(Provisional {
+            t: tr.last_fix,
+            needs_peer: false,
+        });
         for (_, f) in tr.history.iter_mut() {
             f.x.p += Vector3::new(0.3, 0.0, 0.0);
         }
@@ -6083,15 +6099,54 @@ mod tests {
             "unconfirmed single-sensor pose must not publish"
         );
         assert_eq!(tr.stats.refused_acquisitions, 0);
+        // A second agreeing strong engine pose from the same sensor must NOT confirm it.
+        for tick in 1..=10u64 {
+            tr.imu(ImuSample {
+                t: t_e + tick * 2_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(1.9, G, 0.0),
+            });
+        }
+        let out0_again = tr.frame(
+            t_e + 20_000_000,
+            0,
+            &w.cams[0],
+            &b0,
+            Some(EnginePose::strong(pose)),
+            &[],
+        );
+        assert!(
+            matches!(out0_again, Outcome::Updated(_)),
+            "got {out0_again:?}"
+        );
+        assert!(
+            tr.provisional.is_some(),
+            "same camera must not clear tilt-band provisional state"
+        );
+        assert!(
+            !tr.tracking(),
+            "same-camera strong pose must not publish tilt-band acquisition"
+        );
+        // An independent second sensor confirms and publishes it.
         let b1 = blobs_at(&w.cams[1], &pose);
-        let out1 = tr.frame(t_e, 1, &w.cams[1], &b1, Some(EnginePose::strong(pose)), &[]);
+        let out1 = tr.frame(
+            t_e + 20_000_000,
+            1,
+            &w.cams[1],
+            &b1,
+            Some(EnginePose::strong(pose)),
+            &[],
+        );
         assert!(matches!(out1, Outcome::Updated(_)), "got {out1:?}");
         assert!(
             tr.tracking(),
             "second sensor must confirm resting biased hand"
         );
 
-        // Part B: 10-deg wrong pose at rest on 1 sensor with zero bias stays unconfirmed (not published).
+        // Part B: 10-deg wrong pose at rest on 1 sensor with zero bias stays unconfirmed even
+        // across repeated agreeing strong engine poses from the same camera, and drops without
+        // ever publishing when no second sensor confirms.
         let tilted10 = Isometry3::from_parts(
             pose.translation,
             UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 10f64.to_radians()),
@@ -6110,19 +6165,61 @@ mod tests {
         assert!(matches!(out_w, Outcome::Acquired(_)), "got {out_w:?}");
         assert!(tr_wrong.provisional.is_some());
         assert!(!tr_wrong.tracking());
-        // If no second sensor confirms within confirm_within_ns, the provisional pose is dropped.
-        let t_late = t_e + tr_wrong.params.search.confirm_within_ns + 50_000_000;
-        for tick in 1..=200u64 {
-            tr_wrong.imu(ImuSample {
+        let mut cur_tick = 0u64;
+        for dt_ms in [20u64, 40] {
+            let target_tick = dt_ms / 2;
+            while cur_tick < target_tick {
+                cur_tick += 1;
+                tr_wrong.imu(ImuSample {
+                    t: t_e + cur_tick * 2_000_000,
+                    hidden: None,
+                    gyro: Vector3::zeros(),
+                    accel: Vector3::new(0.0, G, 0.0),
+                });
+            }
+            let out_same = tr_wrong.frame(
+                t_e + dt_ms * 1_000_000,
+                0,
+                &w.cams[0],
+                &bw,
+                Some(EnginePose::strong(tilted10)),
+                &[],
+            );
+            assert!(matches!(out_same, Outcome::Updated(_)), "got {out_same:?}");
+            assert!(
+                tr_wrong.provisional.is_some(),
+                "same camera must not clear tilt-band provisional state"
+            );
+            assert!(
+                !tr_wrong.tracking(),
+                "same-camera strong pose must not publish tilted wrong lock"
+            );
+        }
+        // Without a second sensor, a provisional tilt-band pose expires after confirm_within_ns.
+        let mut tr_expire = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        feed_still(&mut tr_expire, Vector3::new(0.0, G, 0.0));
+        let out_e = tr_expire.frame(
+            t_e,
+            0,
+            &w.cams[0],
+            &bw,
+            Some(EnginePose::strong(tilted10)),
+            &[],
+        );
+        assert!(matches!(out_e, Outcome::Acquired(_)), "got {out_e:?}");
+        let t_late = t_e + tr_expire.params.search.confirm_within_ns + 50_000_000;
+        let ticks = (t_late - t_e) / 2_000_000;
+        for tick in 1..=ticks {
+            tr_expire.imu(ImuSample {
                 t: t_e + tick * 2_000_000,
                 hidden: None,
                 gyro: Vector3::zeros(),
                 accel: Vector3::new(0.0, G, 0.0),
             });
         }
-        let _ = tr_wrong.frame(t_late, 0, &w.cams[0], &bw, None, &[]);
-        assert_eq!(tr_wrong.stats.unconfirmed_acquisitions, 1);
-        assert!(!tr_wrong.tracking());
+        let _ = tr_expire.frame(t_late, 0, &w.cams[0], &bw, None, &[]);
+        assert_eq!(tr_expire.stats.unconfirmed_acquisitions, 1);
+        assert!(!tr_expire.tracking());
 
         // Part C: verified bias (0) refuses a 10-deg tilt outright; cold refuses > cold_max (30 deg).
         let mut tr_ver = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());

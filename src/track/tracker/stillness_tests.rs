@@ -489,7 +489,10 @@ fn stillness_through_imu_preserves_camera_expiry_priors_and_gap_cleanup() {
     a.track_confirmed = true;
     a.refusing_since = first.t - 4_000_000;
     a.ambiguous_since = first.t - 6_000_000;
-    a.provisional = Some(first.t - 8_000_000);
+    a.provisional = Some(Provisional {
+        t: first.t - 8_000_000,
+        needs_peer: false,
+    });
     populate_camera_bookkeeping(&mut a, first.t);
     // Exact strict-cutoff boundary, with expired and retained entries on both sides.
     let cutoff = first.t - a.params.history_ns - a.params.history_ns.max(CROSS_CHECK_NS);

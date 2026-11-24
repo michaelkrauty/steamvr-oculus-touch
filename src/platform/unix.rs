@@ -81,6 +81,40 @@ pub fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+pub struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: an open descriptor owned by this guard.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub fn lock_file(path: &Path) -> io::Result<FileLock> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    loop {
+        // SAFETY: an open descriptor owned by `file`.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(FileLock(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 pub fn swap_dir(stage: &Path, dir: &Path, exists: bool) -> io::Result<()> {
     let c = |p: &Path| {
         std::ffi::CString::new(p.as_os_str().as_bytes())
