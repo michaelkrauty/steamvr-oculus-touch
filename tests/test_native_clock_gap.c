@@ -90,6 +90,8 @@ void ohmd_assert_fail(const char *expr, const char *file, int line, const char *
 /* A recursive acquisition or tracker_lock acquisition while holding device_lock
  * fails rather than hiding an owner lock-order regression. */
 static _Thread_local int locks_held;
+/* The exposure paths take a device's lock under tracker_lock, the tracker's own order. */
+static bool tracker_then_device;
 ohmd_mutex *ohmd_create_mutex(ohmd_context *ctx)
 {
 	(void)ctx;
@@ -100,8 +102,8 @@ ohmd_mutex *ohmd_create_mutex(ohmd_context *ctx)
 void ohmd_destroy_cond(ohmd_cond *c) { CHECK(pthread_cond_destroy((pthread_cond_t *)c) == 0); free(c); }
 void ohmd_cond_broadcast(ohmd_cond *c) { CHECK(pthread_cond_broadcast((pthread_cond_t *)c) == 0); }
 void ohmd_destroy_mutex(ohmd_mutex *m) { CHECK(pthread_mutex_destroy((pthread_mutex_t *)m) == 0); free(m); }
-void ohmd_lock_mutex(ohmd_mutex *m) { CHECK(locks_held == 0); CHECK(pthread_mutex_lock((pthread_mutex_t *)m) == 0); locks_held++; }
-void ohmd_unlock_mutex(ohmd_mutex *m) { CHECK(locks_held == 1); locks_held--; CHECK(pthread_mutex_unlock((pthread_mutex_t *)m) == 0); }
+void ohmd_lock_mutex(ohmd_mutex *m) { CHECK(locks_held == 0 || (tracker_then_device && locks_held == 1)); CHECK(pthread_mutex_lock((pthread_mutex_t *)m) == 0); locks_held++; }
+void ohmd_unlock_mutex(ohmd_mutex *m) { CHECK(locks_held == 1 || (tracker_then_device && locks_held == 2)); locks_held--; CHECK(pthread_mutex_unlock((pthread_mutex_t *)m) == 0); }
 uint64_t ohmd_monotonic_get(ohmd_context *ctx) { (void)ctx; return 10000000000ull; }
 led_search_model_t *led_search_model_new(rift_leds *leds) { (void)leds; return NULL; }
 bool rift_sensor_add_device(rift_sensor_ctx *ctx, rift_tracked_device *dev) { (void)ctx; (void)dev; return true; }
@@ -572,8 +574,57 @@ static int ownership_regression(void)
 	return retained ? 1 : 0;
 }
 
+/* A radio the caller serves (a FreeTouch dongle) times the exposures: the exposure it announces
+ * is the one a frame starting just after it captures, with a delay slot for each controller,
+ * so the pose search and fusion see it as they see the headset's. */
+static int radio_asks;
+static int radio_exposure(void *user, uint32_t *poll_ts, uint32_t *exposure_ts, uint16_t *count)
+{
+	CHECK(user == &radio_asks);
+	if (radio_asks++)
+		return 0; /* none new since */
+	*poll_ts = 4100;
+	*exposure_ts = 4000;
+	*count = 7;
+	return 1;
+}
+static int radio_exposure_reaches_both_controllers(void)
+{
+	struct fixture *f = create_fixture(3, 1000000);
+	f->ctx.devices[1].device_lock = ohmd_create_mutex(NULL);
+	posef pose = {.orient = {.w = 1}};
+	rift_leds leds = {0};
+	rift_tracked_device_imu_calibration calibration = f->calibration;
+	rift_tracked_device_priv *right = (rift_tracked_device_priv *)rift_tracker_add_device(&f->ctx, 1,
+		&pose, &pose, &leds, &calibration);
+	CHECK(f->ctx.n_devices == 2);
+	const ohmd_cv1touch_radio radio = {.user = &radio_asks, .exposure = radio_exposure};
+	tracker_then_device = true;
+	rift_tracker_take_radio_exposure(&f->ctx, &radio);
+	rift_tracker_take_radio_exposure(&f->ctx, &radio);
+	CHECK(radio_asks == 2 && f->ctx.exposure_history_size == 1);
+	rift_tracker_exposure_info info;
+	uint64_t now = ohmd_monotonic_get(NULL);
+	CHECK(rift_tracker_frame_captured(&f->ctx, now + 4000000, now + 1500000, &info, "sensor"));
+	CHECK(info.count == 7 && info.hmd_ts == 4000 && info.led_pattern_phase == 255 && info.n_devices == 2);
+	CHECK(info.devices[0].fusion_slot >= 0 && info.devices[1].fusion_slot >= 0);
+	/* a radio with no exposure callback announces none */
+	const ohmd_cv1touch_radio none = {0};
+	rift_tracker_take_radio_exposure(&f->ctx, &none);
+	CHECK(f->ctx.exposure_history_size == 1);
+	rift_tracker_frame_release(&f->ctx, now + 9000000, now + 1500000, &info, "sensor");
+	rift_kalman_6dof_clear(&right->ukf_fusion);
+	ohmd_destroy_mutex(right->device_lock);
+	destroy_fixture(f);
+	CHECK(live_matrices == 0);
+	puts("test_native_clock_gap: ok");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "radio-exposure") == 0)
+		return radio_exposure_reaches_both_controllers();
 	if (argc == 2 && strcmp(argv[1], "ownership") == 0)
 		return ownership_regression();
 	if (argc == 2 && strcmp(argv[1], "continuity") == 0) {

@@ -194,6 +194,22 @@ impl DongleExposures {
         })
     }
 
+    /// The newest exposure at or before `host_ns`, once the grid is anchored: for the engine,
+    /// which is told of each exposure as the headset's IMU reports tell it.
+    pub fn latest(&self, host_ns: u64) -> Option<Exposure> {
+        if self.period_ns == 0 {
+            return None;
+        }
+        let p = self.period_ns as i64;
+        let d = self.clock.to_device(host_ns)? as i64;
+        let t0 = self.t0?;
+        let e = (t0 + (d - t0).div_euclid(p) * p) as u64;
+        Some(Exposure {
+            count: e / self.period_ns,
+            device_ns: e,
+        })
+    }
+
     /// The earliest full window's lower edge places the grid: anchor on it when there is no
     /// anchor, when the fit has settled, or when the grid has left it.
     fn check(&mut self, device_ns: u64) {

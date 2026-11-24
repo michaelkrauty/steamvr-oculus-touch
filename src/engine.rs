@@ -701,9 +701,7 @@ impl Engine {
                 let why = CStr::from_ptr(ffi::ohmd_ctx_get_error(ctx))
                     .to_string_lossy()
                     .into_owned();
-                return Err(format!(
-                    "Rift CV1 controllers not available (is the headset on USB?) {why}"
-                ));
+                return Err(controllers_unavailable(engine.dongle.is_some(), &why));
             }
             engine.last_io_errors = ffi::ohmd_cv1touch_get_io_errors(engine.hands[HAND_RIGHT]);
             engine.retirement.0.lock().unwrap().device =
@@ -1042,12 +1040,22 @@ impl Drop for Engine {
     }
 }
 
+/// Why the engine did not open: the controllers are missing from the headset or the dongle.
+#[cfg(feature = "engine")]
+fn controllers_unavailable(dongle: bool, why: &str) -> String {
+    if dongle {
+        format!("Rift CV1 controllers not available (is the FreeTouch dongle plugged in?) {why}")
+    } else {
+        format!("Rift CV1 controllers not available (is the headset on USB?) {why}")
+    }
+}
+
 /// The engine's view of `dongle` (`ohmd_cv1touch_set_radio`): callbacks into it, and its address.
 #[cfg(feature = "engine")]
 fn dongle_radio(dongle: &Arc<crate::dongle::Dongle>) -> ffi::ohmd_cv1touch_radio {
     use crate::dongle::{Dongle, Flash};
     use std::time::Duration;
-    // SAFETY (all four): `user` is the engine's dongle, which outlives the context; buffers are
+    // SAFETY (all five): `user` is the engine's dongle, which outlives the context; buffers are
     // the engine's, of the sizes it passes.
     unsafe extern "C" fn read_report(
         user: *mut c_void,
@@ -1107,12 +1115,28 @@ fn dongle_radio(dongle: &Arc<crate::dongle::Dongle>) -> ffi::ohmd_cv1touch_radio
     unsafe extern "C" fn cancel(user: *mut c_void) {
         ffi_callback(|| unsafe { (*(user as *const Dongle)).cancel_read() });
     }
+    unsafe extern "C" fn exposure(
+        user: *mut c_void,
+        poll_ts: *mut u32,
+        exposure_ts: *mut u32,
+        count: *mut u16,
+    ) -> c_int {
+        let mut ret = 0;
+        ffi_callback(|| unsafe {
+            if let Some(e) = (*(user as *const Dongle)).take_exposure() {
+                (*poll_ts, *exposure_ts, *count) = (e.poll_us, e.exposure_us, e.count);
+                ret = 1;
+            }
+        });
+        ret
+    }
     ffi::ohmd_cv1touch_radio {
         user: Arc::as_ptr(dongle) as *mut c_void,
         read_report: Some(read_report),
         read_flash: Some(read_flash),
         send_haptics: Some(send_haptics),
         cancel: Some(cancel),
+        exposure: Some(exposure),
         address: dongle.identity.address,
     }
 }
@@ -1214,6 +1238,14 @@ impl Drop for RadioDecoder {
 
 #[cfg(test)]
 mod tests {
+    /// A failed open names the radio the controllers were to come from.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn a_failed_open_names_the_radio() {
+        assert!(super::controllers_unavailable(true, "").contains("FreeTouch dongle plugged in"));
+        assert!(super::controllers_unavailable(false, "").contains("headset on USB"));
+    }
+
     #[test]
     fn discovery_identity_round_trips_pinned_sysfs_and_windows_arrival() {
         use crate::ffi;

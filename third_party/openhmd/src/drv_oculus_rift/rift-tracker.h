@@ -21,6 +21,7 @@ rift_tracker_ctx *rift_tracker_new (ohmd_context* ohmd_ctx, const uint8_t radio_
 
 rift_tracked_device *rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, posef *model_pose, rift_leds *leds, rift_tracked_device_imu_calibration *calib);
 void rift_tracker_on_new_exposure (rift_tracker_ctx *ctx, uint32_t hmd_ts, uint16_t exposure_count, uint32_t exposure_hmd_ts, uint8_t led_pattern_phase);
+void rift_tracker_take_radio_exposure (rift_tracker_ctx *ctx, const ohmd_cv1touch_radio *radio);
 uint8_t rift_tracker_get_device_list(rift_tracker_ctx *tracker_ctx, rift_tracked_device **dev_list);
 
 bool rift_tracker_frame_captured (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t frame_start_local_ts, rift_tracker_exposure_info *info, const char *source);

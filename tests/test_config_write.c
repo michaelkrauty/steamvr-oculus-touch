@@ -308,6 +308,11 @@ void rift_tracker_on_new_exposure(rift_tracker_ctx *ctx, uint32_t hmd_ts,
 	(void)ctx; (void)hmd_ts; (void)exposure_count; (void)exposure_hmd_ts; (void)led_pattern_phase;
 	CHECK(false);
 }
+void rift_tracker_take_radio_exposure(rift_tracker_ctx *ctx, const ohmd_cv1touch_radio *radio)
+{
+	(void)ctx; (void)radio;
+	CHECK(false);
+}
 static void reset(enum cache_case failure, ohmd_context *ctx)
 {
 	scenario = failure;

@@ -76,6 +76,7 @@ struct rift_hmd_s {
 
 	uint8_t radio_address[5];
 	uint32_t io_errors; /* cv1touch: HID read failures (headset unplugged) */
+	bool radio_gone_logged; /* cv1touch: a radio the caller serves is gone, which is said once */
 	rift_leds leds;
 
 	uint16_t remote_buttons_state;
@@ -648,6 +649,9 @@ static void update_hmd(rift_hmd_t *priv)
 			wait_ms = 0;
 		}
 	}
+	/* cv1touch: after the radio's reports, the exposure they announced */
+	if (priv->radio.external)
+		rift_tracker_take_radio_exposure (priv->tracker_ctx, priv->radio.external);
 
 	// Read all the messages from the device.
 	do {
@@ -682,7 +686,10 @@ static void update_hmd(rift_hmd_t *priv)
 		// Read all the controller messages from the radio device.
 		size = priv->radio.ops->read_report(&priv->radio, buffer, FEATURE_BUFFER_SIZE, 0);
 		if(size < 0){
-			LOGE("error reading from controllers");
+			/* cv1touch: a radio the caller serves fails only once it is gone, for good */
+			if (!priv->radio_gone_logged)
+				LOGE("error reading from controllers");
+			priv->radio_gone_logged = priv->radio.external != NULL;
 			priv->io_errors++;
 			break;
 		} else if(size > 0) {
@@ -1402,7 +1409,7 @@ cleanup:
 }
 
 /* cv1touch: the controllers on a radio the caller serves (ohmd_cv1touch_set_radio), with no
- * headset: nothing is sent but what the radio's ops send, and no exposures come. */
+ * headset: nothing is sent but what the radio's ops send, and the exposures come from it. */
 #define CV1TOUCH_RADIO_PATH "cv1touch-radio"
 
 static rift_hmd_t *open_radio(ohmd_driver* driver)

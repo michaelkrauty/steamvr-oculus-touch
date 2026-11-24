@@ -131,12 +131,25 @@ pub fn identify(link: &dyn Link, parser: &mut Parser, wait: Duration) -> Result<
     }
 }
 
+/// A camera exposure on the dongle's clock: the poll it was learnt from and the exposure (µs),
+/// and its count, as the headset's IMU reports carry them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exposure {
+    pub poll_us: u32,
+    pub exposure_us: u32,
+    pub count: u16,
+}
+
 /// What the dongle hands its owner as it reads.
 pub struct Hooks {
-    /// The host time a poll timestamp on the dongle's clock arrived, that timestamp (µs) and the
-    /// exposure period the polls announce (µs), from the status record sent every 10 ms: the
-    /// radio's clock, as the headset's IMU reports are with a headset.
-    pub clock: Box<dyn Fn(u64, u32, u32) + Send + Sync>,
+    /// The host time a poll timestamp on the dongle's clock arrived and that timestamp (µs), from
+    /// every controller record, and from the status record sent every 10 ms with the exposure
+    /// period the polls announce (µs): the radio's clock, as the headset's IMU reports are with a
+    /// headset.
+    pub clock: Box<dyn Fn(u64, u32, Option<u32>) + Send + Sync>,
+    /// The sensors' newest exposure the owner has timed from that clock since it was last asked,
+    /// for the engine (`Dongle::take_exposure`).
+    pub exposure: Box<dyn Fn() -> Option<Exposure> + Send + Sync>,
     pub log: Box<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -197,6 +210,7 @@ impl Shared {
     fn dispatch(&self, event: Event) {
         match event {
             Event::Report { input, report } => {
+                (self.hooks.clock)(crate::platform::now_ns(), input.poll_us, None);
                 if let Some(r) = freetouch::radio_report(input.session, &report) {
                     self.engine.push(r);
                     self.radio.push(r);
@@ -204,7 +218,7 @@ impl Shared {
             }
             Event::Status(s) => {
                 if let Some((poll_us, period_us)) = s.poll_clock() {
-                    (self.hooks.clock)(crate::platform::now_ns(), poll_us, period_us);
+                    (self.hooks.clock)(crate::platform::now_ns(), poll_us, Some(period_us));
                 }
             }
             Event::Reply(r) => {
@@ -374,6 +388,11 @@ impl Dongle {
         Flash::Pending
     }
 
+    /// The sensors' newest exposure, once, for the engine's tracker (`Hooks::exposure`).
+    pub fn take_exposure(&self) -> Option<Exposure> {
+        (self.shared.hooks.exposure)()
+    }
+
     /// Gives up the calibration read under way.
     pub fn cancel_read(&self) {
         *self.shared.read.lock().unwrap() = None;
@@ -506,12 +525,16 @@ mod tests {
         status(9, 21, firmware, &[&ADDRESS[..], &KEY[..]].concat())
     }
 
-    fn hooks() -> (Hooks, Seen<(u64, u32)>, Seen<String>) {
+    /// Each clock sample the hook was given: the poll stamp and the period with it.
+    type Clock = Seen<(u32, Option<u32>)>;
+
+    fn hooks() -> (Hooks, Clock, Seen<String>) {
         let clock = Arc::new(Mutex::new(Vec::new()));
         let logs = Arc::new(Mutex::new(Vec::new()));
         let (c, l) = (clock.clone(), logs.clone());
         let hooks = Hooks {
-            clock: Box::new(move |host, us, _| c.lock().unwrap().push((host, us))),
+            clock: Box::new(move |_, us, period| c.lock().unwrap().push((us, period))),
+            exposure: Box::new(|| None),
             log: Box::new(move |s| l.lock().unwrap().push(s.to_owned())),
         };
         (hooks, clock, logs)
@@ -649,7 +672,9 @@ mod tests {
         );
         assert_eq!(port.try_read(&mut buf).unwrap(), Some(64));
         assert_eq!(buf, want);
-        until(|| clock.lock().unwrap().iter().any(|&(_, us)| us == 7000));
+        until(|| clock.lock().unwrap().len() == 2);
+        // the controller record's poll, then the status record's with the period
+        assert_eq!(*clock.lock().unwrap(), [(5000, None), (7000, Some(19200))]);
         // nothing more: the engine's wait ends empty
         assert_eq!(
             dongle

@@ -294,12 +294,6 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             Some(DAEMON_NOT_RUNNING)
         } else if second.as_ref().is_some_and(|v| v["engine_ready"] == false) {
             Some("tracking is starting up; wait a few seconds")
-        } else if stage != Stage::Inputs
-            && second
-                .as_ref()
-                .is_some_and(|v| v["radio"]["kind"] == "freetouch")
-        {
-            Some(DONGLE_SETUP)
         } else if recording || !normal_mode {
             Some("cv1touchd is busy with a recording or another calibration")
         } else if !fresh {
@@ -349,9 +343,6 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         moved: second.as_ref().map(moved_sensors).unwrap_or_default(),
     }
 }
-
-/// Why the stages that need controller position are blocked while the radio is a FreeTouch dongle.
-const DONGLE_SETUP: &str = "the controllers' radio is a FreeTouch dongle, and controller position needs camera tracking timed from the dongle, which this version of cv1touch does not have yet";
 
 fn daemon_start_advice() -> &'static str {
     if cfg!(windows) {
