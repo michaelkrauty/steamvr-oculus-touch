@@ -358,6 +358,12 @@ pub mod hid {
         pub fn wake(&self) {
             self.0.wake()
         }
+
+        /// Waits until this waker or `other` fires, or `timeout` (None: no limit) passes: which
+        /// fired, this one as `report`.
+        pub fn wait_with(&self, other: &Waker, timeout: Option<Duration>) -> io::Result<Woke> {
+            os::wait_wakers(&self.0, &other.0, timeout)
+        }
     }
 
     /// What ended a wait (both may be false: the timeout).
@@ -419,6 +425,48 @@ pub mod hid {
     pub(crate) fn is_headset_path(path: &str, interface: u8) -> bool {
         let path = path.to_ascii_lowercase();
         path.contains("vid_2833&pid_0031") && path.contains(&format!("&mi_{interface:02}"))
+    }
+}
+
+pub mod serial {
+    //! USB serial ports (CDC ACM): /dev/ttyACM* on Linux, COM ports on Windows. Opening one
+    //! raises DTR and sets 115200 baud; nothing is written until the caller writes.
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::os;
+
+    /// A serial port of a USB device, as the system lists it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Candidate {
+        pub path: PathBuf,
+        /// The device's own name for itself: its USB product string on Linux, the name it
+        /// reported on the bus on Windows (its interface's or its product string).
+        pub name: String,
+    }
+
+    /// The serial ports of USB devices `vendor`:`product`.
+    pub fn ports(vendor: u16, product: u16) -> io::Result<Vec<Candidate>> {
+        os::serial_ports(vendor, product)
+    }
+
+    pub struct Port(os::SerialPort);
+
+    impl Port {
+        pub fn open(path: &std::path::Path) -> io::Result<Port> {
+            os::SerialPort::open(path).map(Port)
+        }
+
+        /// Bytes received into `buf`, waiting up to `timeout` for the first: 0 when none came.
+        /// An error means the port is gone.
+        pub fn read(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            self.0.read(buf, timeout)
+        }
+
+        pub fn write_all(&self, data: &[u8]) -> io::Result<()> {
+            self.0.write_all(data)
+        }
     }
 }
 

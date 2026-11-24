@@ -157,6 +157,7 @@ struct ohmd_context {
 	void *cv1touch_activity_user;
 	ohmd_cv1touch_sensor_attachment_cb cv1touch_sensor_attachment_cb;
 	void *cv1touch_sensor_attachment_user;
+	ohmd_cv1touch_radio cv1touch_radio; /* read_report NULL: the headset is the radio */
 };
 
 // helper functions

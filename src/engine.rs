@@ -538,6 +538,9 @@ pub struct Engine {
     sink: *mut Arc<dyn EngineSink>,
     #[cfg(windows)]
     _sensor_attachments: Box<SensorAttachments>,
+    /// The radio in place of the headset's, if any: the context's callbacks point at it, and it
+    /// drops after the context.
+    dongle: Option<Arc<crate::dongle::Dongle>>,
 }
 
 #[cfg(feature = "engine")]
@@ -609,8 +612,13 @@ pub fn sensor_serial(s: &Sensor) -> String {
 
 #[cfg(feature = "engine")]
 impl Engine {
-    /// Probes and opens both Touch controllers with OpenHMD's auto-update thread disabled.
-    pub fn open(opts: &EngineOptions, sink: Arc<dyn EngineSink>) -> Result<Engine, String> {
+    /// Probes and opens both Touch controllers with OpenHMD's auto-update thread disabled: on
+    /// `dongle` when given, with no headset, else on the headset's radio.
+    pub fn open(
+        opts: &EngineOptions,
+        sink: Arc<dyn EngineSink>,
+        dongle: Option<Arc<crate::dongle::Dongle>>,
+    ) -> Result<Engine, String> {
         let sensors = build_sensor_config(opts)?;
         // Capture before creating the native context: a later USB listing can belong to a
         // replacement whose predecessor's failed stream object has already been freed.
@@ -634,7 +642,11 @@ impl Engine {
                 sink,
                 #[cfg(windows)]
                 _sensor_attachments: sensor_attachments,
+                dongle,
             };
+            if let Some(dongle) = &engine.dongle {
+                ffi::ohmd_cv1touch_set_radio(ctx, &dongle_radio(dongle));
+            }
             #[cfg(windows)]
             ffi::ohmd_cv1touch_set_sensor_attachment_callback(
                 ctx,
@@ -991,6 +1003,11 @@ impl Engine {
         buf
     }
 
+    /// The dongle the controllers are on, or None for the headset's radio.
+    pub fn dongle(&self) -> Option<&Arc<crate::dongle::Dongle>> {
+        self.dongle.as_ref()
+    }
+
     pub fn haptic(&mut self, hand: usize, duration_s: f32, frequency_hz: f32, amplitude: f32) {
         // SAFETY: valid device.
         unsafe {
@@ -1022,6 +1039,81 @@ impl Drop for Engine {
             ffi::ohmd_ctx_destroy(self.ctx);
             drop(Box::from_raw(self.sink));
         }
+    }
+}
+
+/// The engine's view of `dongle` (`ohmd_cv1touch_set_radio`): callbacks into it, and its address.
+#[cfg(feature = "engine")]
+fn dongle_radio(dongle: &Arc<crate::dongle::Dongle>) -> ffi::ohmd_cv1touch_radio {
+    use crate::dongle::{Dongle, Flash};
+    use std::time::Duration;
+    // SAFETY (all four): `user` is the engine's dongle, which outlives the context; buffers are
+    // the engine's, of the sizes it passes.
+    unsafe extern "C" fn read_report(
+        user: *mut c_void,
+        buf: *mut u8,
+        size: c_int,
+        wait_ms: c_int,
+    ) -> c_int {
+        let mut ret = -1;
+        ffi_callback(|| unsafe {
+            let dongle = &*(user as *const Dongle);
+            let buf = std::slice::from_raw_parts_mut(buf, size.max(0) as usize);
+            let wait = Duration::from_millis(wait_ms.max(0) as u64);
+            ret = match dongle.read_report(buf, wait) {
+                Ok(Some(n)) => n as c_int,
+                Ok(None) => 0,
+                Err(_) => -1,
+            };
+        });
+        ret
+    }
+    unsafe extern "C" fn read_flash(
+        user: *mut c_void,
+        device_type: u8,
+        offset: u16,
+        length: u16,
+        data: *mut u8,
+    ) -> c_int {
+        let mut ret = -1;
+        ffi_callback(|| unsafe {
+            let dongle = &*(user as *const Dongle);
+            let data = std::slice::from_raw_parts_mut(data, usize::from(length));
+            ret = match dongle.read_flash(device_type, offset, length, data) {
+                Flash::Pending => 1,
+                Flash::Done => 0,
+                Flash::Failed => -1,
+            };
+        });
+        ret
+    }
+    unsafe extern "C" fn send_haptics(
+        user: *mut c_void,
+        device_type: u8,
+        low_freq: bool,
+        amplitude: u8,
+    ) -> c_int {
+        let mut ret = -1;
+        ffi_callback(|| unsafe {
+            let dongle = &*(user as *const Dongle);
+            ret = if dongle.haptic(device_type, low_freq, amplitude).is_ok() {
+                0
+            } else {
+                -1
+            };
+        });
+        ret
+    }
+    unsafe extern "C" fn cancel(user: *mut c_void) {
+        ffi_callback(|| unsafe { (*(user as *const Dongle)).cancel_read() });
+    }
+    ffi::ohmd_cv1touch_radio {
+        user: Arc::as_ptr(dongle) as *mut c_void,
+        read_report: Some(read_report),
+        read_flash: Some(read_flash),
+        send_haptics: Some(send_haptics),
+        cancel: Some(cancel),
+        address: dongle.identity.address,
     }
 }
 

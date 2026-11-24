@@ -13,6 +13,7 @@ pub mod calendar;
 pub mod calib;
 pub mod clock_map;
 pub mod control;
+pub mod dongle;
 pub mod engine;
 pub mod eval;
 pub mod ffi;

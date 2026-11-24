@@ -602,7 +602,7 @@ static void update_hmd_outputs(rift_hmd_t *priv, uint64_t now)
 	now = ohmd_monotonic_get(priv->ctx);
 	// Handle keep alive messages
 	double t = ohmd_get_tick();
-	if(t - priv->last_keep_alive >= (double)priv->sensor_config.keep_alive_interval / 1000.0 - .2){
+	if(priv->handle && t - priv->last_keep_alive >= (double)priv->sensor_config.keep_alive_interval / 1000.0 - .2){
 		// send keep alive message
 		rift_send_keepalive(priv);
 		// Update the time of the last keep alive we have sent.
@@ -627,7 +627,7 @@ static void update_hmd(rift_hmd_t *priv)
 
 	/* cv1touch: wait briefly for the next radio report so a dedicated update thread wakes as
 	 * soon as controller data lands, instead of sleeping a fixed interval between polls. */
-	if (priv->radio_handle != NULL && priv->ctx->cv1touch_config.radio_wait_ms > 0) {
+	if (priv->radio.ops != NULL && priv->ctx->cv1touch_config.radio_wait_ms > 0) {
 		/* then every report queued behind it, so a slow pass does not leave the engine's
 		 * controller state further behind each time */
 		int wait_ms = priv->ctx->cv1touch_config.radio_wait_ms;
@@ -657,7 +657,8 @@ static void update_hmd(rift_hmd_t *priv)
 
 		got_a_msg = false;
 
-		size = hid_read(priv->handle, buffer, FEATURE_BUFFER_SIZE);
+		/* cv1touch: no headset with a radio the caller serves */
+		size = priv->handle ? hid_read(priv->handle, buffer, FEATURE_BUFFER_SIZE) : 0;
 		if(size < 0){
 			LOGE("error reading from HMD");
 			priv->io_errors++;
@@ -675,7 +676,7 @@ static void update_hmd(rift_hmd_t *priv)
 			}
 		}
 
-		if (priv->radio_handle == NULL)
+		if (priv->radio.ops == NULL)
 			continue;
 
 		// Read all the controller messages from the radio device.
@@ -1400,15 +1401,48 @@ cleanup:
 	return NULL;
 }
 
+/* cv1touch: the controllers on a radio the caller serves (ohmd_cv1touch_set_radio), with no
+ * headset: nothing is sent but what the radio's ops send, and no exposures come. */
+#define CV1TOUCH_RADIO_PATH "cv1touch-radio"
+
+static rift_hmd_t *open_radio(ohmd_driver* driver)
+{
+	rift_hmd_t* priv = ohmd_alloc(driver->ctx, sizeof(rift_hmd_t));
+	if(!priv)
+		return NULL;
+
+	priv->revision = REV_CV1;
+	priv->use_count = 1;
+	priv->ctx = driver->ctx;
+	priv->have_imu_timestamp = false;
+	priv->last_imu_timestamp = -1;
+
+	rift_hmd_radio_init_external(&priv->radio, &driver->ctx->cv1touch_radio);
+	priv->radio.ops->get_address(&priv->radio, priv->radio_address);
+	init_touch_device (&priv->touch_dev[0], 1, RIFT_TOUCH_CONTROLLER_RIGHT);
+	init_touch_device (&priv->touch_dev[1], 2, RIFT_TOUCH_CONTROLLER_LEFT);
+	priv->hmd_dev.id = 0;
+	priv->hmd_dev.hmd = priv;
+
+	priv->tracker_ctx = rift_tracker_new (driver->ctx, priv->radio_address);
+	if (priv->tracker_ctx == NULL) {
+		ohmd_set_error(driver->ctx, "Failed to create Rift sensor tracker");
+		close_hmd (priv);
+		return NULL;
+	}
+	return priv;
+}
+
 static void close_hmd(rift_hmd_t *hmd)
 {
 	if (hmd->tracker_ctx)
 		rift_tracker_free(hmd->tracker_ctx);
-	if (hmd->radio_handle) {
+	if (hmd->radio.ops)
 		rift_hmd_radio_clear(&hmd->radio);
+	if (hmd->radio_handle)
 		hid_close(hmd->radio_handle);
-	}
-	hid_close(hmd->handle);
+	if (hmd->handle)
+		hid_close(hmd->handle);
 
 	rift_touch_clear_calibration (&hmd->touch_dev[0].calibration);
 	rift_touch_clear_calibration (&hmd->touch_dev[1].calibration);
@@ -1457,7 +1491,7 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 	bool is_controller = false;
 
 	if (hmd == NULL) {
-		hmd = open_hmd (driver, desc);
+		hmd = strcmp(desc->path, CV1TOUCH_RADIO_PATH) == 0 ? open_radio (driver) : open_hmd (driver, desc);
 		if (hmd == NULL)
 			return NULL;
 		push_hmd (hmd, desc->path);
@@ -1495,8 +1529,32 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 
 #define RIFT_ID_COUNT 5
 
+/* cv1touch: a radio the caller serves lists its two controllers, and no headset is looked for. */
+static void list_radio_controllers(ohmd_driver* driver, ohmd_device_list* list)
+{
+	for (int id = 1; id <= 2; id++) {
+		ohmd_device_desc* desc = &list->devices[list->num_devices++];
+		strcpy(desc->driver, "OpenHMD Rift Driver");
+		strcpy(desc->vendor, "Oculus VR, Inc.");
+		strcpy(desc->product, id == 1 ? "Rift (CV1): Right Controller" : "Rift (CV1): Left Controller");
+		strcpy(desc->path, CV1TOUCH_RADIO_PATH);
+		desc->revision = REV_CV1;
+		desc->device_class = OHMD_DEVICE_CLASS_CONTROLLER;
+		desc->device_flags = OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING | OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING |
+			(id == 1 ? OHMD_DEVICE_FLAGS_RIGHT_CONTROLLER : OHMD_DEVICE_FLAGS_LEFT_CONTROLLER) |
+			OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK;
+		desc->driver_ptr = driver;
+		desc->id = id;
+	}
+}
+
 static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 {
+	if (driver->ctx->cv1touch_radio.read_report) {
+		list_radio_controllers(driver, list);
+		return;
+	}
+
 	// enumerate HID devices and add any Rifts found to the device list
 
 	rift_devices rd[RIFT_ID_COUNT] = {

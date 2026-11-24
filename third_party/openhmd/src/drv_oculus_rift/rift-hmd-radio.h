@@ -39,11 +39,13 @@ struct rift_hmd_radio_ops {
 };
 
 extern const rift_hmd_radio_ops rift_hmd_radio_headset_ops;
+extern const rift_hmd_radio_ops rift_hmd_radio_external_ops;
 
 struct rift_hmd_radio_state {
 	const rift_hmd_radio_ops *ops;
 	hid_device *handle; /* the headset's radio interface: reports and commands */
 	hid_device *hmd_handle; /* the headset's own interface: the radio address */
+	const ohmd_cv1touch_radio *external; /* or a radio the caller serves */
 
 	enum rift_radio_cmd_state cur_read_cmd; /* Which radio read/write command is in progress */
 	bool discard_reply; /* drain an abandoned command before submitting another */
@@ -63,6 +65,7 @@ struct rift_hmd_radio_state {
 };
 
 void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_device *hmd_handle);
+void rift_hmd_radio_init_external(rift_hmd_radio_state *radio, const ohmd_cv1touch_radio *external);
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio);
 int rift_touch_get_calibration(ohmd_context* ctx,
 		rift_hmd_radio_state *radio,

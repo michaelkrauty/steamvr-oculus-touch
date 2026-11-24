@@ -521,6 +521,18 @@ fn daemon_checks(
     if let Some((ok, note)) = status::sensor_hotplug_check(status, explained) {
         checks.push(("sensor_hotplug", ok, note));
     }
+    match (
+        status["radio"]["kind"].as_str(),
+        status::dongle_note(status),
+    ) {
+        (_, Some(note)) => checks.push(("radio", true, note)),
+        (Some("headset"), None) => checks.push((
+            "radio",
+            true,
+            "the Rift headset is the controllers' radio".into(),
+        )),
+        _ => {}
+    }
     if let Some(note) = status::other_headset_note(status) {
         checks.push(("headset", true, format!("warning: {note}")));
     }
@@ -962,6 +974,9 @@ fn status_board(shm_name: &str) -> i32 {
             .as_ref()
             .and_then(|v| status::sensor_hotplug_note(v, &stream_explained))
         {
+            push_line(&mut frame, &note);
+        }
+        if let Some(note) = complete.as_ref().and_then(status::dongle_note) {
             push_line(&mut frame, &note);
         }
         if let Some(note) = complete.as_ref().and_then(status::other_headset_note) {

@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use cv1touch::base_pin;
 use cv1touch::control::{self, Command};
+use cv1touch::dongle;
 use cv1touch::engine::{self, Blob, Engine, EngineOptions, EngineSink};
 use cv1touch::flight::{self, FlightRecorder};
 use cv1touch::flight_writer;
@@ -260,6 +261,8 @@ struct Daemon {
     /// Whether that headset is another than the registration's
     /// (`align::Registration::other_headset`), for `status`.
     other_headset: AtomicBool,
+    /// The open engine's radio for `status` (`radio_status`); None while no engine is open.
+    radio: Mutex<Option<serde_json::Value>>,
     /// The base-station pin (see `BasePin`).
     base_pin: Mutex<BasePin>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
@@ -321,6 +324,14 @@ impl Daemon {
 
     fn wake_radio(&self) {
         self.radio_wake.wake();
+    }
+
+    /// A sample of the radio's clock: the headset's IMU report time, or a FreeTouch dongle's poll
+    /// time, in µs, and the host time it arrived.
+    fn radio_clock(&self, ts: u64, us: u32) {
+        if self.tracker == TrackerKind::Rust && self.track_in.lock().unwrap().push_clock(ts, us) {
+            self.wake_radio();
+        }
     }
 
     /// After `quit` or a sleeper's condition is set: taking the lock orders this after any
@@ -746,10 +757,7 @@ impl EngineSink for Daemon {
         }
         if self.tracker == TrackerKind::Rust && source == 0 {
             if let Some(us) = pipeline::hmd_report_timestamp(data) {
-                let ready = self.track_in.lock().unwrap().push_clock(ts, us);
-                if ready {
-                    self.wake_radio();
-                }
+                self.radio_clock(ts, us);
             }
         }
     }
@@ -2248,16 +2256,95 @@ fn sensor_watch_main(d: Arc<Daemon>) {
 /// The only thread that touches OpenHMD.
 fn engine_main(d: Arc<Daemon>) {
     let mut last_err = String::new();
+    let mut last_radio = String::new();
     let mut reopening_since = None;
     while !d.quit.load(Ordering::Acquire) {
         let (opts, revision) = requested_engine_options(&d);
-        let Some(e) = open_engine(&d, &mut last_err, || Engine::open(&opts, d.clone())) else {
+        let dongle = choose_dongle(&d, &mut last_radio);
+        let Some(e) = open_engine(&d, &mut last_err, || Engine::open(&opts, d.clone(), dongle))
+        else {
             sleep_interruptible(&d, 1000);
             continue;
         };
         watch_worker_resources(&d.failed_worker, ENGINE_WORKER, true, e, |e| {
             engine_session(&d, &opts, revision, e, &mut reopening_since);
         });
+    }
+}
+
+/// The FreeTouch dongle the engine is to open, or None for the headset's radio. A plugged-in
+/// headset is always the radio, and a dongle beside it is left closed. Without one, the first port
+/// on the dongle's USB ID that names itself FreeTouch and then sends a FreeTouch identity of a
+/// usable firmware (`dongle::identify`) is used; nothing is written to any other. What it finds
+/// is logged when it changes.
+fn choose_dongle(d: &Arc<Daemon>, last: &mut String) -> Option<Arc<dongle::Dongle>> {
+    let ports = platform::serial::ports(dongle::VENDOR, dongle::PRODUCT).unwrap_or_default();
+    let (tries, mut notes) = dongle_candidates(hid::headset_interface(1).is_some(), &ports);
+    let mut found = None;
+    for port in tries {
+        let at = port.path.display();
+        let hooks = dongle::Hooks {
+            clock: Box::new({
+                let d = d.clone();
+                move |ts, us, _period| d.radio_clock(ts, us)
+            }),
+            log: Box::new(|line| log!("{line}")),
+        };
+        match dongle::Dongle::open(&port.path, hooks) {
+            Ok(found_one) => {
+                let firmware = found_one.identity.firmware;
+                notes.push(format!(
+                    "the controllers' radio is the FreeTouch dongle at {at}, firmware {}{}. Controller position needs camera tracking timed from the dongle, which this version of cv1touch does not have yet",
+                    dongle::firmware_text(firmware),
+                    if firmware > dongle::KNOWN_FIRMWARE {
+                        format!(", newer than the {} this version of cv1touch was made for: if the controllers misbehave, run cv1touch report and attach the file it writes to your bug report", dongle::firmware_text(dongle::KNOWN_FIRMWARE))
+                    } else {
+                        String::new()
+                    }
+                ));
+                found = Some(Arc::new(found_one));
+                break;
+            }
+            Err(e) => notes.push(format!("{at} {e}")),
+        }
+    }
+    let note = notes.join("; ");
+    if note != *last {
+        if !note.is_empty() {
+            log!("{note}");
+        }
+        *last = note;
+    }
+    found
+}
+
+/// The ports on the dongle's USB ID worth opening, in order, and what is said about the others.
+/// None while a headset is plugged in: it is the radio, and the dongle is left alone.
+fn dongle_candidates(
+    headset: bool,
+    ports: &[platform::serial::Candidate],
+) -> (Vec<&platform::serial::Candidate>, Vec<String>) {
+    let (named, other): (Vec<_>, Vec<_>) =
+        ports.iter().partition(|p| dongle::named_freetouch(&p.name));
+    if headset {
+        let note = (!named.is_empty()).then(|| "a FreeTouch dongle is plugged in beside the Rift headset: the headset is the controllers' radio, and the dongle is left alone".to_owned());
+        return (Vec::new(), note.into_iter().collect());
+    }
+    let notes = other
+        .iter()
+        .map(|p| format!("{} on the FreeTouch dongle's USB ID calls itself \"{}\", so it is another device: left alone", p.path.display(), p.name))
+        .collect();
+    (named, notes)
+}
+
+/// What `status` says about the engine's radio.
+fn radio_status(e: &Engine) -> serde_json::Value {
+    match e.dongle() {
+        None => serde_json::json!({"kind": "headset"}),
+        Some(dongle) => serde_json::json!({
+            "kind": "freetouch",
+            "firmware": dongle::firmware_text(dongle.identity.firmware),
+        }),
     }
 }
 
@@ -2348,6 +2435,7 @@ fn engine_session(
         e.sensor_retirement(),
     );
     begin_engine_session(d);
+    *d.radio.lock().unwrap() = Some(radio_status(e));
     log!("engine running with {} sensor(s)", e.sensors().len());
     make_usb_thread_realtime();
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
@@ -2384,24 +2472,33 @@ fn engine_session(
         let stop = StopRadio { d, link: &link };
         let radio = start_engine_run(d, revision, reopening_since, || {
             new_pipeline(d, opts, e).and_then(|pipe| {
-                let Some(path) = hid::headset_interface(1) else {
-                    log!("no HID interface for the headset's radio: publishing OpenHMD poses");
-                    return None;
-                };
-                // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
-                let (dec, file) = radio_resources(|| unsafe { e.radio_decoder() }, || {
-                    match hid::Device::open(&path) {
-                        Ok(f) => Some(f),
-                        Err(err) => {
-                            log!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display());
-                            None
+                let (dec, file, source) = if let Some(dongle) = e.dongle() {
+                    // SAFETY: as below
+                    let (dec, port) = radio_resources(|| unsafe { e.radio_decoder() }, || {
+                        Some(Radio::Dongle(dongle.radio_port()))
+                    })?;
+                    (dec, port, "the FreeTouch dongle".to_owned())
+                } else {
+                    let Some(path) = hid::headset_interface(1) else {
+                        log!("no HID interface for the headset's radio: publishing OpenHMD poses");
+                        return None;
+                    };
+                    // SAFETY: the decoder goes to the scoped radio thread, joined before the engine closes
+                    let (dec, file) = radio_resources(|| unsafe { e.radio_decoder() }, || {
+                        match hid::Device::open(&path) {
+                            Ok(f) => Some(Radio::Headset(f)),
+                            Err(err) => {
+                                log!("cannot read the radio at {}: {err}; publishing OpenHMD poses", path.display());
+                                None
+                            }
                         }
-                    }
-                })?;
+                    })?;
+                    (dec, file, path.display().to_string())
+                };
                 // Opening the HID handle already starts a Windows read: mark a startup panic before
                 // its local handle can wait for cancellation while unwinding.
                 let _startup = WorkerExit { failed: &d.failed_worker, worker: ENGINE_WORKER, panic_only: true };
-                log!("publishing cv1touch tracker poses from the radio thread ({}; OpenHMD acquires only)", path.display());
+                log!("publishing cv1touch tracker poses from the radio thread ({source}; OpenHMD acquires only)");
                 let watch = LandmarkWatch::load();
                 let (d, link) = (d, &link);
                 let job = WorkerResources::starting(&d.failed_worker, ENGINE_WORKER, (dec, file, pipe, watch));
@@ -2423,6 +2520,7 @@ fn engine_session(
             }
         });
     });
+    *d.radio.lock().unwrap() = None;
     end_engine_sensors(d);
     deliver_pending_biases(&link, save_biases);
 }
@@ -4258,6 +4356,28 @@ fn retire_radio_sensor(
 /// sample as it lands (the tracker's pose at it), and between reports feeds the tracker the camera
 /// frames one at a time, so a report waits for at most one frame. Runs SCHED_RR (`make_realtime`)
 /// with inherited affinity or the explicit `CV1TOUCH_CPUS` selection.
+/// What the radio thread reads: the headset's radio interface, or the dongle's reports.
+enum Radio {
+    Headset(hid::Device),
+    Dongle(dongle::RadioPort),
+}
+
+impl hid::RadioPort for Radio {
+    fn wait(&mut self, waker: &hid::Waker, timeout: Option<Duration>) -> io::Result<hid::Woke> {
+        match self {
+            Radio::Headset(r) => r.wait(waker, timeout),
+            Radio::Dongle(r) => r.wait(waker, timeout),
+        }
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self {
+            Radio::Headset(r) => r.try_read(buf),
+            Radio::Dongle(r) => r.try_read(buf),
+        }
+    }
+}
+
 fn radio_main(
     d: &Daemon,
     link: &RadioLink,
@@ -5809,7 +5929,7 @@ fn status_json(d: &Daemon) -> String {
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{},\"radio\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
@@ -5844,6 +5964,7 @@ fn status_json(d: &Daemon) -> String {
         serde_json::to_string(&ignored_sensors).unwrap(),
         serde_json::to_string(&calibrated_sensors).unwrap(),
         serde_json::to_string(&sensor_streams).unwrap(),
+        serde_json::to_string(&*d.radio.lock().unwrap()).unwrap(),
     )
 }
 
@@ -6960,6 +7081,7 @@ fn main() {
         universe_unmeasured: Mutex::new(None),
         driver_headset: Mutex::new(None),
         other_headset: AtomicBool::new(false),
+        radio: Mutex::new(None),
         base_pin: Mutex::new(BasePin {
             watch: base_pin::Watch::new(settings.pin_base_station),
             ..Default::default()
@@ -9056,6 +9178,7 @@ mod tests {
             universe_unmeasured: Mutex::new(None),
             driver_headset: Mutex::new(None),
             other_headset: AtomicBool::new(false),
+            radio: Mutex::new(None),
             base_pin: Mutex::new(BasePin::default()),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
@@ -20533,6 +20656,27 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
         assert_eq!(value["sensor_streams"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_headset_is_the_radio_and_only_freetouch_ports_are_tried() {
+        let port = |path: &str, name: &str| platform::serial::Candidate {
+            path: path.into(),
+            name: name.into(),
+        };
+        let ports = [
+            port("/dev/ttyACM0", "TinyUSB Device"),
+            port("/dev/ttyACM1", "FreeTouch dongle"),
+        ];
+        let (tries, notes) = dongle_candidates(false, &ports);
+        assert_eq!(tries, [&ports[1]]);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("/dev/ttyACM0") && notes[0].contains("left alone"));
+        // with a headset plugged in, no port is opened
+        let (tries, notes) = dongle_candidates(true, &ports);
+        assert!(tries.is_empty());
+        assert!(notes[0].contains("the headset is the controllers' radio"));
+        assert!(dongle_candidates(true, &ports[..1]).1.is_empty());
     }
 
     #[test]

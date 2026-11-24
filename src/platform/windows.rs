@@ -1225,6 +1225,206 @@ pub fn headset_interface(interface: u8) -> Option<std::path::PathBuf> {
 /// The console's control events, set into a manual-reset event by the handler.
 pub struct ShutdownRequests;
 
+pub fn wait_wakers(
+    a: &Waker,
+    b: &Waker,
+    timeout: Option<Duration>,
+) -> io::Result<crate::platform::hid::Woke> {
+    use crate::platform::hid::Woke;
+    let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(INFINITE as u128 - 1) as u32);
+    let handles = [a.0 .0, b.0 .0];
+    // SAFETY: two valid event handles.
+    match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) } {
+        WAIT_OBJECT_0 => Ok(Woke {
+            report: true,
+            waker: false,
+        }),
+        r if r == WAIT_OBJECT_0 + 1 => Ok(Woke {
+            report: false,
+            waker: true,
+        }),
+        WAIT_TIMEOUT => Ok(Woke::default()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// A COM port opened for overlapped I/O: one read and one write may be under way at once.
+pub struct SerialPort {
+    handle: Handle,
+    read: std::sync::Mutex<Handle>,
+    write: std::sync::Mutex<Handle>,
+}
+
+// SAFETY: the handle may be used from any thread; each operation's event is behind its lock.
+unsafe impl Send for SerialPort {}
+unsafe impl Sync for SerialPort {}
+
+impl SerialPort {
+    pub fn open(path: &Path) -> io::Result<SerialPort> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Devices::Communication::{
+            EscapeCommFunction, GetCommState, SetCommState, SetCommTimeouts, COMMTIMEOUTS, DCB,
+            NOPARITY, ONESTOPBIT, SETDTR,
+        };
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path; the handle is owned below.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = Handle(handle);
+        // SAFETY: our port handle and structures of the stated sizes.
+        unsafe {
+            let mut dcb: DCB = std::mem::zeroed();
+            dcb.DCBlength = std::mem::size_of::<DCB>() as u32;
+            if GetCommState(handle.0, &mut dcb) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            dcb.BaudRate = 115200;
+            dcb.ByteSize = 8;
+            dcb.Parity = NOPARITY;
+            dcb.StopBits = ONESTOPBIT;
+            // fBinary, DTR on (fDtrControl = DTR_CONTROL_ENABLE), no flow control
+            dcb._bitfield = 1 | (1 << 4);
+            if SetCommState(handle.0, &dcb) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // a read returns what has come, or waits up to 100 ms for the first byte
+            let timeouts = COMMTIMEOUTS {
+                ReadIntervalTimeout: u32::MAX,
+                ReadTotalTimeoutMultiplier: u32::MAX,
+                ReadTotalTimeoutConstant: 100,
+                WriteTotalTimeoutMultiplier: 0,
+                WriteTotalTimeoutConstant: 1000,
+            };
+            if SetCommTimeouts(handle.0, &timeouts) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            EscapeCommFunction(handle.0, SETDTR);
+        }
+        Ok(SerialPort {
+            handle,
+            read: std::sync::Mutex::new(manual_event()?),
+            write: std::sync::Mutex::new(manual_event()?),
+        })
+    }
+
+    pub fn read(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        let event = self.read.lock().unwrap();
+        // SAFETY: zeroed is a valid OVERLAPPED; it and `buf` outlive the read, which `finish`
+        // completes or cancels and waits out before returning.
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = event.0;
+            if ReadFile(
+                self.handle.0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                &mut ov,
+            ) == 0
+                && GetLastError() != ERROR_IO_PENDING
+            {
+                return Err(io::Error::last_os_error());
+            }
+            match finish(
+                self.handle.0,
+                &mut ov,
+                Some(timeout + Duration::from_millis(100)),
+            ) {
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(0),
+                r => r,
+            }
+        }
+    }
+
+    pub fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        let event = self.write.lock().unwrap();
+        // SAFETY: as in `read`.
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = event.0;
+            if WriteFile(
+                self.handle.0,
+                data.as_ptr(),
+                data.len() as u32,
+                std::ptr::null_mut(),
+                &mut ov,
+            ) == 0
+                && GetLastError() != ERROR_IO_PENDING
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if finish(self.handle.0, &mut ov, Some(Duration::from_secs(2)))? != data.len() {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The COM ports of USB devices `vendor`:`product`: the nodes whose name ends in "(COMn)", with
+/// the name each reported on the bus.
+pub fn serial_ports(
+    vendor: u16,
+    product: u16,
+) -> io::Result<Vec<crate::platform::serial::Candidate>> {
+    let mut found = Vec::new();
+    usb_devices_each(vendor, Some("USB"), |devinst, _, node| {
+        if node.product != product {
+            return;
+        }
+        let Some(port) = node
+            .name
+            .rsplit_once("(COM")
+            .and_then(|(_, n)| n.strip_suffix(')'))
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return;
+        };
+        found.push(crate::platform::serial::Candidate {
+            path: format!(r"\\.\COM{port}").into(),
+            name: bus_reported_name(devinst).unwrap_or_default(),
+        });
+    })?;
+    Ok(found)
+}
+
+fn bus_reported_name(devinst: u32) -> Option<String> {
+    use windows_sys::Win32::Devices::{
+        DeviceAndDriverInstallation::{CM_Get_DevNode_PropertyW, CR_SUCCESS},
+        Properties::{DEVPKEY_Device_BusReportedDeviceDesc, DEVPROP_TYPE_STRING},
+    };
+    let mut buf = [0u16; 256];
+    let (mut kind, mut size) = (0u32, std::mem::size_of_val(&buf) as u32);
+    // SAFETY: a string property into a buffer of the stated size in bytes.
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_BusReportedDeviceDesc,
+            &mut kind,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            0,
+        )
+    };
+    if result != CR_SUCCESS || kind != DEVPROP_TYPE_STRING {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
 static SHUTDOWN_EVENT: OnceLock<usize> = OnceLock::new();
 static SHUTDOWN_KIND: AtomicU32 = AtomicU32::new(u32::MAX);
 

@@ -2,3 +2,7 @@
 # Install before 73-seat-late.rules so logind can apply the ACL.
 SUBSYSTEM=="usb", ATTRS{idVendor}=="2833", TAG+="uaccess"
 SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="2833", TAG+="uaccess"
+# A FreeTouch dongle in place of the headset. Its USB ID cafe:4001 is TinyUSB's example ID, so its
+# product string is matched too. Its serial port is for the active seat, and ModemManager is told
+# not to probe it as a modem (it would write AT commands to it).
+SUBSYSTEM=="tty", KERNEL=="ttyACM*", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4001", ATTRS{product}=="FreeTouch dongle", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
