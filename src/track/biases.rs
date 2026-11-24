@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
@@ -96,19 +97,54 @@ pub fn load(path: &Path) -> BiasFile {
         .unwrap_or_default()
 }
 
-/// Writes `f` to `path` through a temporary file, so a crash never leaves half a file.
-pub fn save(path: &Path, f: &BiasFile) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let lock = lock_path(path);
+    let _guard =
+        crate::platform::fs::lock_file(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+    f()
+}
+
+fn save_unlocked(path: &Path, f: &BiasFile) -> Result<(), String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("imu-biases.json");
+    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
     let text = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", tmp.display()));
+    }
+    if let Err(e) = crate::platform::fs::rename_replacing(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Writes `f` to `path` through a unique temporary file under the bias-file lock, so overlapping
+/// writers cannot collide and a crash never leaves half a file.
+pub fn save(path: &Path, f: &BiasFile) -> Result<(), String> {
+    with_lock(path, || save_unlocked(path, f))
 }
 
 /// Updates `verified_accel` in `path` for each `(key, bias)` without disturbing saved gyro biases
-/// or other controllers.
+/// or other controllers. Serialized across processes with `merge_updates`.
 pub fn save_verified_accel(
     path: &Path,
     entries: &[(String, Vector3<f64>)],
@@ -117,23 +153,25 @@ pub fn save_verified_accel(
     if entries.is_empty() {
         return Ok(());
     }
-    let mut file = load(path);
-    for (k, a) in entries {
-        let accel = [a.x, a.y, a.z];
-        file.controllers
-            .entry(k.clone())
-            .and_modify(|e| {
-                e.verified_accel = Some(accel);
-                e.updated_unix_s = updated_unix_s;
-            })
-            .or_insert(Entry {
-                gyro: [0.0; 3],
-                accel,
-                verified_accel: Some(accel),
-                updated_unix_s,
-            });
-    }
-    save(path, &file)
+    with_lock(path, || {
+        let mut file = load(path);
+        for (k, a) in entries {
+            let accel = [a.x, a.y, a.z];
+            file.controllers
+                .entry(k.clone())
+                .and_modify(|e| {
+                    e.verified_accel = Some(accel);
+                    e.updated_unix_s = updated_unix_s;
+                })
+                .or_insert(Entry {
+                    gyro: [0.0; 3],
+                    accel,
+                    verified_accel: Some(accel),
+                    updated_unix_s,
+                });
+        }
+        save_unlocked(path, &file)
+    })
 }
 
 /// One controller's bias update from the daemon's radio thread, merged into the on-disk file so an
@@ -157,60 +195,60 @@ pub fn merge_updates(path: &Path, updates: &BTreeMap<String, Update>) -> Result<
     if updates.is_empty() {
         return Ok(());
     }
-    let mut file = load(path);
-    let mut changed = false;
-    for (k, u) in updates {
-        let disk = file.controllers.get(k).copied();
-        let disk_verified = disk.and_then(|e| e.verified_accel);
-        let verified_accel = match u.verified_accel {
-            Some(Some(v)) => Some(v),
-            Some(None) => {
-                if disk_verified == u.invalidated_from {
-                    None
-                } else {
-                    disk_verified
+    with_lock(path, || {
+        let mut file = load(path);
+        let mut changed = false;
+        for (k, u) in updates {
+            let disk = file.controllers.get(k).copied();
+            let disk_verified = disk.and_then(|e| e.verified_accel);
+            let verified_accel = match u.verified_accel {
+                Some(Some(v)) => Some(v),
+                Some(None) => {
+                    if disk_verified == u.invalidated_from {
+                        None
+                    } else {
+                        disk_verified
+                    }
                 }
-            }
-            None => disk_verified,
-        };
-        if let Some((gyro, accel)) = u.tracking {
-            file.controllers.insert(
-                k.clone(),
-                Entry {
-                    gyro,
-                    accel,
-                    verified_accel,
-                    updated_unix_s: u.updated_unix_s,
-                },
-            );
-            changed = true;
-        } else if let Some(mut e) = disk {
-            if e.verified_accel != verified_accel {
-                e.verified_accel = verified_accel;
-                e.updated_unix_s = u.updated_unix_s;
-                file.controllers.insert(k.clone(), e);
+                None => disk_verified,
+            };
+            if let Some((gyro, accel)) = u.tracking {
+                file.controllers.insert(
+                    k.clone(),
+                    Entry {
+                        gyro,
+                        accel,
+                        verified_accel,
+                        updated_unix_s: u.updated_unix_s,
+                    },
+                );
+                changed = true;
+            } else if let Some(mut e) = disk {
+                if e.verified_accel != verified_accel {
+                    e.verified_accel = verified_accel;
+                    e.updated_unix_s = u.updated_unix_s;
+                    file.controllers.insert(k.clone(), e);
+                    changed = true;
+                }
+            } else if let Some(v) = verified_accel {
+                file.controllers.insert(
+                    k.clone(),
+                    Entry {
+                        gyro: [0.0; 3],
+                        accel: v,
+                        verified_accel: Some(v),
+                        updated_unix_s: u.updated_unix_s,
+                    },
+                );
                 changed = true;
             }
-        } else if let Some(v) = verified_accel {
-            file.controllers.insert(
-                k.clone(),
-                Entry {
-                    gyro: [0.0; 3],
-                    accel: v,
-                    verified_accel: Some(v),
-                    updated_unix_s: u.updated_unix_s,
-                },
-            );
-            changed = true;
         }
-    }
-    if changed {
-        save(path, &file)
-    } else {
+        if changed {
+            save_unlocked(path, &file)?;
+        }
         Ok(())
-    }
+    })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +428,113 @@ mod tests {
         let new_entry = load(&path).controllers["right-3333"];
         assert_eq!(new_entry.verified_accel, Some([0.0, 1.85, 0.0]));
         assert_eq!(new_entry.accel, [0.0, 1.85, 0.0]);
+    }
+
+    #[test]
+    fn lock_exclusive_serializes_calibration_and_daemon_merge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("imu-biases.json");
+        let mut init = BiasFile::default();
+        init.controllers.insert(
+            "left-1111".into(),
+            Entry {
+                gyro: [0.01, 0.0, 0.0],
+                accel: [0.0, 0.2, 0.0],
+                verified_accel: None,
+                updated_unix_s: 100,
+            },
+        );
+        save(&path, &init).unwrap();
+
+        let guard = crate::platform::fs::lock_file(&lock_path(&path)).unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_t = finished.clone();
+        let path_t = path.clone();
+        let daemon = std::thread::spawn(move || {
+            let mut updates = BTreeMap::new();
+            updates.insert(
+                "left-1111".into(),
+                Update {
+                    tracking: Some(([0.02, 0.03, 0.04], [0.0, 1.88, 0.0])),
+                    verified_accel: None,
+                    invalidated_from: None,
+                    updated_unix_s: 210,
+                },
+            );
+            merge_updates(&path_t, &updates).unwrap();
+            finished_t.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "merge_updates must wait for the exclusive lock"
+        );
+        let mut cal = load(&path);
+        cal.controllers.get_mut("left-1111").unwrap().verified_accel = Some([-0.04, 1.90, 0.10]);
+        save_unlocked(&path, &cal).unwrap();
+        drop(guard);
+
+        daemon.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        let final_entry = load(&path).controllers["left-1111"];
+        assert_eq!(final_entry.gyro, [0.02, 0.03, 0.04]);
+        assert_eq!(final_entry.verified_accel, Some([-0.04, 1.90, 0.10]));
+    }
+
+    #[test]
+    fn concurrent_calibration_and_daemon_updates_never_collide_or_lose_verified_accel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("imu-biases.json");
+        let cal_bias = Vector3::new(-0.04, 1.90, 0.10);
+        save_verified_accel(&path, &[("left-1111".into(), cal_bias)], 100).unwrap();
+
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                save_verified_accel(&p1, &[("left-1111".into(), cal_bias)], 200 + i).unwrap();
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                let mut updates = BTreeMap::new();
+                updates.insert(
+                    "left-1111".into(),
+                    Update {
+                        tracking: Some(([0.01, 0.02, 0.03], [-0.04, 1.89, 0.10])),
+                        verified_accel: None,
+                        invalidated_from: None,
+                        updated_unix_s: 300 + i,
+                    },
+                );
+                updates.insert(
+                    "right-2222".into(),
+                    Update {
+                        tracking: Some(([-0.01, 0.0, 0.01], [0.0, 0.3, 0.0])),
+                        verified_accel: None,
+                        invalidated_from: None,
+                        updated_unix_s: 300 + i,
+                    },
+                );
+                merge_updates(&p2, &updates).unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_file = load(&path);
+        assert_eq!(
+            final_file.controllers["left-1111"].verified_accel,
+            Some([-0.04, 1.90, 0.10])
+        );
+        assert_eq!(final_file.controllers["left-1111"].gyro, [0.01, 0.02, 0.03]);
+        assert_eq!(
+            final_file.controllers["right-2222"].gyro,
+            [-0.01, 0.0, 0.01]
+        );
     }
 }

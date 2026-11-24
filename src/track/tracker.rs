@@ -44,6 +44,35 @@ const WRONG_LOCK_MAX_REFUSED: usize = 4;
 
 /// Dropped wrong-lock orientations, carried on by the gyro, and how the engine behaved during
 /// their refusal window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Provisional {
+    t: u64,
+    /// Acquired inside the cold accelerometer-bias tilt band (`steady_up_with_raw`): must be
+    /// confirmed by a second sensor (`track_confirmed`), never by a repeated strong engine pose from
+    /// the same camera.
+    needs_peer: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CamRefusal {
+    camera: usize,
+    since: u64,
+    last_t: u64,
+    count: u32,
+}
+
+/// Repeated tilt-gate refusals of a resting pose while `bias_ref` is set, when the pose still fits
+/// raw gravity within the physically plausible hardware-bias band. At least two distinct sensors
+/// each sustaining the same refused orientation across `wrong_lock_memory_ns` exhaust one
+/// stale-reference window (two windows invalidate the verified reference without needing an
+/// acquired track first).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TiltRefusal {
+    last_t: u64,
+    first_q: UnitQuaternion<f64>,
+    cams: [Option<CamRefusal>; WRONG_LOCK_MAX_REFUSED],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WrongLock {
     t: u64,
@@ -530,11 +559,11 @@ pub struct Tracker {
     /// while the controller moves.
     refused_by: Vec<(usize, UnitQuaternion<f64>)>,
     /// The exposure of an acquisition no second sensor has confirmed yet, one from an engine pose
-    /// rated only good or from the tracker's own search (`search_kept`): either can fit one view
-    /// and be wrong. Until a second sensor confirms it the track takes updates but is not
-    /// published; if none has within `SearchParams::confirm_within_ns`, the track is dropped, and
-    /// with it the kept orientation.
-    provisional: Option<u64>,
+    /// rated only good or from the tracker's own search (`search_kept`), or inside the cold
+    /// accelerometer-bias tilt band: any of these can fit one view and be wrong. Until confirmed
+    /// the track takes updates but is not published; if none confirms within
+    /// `SearchParams::confirm_within_ns`, the track is dropped, and with it the kept orientation.
+    provisional: Option<Provisional>,
     /// A track acquired with no orientation to check it against, while the engine's pose or one
     /// of its ring turns still explains the frames about as well as the track: one frame can
     /// favour an alias (the engine itself locks onto one), and gravity cannot settle it while the
@@ -567,6 +596,8 @@ pub struct Tracker {
     bias_verifier: BiasVerifier,
     /// A dropped wrong lock's orientation, carried on by the gyro.
     wrong_lock: Option<WrongLock>,
+    /// Repeated tilt-gate refusals against a verified reference (see `TiltRefusal`).
+    tilt_refusals: [Option<TiltRefusal>; WRONG_LOCK_MAX_REFUSED],
     /// Accelerometer bias (`ba`) that triggered the most recent wrong-lock drop, for diagnostics.
     last_wrong_lock_ba: Option<Vector3<f64>>,
     /// The LED constellation's ring aliases, tested at acquisition.
@@ -743,6 +774,7 @@ impl Tracker {
             track_acquired_at: 0,
             bias_verifier: BiasVerifier::default(),
             wrong_lock: None,
+            tilt_refusals: [None; WRONG_LOCK_MAX_REFUSED],
             last_wrong_lock_ba: None,
             aliases,
             refuted: None,
@@ -985,6 +1017,7 @@ impl Tracker {
         self.bias_pending = None;
         self.track_acquired_at = 0;
         self.bias_verifier.clear();
+        self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
     }
 
     /// Host time exposed a discontinuity that the controller's elapsed time concealed.
@@ -1097,6 +1130,7 @@ impl Tracker {
         self.bias_ref_invalidated = false;
         self.stale_ref_windows = 0;
         self.cold_bias_tolerance = false;
+        self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
         let sd = sd_accel.max(1e-3);
         match &mut self.saved_bias {
             Some(f) => {
@@ -1189,12 +1223,105 @@ impl Tracker {
         self.enable_cold_bias_tolerance();
     }
 
+    fn note_verified_tilt_refusal(&mut self, t: u64, camera: usize, q: UnitQuaternion<f64>) {
+        let window = self.params.wrong_lock_memory_ns;
+        let active_gap = self.params.max_refusing_ns;
+        for slot in &mut self.tilt_refusals {
+            if slot.is_some_and(|tr| t.abs_diff(tr.last_t) > window) {
+                *slot = None;
+            }
+        }
+        if let Some(tr) = self
+            .tilt_refusals
+            .iter_mut()
+            .flatten()
+            .find(|tr| q.angle_to(&tr.first_q) <= self.params.wrong_lock_turn_rad)
+        {
+            tr.last_t = tr.last_t.max(t);
+            for cslot in &mut tr.cams {
+                if cslot.is_some_and(|c| t.abs_diff(c.last_t) > window) {
+                    *cslot = None;
+                }
+            }
+            if let Some(c) = tr.cams.iter_mut().flatten().find(|c| c.camera == camera) {
+                c.since = c.since.min(t);
+                c.last_t = c.last_t.max(t);
+                c.count = c.count.saturating_add(1);
+            } else {
+                let fresh_cam = CamRefusal {
+                    camera,
+                    since: t,
+                    last_t: t,
+                    count: 1,
+                };
+                if let Some(empty) = tr.cams.iter_mut().find(|c| c.is_none()) {
+                    *empty = Some(fresh_cam);
+                } else if let Some((victim, _)) =
+                    tr.cams.iter().enumerate().min_by_key(|&(_, c)| {
+                        let c = c.unwrap();
+                        (c.count >= COLD_BIAS_MIN_REFUSALS, c.count, c.last_t)
+                    })
+                {
+                    tr.cams[victim] = Some(fresh_cam);
+                }
+            }
+            let sustained = tr
+                .cams
+                .iter()
+                .flatten()
+                .filter(|c| {
+                    c.count >= COLD_BIAS_MIN_REFUSALS
+                        && c.last_t.saturating_sub(c.since) >= window
+                        && t.abs_diff(c.last_t) <= active_gap
+                })
+                .count();
+            if sustained >= 2 {
+                self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
+                self.note_wrong_lock_window_exhausted();
+            }
+            return;
+        }
+        let mut cams = [None; WRONG_LOCK_MAX_REFUSED];
+        cams[0] = Some(CamRefusal {
+            camera,
+            since: t,
+            last_t: t,
+            count: 1,
+        });
+        let fresh = TiltRefusal {
+            last_t: t,
+            first_q: q,
+            cams,
+        };
+        if let Some(empty) = self.tilt_refusals.iter_mut().find(|s| s.is_none()) {
+            *empty = Some(fresh);
+            return;
+        }
+        let victim = self
+            .tilt_refusals
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, s)| {
+                let tr = s.unwrap();
+                let n_cams = tr.cams.iter().flatten().count();
+                (n_cams >= 2, tr.last_t)
+            })
+            .map(|(i, _)| i)
+            .unwrap();
+        self.tilt_refusals[victim] = Some(fresh);
+    }
+
     fn enable_cold_bias_tolerance(&mut self) {
         let cleared_ref = self.bias_ref.take().is_some();
         if cleared_ref {
             self.bias_ref_invalidated = true;
+            if !self.tracking() {
+                self.forget_track();
+            }
+            self.acquired_bias = None;
         }
         self.stale_ref_windows = 0;
+        self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
         self.cold_bias_tolerance = true;
         let sd = self.cold_ba_sd();
         if let Some(sb) = &mut self.saved_bias {
@@ -1227,6 +1354,7 @@ impl Tracker {
                 wl.alt_sustained = true;
             }
             self.stale_ref_windows = 0;
+            self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
         }
     }
 
@@ -1544,7 +1672,7 @@ impl Tracker {
         self.stats.frames += 1;
         if self
             .provisional
-            .is_some_and(|t| t_e.saturating_sub(t) > self.params.search.confirm_within_ns)
+            .is_some_and(|p| t_e.saturating_sub(p.t) > self.params.search.confirm_within_ns)
         {
             self.stats.unconfirmed_acquisitions += 1;
             self.forget_track();
@@ -1611,7 +1739,7 @@ impl Tracker {
         // kept orientation the track was found with refuses its turn: then it is a flip
         let settling =
             engine.filter(|e| e.strong && labelled.len() >= self.params.acquire_min_leds);
-        if let (Some(_), Some(e)) = (self.provisional, settling) {
+        if let (Some(prov), Some(e)) = (self.provisional, settling) {
             if let Some((_, prior)) = self.state_at(t_e) {
                 let track = self.body.world_from_model(&prior.x);
                 let turned = track.rotation.angle_to(&e.world_from_model.rotation)
@@ -1622,7 +1750,9 @@ impl Tracker {
                 let remembered = self.last_confirmed != 0
                     && t_e.saturating_sub(self.last_confirmed) <= self.params.orientation_memory_ns;
                 if !turned && !moved {
-                    self.provisional = None;
+                    if !prov.needs_peer {
+                        self.provisional = None;
+                    }
                 } else if !(turned && remembered) {
                     self.give_up_fix();
                 }
@@ -1958,24 +2088,37 @@ impl Tracker {
         };
         self.ambiguous_since = 0;
         // lying still, the accelerometer knows which way is up
+        let mut needs_peer = false;
         let steady_ba = carried
             .map(|f| f.x.ba)
             .or(self.bias_ref)
             .unwrap_or_default();
-        if let Some(up) = self.steady_up(t_e, steady_ba) {
-            let tilt = (chosen.0.x.q.inverse() * Vector3::y()).angle(&up);
+        if let Some((up, raw_up)) = self.steady_up_with_raw(t_e, steady_ba) {
+            let pose_up = chosen.0.x.q.inverse() * Vector3::y();
+            let tilt = pose_up.angle(&up);
             if tilt > self.params.still_max_tilt_rad {
                 // Without a verified bias, a large hardware offset perpendicular to gravity tilts
                 // raw `up` by up to atan(max_accel_bias_cold / g) (~17 deg) while passing the
                 // magnitude check. Refuse tilts beyond that outright; inside the bias-tilt band,
                 // require a second sensor to confirm instead of locking out a resting biased hand.
+                // With a verified bias, allow two agreeing sensors inside the physically plausible
+                // raw-gravity band to exhaust stale-reference windows so a stale perpendicular
+                // reference cannot lock out a resting controller forever.
                 let cold_max = self.params.still_max_tilt_rad
                     + (self.params.max_accel_bias_cold / self.params.gravity).atan();
-                if self.bias_ref.is_some() || tilt > cold_max {
+                if self.bias_ref.is_some() {
+                    if pose_up.angle(&raw_up) <= cold_max {
+                        self.note_verified_tilt_refusal(t_e, camera, chosen.0.x.q);
+                    }
+                    self.stats.refused_acquisitions += 1;
+                    return Outcome::Waiting;
+                }
+                if tilt > cold_max {
                     self.stats.refused_acquisitions += 1;
                     return Outcome::Waiting;
                 }
                 unconfirmed = true;
+                needs_peer = true;
             }
         }
         // a turned pose can be the orientation of a lock just dropped as wrong
@@ -1988,13 +2131,14 @@ impl Tracker {
                 }
             }
         }
+        self.tilt_refusals = [None; WRONG_LOCK_MAX_REFUSED];
         if turned {
             self.stats.alias_turns += 1;
         }
         if unconfirmed {
             self.refusing_since = 0;
         }
-        self.provisional = unconfirmed.then_some(t_e);
+        self.provisional = unconfirmed.then_some(Provisional { t: t_e, needs_peer });
         // labels from an engine pose turned from the track's are a flip or a mislabel
         self.engine_labels_off = turned || refused;
         let (prior, fit) = chosen;
@@ -2419,9 +2563,10 @@ impl Tracker {
         }
     }
 
-    /// Gravity's direction in the controller at controller time `t`, less the bias `ba`, when the
-    /// accelerometer held steady before it (see `Params::still_max_tilt_rad`).
-    fn steady_up(&self, t: u64, ba: Vector3<f64>) -> Option<Vector3<f64>> {
+    /// Gravity's direction in the controller at controller time `t`, less the bias `ba`, alongside
+    /// the raw steady acceleration direction, when the accelerometer held steady before `t` (see
+    /// `Params::still_max_tilt_rad`).
+    fn steady_up_with_raw(&self, t: u64, ba: Vector3<f64>) -> Option<(Vector3<f64>, Vector3<f64>)> {
         let k = self.imu.partition_point(|s| s.t <= t);
         let from = t.saturating_sub(self.params.steady_window_ns);
         // the window must be covered: a sample at or before its start
@@ -2433,7 +2578,12 @@ impl Tracker {
         let mean = win.clone().map(|s| s.accel).sum::<Vector3<f64>>() / win.len() as f64;
         let steady = win.all(|s| (s.accel - mean).norm() < self.params.steady_accel)
             && ((mean - ba).norm() - self.params.gravity).abs() < self.params.steady_accel;
-        steady.then(|| (mean - ba).normalize())
+        steady.then(|| ((mean - ba).normalize(), mean.normalize()))
+    }
+
+    #[cfg(test)]
+    fn steady_up(&self, t: u64, ba: Vector3<f64>) -> Option<Vector3<f64>> {
+        self.steady_up_with_raw(t, ba).map(|(up, _)| up)
     }
 
     /// How badly an acquisition hypothesis explains its frame (see `Params::alias_sigma_px`).
@@ -4383,7 +4533,10 @@ mod tests {
         }
         assert!(tr.tracking() && tr.last_confirmed != 0);
         // as if the track were an unconfirmed one, 30 cm off
-        tr.provisional = Some(tr.last_fix);
+        tr.provisional = Some(Provisional {
+            t: tr.last_fix,
+            needs_peer: false,
+        });
         for (_, f) in tr.history.iter_mut() {
             f.x.p += Vector3::new(0.3, 0.0, 0.0);
         }
@@ -6083,15 +6236,54 @@ mod tests {
             "unconfirmed single-sensor pose must not publish"
         );
         assert_eq!(tr.stats.refused_acquisitions, 0);
+        // A second agreeing strong engine pose from the same sensor must NOT confirm it.
+        for tick in 1..=10u64 {
+            tr.imu(ImuSample {
+                t: t_e + tick * 2_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(1.9, G, 0.0),
+            });
+        }
+        let out0_again = tr.frame(
+            t_e + 20_000_000,
+            0,
+            &w.cams[0],
+            &b0,
+            Some(EnginePose::strong(pose)),
+            &[],
+        );
+        assert!(
+            matches!(out0_again, Outcome::Updated(_)),
+            "got {out0_again:?}"
+        );
+        assert!(
+            tr.provisional.is_some(),
+            "same camera must not clear tilt-band provisional state"
+        );
+        assert!(
+            !tr.tracking(),
+            "same-camera strong pose must not publish tilt-band acquisition"
+        );
+        // An independent second sensor confirms and publishes it.
         let b1 = blobs_at(&w.cams[1], &pose);
-        let out1 = tr.frame(t_e, 1, &w.cams[1], &b1, Some(EnginePose::strong(pose)), &[]);
+        let out1 = tr.frame(
+            t_e + 20_000_000,
+            1,
+            &w.cams[1],
+            &b1,
+            Some(EnginePose::strong(pose)),
+            &[],
+        );
         assert!(matches!(out1, Outcome::Updated(_)), "got {out1:?}");
         assert!(
             tr.tracking(),
             "second sensor must confirm resting biased hand"
         );
 
-        // Part B: 10-deg wrong pose at rest on 1 sensor with zero bias stays unconfirmed (not published).
+        // Part B: 10-deg wrong pose at rest on 1 sensor with zero bias stays unconfirmed even
+        // across repeated agreeing strong engine poses from the same camera, and drops without
+        // ever publishing when no second sensor confirms.
         let tilted10 = Isometry3::from_parts(
             pose.translation,
             UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 10f64.to_radians()),
@@ -6110,19 +6302,61 @@ mod tests {
         assert!(matches!(out_w, Outcome::Acquired(_)), "got {out_w:?}");
         assert!(tr_wrong.provisional.is_some());
         assert!(!tr_wrong.tracking());
-        // If no second sensor confirms within confirm_within_ns, the provisional pose is dropped.
-        let t_late = t_e + tr_wrong.params.search.confirm_within_ns + 50_000_000;
-        for tick in 1..=200u64 {
-            tr_wrong.imu(ImuSample {
+        let mut cur_tick = 0u64;
+        for dt_ms in [20u64, 40] {
+            let target_tick = dt_ms / 2;
+            while cur_tick < target_tick {
+                cur_tick += 1;
+                tr_wrong.imu(ImuSample {
+                    t: t_e + cur_tick * 2_000_000,
+                    hidden: None,
+                    gyro: Vector3::zeros(),
+                    accel: Vector3::new(0.0, G, 0.0),
+                });
+            }
+            let out_same = tr_wrong.frame(
+                t_e + dt_ms * 1_000_000,
+                0,
+                &w.cams[0],
+                &bw,
+                Some(EnginePose::strong(tilted10)),
+                &[],
+            );
+            assert!(matches!(out_same, Outcome::Updated(_)), "got {out_same:?}");
+            assert!(
+                tr_wrong.provisional.is_some(),
+                "same camera must not clear tilt-band provisional state"
+            );
+            assert!(
+                !tr_wrong.tracking(),
+                "same-camera strong pose must not publish tilted wrong lock"
+            );
+        }
+        // Without a second sensor, a provisional tilt-band pose expires after confirm_within_ns.
+        let mut tr_expire = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        feed_still(&mut tr_expire, Vector3::new(0.0, G, 0.0));
+        let out_e = tr_expire.frame(
+            t_e,
+            0,
+            &w.cams[0],
+            &bw,
+            Some(EnginePose::strong(tilted10)),
+            &[],
+        );
+        assert!(matches!(out_e, Outcome::Acquired(_)), "got {out_e:?}");
+        let t_late = t_e + tr_expire.params.search.confirm_within_ns + 50_000_000;
+        let ticks = (t_late - t_e) / 2_000_000;
+        for tick in 1..=ticks {
+            tr_expire.imu(ImuSample {
                 t: t_e + tick * 2_000_000,
                 hidden: None,
                 gyro: Vector3::zeros(),
                 accel: Vector3::new(0.0, G, 0.0),
             });
         }
-        let _ = tr_wrong.frame(t_late, 0, &w.cams[0], &bw, None, &[]);
-        assert_eq!(tr_wrong.stats.unconfirmed_acquisitions, 1);
-        assert!(!tr_wrong.tracking());
+        let _ = tr_expire.frame(t_late, 0, &w.cams[0], &bw, None, &[]);
+        assert_eq!(tr_expire.stats.unconfirmed_acquisitions, 1);
+        assert!(!tr_expire.tracking());
 
         // Part C: verified bias (0) refuses a 10-deg tilt outright; cold refuses > cold_max (30 deg).
         let mut tr_ver = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
@@ -6199,6 +6433,278 @@ mod tests {
         assert!(tr.accel_bias_invalidated());
         assert!(tr.cold_bias_tolerance);
         assert_eq!(tr.stale_ref_windows, 0);
+    }
+
+    /// A stale verified accelerometer bias perpendicular to gravity can trip `steady_up_with_raw`'s
+    /// tilt gate (~8.7 deg for 1.5 m/s^2) while still passing its magnitude check. Repeated
+    /// agreeing refusals from two sensors across two memory windows must invalidate the stale
+    /// reference so the resting controller recovers without requiring movement or an acquired track
+    /// first, even when a third sensor interleaves a conflicting orientation or the first camera
+    /// drops out and two peers sustain it.
+    #[test]
+    fn a_stale_verified_accel_bias_recovers_from_tilt_gate_refusals_with_two_sensors() {
+        let w = world(5);
+        let pose =
+            Isometry3::from_parts(Translation3::new(0.0, 1.0, 0.0), UnitQuaternion::identity());
+        let alias = Isometry3::from_parts(
+            pose.translation,
+            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 180f64.to_radians())
+                * UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 12f64.to_radians()),
+        );
+        let mut rng = Rng::new(11);
+        let b0 = sight_posed(&w, &w.cams[0], &pose, &mut rng, 0.0);
+        let b0_alias = sight_posed(&w, &w.cams[0], &alias, &mut rng, 0.0);
+        let b1 = sight_posed(&w, &w.cams[1], &pose, &mut rng, 0.0);
+        let b2 = sight_posed(&w, &w.cams[2], &pose, &mut rng, 0.0);
+
+        let mut tr = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        let stale = Vector3::new(1.5, 0.0, 0.0);
+        tr.seed_verified_accel(stale, crate::track::biases::SEED_SD_ACCEL);
+
+        let t0 = 1_000_000_000u64;
+        for tick in 0..=100u64 {
+            tr.imu(ImuSample {
+                t: t0 + tick * 2_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            });
+        }
+        let mut cur_t = t0 + 200_000_000;
+        let mut next_frame = cur_t;
+        let mut checked_single_window = false;
+        let mut recovered_at = None;
+        let mut sent_cam0_once = false;
+        for _ in 0..3000 {
+            cur_t += 2_000_000;
+            tr.imu(ImuSample {
+                t: cur_t,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            });
+            if cur_t >= next_frame {
+                // Cam 0 sees the true pose once then interleaves a conflicting alias (proving
+                // first-camera dropout and competing orientations cannot wedge recovery), while
+                // cams 1 + 2 sustain the true pose with out-of-order timestamps.
+                if !sent_cam0_once {
+                    sent_cam0_once = true;
+                    let _ = tr.frame(
+                        cur_t,
+                        0,
+                        &w.cams[0],
+                        &b0,
+                        Some(EnginePose::strong(pose)),
+                        &[],
+                    );
+                } else {
+                    let _ = tr.frame(
+                        cur_t,
+                        0,
+                        &w.cams[0],
+                        &b0_alias,
+                        Some(EnginePose::strong(alias)),
+                        &[],
+                    );
+                }
+                let _ = tr.frame(
+                    cur_t,
+                    1,
+                    &w.cams[1],
+                    &b1,
+                    Some(EnginePose::strong(pose)),
+                    &[],
+                );
+                let _ = tr.frame(
+                    cur_t - 2_000_000,
+                    2,
+                    &w.cams[2],
+                    &b2,
+                    Some(EnginePose::strong(pose)),
+                    &[],
+                );
+                next_frame += 20_000_000;
+                let elapsed = cur_t - (t0 + 200_000_000);
+                if !checked_single_window && elapsed >= 2_500_000_000 {
+                    checked_single_window = true;
+                    assert_eq!(
+                        tr.verified_accel_bias(),
+                        Some(stale),
+                        "a single tilt-refusal window must not clear a verified bias"
+                    );
+                    assert_eq!(tr.stale_ref_windows, 1);
+                    assert!(!tr.tracking());
+                }
+                if recovered_at.is_none() && tr.tracking() && tr.track_confirmed {
+                    recovered_at = Some(elapsed);
+                }
+            }
+        }
+        assert!(checked_single_window);
+        assert!(
+            recovered_at.is_some(),
+            "two agreeing sensors must recover from stale perpendicular verified bias (refused={})",
+            tr.stats.refused_acquisitions
+        );
+        assert_eq!(tr.verified_accel_bias(), None);
+        assert!(tr.accel_bias_invalidated());
+        assert!(tr.cold_bias_tolerance);
+        assert_eq!(tr.stats.wrong_locks, 0);
+        let out = tr.output().expect("recovered tracker publishes pose");
+        assert!((out.world_from_model.translation.vector - pose.translation.vector).norm() < 0.02);
+    }
+
+    /// A single camera repeatedly offering a tilted pose, isolated stray peer frames, a short
+    /// two-sensor burst, or two cameras offering a pose far beyond the physically plausible
+    /// hardware-bias band must never invalidate a verified bias.
+    #[test]
+    fn single_camera_or_extreme_tilt_refusals_do_not_invalidate_verified_accel_bias() {
+        let w = world(5);
+        let pose =
+            Isometry3::from_parts(Translation3::new(0.0, 1.0, 0.0), UnitQuaternion::identity());
+        let tilted45 = Isometry3::from_parts(
+            pose.translation,
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 45f64.to_radians()),
+        );
+        let mut rng = Rng::new(13);
+        let b0 = sight_posed(&w, &w.cams[0], &pose, &mut rng, 0.0);
+        let b1 = sight_posed(&w, &w.cams[1], &pose, &mut rng, 0.0);
+        let b0_far = sight_posed(&w, &w.cams[0], &tilted45, &mut rng, 0.0);
+        let b1_far = sight_posed(&w, &w.cams[1], &tilted45, &mut rng, 0.0);
+
+        let seed = Vector3::new(1.5, 0.0, 0.0);
+        let mut tr_one = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr_one.seed_verified_accel(seed, crate::track::biases::SEED_SD_ACCEL);
+        let mut tr_stray = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr_stray.seed_verified_accel(seed, crate::track::biases::SEED_SD_ACCEL);
+        let mut tr_burst = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr_burst.seed_verified_accel(seed, crate::track::biases::SEED_SD_ACCEL);
+        let mut tr_far = Tracker::new(1, w.body.clone(), Params::default(), w.cams.len());
+        tr_far.seed_verified_accel(seed, crate::track::biases::SEED_SD_ACCEL);
+
+        let t0 = 1_000_000_000u64;
+        for tick in 0..=100u64 {
+            let s = ImuSample {
+                t: t0 + tick * 2_000_000,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            };
+            tr_one.imu(s);
+            tr_stray.imu(s);
+            tr_burst.imu(s);
+            tr_far.imu(s);
+        }
+        let mut cur_t = t0 + 200_000_000;
+        let mut next_frame = cur_t;
+        let mut stray_hits = 0u32;
+        let mut burst_frames = 0u32;
+        for _ in 0..3000 {
+            cur_t += 2_000_000;
+            let s = ImuSample {
+                t: cur_t,
+                hidden: None,
+                gyro: Vector3::zeros(),
+                accel: Vector3::new(0.0, G, 0.0),
+            };
+            tr_one.imu(s);
+            tr_stray.imu(s);
+            tr_burst.imu(s);
+            tr_far.imu(s);
+            if cur_t >= next_frame {
+                let elapsed = cur_t - (t0 + 200_000_000);
+                let _ = tr_one.frame(
+                    cur_t,
+                    0,
+                    &w.cams[0],
+                    &b0,
+                    Some(EnginePose::strong(pose)),
+                    &[],
+                );
+                let _ = tr_stray.frame(
+                    cur_t,
+                    0,
+                    &w.cams[0],
+                    &b0,
+                    Some(EnginePose::strong(pose)),
+                    &[],
+                );
+                // Three sparse stray peer frames across 2.1 s (< COLD_BIAS_MIN_REFUSALS) must not
+                // exhaust a window even though their span exceeds wrong_lock_memory_ns.
+                if (stray_hits == 0 && elapsed >= 100_000_000)
+                    || (stray_hits == 1 && elapsed >= 1_500_000_000)
+                    || (stray_hits == 2 && elapsed >= 2_200_000_000)
+                {
+                    stray_hits += 1;
+                    let _ = tr_stray.frame(
+                        cur_t,
+                        1,
+                        &w.cams[1],
+                        &b1,
+                        Some(EnginePose::strong(pose)),
+                        &[],
+                    );
+                }
+                // A short 2-sensor burst (< 200 ms) must not exhaust a window either.
+                if burst_frames < 8 {
+                    burst_frames += 1;
+                    let _ = tr_burst.frame(
+                        cur_t,
+                        0,
+                        &w.cams[0],
+                        &b0,
+                        Some(EnginePose::strong(pose)),
+                        &[],
+                    );
+                    let _ = tr_burst.frame(
+                        cur_t,
+                        1,
+                        &w.cams[1],
+                        &b1,
+                        Some(EnginePose::strong(pose)),
+                        &[],
+                    );
+                }
+                let _ = tr_far.frame(
+                    cur_t,
+                    0,
+                    &w.cams[0],
+                    &b0_far,
+                    Some(EnginePose::strong(tilted45)),
+                    &[],
+                );
+                let _ = tr_far.frame(
+                    cur_t,
+                    1,
+                    &w.cams[1],
+                    &b1_far,
+                    Some(EnginePose::strong(tilted45)),
+                    &[],
+                );
+                next_frame += 20_000_000;
+            }
+        }
+        assert_eq!(tr_one.verified_accel_bias(), Some(seed));
+        assert!(!tr_one.accel_bias_invalidated());
+        assert!(!tr_one.tracking());
+        assert_eq!(tr_one.stale_ref_windows, 0);
+        assert!(tr_one.stats.refused_acquisitions > 100);
+
+        assert_eq!(tr_stray.verified_accel_bias(), Some(seed));
+        assert!(!tr_stray.accel_bias_invalidated());
+        assert!(!tr_stray.tracking());
+        assert_eq!(tr_stray.stale_ref_windows, 0);
+
+        assert_eq!(tr_burst.verified_accel_bias(), Some(seed));
+        assert!(!tr_burst.accel_bias_invalidated());
+        assert!(!tr_burst.tracking());
+        assert_eq!(tr_burst.stale_ref_windows, 0);
+
+        assert_eq!(tr_far.verified_accel_bias(), Some(seed));
+        assert!(!tr_far.accel_bias_invalidated());
+        assert!(!tr_far.tracking());
+        assert_eq!(tr_far.stale_ref_windows, 0);
+        assert!(tr_far.stats.refused_acquisitions > 100);
     }
 }
 

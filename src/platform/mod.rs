@@ -87,6 +87,15 @@ pub mod fs {
     pub fn swap_dir(stage: &Path, dir: &Path, exists: bool) -> io::Result<()> {
         os::swap_dir(stage, dir, exists)
     }
+
+    /// An exclusive advisory lock held on a lock file until dropped.
+    pub struct FileLock(#[allow(dead_code)] os::FileLock);
+
+    /// Opens (creating if absent, private to this user, not following links) `path` and acquires
+    /// an exclusive blocking lock on it until the returned guard is dropped.
+    pub fn lock_file(path: &Path) -> io::Result<FileLock> {
+        os::lock_file(path).map(FileLock)
+    }
 }
 
 pub mod dylib {
