@@ -1285,12 +1285,16 @@ fn tilt_deg(d: &Daemon) -> f64 {
     d.tilt_mdeg.load(Ordering::Acquire) as f64 / 1000.0
 }
 
-/// The settings as they are now: what every change saves, so that none drops another.
+/// The settings as they are now: what every change saves, so that none drops another. The
+/// dongle's exposure offset is a calibration the daemon never changes: the file's is kept.
 fn current_settings(d: &Daemon) -> settings::Settings {
     let tilt_mdeg = d.tilt_mdeg.load(Ordering::Acquire);
     settings::Settings {
         tilt_deg: (tilt_mdeg != 0).then(|| tilt_mdeg as f64 / 1000.0),
         pin_base_station: d.base_pin.lock().unwrap().watch.enabled,
+        dongle_exposure_offset_ns: settings::load(&d.settings_path)
+            .ok()
+            .and_then(|s| s.dongle_exposure_offset_ns),
         ..settings::Settings::default()
     }
 }
@@ -13461,11 +13465,14 @@ mod tests {
             handle(&d, "tilt 50"),
             "err tilt must be a number of degrees within +-45"
         );
+        let mut kept = settings::load(&d.settings_path).unwrap();
+        kept.dongle_exposure_offset_ns = Some(3_500_000);
+        settings::save(&d.settings_path, &kept).unwrap();
         handle(&d, "tilt 0");
         assert_eq!(d.shm.alignment().unwrap().render_orient, a.render_orient);
         assert_eq!(
-            settings::load(&d.settings_path).map(|s| s.tilt_deg),
-            Ok(None)
+            settings::load(&d.settings_path).map(|s| (s.tilt_deg, s.dongle_exposure_offset_ns)),
+            Ok((None, Some(3_500_000)))
         );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
