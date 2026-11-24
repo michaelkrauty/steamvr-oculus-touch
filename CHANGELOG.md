@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.6.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) - 2026-11-24
+
 ### Added
 
 - `cv1touch status` now shows the battery level of each controller that is on, for example `left: 6DoF, battery 87 %`, and nothing for one that is asleep or out of range, since a controller sends its level only while it is awake. `status --json` gives it as `battery_percent` for each hand, or null then.

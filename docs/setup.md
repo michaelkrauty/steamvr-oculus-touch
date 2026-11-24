@@ -39,7 +39,7 @@ Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or r
 
 ## Install
 
-Start SteamVR once, so that it records where it is installed, then quit it and run `python3 scripts/install.py` from the repository root. If the installer does not find SteamVR, it says so before it builds anything. A clone of the `v0.5.1` tag or an extracted [v0.5.1 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.5.1) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
+Start SteamVR once, so that it records where it is installed, then quit it and run `python3 scripts/install.py` from the repository root. If the installer does not find SteamVR, it says so before it builds anything. A clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
 
 | Location | Purpose |
 | --- | --- |
@@ -171,11 +171,11 @@ The live status board lists every sensor. `camera_queue.dropped_frames` counts e
 
 **From v0.2.0 to v0.3.x:** update both the daemon and the SteamVR driver with the installer, then start SteamVR again. The shared-memory ABI changed from v3 to v4; mixing the two releases disconnects the controllers rather than reading incompatible poses. Calibration and settings are kept. Run `cv1touch doctor` and `cv1touch setup --check` after upgrading. The controllers now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch bindings, but custom bindings for the old controller type may need to be selected or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
 
-Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.5.1` with the desired published tag:
+Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.6.0` with the desired published tag:
 
 ```sh
 git fetch origin --tags
-git checkout --detach v0.5.1
+git checkout --detach v0.6.0
 python3 scripts/install.py
 ```
 
