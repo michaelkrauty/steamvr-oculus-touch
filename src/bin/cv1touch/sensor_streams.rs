@@ -343,7 +343,7 @@ fn with_sources(
         if calibrated.difference(&ignored).next().is_none() {
             return skip("no calibrated sensors are enabled");
         }
-        return pending("the tracking engine isn't running, so camera video couldn't be checked: check the headset's USB connection and power; check daemon logs for an engine open error");
+        return pending("the tracking engine isn't running, so camera video couldn't be checked: check the USB connection of the headset or dongle; check daemon logs for an engine open error");
     }
     if !status::has_received_frame_counters(current)
         && current["sensor_video_quality"] != true
@@ -2048,10 +2048,10 @@ mod tests {
             ),
             (
                 "waiting_headset",
-                "Waiting for the headset; this sensor is opened with it.",
+                "Waiting for the controllers' radio (headset or dongle); this sensor is opened with it.",
                 Outcome::Pending,
-                format!("not verified: SENSORX is plugged in. Waiting for the headset; this sensor is opened with it{settles}"),
-                "checking sensor_streams: SENSORX is plugged in. Waiting for the headset; this sensor is opened with it".to_string(),
+                format!("not verified: SENSORX is plugged in. Waiting for the controllers' radio (headset or dongle); this sensor is opened with it{settles}"),
+                "checking sensor_streams: SENSORX is plugged in. Waiting for the controllers' radio (headset or dongle); this sensor is opened with it".to_string(),
             ),
         ];
         for (state, detail, outcome, conclusion, board) in cases {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! cv1touchd: owns the Rift CV1 headset radio and sensors through the vendored OpenHMD engine and
-//! publishes both Touch controllers' state to shared memory.
+//! cv1touchd: owns the controllers' radio (a Rift CV1 headset or a FreeTouch dongle) and the
+//! sensors through the vendored OpenHMD engine and publishes both Touch controllers' state to
+//! shared memory.
 
 #[cfg(test)]
 #[path = "../../tests/support/socket_dir.rs"]
@@ -2594,7 +2595,7 @@ fn anchor_note(a: &exposure::Anchor) -> String {
 }
 
 /// One attempt to open the engine, with the sensors ready now. While it cannot open (the
-/// headset is missing), those sensors wait for the headset rather than for the engine.
+/// radio is missing), those sensors wait for the radio rather than for the engine.
 fn open_engine<E>(
     d: &Daemon,
     last_err: &mut String,
@@ -2625,7 +2626,7 @@ fn finish_engine_open<E>(
             *d.dongle_timing.lock().unwrap() = None;
             d.sensor_watch.lock().unwrap().open_failed();
             if err != *last_err {
-                log!("waiting for headset: {err}");
+                log!("waiting for the controllers' radio: {err}");
                 *last_err = err;
             }
             engine_unavailable(d, shm::now_ns());

@@ -852,7 +852,7 @@ impl Monitor {
             let failed = self.add_failed.get(serial).filter(|(a, _)| ours(a));
             let refused = self.refused.get(serial).is_some_and(ours);
             let (state, detail) = if self.engine_waiting && self.opening_serials.contains(serial) {
-                ("waiting_headset", "Waiting for the headset; this sensor is opened with it.")
+                ("waiting_headset", "Waiting for the controllers' radio (headset or dongle); this sensor is opened with it.")
             } else if (self.opening && self.opening_serials.contains(serial)) || self.adding.contains_key(serial) {
                 ("opening", ADDING_DETAIL)
             } else if let Some((_, detail)) = failed {
@@ -872,7 +872,7 @@ impl Monitor {
                 // waits until the driver interfaces are active. Say which one this build is.
                 ("waiting_usb", usb_access_detail())
             } else if self.opening { ("opening", OPENING_DETAIL) }
-            else if self.engine_waiting { ("waiting_headset", "Waiting for the headset; this sensor is opened with it.") }
+            else if self.engine_waiting { ("waiting_headset", "Waiting for the controllers' radio (headset or dongle); this sensor is opened with it.") }
             // the running engine adds it on its next pass, once its old object is released, or
             // when its retry is due
             else if self.running { ("opening", ADDING_DETAIL) }
