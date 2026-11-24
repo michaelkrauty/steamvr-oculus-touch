@@ -443,7 +443,7 @@ fn json_status() -> i32 {
 /// A check `doctor` makes: its name, whether it passed, and what it looked at or found.
 type DoctorCheck = (&'static str, bool, String);
 
-/// The Oculus USB vendor: the headset, its sensors and the Touch controllers' dongle.
+/// The Oculus USB vendor: the headset and its sensors.
 const OCULUS: u16 = 0x2833;
 
 /// What `doctor` checks, and the daemon's status if it answered. One cause gives one line:

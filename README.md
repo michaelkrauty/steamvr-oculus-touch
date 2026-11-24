@@ -4,12 +4,12 @@ Use first-generation Oculus Rift CV1 Touch controllers in SteamVR on Linux and W
 
 SteamVR Oculus Touch combines a Rust optical/inertial tracker and daemon, a native SteamVR driver, calibration tools, and a modified OpenHMD acquisition engine in one repository. SteamVR receives controller poses, buttons, capacitive touch, triggers, sticks, and haptics through its normal driver interfaces.
 
-**Status:** v0.5.1. Tested and working on Linux. Untested on Windows, but it should work. This project is independent of Meta, Oculus, and Valve.
+**Status:** v0.5.1. Tested and working on Linux with a CV1 headset. Untested on Windows and with a [FreeTouch dongle in place of the headset](docs/no-headset.md), but both should work. This project is independent of Meta, Oculus, and Valve.
 
 ## Hardware and software
 
-- Original **Rift CV1 Touch** controllers, already paired to a CV1 headset. Rift S and Quest Touch controllers are unsupported. Pairing is not implemented here.
-- A **CV1 headset connected over USB**, used as the controllers' radio receiver. The CV1 display is not used by this driver.
+- Original **Rift CV1 Touch** controllers, paired to a CV1 headset or to a FreeTouch dongle. Rift S and Quest Touch controllers are unsupported. cv1touch does not pair controllers itself.
+- A radio for the controllers: a **CV1 headset connected over USB** (its display is not used), or a FreeTouch USB dongle ([without a Rift headset](docs/no-headset.md)).
 - Two or more CV1 tracking sensors with overlapping views of the play area ([adding sensors](docs/setup.md#add-or-remove-sensors)).
 - A working native Linux SteamVR installation and an independently tracked SteamVR headset for coordinate registration. A separate reference controller is optional.
 - Linux x86-64, Rust 1.85 or newer, and the native build dependencies below. The default service setup uses systemd user services and logind device access.

@@ -33,7 +33,7 @@ sudo install -m 0644 udev/70-cv1touch.rules /etc/udev/rules.d/70-cv1touch.rules
 sudo udevadm control --reload-rules
 ```
 
-Reconnect the CV1 headset and sensors after reloading the rules. The rule grants the active local seat user access through logind ACLs to Oculus USB and hidraw devices. A remote-only or headless session may need administrator-managed device-group permissions instead; the provided rule intentionally does not make devices world-writable.
+Reconnect the CV1 headset or FreeTouch dongle and the sensors after reloading the rules. The rule grants the active local seat user access through logind ACLs to Oculus USB and hidraw devices. A remote-only or headless session may need administrator-managed device-group permissions instead; the provided rule intentionally does not make devices world-writable.
 
 Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or report incomplete frames, check the kernel USB log and try distributing sensors between USB controllers. Additional sensors do not help when their transfers cannot be sustained.
 
@@ -97,7 +97,7 @@ Recordings keep 2 to 20 GiB of disk space free (5% of the disk, within those bou
 
 ## Calibrate and align
 
-Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. A previously paired CV1 headset supplies the radio link; your other SteamVR headset supplies the reference pose.
+Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. The CV1 headset, or a [FreeTouch dongle](no-headset.md), supplies the radio link; your other SteamVR headset supplies the reference pose.
 
 1. Start the service and wake both controllers. `cv1touch status --json` should show every connected sensor receiving frames. Ensure every sensor has a useful view of the play area and overlaps another sensor. `cv1touch status` is a continuously updating dashboard; Ctrl+C exits it.
 2. Run `cv1touch calibrate`. Follow the timed 60-second capture: move both controllers slowly throughout the space and turn them through varied orientations. Spend time in overlapping views. The solver rejects insufficient or inconsistent observations and preserves the previous calibration when it succeeds. A rejected solve is a request for a better capture, not a reason to use `--force` routinely.
@@ -149,7 +149,7 @@ The left controller's Menu button stays SteamVR's own: it opens the SteamVR menu
 
 ## Add or remove sensors
 
-Connect or unplug sensors while the daemon runs. The daemon normally notices a settled USB change in about two seconds and adds a connected sensor without restarting the tracking engine. USB access, other pending sensors or a failed start can delay or prevent it. Its frames are used once its video is in step with the headset. While no engine runs (the headset is missing, or the daemon is changing tracking mode), the engine tries to open the sensor as it starts.
+Connect or unplug sensors while the daemon runs. The daemon normally notices a settled USB change in about two seconds and adds a connected sensor without restarting the tracking engine. USB access, other pending sensors or a failed start can delay or prevent it. Its frames are used once its video is in step with the controllers' radio. While no engine runs (the radio is missing, or the daemon is changing tracking mode), the engine tries to open the sensor as it starts.
 
 `cv1touch status` and `cv1touch doctor` show why a new sensor is waiting: the engine opening it, USB access not ready yet, or why the engine could not open it, with what to do. Check `cv1touch status --json`: `sensor_total` should match the number admitted, every sensor's `frames` counter should advance, and in calibrated mode a new sensor has `placed: 0` until calibrated. Without saved calibration, the daemon still uses provisional sensor placement. There is no fixed sensor-count limit. USB transport, memory, and processing capacity still apply; distribute cameras across available USB controllers and check the logs if an open or stream start fails. A device that was busy or not there yet is tried again a second later, up to three times; a sensor whose video could not start is not tried again until it is plugged in again, so move it to a different USB controller and the daemon starts it there. To leave particular cameras closed, pass `--ignore-sensor SERIAL` to the daemon; the option is repeatable, and serials match without regard to letter case. The same applies to camera serials typed into calibration commands and read from recordings. Re-placing an existing sensor keeps its saved spelling and, if it is the reference sensor, keeps it as the reference.
 
