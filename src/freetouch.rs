@@ -266,7 +266,10 @@ impl Parser {
                 Record::Reply(r) => break Some(Event::Reply(r)),
                 Record::Input(input) => {
                     let Some(key) = self.key else {
+                        // Without a key the record boundary is unauthenticated: a cut record's
+                        // magic over the next record's bytes would otherwise swallow the identity.
                         self.losses.no_key += 1;
+                        at -= RECORD_SIZE - 1;
                         continue;
                     };
                     let Some(report) = decrypt(&key, &input) else {
@@ -443,7 +446,7 @@ mod tests {
         assert_eq!(
             p.losses,
             Losses {
-                skipped: 53,
+                skipped: 106,
                 missing: 0,
                 bad_mic: 1,
                 no_key: 1,
@@ -488,6 +491,38 @@ mod tests {
         );
         p.push(&last[53..]);
         assert_eq!(reports(&mut p), [(2, report(6))]);
+    }
+
+    #[test]
+    fn a_cut_input_before_the_identity_does_not_swallow_it() {
+        let mut p = Parser::new();
+        // A truncated CV1I whose first 20 bytes pass parse() once the identity's bytes follow.
+        p.push(&encode_input(&KEY, 1, 0, 0, 2, 1, &report(1))[..20]);
+        p.push(&identity(&KEY));
+        p.push(&encode_input(&KEY, 2, 2000, 0, 2, 1, &report(2)));
+        assert_eq!(reports(&mut p), [(2, report(2))]);
+        assert_eq!(
+            p.losses,
+            Losses {
+                skipped: 19,
+                missing: 0,
+                bad_mic: 0,
+                no_key: 1,
+            }
+        );
+
+        // Same across a read boundary: the first 54 bytes arrive before the rest of the identity.
+        let mut p = Parser::new();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&encode_input(&KEY, 1, 0, 0, 2, 1, &report(1))[..20]);
+        stream.extend_from_slice(&identity(&KEY));
+        stream.extend_from_slice(&encode_input(&KEY, 2, 2000, 0, 2, 1, &report(2)));
+        p.push(&stream[..RECORD_SIZE]);
+        assert_eq!(p.next_event(), None);
+        p.push(&stream[RECORD_SIZE..]);
+        assert_eq!(reports(&mut p), [(2, report(2))]);
+        assert_eq!(p.losses.no_key, 1);
+        assert_eq!(p.losses.skipped, 19);
     }
 
     #[test]
