@@ -463,7 +463,15 @@ mod pty {
 
     /// Maximum queued outgoing bytes waiting on a slow or stalled PTY consumer before newer
     /// records are dropped to keep playback and unplug scheduling moving.
-    const MAX_PENDING_BYTES: usize = 64 * 1024;
+    const MAX_PENDING_BYTES: usize = 128 * 1024;
+    /// After the last recorded item has played, keep draining accepted pending bytes while the host
+    /// makes progress, stopping once no write succeeds for this long or `DRAIN_MAX_TIMEOUT` elapses.
+    const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+    const DRAIN_MAX_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Brief grace after `pending` empties at normal end-of-playback so Linux's PTY line
+    /// discipline (`flush_to_ldisc`) can finish delivering the kernel buffer to an active reader
+    /// before closing the master triggers `EIO`. Wakes immediately if the host closes the port.
+    const END_CLOSE_GRACE: Duration = Duration::from_millis(50);
 
     /// Bounded outgoing byte queue preserving whole-record framing when dropping under pressure.
     #[derive(Default)]
@@ -597,13 +605,17 @@ mod pty {
             }
         }
 
-        /// Writes as much of `pending` as the PTY accepts without blocking. Returns `Ok(false)` if
-        /// the host closed the port (`EIO`).
-        fn flush(&mut self, pending: &mut PendingOut) -> io::Result<bool> {
+        /// Writes as much of `pending` as the PTY accepts without blocking. Returns `(open,
+        /// bytes_written)` where `open == false` means the host closed the port (`EIO`).
+        fn flush(&mut self, pending: &mut PendingOut) -> io::Result<(bool, usize)> {
+            let mut written = 0usize;
             while let Some(slice) = pending.front_slice() {
                 match self.master.write(slice) {
                     Ok(0) => break,
-                    Ok(n) => pending.consume(n),
+                    Ok(n) => {
+                        pending.consume(n);
+                        written += n;
+                    }
                     Err(e)
                         if matches!(
                             e.kind(),
@@ -614,12 +626,12 @@ mod pty {
                     }
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                         pending.clear();
-                        return Ok(false);
+                        return Ok((false, written));
                     }
                     Err(e) => return Err(e),
                 }
             }
-            Ok(true)
+            Ok((true, written))
         }
     }
 
@@ -672,10 +684,36 @@ mod pty {
         let at = |i: &Item, sim: &Sim| sim.playback(Duration::from_nanos(i.host_ns() - first_ns));
         let mut unplug = plan.unplug.iter().peekable();
         let mut next = 0;
+        let mut drain_started: Option<Instant> = None;
+        let mut drain_idle_deadline: Option<Instant> = None;
+        let mut end_grace_deadline: Option<Instant> = None;
         loop {
             let now = start.map_or(Duration::ZERO, |s| s.elapsed());
-            if start.is_some() && (plan.until.is_some_and(|u| now >= u) || next == items.len()) {
+            if start.is_some() && plan.until.is_some_and(|u| now >= u) {
                 return Ok(served);
+            }
+            let draining = start.is_some() && next == items.len();
+            let mut drain_until: Option<Instant> = None;
+            if draining {
+                if !held {
+                    return Ok(served);
+                }
+                let wall = Instant::now();
+                let started = *drain_started.get_or_insert(wall);
+                let max_limit = started + DRAIN_MAX_TIMEOUT;
+                if wall >= max_limit {
+                    return Ok(served);
+                }
+                let limit = if pending.is_empty() {
+                    (*end_grace_deadline.get_or_insert(wall + END_CLOSE_GRACE)).min(max_limit)
+                } else {
+                    end_grace_deadline = None;
+                    (*drain_idle_deadline.get_or_insert(wall + DRAIN_IDLE_TIMEOUT)).min(max_limit)
+                };
+                if wall >= limit {
+                    return Ok(served);
+                }
+                drain_until = Some(limit);
             }
             if let Some(&&(when, down)) = unplug.peek() {
                 if start.is_some() && now >= when {
@@ -693,6 +731,9 @@ mod pty {
             }
             let mut wait = match (start, items.get(next)) {
                 (Some(_), Some(item)) => at(item, sim).saturating_sub(now),
+                (Some(_), None) => drain_until.map_or(Duration::ZERO, |d| {
+                    d.saturating_duration_since(Instant::now())
+                }),
                 _ => Duration::from_millis(50),
             };
             if start.is_some() {
@@ -752,8 +793,13 @@ mod pty {
                         served.records += 1;
                     }
                 }
-                if !pending.is_empty() && !pty.flush(&mut pending)? {
-                    held = false;
+                if !pending.is_empty() {
+                    let (open, written) = pty.flush(&mut pending)?;
+                    if !open {
+                        held = false;
+                    } else if written > 0 && draining {
+                        drain_idle_deadline = Some(Instant::now() + DRAIN_IDLE_TIMEOUT);
+                    }
                 }
             }
         }
@@ -1304,6 +1350,130 @@ mod tests {
                 "expected frames through until: {}",
                 frames.len()
             );
+        }
+
+        /// When the final batch of items exceeds the kernel PTY buffer, an actively reading host
+        /// still receives every accepted record instead of having `pending` dropped at end of
+        /// playback, while a stalled reader still terminates within the bounded drain timeout.
+        #[test]
+        fn pending_output_drains_at_end_of_playback() {
+            use std::io::Read;
+
+            let build_burst = |total_touches: u64| -> Vec<Item> {
+                let mut played = Vec::with_capacity(total_touches as usize + 16);
+                let base_ns = 1_000_000u64;
+                played.push(Item::Clock {
+                    host_ns: base_ns,
+                    us: 0,
+                });
+                for i in 0..total_touches {
+                    // Spread across 10 ms (~86 KiB total: overflows the kernel PTY buffer while
+                    // fitting inside `MAX_PENDING_BYTES`).
+                    let host_ns = base_ns + (i * 10_000_000) / total_touches;
+                    played.push(Item::Touch {
+                        host_ns,
+                        session: 2,
+                        report: report((i & 0xff) as u8),
+                    });
+                }
+                played
+            };
+
+            // Part A: host delays briefly so all items play and overflow into `pending`, then
+            // reads everything to EOF and must receive all 1,600 controller reports.
+            let total_touches = 1_600u64;
+            let played = build_burst(total_touches);
+            let (tx, ports) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut sim = Sim::new(config());
+                serve(
+                    &mut sim,
+                    &played,
+                    &Plan::default(),
+                    &mut |p| {
+                        let _ = tx.send(p.to_owned());
+                        Ok(())
+                    },
+                    &mut |_| {},
+                    &mut |_| {},
+                )
+                .unwrap()
+            });
+
+            let port = ports.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut host = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&port)
+                .unwrap();
+            // Let `serve` play all items over 10 ms and enter end-of-playback draining with
+            // unread records buffered in `pending`.
+            std::thread::sleep(Duration::from_millis(60));
+            let mut parser = Parser::new();
+            let mut buf = [0u8; 4096];
+            let mut reports = 0u64;
+            let mut total_bytes = 0usize;
+            loop {
+                match host.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total_bytes += n;
+                        parser.push(&buf[..n]);
+                        while let Some(ev) = parser.next_event() {
+                            if matches!(ev, Event::Report { .. }) {
+                                reports += 1;
+                            }
+                        }
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                    Err(e) => panic!("unexpected PTY read error: {e}"),
+                }
+            }
+            let served = server.join().unwrap();
+            assert_eq!(served.opens, 1);
+            assert_eq!(
+                reports,
+                total_touches,
+                "expected all accepted records to drain at end of playback (served={} bytes={}/{})",
+                served.records,
+                total_bytes,
+                served.records as usize * RECORD_SIZE
+            );
+
+            // Part B: a stalled host at end of playback (no Plan::until) still terminates promptly
+            // once the idle drain timeout expires.
+            let played_stalled = build_burst(total_touches);
+            let (tx2, ports2) = mpsc::channel();
+            let server2 = std::thread::spawn(move || {
+                let mut sim = Sim::new(config());
+                serve(
+                    &mut sim,
+                    &played_stalled,
+                    &Plan::default(),
+                    &mut |p| {
+                        let _ = tx2.send(p.to_owned());
+                        Ok(())
+                    },
+                    &mut |_| {},
+                    &mut |_| {},
+                )
+                .unwrap()
+            });
+            let port2 = ports2.recv_timeout(Duration::from_secs(2)).unwrap();
+            let stalled = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&port2)
+                .unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(server2.join().unwrap());
+            });
+            let served2 = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stalled end-of-playback drain must terminate within bounded timeout");
+            drop(stalled);
+            assert_eq!(served2.opens, 1);
         }
     }
 }
