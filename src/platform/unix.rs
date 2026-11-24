@@ -915,6 +915,171 @@ fn headset_hidraw(sys_class_hidraw: &Path, interface: u8) -> Option<std::path::P
         .map(|n| Path::new("/dev").join(n))
 }
 
+pub fn wait_wakers(
+    a: &Waker,
+    b: &Waker,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<crate::platform::hid::Woke> {
+    use std::os::fd::AsRawFd;
+    let mut fds = [a, b].map(|w| libc::pollfd {
+        fd: w.0.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as libc::c_int);
+    // SAFETY: a valid pollfd array.
+    if unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) } < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted {
+            Ok(Default::default())
+        } else {
+            Err(e)
+        };
+    }
+    let [report, waker] = [0, 1].map(|i| fds[i].revents & libc::POLLIN != 0);
+    if report {
+        a.drain();
+    }
+    if waker {
+        b.drain();
+    }
+    Ok(crate::platform::hid::Woke { report, waker })
+}
+
+/// A tty in raw mode, read and written without blocking.
+pub struct SerialPort(File);
+
+impl SerialPort {
+    pub fn open(path: &Path) -> io::Result<SerialPort> {
+        use std::os::fd::AsRawFd;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let fd = file.as_raw_fd();
+        // SAFETY: termios calls on our descriptor with a termios it filled in.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::cfmakeraw(&mut t);
+            t.c_cflag |= libc::CLOCAL | libc::CREAD;
+            t.c_cflag &= !libc::CRTSCTS;
+            libc::cfsetispeed(&mut t, libc::B115200);
+            libc::cfsetospeed(&mut t, libc::B115200);
+            if libc::tcsetattr(fd, libc::TCSANOW, &t) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let dtr: libc::c_int = libc::TIOCM_DTR;
+            if libc::ioctl(fd, libc::TIOCMBIS, &dtr) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(SerialPort(file))
+    }
+
+    fn poll(&self, events: libc::c_short, timeout: std::time::Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut fd, 1, ms) } < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the device hung up",
+            ));
+        }
+        Ok(fd.revents & events != 0)
+    }
+
+    pub fn read(&self, buf: &mut [u8], timeout: std::time::Duration) -> io::Result<usize> {
+        use std::io::Read;
+        if !self.poll(libc::POLLIN, timeout)? {
+            return Ok(0);
+        }
+        match (&self.0).read(buf) {
+            Ok(0) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "end of file")),
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        while !data.is_empty() {
+            match (&self.0).write(data) {
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !self.poll(libc::POLLOUT, std::time::Duration::from_secs(1))? {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn serial_ports(
+    vendor: u16,
+    product: u16,
+) -> io::Result<Vec<crate::platform::serial::Candidate>> {
+    serial_ports_in(Path::new("/sys/class/tty"), vendor, product)
+}
+
+/// The ttyACM nodes under `sys_class_tty` (normally /sys/class/tty) whose USB device is
+/// `vendor`:`product`, with its product string.
+fn serial_ports_in(
+    sys_class_tty: &Path,
+    vendor: u16,
+    product: u16,
+) -> io::Result<Vec<crate::platform::serial::Candidate>> {
+    let mut names: Vec<String> = std::fs::read_dir(sys_class_tty)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("ttyACM"))
+        .collect();
+    names.sort();
+    let id = |dir: &Path, file: &str| {
+        std::fs::read_to_string(dir.join(file))
+            .ok()
+            .and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
+    };
+    Ok(names
+        .into_iter()
+        .filter_map(|n| {
+            // device -> the USB interface; its parent is the USB device
+            let interface = std::fs::canonicalize(sys_class_tty.join(&n).join("device")).ok()?;
+            let usb = interface.parent()?;
+            (id(usb, "idVendor")? == vendor && id(usb, "idProduct")? == product).then(|| {
+                crate::platform::serial::Candidate {
+                    path: Path::new("/dev").join(&n),
+                    name: std::fs::read_to_string(usb.join("product"))
+                        .map(|s| s.trim().to_owned())
+                        .unwrap_or_default(),
+                }
+            })
+        })
+        .collect())
+}
+
 /// SIGINT and SIGTERM, blocked and read from a signalfd.
 pub struct ShutdownRequests(std::os::fd::OwnedFd);
 
@@ -1951,6 +2116,44 @@ mod tests {
 
     /// A tree laid out as /sys/bus/usb/devices: a sensor with its video interface bound to
     /// uvcvideo, a headset interface with no driver, and another maker's mouse.
+    /// A ttyACM node's USB device, two levels up its `device` link: the dongle's ID with its
+    /// product string, another device on the same ID, and another maker's modem.
+    #[test]
+    fn serial_ports_are_read_from_sysfs() {
+        use crate::platform::serial::Candidate;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let usb = |name: &str, vendor: &str, product: &str, string: &str| {
+            let dir = root.join("devices").join(name);
+            std::fs::create_dir_all(dir.join(format!("{name}:1.0"))).unwrap();
+            std::fs::write(dir.join("idVendor"), format!("{vendor}\n")).unwrap();
+            std::fs::write(dir.join("idProduct"), format!("{product}\n")).unwrap();
+            std::fs::write(dir.join("product"), format!("{string}\n")).unwrap();
+            dir.join(format!("{name}:1.0"))
+        };
+        let tty = |node: &str, interface: &Path| {
+            std::fs::create_dir_all(root.join("class").join(node)).unwrap();
+            std::os::unix::fs::symlink(interface, root.join("class").join(node).join("device"))
+                .unwrap();
+        };
+        tty("ttyACM0", &usb("1-1", "cafe", "4001", "FreeTouch dongle"));
+        tty("ttyACM1", &usb("1-2", "cafe", "4001", "TinyUSB Device"));
+        tty("ttyACM2", &usb("1-3", "1bc7", "1201", "Modem"));
+        std::fs::create_dir_all(root.join("class/ttyS0")).unwrap();
+        let found = serial_ports_in(&root.join("class"), 0xcafe, 0x4001).unwrap();
+        let candidate = |node: &str, name: &str| Candidate {
+            path: Path::new("/dev").join(node),
+            name: name.into(),
+        };
+        assert_eq!(
+            found,
+            [
+                candidate("ttyACM0", "FreeTouch dongle"),
+                candidate("ttyACM1", "TinyUSB Device")
+            ]
+        );
+    }
+
     #[test]
     fn usb_devices_are_read_from_sysfs() {
         use crate::platform::usb::Node;

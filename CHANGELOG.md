@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- Without a Rift headset plugged in, cv1touch can use a [FreeTouch](https://github.com/Juspertinry/freetouch-dongle) dongle (firmware 3.1 or later) as the controllers' radio: buttons, sticks, triggers, capacitive touch, battery level, vibration and controller orientation. Controller position is not available with a dongle yet: it needs camera tracking timed from the dongle. `cv1touch status`, `cv1touch doctor` and `cv1touch setup` say which radio is in use, and setup holds the stages that need position. A device on the dongle's USB ID (`cafe:4001`, TinyUSB's example ID) is used only when it names itself FreeTouch and then sends a FreeTouch identity; nothing is written to any other. A headset plugged in is always the radio, and a dongle beside it is left alone. An unplugged dongle is picked up again when it is plugged back in. Each controller's factory calibration is read through the dongle as through the headset, and one cv1touch has read before comes from its cache after the controller's calibration hash is read. On Linux, `udev/70-cv1touch.rules` now gives the dongle's serial port to the logged-in user and keeps ModemManager from probing it, so the rule needs installing again.
+
 ## [0.6.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) - 2026-11-24
 
 ### Added

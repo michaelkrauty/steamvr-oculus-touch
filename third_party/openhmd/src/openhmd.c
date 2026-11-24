@@ -775,6 +775,11 @@ OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_report_callback(ohmd_conte
 	ctx->cv1touch_report_user = user;
 }
 
+OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_radio(ohmd_context *ctx, const ohmd_cv1touch_radio *radio)
+{
+	ctx->cv1touch_radio = *radio;
+}
+
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_activity_callback(ohmd_context *ctx, ohmd_cv1touch_activity_cb cb, void *user)
 {
 	ctx->cv1touch_activity_cb = cb;

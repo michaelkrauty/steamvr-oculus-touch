@@ -287,6 +287,7 @@ test('touch_calibration_drain_notice', test_touch_calibration, args: ['drain_not
 test('touch_calibration_wake', test_touch_calibration, args: ['wake'])
 test('touch_calibration_wake_reason', test_touch_calibration, args: ['wake_reason'])
 test('touch_calibration_ops', test_touch_calibration, args: ['ops'])
+test('touch_calibration_external', test_touch_calibration, args: ['external'])
 
 # Cache I/O failures reach the caller without making valid controller calibration unusable.
 test_config_write = executable('test_config_write', 'test_config_write.c',

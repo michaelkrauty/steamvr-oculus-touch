@@ -354,6 +354,17 @@ pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
 /// While SteamVR's headset is another than the one the controllers were lined up with
 /// (`alignment.headset`, `align::Registration::other_headset`), what doctor and the status board
 /// say about it, with the way to line them up with this one.
+/// What the daemon's status says the controllers' radio is (`radio.kind`), for `status`, `doctor`
+/// and `setup`: None for the Rift headset, or while no engine is open.
+pub fn dongle_note(value: &serde_json::Value) -> Option<String> {
+    (value["radio"]["kind"] == "freetouch").then(|| {
+        format!(
+            "The controllers' radio is a FreeTouch dongle (firmware {}), not a Rift headset. Buttons, sticks, triggers, touch, battery, vibration and controller orientation work; controller position needs camera tracking timed from the dongle, which this version of cv1touch does not have yet.",
+            value["radio"]["firmware"].as_str().unwrap_or("unknown")
+        )
+    })
+}
+
 pub fn other_headset_note(value: &serde_json::Value) -> Option<String> {
     (value["alignment"]["headset"] == "other").then(|| {
         format!(
@@ -637,6 +648,24 @@ impl RateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dongle is named with its firmware, and that position is missing; the headset is not
+    /// mentioned, nor a daemon without the field.
+    #[test]
+    fn a_dongle_radio_is_said_plainly() {
+        let note =
+            dongle_note(&serde_json::json!({"radio": {"kind": "freetouch", "firmware": "3.1"}}));
+        let note = note.unwrap();
+        assert!(
+            note.contains("FreeTouch dongle (firmware 3.1)")
+                && note.contains("controller position needs")
+        );
+        assert_eq!(
+            dongle_note(&serde_json::json!({"radio": {"kind": "headset"}})),
+            None
+        );
+        assert_eq!(dongle_note(&serde_json::json!({})), None);
+    }
 
     /// What doctor and the status board say about the base-station pin: the unmeasured base's
     /// remedy is a restart once cv1touch pinned a measured station, and a wait for the pinned

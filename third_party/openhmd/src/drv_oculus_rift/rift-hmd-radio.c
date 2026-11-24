@@ -682,6 +682,63 @@ void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_de
 	radio->hmd_handle = hmd_handle;
 }
 
+/* cv1touch: a radio the caller serves (ohmd_cv1touch_set_radio). It matches each reply to its
+ * own request, so no abandoned command can answer a later one: nothing needs draining. */
+static int external_read_report(rift_hmd_radio_state *radio, unsigned char *buf, int size, int wait_ms)
+{
+	return radio->external->read_report(radio->external->user, buf, size, wait_ms);
+}
+
+static int external_read_flash(rift_hmd_radio_state *radio, uint8_t device_type,
+		uint16_t offset, uint16_t length, uint8_t *data)
+{
+	int ret = radio->external->read_flash(radio->external->user, device_type, offset, length, data);
+	if (ret > 0)
+		return -EINPROGRESS;
+	if (ret < 0)
+		return -EIO;
+	radio->calibration_progress++;
+	return 0;
+}
+
+static int external_send_haptics(rift_hmd_radio_state *radio, uint8_t device_type, bool low_freq, uint8_t amplitude)
+{
+	return radio->external->send_haptics(radio->external->user, device_type, low_freq, amplitude) < 0 ? -EIO : 0;
+}
+
+static int external_drain_abandoned(ohmd_context *ctx, rift_hmd_radio_state *radio)
+{
+	(void)ctx;
+	radio->discard_reply = false;
+	return 0;
+}
+
+static void external_abandon_command(rift_hmd_radio_state *radio)
+{
+	radio->external->cancel(radio->external->user);
+}
+
+static bool external_get_address(rift_hmd_radio_state *radio, uint8_t address[5])
+{
+	memcpy(address, radio->external->address, 5);
+	return true;
+}
+
+const rift_hmd_radio_ops rift_hmd_radio_external_ops = {
+	.read_report = external_read_report,
+	.read_flash = external_read_flash,
+	.send_haptics = external_send_haptics,
+	.drain_abandoned = external_drain_abandoned,
+	.abandon_command = external_abandon_command,
+	.get_address = external_get_address,
+};
+
+void rift_hmd_radio_init_external(rift_hmd_radio_state *radio, const ohmd_cv1touch_radio *external)
+{
+	radio->ops = &rift_hmd_radio_external_ops;
+	radio->external = external;
+}
+
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio)
 {
 	if (radio->read_block) {
