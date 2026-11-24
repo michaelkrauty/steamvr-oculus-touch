@@ -969,6 +969,11 @@ impl Waker {
         // SAFETY: our event handle.
         unsafe { SetEvent(self.0 .0) };
     }
+
+    pub fn clear(&self) {
+        // SAFETY: our event handle.
+        unsafe { ResetEvent(self.0 .0) };
+    }
 }
 
 /// Reports the HID class driver queues for this handle, beyond the default 32, so a busy moment

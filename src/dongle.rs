@@ -162,13 +162,16 @@ impl Queue {
             q.pop_front();
         }
         q.push_back(report);
+        self.waker.wake();
         drop(q);
-        self.wake();
+        self.ready.notify_all();
     }
 
     fn wake(&self) {
-        self.ready.notify_all();
+        let _q = self.reports.lock().unwrap();
         self.waker.wake();
+        drop(_q);
+        self.ready.notify_all();
     }
 }
 
@@ -406,11 +409,17 @@ pub struct RadioPort(Arc<Shared>);
 impl hid::RadioPort for RadioPort {
     fn wait(&mut self, waker: &hid::Waker, timeout: Option<Duration>) -> io::Result<hid::Woke> {
         let q = &self.0.radio;
-        if !q.reports.lock().unwrap().is_empty() || self.0.gone.load(Ordering::Acquire) {
-            return Ok(hid::Woke {
-                report: true,
-                waker: false,
-            });
+        {
+            let reports = q.reports.lock().unwrap();
+            if !reports.is_empty() || self.0.gone.load(Ordering::Acquire) {
+                return Ok(hid::Woke {
+                    report: true,
+                    waker: false,
+                });
+            }
+            // Empty and not gone under `reports`: clear any wakeup left by a report read after a
+            // fast-path wait; any later `push` or `gone` wake acquires `reports` first.
+            q.waker.clear();
         }
         q.waker.wait_with(waker, timeout)
     }
@@ -648,12 +657,20 @@ mod tests {
                 .unwrap(),
             None
         );
+        // a report consumed after a fast-path wait leaves no stale report wakeup:
+        // waiting with no waker times out, and waiting with a waker reports only the waker
+        assert_eq!(
+            port.wait(&waker, Some(Duration::from_millis(20))).unwrap(),
+            hid::Woke::default()
+        );
         // the radio thread's wait still ends on its waker
         waker.wake();
-        assert!(
-            port.wait(&waker, Some(Duration::from_secs(5)))
-                .unwrap()
-                .waker
+        assert_eq!(
+            port.wait(&waker, Some(Duration::from_secs(5))).unwrap(),
+            hid::Woke {
+                report: false,
+                waker: true,
+            }
         );
     }
 
