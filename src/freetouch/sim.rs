@@ -452,6 +452,7 @@ pub use pty::{serve, Plan, Pty, Served};
 #[cfg(target_os = "linux")]
 mod pty {
     //! The dongle on a pseudo-terminal: its other end is the port a host opens.
+    use std::collections::VecDeque;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -460,17 +461,66 @@ mod pty {
 
     use super::{Exposure, Item, Sim, RECORD_SIZE};
 
+    /// Maximum queued outgoing bytes waiting on a slow or stalled PTY consumer before newer
+    /// records are dropped to keep playback and unplug scheduling moving.
+    const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+    /// Bounded outgoing byte queue preserving whole-record framing when dropping under pressure.
+    #[derive(Default)]
+    struct PendingOut {
+        chunks: VecDeque<Vec<u8>>,
+        head: usize,
+        bytes: usize,
+    }
+
+    impl PendingOut {
+        fn push(&mut self, chunk: Vec<u8>) -> bool {
+            if chunk.is_empty() || self.bytes + chunk.len() > MAX_PENDING_BYTES {
+                return false;
+            }
+            self.bytes += chunk.len();
+            self.chunks.push_back(chunk);
+            true
+        }
+
+        fn is_empty(&self) -> bool {
+            self.chunks.is_empty()
+        }
+
+        fn front_slice(&self) -> Option<&[u8]> {
+            self.chunks.front().map(|c| &c[self.head..])
+        }
+
+        fn consume(&mut self, n: usize) {
+            self.head += n;
+            self.bytes = self.bytes.saturating_sub(n);
+            if self.chunks.front().is_some_and(|c| self.head >= c.len()) {
+                self.chunks.pop_front();
+                self.head = 0;
+            }
+        }
+
+        fn clear(&mut self) {
+            self.chunks.clear();
+            self.head = 0;
+            self.bytes = 0;
+        }
+    }
+
     pub struct Pty {
         master: File,
         path: PathBuf,
     }
 
     impl Pty {
-        /// A new pseudo-terminal in raw mode, so that nothing echoes the dongle's own bytes.
+        /// A new pseudo-terminal in raw nonblocking mode, so that nothing echoes the dongle's own
+        /// bytes and a stalled consumer cannot block playback.
         pub fn open() -> io::Result<Pty> {
             // SAFETY: pty setup on a descriptor this function owns, with buffers it owns.
             unsafe {
-                let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+                let fd = libc::posix_openpt(
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                );
                 if fd < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -511,16 +561,26 @@ mod pty {
         }
 
         /// None while no host holds the port open; else the bytes it wrote within `timeout`.
-        fn wait(&mut self, timeout: Duration, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        /// When `want_write` is set, also wakes as soon as the PTY accepts outgoing bytes.
+        fn wait(
+            &mut self,
+            timeout: Duration,
+            want_write: bool,
+            buf: &mut [u8],
+        ) -> io::Result<Option<usize>> {
             let mut fd = libc::pollfd {
                 fd: self.master.as_raw_fd(),
-                events: libc::POLLIN,
+                events: libc::POLLIN | if want_write { libc::POLLOUT } else { 0 },
                 revents: 0,
             };
             let ms = timeout.as_millis().min(1000) as libc::c_int;
             // SAFETY: one valid pollfd.
             if unsafe { libc::poll(&mut fd, 1, ms) } < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    return Ok(Some(0));
+                }
+                return Err(err);
             }
             if fd.revents & libc::POLLHUP != 0 {
                 std::thread::sleep(timeout.min(Duration::from_millis(5)));
@@ -531,9 +591,35 @@ mod pty {
             }
             match self.master.read(buf) {
                 Ok(n) => Ok(Some(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Some(0)),
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(None),
                 Err(e) => Err(e),
             }
+        }
+
+        /// Writes as much of `pending` as the PTY accepts without blocking. Returns `Ok(false)` if
+        /// the host closed the port (`EIO`).
+        fn flush(&mut self, pending: &mut PendingOut) -> io::Result<bool> {
+            while let Some(slice) = pending.front_slice() {
+                match self.master.write(slice) {
+                    Ok(0) => break,
+                    Ok(n) => pending.consume(n),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        pending.clear();
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(true)
         }
     }
 
@@ -580,6 +666,7 @@ mod pty {
         let mut pty = Pty::open()?;
         plugged(pty.path())?;
         let mut buf = [0u8; 4096];
+        let mut pending = PendingOut::default();
         let (mut held, mut start) = (false, None::<Instant>);
         let first_ns = items.first().map_or(0, Item::host_ns);
         let at = |i: &Item, sim: &Sim| sim.playback(Duration::from_nanos(i.host_ns() - first_ns));
@@ -594,6 +681,7 @@ mod pty {
                 if start.is_some() && now >= when {
                     unplug.next();
                     log(&format!("unplugged {:.3} s in", now.as_secs_f64()));
+                    pending.clear();
                     drop(pty);
                     std::thread::sleep(down);
                     pty = Pty::open()?;
@@ -603,17 +691,26 @@ mod pty {
                     continue;
                 }
             }
-            let wait = match (start, items.get(next)) {
+            let mut wait = match (start, items.get(next)) {
                 (Some(_), Some(item)) => at(item, sim).saturating_sub(now),
                 _ => Duration::from_millis(50),
             };
+            if start.is_some() {
+                if let Some(&&(when, _)) = unplug.peek() {
+                    wait = wait.min(when.saturating_sub(now));
+                }
+                if let Some(until) = plan.until {
+                    wait = wait.min(until.saturating_sub(now));
+                }
+            }
             let mut out: Vec<[u8; RECORD_SIZE]> = Vec::new();
-            match pty.wait(wait, &mut buf)? {
+            match pty.wait(wait, held && !pending.is_empty(), &mut buf)? {
                 None => {
                     if held {
                         log("the host closed the port");
                     }
                     held = false;
+                    pending.clear();
                 }
                 Some(n) => {
                     if !held {
@@ -645,16 +742,18 @@ mod pty {
                 if held && !plan.foreign {
                     out.extend(records);
                 } else if held && next % 1000 == 0 {
-                    pty.master.write_all(b"TinyUSB CDC example\r\n")?;
+                    pending.push(b"TinyUSB CDC example\r\n".to_vec());
                 }
                 next += 1;
             }
-            if held && !out.is_empty() {
-                served.records += out.len() as u64;
-                match pty.master.write_all(&out.concat()) {
-                    // the host closed the port since the poll
-                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {}
-                    r => r?,
+            if held {
+                for r in out {
+                    if pending.push(r.to_vec()) {
+                        served.records += 1;
+                    }
+                }
+                if !pending.is_empty() && !pty.flush(&mut pending)? {
+                    held = false;
                 }
             }
         }
@@ -1103,6 +1202,108 @@ mod tests {
             assert_eq!(served.opens, 1);
             assert_eq!(served.foreign_bytes, 0);
             assert!(served.records == 0);
+        }
+
+        /// A host that keeps the slave port open without reading must not stall playback, frame
+        /// delivery, scheduled unplugs, or `Plan::until` even after overflowing the kernel PTY
+        /// buffer and the simulator's bounded outgoing queue.
+        #[test]
+        fn a_stalled_host_does_not_block_playback_or_unplug() {
+            let plan = Plan {
+                unplug: vec![(Duration::from_millis(300), Duration::from_millis(50))],
+                until: Some(Duration::from_millis(650)),
+                ..Plan::default()
+            };
+            // Push >250 KiB of controller records in the first 250 ms — well past Linux's ~64 KiB
+            // PTY buffer and `MAX_PENDING_BYTES` — alongside normal clock and exposure items.
+            let mut played = Vec::with_capacity(5500);
+            let base_ns = 1_000_000u64;
+            let total_touches = 5_000u64;
+            for i in 0..total_touches {
+                let t_us = i * 50;
+                let host_ns = base_ns + t_us * 1000;
+                if i % 40 == 0 {
+                    played.push(Item::Clock {
+                        host_ns,
+                        us: t_us as u32,
+                    });
+                }
+                played.push(Item::Touch {
+                    host_ns,
+                    session: 2,
+                    report: report((i & 0xff) as u8),
+                });
+            }
+            for t_ms in (250u64..800).step_by(2) {
+                let t_us = t_ms * 1000;
+                played.push(Item::Clock {
+                    host_ns: base_ns + t_us * 1000,
+                    us: t_us as u32,
+                });
+            }
+            for k in 0u64..40 {
+                let exp_us = k * u64::from(DEFAULT_PERIOD_US);
+                played.push(Item::Exposure {
+                    host_ns: base_ns + (exp_us + 500) * 1000,
+                    us: exp_us as u32,
+                    serial: "WMTD1".into(),
+                    record: k + 1,
+                });
+            }
+            played.sort_by_key(Item::host_ns);
+
+            let (tx, ports) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut sim = Sim::new(config());
+                let mut frames = Vec::new();
+                let served = serve(
+                    &mut sim,
+                    &played,
+                    &plan,
+                    &mut |p| {
+                        let _ = tx.send(p.to_owned());
+                        Ok(())
+                    },
+                    &mut |e| frames.push(e.clone()),
+                    &mut |_| {},
+                )
+                .unwrap();
+                (sim, served, frames)
+            });
+
+            let port = ports.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Open the slave port and intentionally never read from it so the kernel PTY buffer
+            // fills completely during playback.
+            let stalled = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&port)
+                .unwrap();
+            // The scheduled unplug must still fire on time and expose the replacement port.
+            let replugged = ports
+                .recv_timeout(Duration::from_secs(2))
+                .expect("scheduled unplug stalled on blocked PTY write");
+            assert_ne!(replugged, port);
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(server.join().unwrap());
+            });
+            let (sim, served, frames) = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("serve hung instead of stopping at Plan::until");
+            drop(stalled);
+            assert_eq!(served.opens, 1);
+            assert!(
+                served.records > 0 && served.records < total_touches,
+                "expected bounded queue to drop excess records while stalled, served={}",
+                served.records
+            );
+            assert_eq!(frames, sim.exposures);
+            assert!(
+                frames.len() >= 25,
+                "expected frames through until: {}",
+                frames.len()
+            );
         }
     }
 }
