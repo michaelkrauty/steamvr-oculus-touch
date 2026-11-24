@@ -247,14 +247,17 @@ OHMD_APIENTRYDLL uint32_t OHMD_APIENTRY ohmd_cv1touch_get_io_errors(ohmd_device 
 
 /* A radio in place of the headset's, served by the caller (cv1touch's FreeTouch dongle). Set
  * before ohmd_ctx_probe, the Rift driver lists its two controllers and no headset, and opens no
- * headset: no keepalive, no feature reports, no exposures. The callbacks run on the thread that
- * updates the devices.
+ * headset: no keepalive, no feature reports, and the sensors' exposures come from exposure. The
+ * callbacks run on the thread that updates the devices.
  * read_report: the next controller report into buf, as hid_read_timeout: its length, 0 when none
  *   came within wait_ms, < 0 once the radio is gone.
  * read_flash: length bytes of a controller's flash at offset, polled with the same arguments:
  *   1 while the read is under way, 0 once data holds them, < 0 when it failed.
  * send_haptics: 0 once the radio has the vibration, < 0 when it could not be sent.
  * cancel: give up the read under way.
+ * exposure: 1 when the sensors made an exposure since the last call that returned 1, with its
+ *   time (exposure_ts) and that of the poll it was learnt from (poll_ts), both on the radio's
+ *   clock (µs), and its count; 0 when none. Each pass of the update thread asks once.
  * address: the radio address the sensors synchronise to. */
 typedef struct ohmd_cv1touch_radio {
 	void *user;
@@ -262,6 +265,7 @@ typedef struct ohmd_cv1touch_radio {
 	int (*read_flash)(void *user, uint8_t device_type, uint16_t offset, uint16_t length, uint8_t *data);
 	int (*send_haptics)(void *user, uint8_t device_type, bool low_freq, uint8_t amplitude);
 	void (*cancel)(void *user);
+	int (*exposure)(void *user, uint32_t *poll_ts, uint32_t *exposure_ts, uint16_t *count);
 	uint8_t address[5];
 } ohmd_cv1touch_radio;
 OHMD_APIENTRYDLL void OHMD_APIENTRY ohmd_cv1touch_set_radio(ohmd_context *ctx, const ohmd_cv1touch_radio *radio);

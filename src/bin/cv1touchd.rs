@@ -34,6 +34,7 @@ use cv1touch::platform::{self, hid, ipc, shutdown, system};
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::sensor_hotplug;
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
+use cv1touch::track::exposure;
 use cv1touch::track::pipeline::{self, Pipeline, Stamped};
 use cv1touch::track::repose;
 use cv1touch::track::tracker::Stats;
@@ -263,6 +264,9 @@ struct Daemon {
     other_headset: AtomicBool,
     /// The open engine's radio for `status` (`radio_status`); None while no engine is open.
     radio: Mutex<Option<serde_json::Value>>,
+    /// With a FreeTouch dongle as the radio, the exposures timed from its clock; None with the
+    /// headset, whose reports carry them.
+    dongle_timing: Mutex<Option<DongleTiming>>,
     /// The base-station pin (see `BasePin`).
     base_pin: Mutex<BasePin>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
@@ -331,6 +335,52 @@ impl Daemon {
     fn radio_clock(&self, ts: u64, us: u32) {
         if self.tracker == TrackerKind::Rust && self.track_in.lock().unwrap().push_clock(ts, us) {
             self.wake_radio();
+        }
+    }
+
+    /// A sample of a FreeTouch dongle's clock: a controller record's poll, or the status record's
+    /// with the exposure period. Both time the exposures, and the newest one not yet announced
+    /// waits for the engine (`DongleTiming::pending`), which takes it after the reports read with
+    /// this sample. The radio clock takes the stamps newer than the newest it has: the two kinds of
+    /// record interleave, and a stamp older than one already taken arrived after it, so it lies
+    /// above the fit's lower envelope.
+    fn dongle_clock(&self, ts: u64, us: u32, period_us: Option<u32>) {
+        let mut timing = self.dongle_timing.lock().unwrap();
+        let Some(t) = timing.as_mut() else {
+            return;
+        };
+        match period_us {
+            // a period beyond 65 ms is no exposure grid
+            Some(p) => t.exposures.status(us, u16::try_from(p).unwrap_or(0), ts),
+            None => t.exposures.poll(us, ts),
+        }
+        if let Some(e) = t.exposures.latest(ts) {
+            if t.announced.is_none_or(|a| e.count > a) {
+                t.announced = Some(e.count);
+                t.pending = Some(dongle::Exposure {
+                    poll_us: us,
+                    exposure_us: e.stamp_us(),
+                    // the headset's exposure counter is 16 bits too
+                    count: e.count as u16,
+                });
+            }
+        }
+        if t.newest_us.is_some_and(|n| (us.wrapping_sub(n) as i32) < 0) {
+            return;
+        }
+        t.newest_us = Some(us);
+        drop(timing);
+        self.radio_clock(ts, us);
+    }
+
+    /// With a dongle, a sensor's frame arrival places the exposure grid (`track::exposure`).
+    fn dongle_frame(&self, info: &engine::FrameInfo) {
+        if let Some(t) = self.dongle_timing.lock().unwrap().as_mut() {
+            let serial = engine::cstr_field(&info.serial);
+            t.exposures.frame(&serial, info.frame_start_host_ns);
+            for a in t.exposures.take_anchors() {
+                log!("{}", anchor_note(&a));
+            }
         }
     }
 
@@ -691,6 +741,7 @@ impl EngineSink for Daemon {
     }
 
     fn frame(&self, info: &engine::FrameInfo, lifetime: u64, blobs: &[Blob]) {
+        self.dongle_frame(info);
         if self.rec.active() {
             self.rec.write(
                 recorder::FRAME_OBS,
@@ -1061,18 +1112,38 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
                 .admitted(&engine::sensor_serial(s))
         })
         .collect();
-    let p = calibrated_pipeline(opts, &sensors);
+    let p = calibrated_pipeline(opts, &sensors, exposure_offset_ns(d, e.dongle().is_some()));
     d.track_in.lock().unwrap().clear();
     d.track_searches.lock().unwrap().clear();
     d.track_identities.lock().unwrap().clear();
     Some(p)
 }
 
+/// The pipeline's exposure offset: with a dongle, whose exposures are timed on its own clock, the
+/// stored offset between its grid and the physical exposure (`Settings::dongle_exposure_offset_ns`)
+/// in place of the headset's.
+fn exposure_offset_ns(d: &Daemon, dongle: bool) -> i64 {
+    if dongle {
+        settings::load(&d.settings_path)
+            .unwrap_or_default()
+            .dongle_exposure_offset_ns()
+    } else {
+        pipeline::DEFAULT_EXPOSURE_OFFSET_NS
+    }
+}
+
 /// A pipeline with the open sensors the calibration has a pose for, registered under the
 /// spelling their frames carry (the calibration may spell the serial in another letter case, as
 /// the native engine allows).
-fn calibrated_pipeline(opts: &EngineOptions, sensors: &[engine::Sensor]) -> Pipeline {
-    let mut p = Pipeline::new(pipeline::Options::default());
+fn calibrated_pipeline(
+    opts: &EngineOptions,
+    sensors: &[engine::Sensor],
+    exposure_offset_ns: i64,
+) -> Pipeline {
+    let mut p = Pipeline::new(pipeline::Options {
+        exposure_offset_ns,
+        ..Default::default()
+    });
     for s in sensors {
         let serial = engine::sensor_serial(s);
         if let Some(pose) = modes::calibrated_pose(opts, &serial) {
@@ -2287,10 +2358,15 @@ fn choose_dongle(d: &Arc<Daemon>, last: &mut String) -> Option<Arc<dongle::Dongl
     let mut found = None;
     for port in tries {
         let at = port.path.display();
+        *d.dongle_timing.lock().unwrap() = Some(DongleTiming::default());
         let hooks = dongle::Hooks {
             clock: Box::new({
                 let d = d.clone();
-                move |ts, us, _period| d.radio_clock(ts, us)
+                move |ts, us, period| d.dongle_clock(ts, us, period)
+            }),
+            exposure: Box::new({
+                let d = d.clone();
+                move || d.dongle_timing.lock().unwrap().as_mut()?.pending.take()
             }),
             log: Box::new(|line| log!("{line}")),
         };
@@ -2298,7 +2374,7 @@ fn choose_dongle(d: &Arc<Daemon>, last: &mut String) -> Option<Arc<dongle::Dongl
             Ok(found_one) => {
                 let firmware = found_one.identity.firmware;
                 notes.push(format!(
-                    "the controllers' radio is the FreeTouch dongle at {at}, firmware {}{}. Controller position needs camera tracking timed from the dongle, which this version of cv1touch does not have yet",
+                    "the controllers' radio is the FreeTouch dongle at {at}, firmware {}{}; camera exposures are timed from its clock",
                     dongle::firmware_text(firmware),
                     if firmware > dongle::KNOWN_FIRMWARE {
                         format!(", newer than the {} this version of cv1touch was made for: if the controllers misbehave, run cv1touch report and attach the file it writes to your bug report", dongle::firmware_text(dongle::KNOWN_FIRMWARE))
@@ -2311,6 +2387,9 @@ fn choose_dongle(d: &Arc<Daemon>, last: &mut String) -> Option<Arc<dongle::Dongl
             }
             Err(e) => notes.push(format!("{at} {e}")),
         }
+    }
+    if found.is_none() {
+        *d.dongle_timing.lock().unwrap() = None;
     }
     let note = notes.join("; ");
     if note != *last {
@@ -2352,6 +2431,48 @@ fn radio_status(e: &Engine) -> serde_json::Value {
     }
 }
 
+/// The open engine's radio for `status`, with a dongle's exposure timing (`exposure::Report`,
+/// which `cv1touch report` carries).
+fn radio_json(d: &Daemon) -> serde_json::Value {
+    let mut radio = d.radio.lock().unwrap().clone().unwrap_or_default();
+    if let (serde_json::Value::Object(r), Some(t)) =
+        (&mut radio, d.dongle_timing.lock().unwrap().as_ref())
+    {
+        if r.get("kind").and_then(serde_json::Value::as_str) == Some("freetouch") {
+            r.insert(
+                "exposure".into(),
+                serde_json::to_value(t.exposures.report()).unwrap(),
+            );
+        }
+    }
+    radio
+}
+
+/// A FreeTouch dongle's exposure timing (`Daemon::dongle_clock`): the grid, the newest poll
+/// stamp the radio clock took, and the newest exposure announced and the one waiting for the
+/// engine.
+#[derive(Default)]
+struct DongleTiming {
+    exposures: exposure::DongleExposures,
+    newest_us: Option<u32>,
+    announced: Option<u64>,
+    pending: Option<dongle::Exposure>,
+}
+
+/// The log line for a change of the dongle's exposure grid.
+fn anchor_note(a: &exposure::Anchor) -> String {
+    match a.why {
+        exposure::Why::Settled => format!(
+            "camera exposures: the sensors' exposure grid is placed on the FreeTouch dongle's clock (moved {:+.3} ms)",
+            a.moved_ns as f64 / 1e6
+        ),
+        exposure::Why::Jump => format!(
+            "camera exposures: the sensors' exposure grid jumped {:+.3} ms on the FreeTouch dongle's clock and is placed again",
+            a.moved_ns as f64 / 1e6
+        ),
+    }
+}
+
 /// One attempt to open the engine, with the sensors ready now. While it cannot open (the
 /// headset is missing), those sensors wait for the headset rather than for the engine.
 fn open_engine<E>(
@@ -2381,6 +2502,7 @@ fn finish_engine_open<E>(
             Some(e)
         }
         Err(err) => {
+            *d.dongle_timing.lock().unwrap() = None;
             d.sensor_watch.lock().unwrap().open_failed();
             if err != *last_err {
                 log!("waiting for headset: {err}");
@@ -2525,6 +2647,7 @@ fn engine_session(
         });
     });
     *d.radio.lock().unwrap() = None;
+    *d.dongle_timing.lock().unwrap() = None;
     end_engine_sensors(d);
     deliver_pending_biases(&link, save_biases);
 }
@@ -3803,6 +3926,15 @@ fn deliver_new_bodies(d: &Daemon, queued: &Mutex<Vec<NewBody>>, mut install: imp
     }
 }
 
+/// What is said when the radio's reads keep failing and the engine reopens.
+fn io_failing_note(dongle: bool) -> &'static str {
+    if dongle {
+        "FreeTouch dongle I/O failing; reopening"
+    } else {
+        "headset I/O failing; reopening"
+    }
+}
+
 /// The engine thread's loop for one open engine: OpenHMD's update (its own filter, the acquisition
 /// the tracker relies on, the headset, haptics), each controller's engine view for the radio
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
@@ -3831,7 +3963,7 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         if !updated {
             failures += 1;
             if failures >= IO_FAILURES_BEFORE_REOPEN {
-                log!("headset I/O failing; reopening");
+                log!("{}", io_failing_note(e.dongle().is_some()));
                 return;
             }
         } else {
@@ -5968,7 +6100,7 @@ fn status_json(d: &Daemon) -> String {
         serde_json::to_string(&ignored_sensors).unwrap(),
         serde_json::to_string(&calibrated_sensors).unwrap(),
         serde_json::to_string(&sensor_streams).unwrap(),
-        serde_json::to_string(&*d.radio.lock().unwrap()).unwrap(),
+        radio_json(d),
     )
 }
 
@@ -7086,6 +7218,7 @@ fn main() {
         driver_headset: Mutex::new(None),
         other_headset: AtomicBool::new(false),
         radio: Mutex::new(None),
+        dongle_timing: Mutex::new(None),
         base_pin: Mutex::new(BasePin {
             watch: base_pin::Watch::new(settings.pin_base_station),
             ..Default::default()
@@ -9183,6 +9316,7 @@ mod tests {
             driver_headset: Mutex::new(None),
             other_headset: AtomicBool::new(false),
             radio: Mutex::new(None),
+            dongle_timing: Mutex::new(None),
             base_pin: Mutex::new(BasePin::default()),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
@@ -13298,7 +13432,120 @@ mod tests {
             settings::load(&d.settings_path).map(|s| (s.tilt_deg, s.dongle_exposure_offset_ns)),
             Ok((None, Some(3_500_000)))
         );
+        // a dongle's pipeline takes the stored offset, the headset's its own
+        assert_eq!(exposure_offset_ns(&d, true), 3_500_000);
+        assert_eq!(
+            exposure_offset_ns(&d, false),
+            pipeline::DEFAULT_EXPOSURE_OFFSET_NS
+        );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// With a dongle, its controller and status records and the frames' arrivals time the
+    /// exposures: once the grid is placed, the engine is given each exposure once, within a poll of
+    /// when it happened, with its stamp and a count that steps by one; the anchor is logged and the
+    /// grid is in `status`. The radio clock takes only stamps newer than its newest.
+    #[test]
+    fn a_dongles_clock_times_the_exposures() {
+        const PERIOD_US: u64 = 19_200;
+        const HOST_FROM_DEVICE_NS: u64 = 7_000_000_000;
+        let d = status_daemon();
+        *d.dongle_timing.lock().unwrap() = Some(DongleTiming::default());
+        let take = || d.dongle_timing.lock().unwrap().as_mut()?.pending.take();
+        // a controller record answering an older poll than the status record before it
+        d.dongle_clock(HOST_FROM_DEVICE_NS + 1_000_000, 900, None);
+        d.dongle_clock(
+            HOST_FROM_DEVICE_NS + 2_000_000,
+            1_000,
+            Some(PERIOD_US as u32),
+        );
+        d.dongle_clock(HOST_FROM_DEVICE_NS + 2_100_000, 960, None);
+        assert_eq!(
+            d.track_in.lock().unwrap().take_clocks(),
+            [
+                (HOST_FROM_DEVICE_NS + 1_000_000, 900),
+                (HOST_FROM_DEVICE_NS + 2_000_000, 1_000)
+            ]
+        );
+
+        // exposures at 5 ms + k * period on the dongle clock; frames arrive 70 to 1070 us later,
+        // records 200 to 1200 us after their poll
+        let mut seed = 1u64;
+        let mut jitter = |span: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % span
+        };
+        let (mut poll_us, mut first, mut last) = (2_000u64, None, None::<dongle::Exposure>);
+        for k in 0..400u64 {
+            let exposure_us = 5_000 + k * PERIOD_US;
+            while poll_us < exposure_us + 1_000 {
+                let host = HOST_FROM_DEVICE_NS + poll_us * 1000 + 200_000 + jitter(1_000_000);
+                let period = (poll_us % 10_000 == 0).then_some(PERIOD_US as u32);
+                d.dongle_clock(host, poll_us as u32, period);
+                if let Some(e) = take() {
+                    // on the true grid, told by the poll it was learnt from, within its delay
+                    let p = PERIOD_US as i64;
+                    let off = (e.exposure_us as i64 - 5_000 + p / 2).rem_euclid(p) - p / 2;
+                    let late = poll_us as i64 - e.exposure_us as i64;
+                    assert_eq!(e.poll_us as u64, poll_us);
+                    assert!(off.abs() < 300, "{off} us off the grid");
+                    assert!((-1_500..3_500).contains(&late), "told {late} us after");
+                    if let Some(l) = last {
+                        assert_eq!(e.count, l.count.wrapping_add(1), "once each, in order");
+                    }
+                    first.get_or_insert(k);
+                    last = Some(e);
+                }
+                poll_us += 2_000;
+            }
+            let arrival = HOST_FROM_DEVICE_NS + exposure_us * 1000 + 70_000 + jitter(1_000_000);
+            d.frame(
+                &engine::FrameInfo {
+                    serial: serial_field("C"),
+                    frame_start_host_ns: arrival,
+                    ..Default::default()
+                },
+                1,
+                &[],
+            );
+        }
+        assert!(first.is_some_and(|k| k <= 200), "{first:?}");
+        let last = last.unwrap();
+        assert_eq!(
+            u64::from(last.count),
+            ((1u64 << 32) + u64::from(last.exposure_us)) / PERIOD_US % 65536
+        );
+        // every anchor went to the log
+        let mut timing = d.dongle_timing.lock().unwrap();
+        let t = timing.as_mut().unwrap();
+        assert!(t.exposures.take_anchors().is_empty() && t.exposures.report().anchors >= 1);
+        drop(timing);
+
+        *d.radio.lock().unwrap() = Some(serde_json::json!({"kind": "freetouch"}));
+        let status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(status["radio"]["exposure"]["period_us"], PERIOD_US);
+        assert!(status["radio"]["exposure"]["anchors"].as_u64() >= Some(1));
+
+        // a headset radio never carries a dongle's exposure report
+        *d.radio.lock().unwrap() = Some(serde_json::json!({"kind": "headset"}));
+        let headset_status: serde_json::Value =
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap();
+        assert!(headset_status["radio"].get("exposure").is_none());
+
+        // a failed engine open clears any dongle timing chosen for that attempt
+        let mut last_err = String::new();
+        assert!(finish_engine_open::<()>(&d, &mut last_err, Err("nope".into())).is_none());
+        assert!(d.dongle_timing.lock().unwrap().is_none());
+    }
+
+    /// The radio whose reads keep failing is the one named.
+    #[test]
+    fn failing_io_names_the_radio() {
+        assert!(io_failing_note(true).starts_with("FreeTouch dongle I/O failing"));
+        assert!(io_failing_note(false).starts_with("headset I/O failing"));
     }
 
     /// A source note stays within a page: the beginning and the end are kept.
@@ -13373,7 +13620,11 @@ mod tests {
             cy: 480.0,
             ..Default::default()
         };
-        let mut p = calibrated_pipeline(&opts, &[sensor("CAMERA1"), sensor("CAMERA10")]);
+        let mut p = calibrated_pipeline(
+            &opts,
+            &[sensor("CAMERA1"), sensor("CAMERA10")],
+            pipeline::DEFAULT_EXPOSURE_OFFSET_NS,
+        );
         assert!(
             p.camera_id("CAMERA1").is_some(),
             "registered as the device spells it"

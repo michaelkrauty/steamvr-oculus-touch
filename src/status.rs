@@ -359,7 +359,7 @@ pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
 pub fn dongle_note(value: &serde_json::Value) -> Option<String> {
     (value["radio"]["kind"] == "freetouch").then(|| {
         format!(
-            "The controllers' radio is a FreeTouch dongle (firmware {}), not a Rift headset. Buttons, sticks, triggers, touch, battery, vibration and controller orientation work; controller position needs camera tracking timed from the dongle, which this version of cv1touch does not have yet.",
+            "The controllers' radio is a FreeTouch dongle (firmware {}), not a Rift headset. The sensors' camera exposures are timed from the dongle's clock, so controller position starts a few seconds after the sensors' video does.",
             value["radio"]["firmware"].as_str().unwrap_or("unknown")
         )
     })
@@ -649,7 +649,7 @@ impl RateTracker {
 mod tests {
     use super::*;
 
-    /// The dongle is named with its firmware, and that position is missing; the headset is not
+    /// The dongle is named with its firmware, and that exposures are timed from it; the headset is not
     /// mentioned, nor a daemon without the field.
     #[test]
     fn a_dongle_radio_is_said_plainly() {
@@ -658,7 +658,7 @@ mod tests {
         let note = note.unwrap();
         assert!(
             note.contains("FreeTouch dongle (firmware 3.1)")
-                && note.contains("controller position needs")
+                && note.contains("timed from the dongle's clock")
         );
         assert_eq!(
             dongle_note(&serde_json::json!({"radio": {"kind": "headset"}})),

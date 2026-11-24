@@ -623,9 +623,12 @@ static void another_radio_carries_calibration_and_haptics(void)
  * the sensors' address go through the caller's callbacks only. */
 static int ext_passes, ext_flash_calls, ext_haptics, ext_cancels, ext_tracker_calls, ext_haptic_amplitude;
 static uint8_t ext_address[5] = {0x11, 0x22, 0x33, 0x44, 0x55};
+static bool ext_gone;
 static int ext_read_report(void *user, unsigned char *buf, int size, int wait_ms)
 {
 	CHECK(user == &ext_passes && size == FEATURE_BUFFER_SIZE && wait_ms >= 0);
+	if (ext_gone)
+		return -1;
 	/* one report from the right controller in each update, then none */
 	if (wait_ms == 0)
 		return 0;
@@ -672,6 +675,14 @@ rift_tracker_ctx *rift_tracker_new(ohmd_context *ctx, const uint8_t address[5])
 	return (rift_tracker_ctx *)(uintptr_t)1;
 }
 void rift_tracker_free(rift_tracker_ctx *ctx) { CHECK(ctx == (rift_tracker_ctx *)(uintptr_t)1); }
+static int ext_exposure_asks;
+static const ohmd_cv1touch_radio *ext_exposure_radio;
+void rift_tracker_take_radio_exposure(rift_tracker_ctx *ctx, const ohmd_cv1touch_radio *radio)
+{
+	CHECK(ctx == (rift_tracker_ctx *)(uintptr_t)1);
+	ext_exposure_radio = radio;
+	ext_exposure_asks++;
+}
 void ohmd_set_default_device_properties(ohmd_device_properties *props) { memset(props, 0, sizeof *props); }
 void *ohmd_allocfn(ohmd_context *ctx, const char *e_msg, size_t size) { (void)ctx; (void)e_msg; return calloc(1, size); }
 static void a_radio_the_caller_serves_replaces_the_headset(void)
@@ -705,6 +716,15 @@ static void a_radio_the_caller_serves_replaces_the_headset(void)
 		.duration = 1.0f, .dirty = true, .end_time = (uint64_t)(-1)};
 	update_hmd(hmd);
 	CHECK(ext_haptics == 1 && ext_haptic_amplitude == 77);
+	/* each pass asks the caller's radio for the exposure its reports announced */
+	CHECK(ext_exposure_asks == ext_passes && ext_exposure_radio == &ctx.cv1touch_radio);
+	/* a radio that is gone fails every read until the engine closes: said once */
+	ext_gone = true;
+	diagnostics[0] = 0;
+	for (int i = 0; i < 5; i++)
+		update_hmd(hmd);
+	const char *said = strstr(diagnostics, "error reading from controllers");
+	CHECK(said && !strstr(said + 1, "error reading from controllers") && hmd->io_errors >= 5);
 	/* nothing reached a HID handle: no keepalive, feature report or read */
 	CHECK(hid_sends == 0 && status_reads == 0 && data_fetches == 0);
 	cached_json = NULL;

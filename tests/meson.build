@@ -98,7 +98,7 @@ test_native_clock_gap = executable('test_native_clock_gap', 'test_native_clock_g
     '-ffunction-sections', '-fdata-sections'],
   dependencies: [threads_dep, dependency('libusb-1.0')], link_args: ['-Wl,--gc-sections', '-lm'])
 test('native_clock_gap', test_native_clock_gap)
-foreach scenario : ['continuity', 'posterior-0', 'posterior-3', 'ownership']
+foreach scenario : ['continuity', 'posterior-0', 'posterior-3', 'ownership', 'radio-exposure']
   test('native_clock_gap_' + scenario.underscorify(), test_native_clock_gap, args: [scenario])
 endforeach
 

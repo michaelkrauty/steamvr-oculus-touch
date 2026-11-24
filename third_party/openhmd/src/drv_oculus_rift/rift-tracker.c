@@ -1157,6 +1157,20 @@ done:
 	ohmd_unlock_mutex (ctx->tracker_lock);
 }
 
+/* cv1touch: a radio the caller serves (ohmd_cv1touch_set_radio) times the exposures in place of
+ * the headset's IMU reports. It has no LED pattern phase; none is used, since blob flicker
+ * detection is never enabled (blobwatch_set_flicker has no caller). */
+#define RADIO_NO_LED_PATTERN_PHASE 255
+
+void rift_tracker_take_radio_exposure (rift_tracker_ctx *ctx, const ohmd_cv1touch_radio *radio)
+{
+	uint32_t poll_ts, exposure_ts;
+	uint16_t count;
+
+	if (radio->exposure && radio->exposure (radio->user, &poll_ts, &exposure_ts, &count) > 0)
+		rift_tracker_on_new_exposure (ctx, poll_ts, count, exposure_ts, RADIO_NO_LED_PATTERN_PHASE);
+}
+
 /* Called from a sensor device when a video frame has been captured.
  * Iterate the exposure history and find the exposure that matches
  * the arrival time of the frame within +/- 10ms
