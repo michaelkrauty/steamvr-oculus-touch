@@ -33,6 +33,8 @@ pub const JUMP_NS: i64 = 500_000;
 const DENSE_GAP_NS: u64 = 100_000_000;
 /// How long the clock fit takes to reflect a new regime: its window of one-second bins.
 const SETTLE_NS: u64 = 20_000_000_000;
+/// A sensor with no frame for this long is dropped from anchoring so it cannot pin the grid.
+const STALE_NS: u64 = 1_000_000_000;
 
 /// One exposure: its index on the unwrapped dongle clock and when it happened there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,8 @@ pub struct Report {
 struct Window {
     /// Arrivals on the dongle clock minus the reference, folded into one period.
     lags: VecDeque<i64>,
+    /// Dongle clock of the newest frame in `lags`, for excluding stopped sensors.
+    last_ns: Option<u64>,
     behind_us: Option<f64>,
 }
 
@@ -90,6 +94,7 @@ pub struct DongleExposures {
     newest_ns: u64,
     period_ns: u64,
     dense_until: Option<u64>,
+    in_dense: bool,
     settle_at: Option<u64>,
     /// Arrivals are folded against this: the grid once anchored, before that the first arrival.
     reference: Option<i64>,
@@ -130,15 +135,17 @@ impl DongleExposures {
             _ => self.stamps.extend(us),
         };
         self.newest_ns = self.newest_ns.max(device_ns);
-        let was_dense = self.dense_until.is_some_and(|u| device_ns < u);
+        let was_dense = self.in_dense;
         if dense {
-            self.dense_until = Some(device_ns + DENSE_GAP_NS);
+            let until = device_ns + DENSE_GAP_NS;
+            self.dense_until = Some(self.dense_until.map_or(until, |u| u.max(until)));
         }
         let reset = self.clock.observe(device_ns, host_ns);
         if reset {
             self.clear();
         }
-        let now_dense = self.dense_until.is_some_and(|u| device_ns < u);
+        let now_dense = self.dense_until.is_some_and(|u| self.newest_ns < u);
+        self.in_dense = now_dense;
         if reset || was_dense != now_dense || self.settle_at.is_none() {
             self.settle_at = Some(device_ns + SETTLE_NS);
         } else if self.settle_at.is_some_and(|s| device_ns >= s) {
@@ -163,6 +170,14 @@ impl DongleExposures {
         let d = self.clock.to_device(host_ns)? as i64;
         let reference = *self.reference.get_or_insert(d);
         let w = self.sensors.entry(serial.to_owned()).or_default();
+        let d_u64 = d as u64;
+        if w.last_ns
+            .is_some_and(|t| d_u64.saturating_sub(t) > STALE_NS)
+        {
+            w.lags.clear();
+            w.behind_us = None;
+        }
+        w.last_ns = Some(d_u64);
         w.lags.push_back((d - reference).rem_euclid(p));
         if w.lags.len() > WINDOW {
             w.lags.pop_front();
@@ -182,6 +197,14 @@ impl DongleExposures {
     /// The earliest full window's lower edge places the grid: anchor on it when there is no
     /// anchor, when the fit has settled, or when the grid has left it.
     fn check(&mut self, device_ns: u64) {
+        for w in self.sensors.values_mut() {
+            if w.last_ns
+                .is_none_or(|t| device_ns.saturating_sub(t) > STALE_NS)
+            {
+                w.lags.clear();
+                w.behind_us = None;
+            }
+        }
         let p = self.period_ns as i64;
         let edges: Vec<(&String, i64)> = self
             .sensors
@@ -276,6 +299,7 @@ mod tests {
         /// The sensors' true exposure grid: an exposure on the dongle clock, us.
         grid_us: u64,
         controllers: bool,
+        sensor_b: bool,
     }
 
     impl Rig {
@@ -286,6 +310,7 @@ mod tests {
                 now_us: start_us,
                 grid_us: start_us - 5_123,
                 controllers: true,
+                sensor_b: true,
             }
         }
 
@@ -320,6 +345,9 @@ mod tests {
                 let next = self.grid_us + (us - self.grid_us).div_ceil(p) * p;
                 if next < us + 2_000 && next >= us {
                     for sensor in ["A", "B"] {
+                        if sensor == "B" && !self.sensor_b {
+                            continue;
+                        }
                         // a frame arrives its lower edge plus up to 3 ms after its exposure
                         let lag = LOWER_EDGE_NS as u64 + self.delay_ns(3_000_000);
                         let host = next * 1000 + HOST_FROM_DEVICE_NS + lag;
@@ -416,5 +444,33 @@ mod tests {
         let anchors = rig.ex.take_anchors();
         assert_eq!(anchors.len(), 1, "{before} then {anchors:?}");
         assert_eq!(anchors[0].why, Why::Settled);
+        // stopping controller records must also trigger a reanchor after the fit's window
+        rig.controllers = false;
+        rig.run(25);
+        let after_stop = rig.ex.take_anchors();
+        assert_eq!(after_stop.len(), 1, "{after_stop:?}");
+        assert_eq!(after_stop[0].why, Why::Settled);
+    }
+
+    #[test]
+    fn a_stopped_sensor_does_not_pin_the_grid_across_a_jump() {
+        let mut rig = Rig::new(1_000_000_000);
+        rig.run(40);
+        rig.sensor_b = false;
+        rig.grid_us += 3_000;
+        let start = rig.now_us;
+        let errors = rig.run(30);
+        let late: Vec<_> = errors
+            .iter()
+            .filter(|e| e.0 > start + 8_000_000)
+            .copied()
+            .collect();
+        assert!(worst(&late) < 300_000, "{}", worst(&late));
+        let r = rig.ex.report();
+        assert_eq!(r.jumps, 1, "{:?}", rig.ex.anchors);
+        assert_eq!(r.sensors.get("B"), Some(&None), "{r:?}");
+        let jump = rig.ex.take_anchors().pop().unwrap();
+        assert_eq!(jump.why, Why::Jump);
+        assert!((jump.moved_ns - 3_000_000).abs() < 300_000, "{jump:?}");
     }
 }
