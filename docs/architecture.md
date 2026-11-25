@@ -49,6 +49,7 @@ Published poses are the newest measurement, stamped with the time the controller
 
 - Poses are published in shared memory (`/cv1touch`, ABI version 4) using single-writer seqlocks, with a futex on Linux and an event on Windows to wake the driver. The driver rejects a mapping with another ABI version or a stale heartbeat. Its eight sensor slots are a diagnostic prefix, not a sensor limit.
 - The control socket is `$XDG_RUNTIME_DIR/cv1touch/control.sock` on Linux and a named pipe on Windows. Inside Steam's pressure-vessel container, which hides `$XDG_RUNTIME_DIR`, the driver uses a second socket at `/dev/shm/cv1touch-control-<uid>/control.sock`. Starting the daemon with `--runtime-dir` or `--shm-name` turns that second socket off.
+- `preview [SERIAL] [2|4]` replies `ok` and JSON with each sensor's latest image, max-pooled by 4 (or by 2 for the named sensor) so that a single-pixel LED still shows, zlib-compressed and base64-encoded, along with its brightest pixel, bright-pixel share, blobs in full-image pixels and each device's match counts. Each request holds a 3 s lease (up to about 15 fps per sensor, or 30 fps for one named sensor); `preview stop` ends it immediately. Without a preview lease a frame costs one atomic load, and sensor threads never block on a reply.
 - Neither is a network interface. Any change to the ABI or the tracking log format must update both readers and writers, their compatibility tests and the changelog together.
 
 ## Sensors during play

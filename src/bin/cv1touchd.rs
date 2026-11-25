@@ -30,6 +30,7 @@ use cv1touch::flight_writer;
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{GapCause, GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
+use cv1touch::preview::PreviewHub;
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::sensor_hotplug;
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
@@ -303,6 +304,8 @@ struct Daemon {
     engine_offline: AtomicBool,
     /// First stop in this reopen, before waiting for workers. Retries retain this boundary.
     engine_stopped_ns: std::sync::atomic::AtomicU64,
+    /// The sensors' images for a client that shows them (control `preview`).
+    preview: PreviewHub,
 }
 
 impl Daemon {
@@ -817,6 +820,9 @@ impl EngineSink for Daemon {
             );
             self.wake_radio();
         }
+        if self.preview.leased() {
+            self.preview.on_frame(info, blobs, shm::now_ns());
+        }
     }
 
     fn image(
@@ -829,6 +835,10 @@ impl EngineSink for Daemon {
     ) {
         self.rec
             .write_frame(info, width, height, stride, pixels, RAW_FRAME_FLOOR);
+        if self.preview.leased() {
+            self.preview
+                .on_image(info, width, height, stride, pixels, shm::now_ns());
+        }
     }
 
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
@@ -4091,6 +4101,7 @@ struct RadioSensors<'a> {
 fn all_sensor_images_wanted(d: &Daemon, started: u64, now: u64) -> bool {
     let timeout = HandConfig::default().connect_timeout_ns;
     d.rec.active()
+        || d.preview.active(now)
         || *d.mode.lock().unwrap() != "calibrated"
         || (0..2).any(|h| {
             d.radio_activity
@@ -4412,7 +4423,7 @@ fn radio_main(
         let idle_ms = if !d.track_in.lock().unwrap().has_frames() {
             let now = shm::now_ns();
             let timers = [next_stats, sensors.reposing.next_tick, biases.next_save];
-            radio_deadline(&link.hands, &own, now, timers)
+            radio_deadline(&link.hands, &own, &d.preview, now, timers)
                 .saturating_sub(now)
                 .div_ceil(1_000_000)
         } else {
@@ -4579,9 +4590,16 @@ fn radio_main(
 /// When the radio thread next has timed work with no report or frame to wake it: each hand it
 /// publishes is republished, or expired, `RADIO_REFRESH_NS` after its last publish, and a hand
 /// it asked for is looked at as often until the engine lets go; then the earliest of `timers`
-/// (statistics, repose tick, bias save). The landmark watch closes its windows and takes its
-/// results on the pass the repose tick (`REPOSE_TICK_NS`) brings at the latest.
-fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u64; 3]) -> u64 {
+/// (statistics, repose tick, bias save), and the end of a preview lease, when the images it
+/// wanted are given up. The landmark watch closes its windows and takes its results on the pass
+/// the repose tick (`REPOSE_TICK_NS`) brings at the latest.
+fn radio_deadline(
+    hands: &HandOwnership,
+    own: &RadioHands,
+    preview: &PreviewHub,
+    now: u64,
+    timers: [u64; 3],
+) -> u64 {
     [HAND_LEFT, HAND_RIGHT]
         .into_iter()
         .filter_map(|h| {
@@ -4594,6 +4612,7 @@ fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u6
             }
         })
         .chain(timers)
+        .chain(preview.lease_until(now))
         .min()
         .unwrap_or(u64::MAX)
 }
@@ -6121,6 +6140,21 @@ fn handle(d: &Daemon, line: &str) -> String {
             "ok".into()
         }
         Ok(Command::Pin(keys, quit)) => pin_reply(d, keys, quit),
+        Ok(Command::Preview { serial, scale }) => {
+            let now = shm::now_ns();
+            let starting = !d.preview.active(now);
+            let reply = d.preview.snapshot_json(serial.as_deref(), scale, now);
+            if starting {
+                // the radio thread asks for every sensor's images now
+                d.wake_radio();
+            }
+            format!("ok {reply}")
+        }
+        Ok(Command::PreviewStop) => {
+            d.preview.stop();
+            d.wake_radio();
+            "ok".into()
+        }
         Ok(Command::Headset { headset, start }) => {
             if let Some(line) = headset_report(d, headset, start) {
                 log(line);
@@ -7155,6 +7189,7 @@ fn main() {
         ],
         engine_offline: AtomicBool::new(true),
         engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
+        preview: Default::default(),
     });
     let endpoints = ControlEndpoints {
         runtime: sock_path.clone(),
@@ -9253,6 +9288,7 @@ mod tests {
             ],
             engine_offline: AtomicBool::new(false),
             engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
+            preview: Default::default(),
         }
     }
 
@@ -11543,6 +11579,62 @@ mod tests {
         let dir = socket_dir::SocketDir::new();
         d.rec.start(&dir.path().join("demand.rec"), awake).unwrap();
         assert!(all_sensor_images_wanted(&d, start, awake + 1));
+    }
+
+    #[test]
+    fn a_preview_wants_every_image_until_its_lease_ends_or_it_stops() {
+        let d = status_daemon();
+        let timeout = HandConfig::default().connect_timeout_ns;
+        let start = 100;
+        use engine::RadioReader::Engine;
+        d.activity(Engine, 1, start, start, true, 0.0);
+        d.activity(Engine, 2, start, start, true, 0.0);
+        let now = start + timeout;
+        assert!(!all_sensor_images_wanted(&d, start, now), "both asleep");
+        d.preview.snapshot_json(None, 4, now);
+        let lease = cv1touch::preview::PREVIEW_LEASE_NS;
+        assert!(all_sensor_images_wanted(&d, start, now));
+        assert!(all_sensor_images_wanted(&d, start, now + lease - 1));
+        assert!(!all_sensor_images_wanted(&d, start, now + lease));
+        d.preview.snapshot_json(Some("SENSOR1"), 2, now + 1);
+        assert!(all_sensor_images_wanted(&d, start, now + 2));
+        d.preview.stop();
+        assert!(!all_sensor_images_wanted(&d, start, now + 2));
+    }
+
+    #[test]
+    fn preview_replies_with_the_images_and_stop_ends_it() {
+        let d = status_daemon();
+        let turn = Mutex::new(());
+        let reply = handle_control(&d, "preview", &turn);
+        let json: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(json["active"], true);
+        assert_eq!(json["sensors"], serde_json::json!([]));
+        let mut info = engine::FrameInfo {
+            frame_start_host_ns: shm::now_ns(),
+            ..Default::default()
+        };
+        for (c, b) in info.serial.iter_mut().zip(b"SENSOR1") {
+            *c = *b as std::ffi::c_char;
+        }
+        d.image(&info, 8, 8, 8, &[200; 64]);
+        d.frame(&info, 1, &[]);
+        let reply = handle_control(&d, "preview SENSOR1 2", &turn);
+        let json: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(json["sensors"][0]["serial"], "SENSOR1");
+        assert_eq!(
+            json["sensors"][0]["width"], 2,
+            "taken at the scale asked for before"
+        );
+        assert_eq!(json["sensors"][0]["max_pixel"], 200);
+        assert!(handle_control(&d, "preview 2", &turn).starts_with("err "));
+        assert_eq!(handle_control(&d, "preview stop", &turn), "ok");
+        assert!(!d.preview.active(shm::now_ns()));
+        d.image(&info, 8, 8, 8, &[200; 64]);
+        let reply = handle_control(&d, "preview", &turn);
+        assert!(reply.contains(r#""sensors":[]"#), "{reply}");
     }
 
     #[cfg(unix)]
@@ -17728,7 +17820,7 @@ mod tests {
             );
             // waiting for the engine's sample, the radio thread sleeps until its next refresh
             assert_eq!(
-                radio_deadline(&link.hands, &own, now + at, [u64::MAX; 3]),
+                radio_deadline(&link.hands, &own, &d.preview, now + at, [u64::MAX; 3]),
                 now + at + RADIO_REFRESH_NS
             );
         }
@@ -18655,25 +18747,47 @@ mod tests {
             last_publish: [995 * ms, 990 * ms],
             ..Default::default()
         };
+        let preview = PreviewHub::default();
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1250 * ms,
             "idle: statistics"
         );
+        let idle = [u64::MAX; 3];
+        preview.snapshot_json(None, 4, now);
+        let lease_end = now + cv1touch::preview::PREVIEW_LEASE_NS;
+        assert_eq!(
+            radio_deadline(&hands, &own, &preview, now, idle),
+            lease_end,
+            "a preview lease's end, to give up its images"
+        );
+        assert_eq!(
+            radio_deadline(&hands, &own, &preview, lease_end, idle),
+            u64::MAX,
+            "an ended lease is not waited for again"
+        );
+        preview.stop();
+        assert_eq!(radio_deadline(&hands, &own, &preview, now, idle), u64::MAX);
         hands.request(HAND_RIGHT);
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1020 * ms,
             "a hand the engine has yet to let go"
         );
         assert!(!hands.engine_publishes(HAND_RIGHT));
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1010 * ms,
             "a published hand's refresh"
         );
         assert_eq!(
-            radio_deadline(&hands, &own, now, [999 * ms, 2000 * ms, 31_000 * ms]),
+            radio_deadline(
+                &hands,
+                &own,
+                &preview,
+                now,
+                [999 * ms, 2000 * ms, 31_000 * ms]
+            ),
             999 * ms,
             "an overdue timer"
         );

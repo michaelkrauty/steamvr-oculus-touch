@@ -65,6 +65,14 @@ pub enum Command {
         inputs: Injected,
         ms: u32,
     },
+    /// The sensors' latest images, max-pooled by `scale` (2 or 4), and their blobs: every
+    /// sensor's, or only `serial`'s. Each keeps them coming for `preview::PREVIEW_LEASE_NS`.
+    Preview {
+        serial: Option<String>,
+        scale: u8,
+    },
+    /// Stop taking images for `preview` now.
+    PreviewStop,
 }
 
 /// The longest press one `inject` makes, ms.
@@ -193,6 +201,43 @@ pub fn calibration_load_line(path: &Path) -> Result<String, String> {
 /// Stop only the recording started with this exact path, even after a lost start reply.
 pub fn record_stop_if_line(path: &Path) -> Result<String, String> {
     Ok(format!("record stop-if {}", quoted_path(path)?))
+}
+
+const PREVIEW_USAGE: &str = "usage: preview [SERIAL] [2|4] | preview stop";
+
+/// `preview [SERIAL] [SCALE]`: scale 4 by default; 2, four times the pixels, only for one sensor,
+/// so that a reply stays small.
+fn preview(args: &[&str]) -> Result<Command, String> {
+    let scale = |w: &str| match w {
+        "2" => Ok(2),
+        "4" => Ok(4),
+        _ => Err(format!("preview: the scale is 2 or 4, not {w}")),
+    };
+    let (serial, scale) = match args {
+        [] => (None, 4),
+        [w] if w.bytes().all(|b| b.is_ascii_digit()) => (None, scale(w)?),
+        [serial] => (Some(*serial), 4),
+        [serial, w] => (Some(*serial), scale(w)?),
+        _ => return Err(PREVIEW_USAGE.into()),
+    };
+    if let Some(serial) = serial {
+        if !(1..=31).contains(&serial.len())
+            || !serial
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || serial.eq_ignore_ascii_case("stop")
+        {
+            return Err(format!(
+                "preview: {serial} is not a sensor serial; {PREVIEW_USAGE}"
+            ));
+        }
+    } else if scale == 2 {
+        return Err("preview: scale 2 is for one sensor: preview SERIAL 2".into());
+    }
+    Ok(Command::Preview {
+        serial: serial.map(str::to_owned),
+        scale,
+    })
 }
 
 /// `headset [start] UNIVERSE SYSTEM SERIAL`, the serial last since it may hold spaces, and "-" for
@@ -343,6 +388,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["calibration", "capture"] => Ok(Command::CalibrationCapture),
         ["calibration", "provisional"] => Ok(Command::CalibrationProvisional),
         ["calibration", ..] => Err("usage: calibration capture | calibration provisional | calibration load <absolute-path>".into()),
+        ["preview", "stop"] => Ok(Command::PreviewStop),
+        ["preview", args @ ..] => preview(args),
         ["alignment", "reload"] => Ok(Command::AlignmentReload),
         ["alignment", ..] => Err("usage: alignment reload".into()),
         [verb, ..] => Err(format!("unknown command '{verb}'")),
@@ -861,6 +908,39 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parse_preview() {
+        let preview = |serial: Option<&str>, scale| {
+            Ok(Command::Preview {
+                serial: serial.map(str::to_owned),
+                scale,
+            })
+        };
+        assert_eq!(parse("preview"), preview(None, 4));
+        assert_eq!(parse("preview 4"), preview(None, 4));
+        assert_eq!(parse("preview WMTD123 2"), preview(Some("WMTD123"), 2));
+        assert_eq!(parse("preview WMTD123"), preview(Some("WMTD123"), 4));
+        assert_eq!(parse("preview wmtd-12_3 4"), preview(Some("wmtd-12_3"), 4));
+        assert_eq!(parse("preview stop"), Ok(Command::PreviewStop));
+        assert_eq!(
+            parse(&format!("preview {}", "A".repeat(31))),
+            preview(Some(&"A".repeat(31)), 4)
+        );
+        assert!(parse("preview 2").unwrap_err().contains("preview SERIAL 2"));
+        for bad in [
+            "preview 3",
+            "preview WMTD123 3",
+            "preview WMTD123 x",
+            "preview bad/serial",
+            "preview stop 2",
+            "preview STOP",
+            "preview WMTD123 2 extra",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse(&format!("preview {}", "A".repeat(32))).is_err());
     }
 
     #[test]
