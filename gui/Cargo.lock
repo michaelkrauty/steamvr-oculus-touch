@@ -660,6 +660,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "ksni",
+ "miniz_oxide 0.8.9",
  "serde_json",
  "windows-sys 0.61.2",
 ]

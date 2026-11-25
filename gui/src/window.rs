@@ -19,7 +19,7 @@ mod stats;
 pub const APP_ID: &str = "cv1touch-gui";
 
 /// The default window fits a healthy setup's overview snugly; it grows to fit more.
-pub const SIZE: [f32; 2] = [580.0, 410.0];
+pub const SIZE: [f32; 2] = [660.0, 410.0];
 /// The heights between which the window follows its overview, and the Stats tab's least.
 const FIT: (f32, f32) = (320.0, 620.0);
 const STATS_HEIGHT: f32 = 560.0;
@@ -92,6 +92,7 @@ pub enum Action {
     Setup,
     Report,
     Recheck,
+    Cameras,
 }
 
 /// The status icon in each colour, for the header.
@@ -259,6 +260,7 @@ impl App {
             }
             Action::Setup => actions::setup(),
             Action::Report => actions::report(),
+            Action::Cameras => crate::tray::show(crate::tray::Kind::Cameras),
             Action::Recheck => {
                 self.client.refresh();
                 self.client.poll();
@@ -339,7 +341,7 @@ impl App {
     }
 }
 
-fn icon_data(tint: Tint) -> egui::IconData {
+pub(crate) fn icon_data(tint: Tint) -> egui::IconData {
     egui::IconData {
         rgba: icon::rgba(tint, 64),
         width: 64,
@@ -613,6 +615,11 @@ fn footer(ui: &mut Ui, view: &View) -> Option<Action> {
                     "Run setup…",
                     Action::Setup,
                     "Open cv1touch setup in a terminal to calibrate sensors, align your headset, or redo a stage.",
+                ),
+                (
+                    "Cameras",
+                    Action::Cameras,
+                    "Open live infrared views from your sensors to aim them and check LED tracking.",
                 ),
             ] {
                 if ui.button(label).on_hover_text(tip).clicked() {

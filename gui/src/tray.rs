@@ -1,4 +1,4 @@
-//! Notification-area process; the status window stays on its own UI thread/process.
+//! Notification-area process; the status and camera windows each run in their own process.
 
 use crate::{actions::ServiceAction, client::StatusResult, icon::Tint, model::Daemon};
 use eframe::egui::{Context, ViewportCommand};
@@ -18,74 +18,117 @@ use linux as platform;
 #[cfg(windows)]
 use windows as platform;
 
-/// What the tray asks of the status window process.
+/// What the tray asks of a window process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Message {
     Open,
     Close,
 }
 
-#[derive(Default)]
-struct StatusWindow(Option<Child>);
+/// The windows, each its own process with its own single instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Status,
+    Cameras,
+}
 
-impl StatusWindow {
+impl Kind {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Status => "--window",
+            Self::Cameras => "--cameras",
+        }
+    }
+
+    /// The menu entry that shows it, and the one that hides it.
+    fn labels(self) -> [&'static str; 2] {
+        match self {
+            Self::Status => ["Show status window", "Hide status window"],
+            Self::Cameras => ["Show cameras", "Hide cameras"],
+        }
+    }
+
+    fn run(self) {
+        match self {
+            Self::Status => crate::window::run(),
+            Self::Cameras => crate::cameras::run(),
+        }
+    }
+
+    fn spawn(self) -> std::io::Result<Child> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg(self.flag()).stdin(Stdio::null());
+        #[cfg(target_os = "linux")]
+        if let Some(token) = ksni::current_xdg_activation_token() {
+            command.env("XDG_ACTIVATION_TOKEN", token);
+        }
+        command.spawn()
+    }
+}
+
+/// Raise a window, or start it; for a window opening another.
+pub fn show(kind: Kind) -> std::io::Result<()> {
+    if !platform::signal_window(kind, Message::Open) {
+        let mut child = kind.spawn()?;
+        thread::spawn(move || child.wait());
+    }
+    Ok(())
+}
+
+struct Window {
+    kind: Kind,
+    child: Option<Child>,
+}
+
+impl Window {
+    fn new(kind: Kind) -> Self {
+        Self { kind, child: None }
+    }
+
     /// Forget a window that has exited; true if that changed anything.
     fn reap(&mut self) -> bool {
         let exited = self
-            .0
+            .child
             .as_mut()
             .is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
         if exited {
-            self.0 = None;
+            self.child = None;
         }
         exited
     }
 
     fn is_open(&mut self) -> bool {
         self.reap();
-        self.0.is_some()
+        self.child.is_some()
     }
 
     fn open(&mut self) {
         self.reap();
-        if platform::signal_window(Message::Open) || self.0.is_some() {
+        if platform::signal_window(self.kind, Message::Open) || self.child.is_some() {
             return;
         }
-        let result = std::env::current_exe().and_then(|exe| {
-            let mut command = Command::new(exe);
-            command.arg("--window").stdin(Stdio::null());
-            #[cfg(target_os = "linux")]
-            if let Some(token) = ksni::current_xdg_activation_token() {
-                command.env("XDG_ACTIVATION_TOKEN", token);
-            }
-            command.spawn()
-        });
-        match result {
-            Ok(child) => self.0 = Some(child),
-            Err(error) => eprintln!("cv1touch-gui: Could not open status window: {error}"),
+        match self.kind.spawn() {
+            Ok(child) => self.child = Some(child),
+            Err(error) => eprintln!("cv1touch-gui: Could not open the window: {error}"),
         }
     }
 
     /// Open the window, or close the one this tray opened.
     fn toggle(&mut self) {
         if self.is_open() {
-            platform::signal_window(Message::Close);
+            platform::signal_window(self.kind, Message::Close);
         } else {
             self.open();
         }
     }
 
     fn toggle_label(&mut self) -> &'static str {
-        if self.is_open() {
-            "Hide status window"
-        } else {
-            "Show status window"
-        }
+        self.kind.labels()[usize::from(self.is_open())]
     }
 }
 
-pub fn run_window() -> Result<(), Box<dyn std::error::Error>> {
-    platform::run_window()
+pub fn run_window(kind: Kind) -> Result<(), Box<dyn std::error::Error>> {
+    platform::run_window(kind)
 }
 pub fn listen_for_activation(ctx: &Context) {
     platform::listen_for_activation(ctx);
@@ -370,7 +413,8 @@ mod linux {
         report: Report,
         action_message: Option<String>,
         action_updates: Sender<Option<String>>,
-        window: Arc<Mutex<StatusWindow>>,
+        window: Arc<Mutex<Window>>,
+        cameras: Arc<Mutex<Window>>,
         quit: Arc<AtomicBool>,
     }
 
@@ -427,8 +471,10 @@ mod linux {
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             let toggle = self.window.lock().unwrap().toggle_label();
+            let cameras = self.cameras.lock().unwrap().toggle_label();
             let mut menu = vec![
                 item(toggle, true, |t| t.window.lock().unwrap().toggle()),
+                item(cameras, true, |t| t.cameras.lock().unwrap().toggle()),
                 note(self.report.summary.clone(), true),
                 note(
                     self.action_message.clone().unwrap_or_default(),
@@ -509,9 +555,16 @@ mod linux {
         }
     }
 
-    pub(super) fn signal_window(message: Message) -> bool {
+    fn name(kind: Kind) -> &'static str {
+        match kind {
+            Kind::Status => "cv1touch-window",
+            Kind::Cameras => "cv1touch-cameras",
+        }
+    }
+
+    pub(super) fn signal_window(kind: Kind, message: Message) -> bool {
         runtime()
-            .and_then(|dir| send(&dir.join("cv1touch-window.sock"), message))
+            .and_then(|dir| send(&dir.join(format!("{}.sock", name(kind))), message))
             .is_ok()
     }
 
@@ -554,10 +607,10 @@ mod linux {
         singleton(&runtime()?, "cv1touch-gui", serve)
     }
 
-    pub(super) fn run_window() -> Result<(), Box<dyn Error>> {
-        singleton(&runtime()?, "cv1touch-window", |socket| {
+    pub(super) fn run_window(kind: Kind) -> Result<(), Box<dyn Error>> {
+        singleton(&runtime()?, name(kind), |socket| {
             WINDOW_SOCKET.with(|slot| slot.replace(Some(socket)));
-            crate::window::run();
+            kind.run();
             Ok(())
         })
     }
@@ -623,19 +676,21 @@ mod linux {
     fn serve(socket: UnixDatagram) -> Result<(), Box<dyn Error>> {
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let quit = Arc::new(AtomicBool::new(false));
-        let window = Arc::new(Mutex::new(StatusWindow::default()));
+        let window = Arc::new(Mutex::new(Window::new(Kind::Status)));
+        let cameras = Arc::new(Mutex::new(Window::new(Kind::Cameras)));
         let (action_updates, action_results) = mpsc::channel();
         let handle = Tray {
             report: Report::default(),
             action_message: None,
             action_updates,
             window: window.clone(),
+            cameras: cameras.clone(),
             quit: quit.clone(),
         }
         .spawn()?;
         let (updates, _stop) = poll_health();
         let mut previous = Report::default();
-        let mut shown = (false, false);
+        let mut shown = (false, false, false);
         while !quit.load(Ordering::Relaxed) && !handle.is_closed() {
             if let Some(message) = action_results.try_iter().last() {
                 handle.update(|t| t.action_message = message);
@@ -650,8 +705,12 @@ mod linux {
                     window.lock().unwrap().open();
                 }
             }
-            // Refresh the menu when the window opens or closes or an action starts or ends.
-            let now = (window.lock().unwrap().is_open(), crate::actions::busy());
+            // Refresh the menu when a window opens or closes or an action starts or ends.
+            let now = (
+                window.lock().unwrap().is_open(),
+                cameras.lock().unwrap().is_open(),
+                crate::actions::busy(),
+            );
             if now != shown {
                 shown = now;
                 handle.update(|_| {});
@@ -791,19 +850,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn window_toggle_follows_the_window_process() {
-        let mut window = StatusWindow(Some(Command::new("sleep").arg("5").spawn().unwrap()));
-        assert_eq!(window.toggle_label(), "Hide status window");
-        let mut child = window.0.take().unwrap();
-        child.kill().unwrap();
-        window.0 = Some(child);
-        // Killed but not yet reaped: the label must not claim it is open.
-        for _ in 0..100 {
-            if window.toggle_label() == "Show status window" {
-                break;
+        for (kind, [show, hide]) in [
+            (Kind::Status, ["Show status window", "Hide status window"]),
+            (Kind::Cameras, ["Show cameras", "Hide cameras"]),
+        ] {
+            let mut window = Window {
+                kind,
+                child: Some(Command::new("sleep").arg("5").spawn().unwrap()),
+            };
+            assert_eq!(window.toggle_label(), hide);
+            let mut child = window.child.take().unwrap();
+            child.kill().unwrap();
+            window.child = Some(child);
+            // Killed but not yet reaped: the label must not claim it is open.
+            for _ in 0..100 {
+                if window.toggle_label() == show {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            assert_eq!(window.toggle_label(), show);
+            assert!(window.child.is_none());
         }
-        assert_eq!(window.toggle_label(), "Show status window");
-        assert!(window.0.is_none());
     }
 }

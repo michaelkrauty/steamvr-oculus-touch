@@ -5,9 +5,11 @@
 
 use crate::{
     actions::ServiceAction,
+    cameras::{self, Settings, Textures},
     client::StatusError,
     config_stats::ConfigStats,
     model::{Daemon, Level, Snapshot},
+    preview_client::{Blob, Device, Feed, Mode, PreviewError, PreviewSnapshot, SensorFrame},
     window::{self, Icons, Tab, View},
 };
 use eframe::egui::{self, Color32, Pos2, Rect, TextureId};
@@ -242,6 +244,7 @@ const SCENARIOS: [(&str, &[&str]); 6] = [
             "52.0 fps",
             "0.14 px",
             "Tracking",
+            "Cameras",
         ],
     ),
     ("overview-asleep", &["Asleep", "Press a button to wake it."]),
@@ -616,4 +619,325 @@ fn rasterize(
     buf.iter()
         .flat_map(|c| c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
         .collect()
+}
+
+/// A synthetic infrared view of sensor `i` pooled by `scale`: a dim room, both controllers'
+/// LED rings as bright spots (sensor 2 sees only the right one), and on sensor 5 a sunlit
+/// window in the corner.
+fn camera_scene(i: usize, scale: u32) -> SensorFrame {
+    let (raw_w, raw_h) = (1280.0f32, 960.0f32);
+    let (w, h) = (1280 / scale, 960 / scale);
+    let mut blobs = Vec::new();
+    let mut ring = |device: u8, cx: f32, cy: f32, leds: u8, seen: u8| {
+        for led in 0..leds {
+            let a = led as f32 / leds as f32 * std::f32::consts::TAU + i as f32;
+            let (x, y) = (cx + 58.0 * a.cos(), cy + 40.0 * a.sin());
+            let matched = led < seen;
+            blobs.push(Blob {
+                x,
+                y,
+                w: 6.0,
+                h: 5.0,
+                led: matched.then_some((device, led * 2 + 1)),
+            });
+        }
+    };
+    let shift = i as f32 * 70.0;
+    if i != 1 {
+        ring(2, 360.0 + shift, 520.0 - shift / 2.0, 11, 9);
+    }
+    ring(1, 820.0 + shift / 2.0, 470.0 + shift / 3.0, 12, 10);
+    for k in 0..3 {
+        blobs.push(Blob {
+            x: 200.0 + 380.0 * k as f32,
+            y: 180.0 + 90.0 * k as f32,
+            w: 4.0,
+            h: 4.0,
+            led: None,
+        });
+    }
+    let mut seed = 0x2545_f491_u32.wrapping_mul(i as u32 + 1);
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let (rx, ry) = ((x * scale) as f32, (y * scale) as f32);
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Back wall, a lighter floor and a doorway; a little sensor noise.
+            let mut v = 4.0 + 10.0 * ry / raw_h + (seed >> 30) as f32;
+            if ry > raw_h * 0.68 {
+                v += 9.0;
+            }
+            if (raw_w * 0.12..raw_w * 0.27).contains(&rx) && ry > raw_h * 0.18 && ry < raw_h * 0.68
+            {
+                v += 7.0;
+            }
+            if i == 4 {
+                let d = ((rx - raw_w).powi(2) + ry.powi(2)).sqrt();
+                v = v.max(255.0 * (1.0 - d / 380.0).clamp(0.0, 1.0).powf(0.35));
+            }
+            for blob in &blobs {
+                let d2 = (rx - blob.x).powi(2) + (ry - blob.y).powi(2);
+                v = v.max(255.0 * (-d2 / 50.0).exp());
+            }
+            pixels.push(v.min(255.0) as u8);
+        }
+    }
+    let bright = pixels.iter().filter(|&&p| p >= 180).count();
+    let devices = [(2, 9, 11), (1, 10, 12)]
+        .into_iter()
+        .filter(|&(device, _, _)| !(i == 1 && device == 2))
+        .map(|(device_id, matched_blobs, visible_leds)| Device {
+            device_id,
+            matched_blobs,
+            visible_leds,
+            pose_valid: true,
+            match_flags: 3,
+        })
+        .collect();
+    SensorFrame {
+        serial: serial(i),
+        frame_ns: 1_000_000 + i as u64,
+        age_ms: 14 + i as u64 * 3,
+        raw_width: 1280,
+        raw_height: 960,
+        width: w,
+        height: h,
+        max_pixel: *pixels.iter().max().unwrap(),
+        // The daemon counts raw pixels; a pooled one stands for scale² of them.
+        bright_permille: (bright * 1000 / pixels.len()) as u32,
+        pixels,
+        blobs,
+        devices,
+        fps: Some(if scale == 2 { 29.6 } else { 15.0 }),
+    }
+}
+
+fn render_cameras(
+    feed: &Feed,
+    settings: &mut Settings,
+    size: [f32; 2],
+) -> (Vec<u8>, (usize, usize), Mode, Vec<String>) {
+    let mut textures = Textures::default();
+    render(egui::Theme::Dark, size, PPP, |ui, ctx| {
+        textures.update(ctx, feed, settings.enhance);
+        cameras::draw(ui, feed, &textures, settings)
+    })
+}
+
+/// Whether any pixel is within 24 of `color` in every channel.
+fn shows(pixels: &[u8], color: Color32) -> bool {
+    let want = color.to_array();
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|p| (0..3).all(|c| p[c].abs_diff(want[c]) <= 24))
+}
+
+#[test]
+fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
+    let grid = Feed::Live(PreviewSnapshot {
+        sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
+    });
+    let glare = match &grid {
+        Feed::Live(s) => s
+            .sensors
+            .iter()
+            .map(|s| s.bright_permille)
+            .collect::<Vec<_>>(),
+        _ => unreachable!(),
+    };
+    assert!(
+        glare[4] >= 15 && glare[..4].iter().all(|&g| g < 15),
+        "{glare:?}"
+    );
+    let mut settings = Settings::default();
+    let (pixels, dims, mode, labels) = render_cameras(&grid, &mut settings, cameras::SIZE);
+    assert_eq!(mode, Mode::All);
+    for text in [
+        "Cameras",
+        "5 sensors streaming",
+        "Blobs & LEDs",
+        "Enhance room",
+        "HUD",
+        "Sensor 1 · …0001 · 15 fps · 14 ms",
+        "Sensor 5 · …0005 · 15 fps · 26 ms",
+        "L 9/11  R 10/12",
+    ] {
+        assert!(
+            labels.iter().any(|l| l == text),
+            "missing {text:?} in {labels:?}"
+        );
+    }
+    // Sensor 2 sees only the right controller; only sensor 5 has glare.
+    assert!(labels.iter().any(|l| l == "R 10/12"), "{labels:?}");
+    assert_eq!(
+        labels.iter().filter(|l| l.starts_with("IR glare")).count(),
+        1
+    );
+    for color in [cameras::LEFT, cameras::RIGHT, cameras::CANVAS] {
+        assert!(shows(&pixels, color), "no {color:?} in the grid");
+    }
+    save("cameras-grid", &pixels, dims);
+    // The overlays and HUD go with their toggles.
+    let mut plain = Settings {
+        blobs: false,
+        hud: false,
+        ..Settings::default()
+    };
+    let (pixels, _, _, labels) = render_cameras(&grid, &mut plain, cameras::SIZE);
+    assert!(!labels
+        .iter()
+        .any(|l| l.starts_with("Sensor 1") || l.starts_with("IR glare")));
+    assert!(!shows(&pixels, cameras::LEFT) && !shows(&pixels, cameras::RIGHT));
+
+    let zoom = Feed::Live(PreviewSnapshot {
+        sensors: vec![camera_scene(0, 4), camera_scene(1, 2)],
+    });
+    let mut settings = Settings {
+        zoom: Some(serial(1)),
+        ..Settings::default()
+    };
+    let (pixels, dims, mode, labels) = render_cameras(&zoom, &mut settings, cameras::SIZE);
+    assert_eq!(mode, Mode::One(serial(1)));
+    for text in [
+        "‹ All cameras",
+        "Sensor 2 · …0002 · 640×480",
+        "Sensor 2 · …0002 · 30 fps · 17 ms",
+        "R 10/12",
+    ] {
+        assert!(
+            labels.iter().any(|l| l == text),
+            "missing {text:?} in {labels:?}"
+        );
+    }
+    assert!(!labels.iter().any(|l| l.starts_with("Sensor 1")));
+    assert!(shows(&pixels, cameras::RIGHT));
+    save("cameras-zoom", &pixels, dims);
+
+    let blobs_only = Feed::Live(PreviewSnapshot {
+        sensors: vec![SensorFrame {
+            width: 0,
+            height: 0,
+            raw_width: 0,
+            raw_height: 0,
+            pixels: Vec::new(),
+            ..camera_scene(0, 4)
+        }],
+    });
+    for (feed, name, text) in [
+        (
+            Feed::Failed(PreviewError::DaemonStopped),
+            Some("cameras-offline"),
+            "cv1touch daemon is not running.",
+        ),
+        (
+            Feed::Failed(PreviewError::UnsupportedDaemon),
+            None,
+            "The running daemon does not support live camera previews yet.",
+        ),
+        (
+            Feed::Live(PreviewSnapshot::default()),
+            None,
+            "No sensors detected.",
+        ),
+        (Feed::Connecting, None, "Connecting to cv1touchd…"),
+        (blobs_only, None, "1 sensor streaming"),
+    ] {
+        let (pixels, dims, _, labels) =
+            render_cameras(&feed, &mut Settings::default(), cameras::SIZE);
+        assert!(
+            labels.iter().any(|l| l == text),
+            "missing {text:?} in {labels:?}"
+        );
+        if let Some(name) = name {
+            save(name, &pixels, dims);
+        }
+    }
+}
+
+#[test]
+fn clicking_a_tile_zooms_and_escape_returns_to_the_grid() {
+    let feed = Feed::Live(PreviewSnapshot {
+        sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
+    });
+    let ctx = egui::Context::default();
+    window::configure_style(&ctx);
+    let mut textures = Textures::default();
+    let mut settings = Settings::default();
+    let mut frame = |events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, cameras::SIZE.into())),
+            events,
+            ..Default::default()
+        };
+        let mut mode = None;
+        ctx.run_ui(input, |ui| {
+            textures.update(ui.ctx(), &feed, settings.enhance);
+            mode = Some(cameras::draw(ui, &feed, &textures, &mut settings));
+        })
+        .textures_delta
+        .clear();
+        mode.unwrap()
+    };
+    frame(Vec::new());
+    frame(Vec::new());
+    // The window's symbols are in the bundled fonts, not drawn as missing glyphs.
+    let font = egui::FontId::proportional(14.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, "‹…×·–")));
+    // Inside the first tile, clear of its labels.
+    let pos = Pos2::new(160.0, 230.0);
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(vec![egui::Event::PointerMoved(pos)]);
+    frame(vec![button(true)]);
+    frame(vec![button(false)]);
+    assert_eq!(frame(Vec::new()), Mode::One(serial(0)));
+    let escape = egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    };
+    frame(vec![escape]);
+    assert_eq!(frame(Vec::new()), Mode::All);
+}
+
+#[test]
+fn the_camera_views_have_no_overlapping_text_down_to_the_least_size() {
+    let grid = Feed::Live(PreviewSnapshot {
+        sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
+    });
+    let zoom = Settings {
+        zoom: Some(serial(4)),
+        ..Settings::default()
+    };
+    for size in [cameras::SIZE, cameras::MIN_SIZE] {
+        for mut settings in [Settings::default(), zoom.clone()] {
+            let mut textures = Textures::default();
+            let (_, _, _, boxes) = render_boxes(
+                egui::Theme::Dark,
+                size,
+                1.0,
+                &mut |ui: &mut egui::Ui, ctx: &egui::Context| {
+                    textures.update(ctx, &grid, settings.enhance);
+                    cameras::draw(ui, &grid, &textures, &mut settings)
+                },
+            );
+            let overlaps = overlaps(&boxes);
+            assert!(overlaps.is_empty(), "{size:?}: {overlaps:?}");
+            for (label, r) in boxes.iter().filter_map(|(l, r)| Some((l, (*r)?))) {
+                assert!(
+                    r.x0 >= 0.0 && r.y0 >= 0.0 && r.x1 <= size[0] as f64 && r.y1 <= size[1] as f64,
+                    "{size:?}: {label:?} is cut off at {r:?}"
+                );
+            }
+            assert!(boxes.iter().any(|(l, _)| l.starts_with("Sensor 5")));
+        }
+    }
 }

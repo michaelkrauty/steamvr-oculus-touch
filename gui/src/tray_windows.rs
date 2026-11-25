@@ -1,4 +1,4 @@
-use super::{handle, poll_health, Context, Message, Report, ServiceAction, StatusWindow};
+use super::{handle, poll_health, Context, Kind, Message, Report, ServiceAction, Window};
 use std::{
     cell::RefCell,
     error::Error,
@@ -31,7 +31,8 @@ const CLASS: &[u16] = &[
     99, 118, 49, 116, 111, 117, 99, 104, 45, 116, 114, 97, 121, 0,
 ];
 struct Tray {
-    window: StatusWindow,
+    window: Window,
+    cameras: Window,
     report: Report,
     updates: Receiver<Report>,
     action_send: Sender<Option<String>>,
@@ -47,19 +48,27 @@ fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
     STATE.with(|state| state.borrow_mut().as_mut().map(f))
 }
 
-// The window (not the tray) owns the auto-reset events, which retain a
+// Each window (not the tray) owns its auto-reset events, which retain a
 // request sent before eframe installs the listener.
-const WINDOW_EVENTS: [&str; 2] = [
-    "Local\\cv1touch-gui-window",
-    "Local\\cv1touch-gui-window-close",
-];
+fn events(kind: Kind) -> [&'static str; 2] {
+    match kind {
+        Kind::Status => [
+            "Local\\cv1touch-gui-window",
+            "Local\\cv1touch-gui-window-close",
+        ],
+        Kind::Cameras => [
+            "Local\\cv1touch-gui-cameras",
+            "Local\\cv1touch-gui-cameras-close",
+        ],
+    }
+}
 const MESSAGES: [Message; 2] = [Message::Open, Message::Close];
 thread_local! {
     static WINDOW_ACTIVATION: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
-pub(super) fn signal_window(message: Message) -> bool {
-    let name = WINDOW_EVENTS[MESSAGES.iter().position(|m| *m == message).unwrap()];
+pub(super) fn signal_window(kind: Kind, message: Message) -> bool {
+    let name = events(kind)[MESSAGES.iter().position(|m| *m == message).unwrap()];
     unsafe {
         let event = OpenEventW(EVENT_MODIFY_STATE, 0, wide(name).as_ptr());
         if event.is_null() {
@@ -71,10 +80,10 @@ pub(super) fn signal_window(message: Message) -> bool {
     }
 }
 
-pub(super) fn run_window() -> Result<(), Box<dyn Error>> {
+pub(super) fn run_window(kind: Kind) -> Result<(), Box<dyn Error>> {
     unsafe {
         let mut events = [ptr::null_mut(); 2];
-        for (slot, name) in events.iter_mut().zip(WINDOW_EVENTS) {
+        for (slot, name) in events.iter_mut().zip(self::events(kind)) {
             *slot = CreateEventW(ptr::null(), 0, 0, wide(name).as_ptr());
             if slot.is_null() {
                 let error = std::io::Error::last_os_error();
@@ -94,7 +103,7 @@ pub(super) fn run_window() -> Result<(), Box<dyn Error>> {
             }
         }
         WINDOW_ACTIVATION.with(|slot| slot.set(events.map(|e| e as usize)));
-        crate::window::run();
+        kind.run();
         let left = WINDOW_ACTIVATION.with(|slot| slot.replace([0; 2]));
         if left[0] != 0 {
             left.iter().for_each(|e| {
@@ -190,8 +199,11 @@ fn open_window() {
     with_tray(|tray| tray.window.open());
 }
 
-fn toggle_window() {
-    with_tray(|tray| tray.window.toggle());
+fn toggle_window(kind: Kind) {
+    with_tray(|tray| match kind {
+        Kind::Status => tray.window.toggle(),
+        Kind::Cameras => tray.cameras.toggle(),
+    });
 }
 
 fn control(action: ServiceAction) {
@@ -223,6 +235,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_TIMER if w == POLL_TIMER => {
             if let Some(Some(report)) = with_tray(|tray| {
                 tray.window.reap();
+                tray.cameras.reap();
                 if let Some(result) = tray.action_results.try_iter().last() {
                     tray.action_error = result;
                 }
@@ -239,20 +252,30 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             0
         }
         TRAY if l as u32 == WM_LBUTTONUP => {
-            toggle_window();
+            toggle_window(Kind::Status);
             0
         }
         TRAY if l as u32 == WM_RBUTTONUP => {
             let menu = CreatePopupMenu();
-            let (toggle, summary, report) = with_tray(|tray| {
+            let (toggle, cameras, summary, report) = with_tray(|tray| {
                 let summary = match &tray.action_error {
                     Some(error) => error.clone(),
                     None if crate::actions::busy() => "Working…".to_owned(),
                     None => tray.report.summary.clone(),
                 };
-                (tray.window.toggle_label(), summary, tray.report.clone())
+                (
+                    tray.window.toggle_label(),
+                    tray.cameras.toggle_label(),
+                    summary,
+                    tray.report.clone(),
+                )
             })
-            .unwrap_or(("Show status window", String::new(), Report::default()));
+            .unwrap_or((
+                Kind::Status.labels()[0],
+                Kind::Cameras.labels()[0],
+                String::new(),
+                Report::default(),
+            ));
             let service = |action| {
                 if report.allows(action) {
                     MF_STRING
@@ -260,8 +283,10 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     MF_STRING | MF_GRAYED
                 }
             };
-            let entries: [(u32, Option<&str>); 11] = [
+            // Each entry's command is its position, from 1.
+            let entries: [(u32, Option<&str>); 12] = [
                 (MF_STRING, Some(toggle)),
+                (MF_STRING, Some(cameras)),
                 (MF_STRING | MF_GRAYED, Some(summary.as_str())),
                 (MF_SEPARATOR, None),
                 (
@@ -309,17 +334,18 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         }
         WM_COMMAND => {
             match w & 0xffff {
-                1 => toggle_window(),
-                4 => control(ServiceAction::Start),
-                5 => control(ServiceAction::Restart),
-                6 => control(ServiceAction::Stop),
-                8 => {
+                1 => toggle_window(Kind::Status),
+                2 => toggle_window(Kind::Cameras),
+                5 => control(ServiceAction::Start),
+                6 => control(ServiceAction::Restart),
+                7 => control(ServiceAction::Stop),
+                9 => {
                     let _ = crate::actions::setup();
                 }
-                9 => {
+                10 => {
                     let _ = crate::actions::report();
                 }
-                11 => {
+                12 => {
                     DestroyWindow(hwnd);
                 }
                 _ => {}
@@ -408,7 +434,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 action_send,
                 action_results,
                 action_error: None,
-                window: StatusWindow::default(),
+                window: Window::new(Kind::Status),
+                cameras: Window::new(Kind::Cameras),
             }));
         });
         let mut msg = MSG::default();
