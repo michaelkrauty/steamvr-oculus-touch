@@ -1,177 +1,153 @@
 # Setup
 
+This guide covers Linux. For Windows, see [cv1touch on Windows](windows.md); the calibration guide is the same on both.
+
 ## Build dependencies
 
-The supported build target is Linux x86-64. Rust 1.85 or newer, Cargo, Meson 1.3 or newer, and Python 3.9 or newer are required; install a stable toolchain using [the official Rust instructions](https://www.rust-lang.org/tools/install) if your distribution packages are older. The OpenVR headers and modified OpenHMD sources are vendored; the build does not need a system OpenVR SDK. Native dependencies are dynamically linked, so build on the distribution where you will run it.
+You need Rust 1.85 or newer, Meson 1.3 or newer and Python 3.9 or newer. If your distribution's Rust is older, install it with [rustup](https://www.rust-lang.org/tools/install). The OpenVR headers and the modified OpenHMD engine are vendored.
 
-On Debian/Ubuntu with a suitable Rust toolchain:
+Debian or Ubuntu:
 
 ```sh
 sudo apt install build-essential pkg-config meson ninja-build clang libclang-dev libhidapi-dev libusb-1.0-0-dev libjpeg-dev libpipewire-0.3-dev libspa-0.2-dev python3 procps
 ```
 
-On Arch Linux:
+Arch Linux:
 
 ```sh
 sudo pacman -S --needed base-devel rust meson ninja clang hidapi libusb libjpeg-turbo pipewire glib2 gstreamer gst-plugins-base python procps-ng
 ```
 
-On Fedora:
+Fedora:
 
 ```sh
 sudo dnf install gcc-c++ libstdc++-static cargo meson ninja-build clang hidapi-devel libusb1-devel libjpeg-turbo-devel pipewire-devel libubsan python3 procps-ng
 ```
 
-Hosted CI builds on Ubuntu 24.04 and Fedora 44; this identifies the build environments, not a SteamVR runtime compatibility guarantee. Check the CI workflow for the declared CI dependency set. Package availability and SteamVR compatibility vary by distribution. Source builds require internet access for Cargo's locked dependencies; native dependencies are resolved from the system.
+CI builds on Ubuntu 24.04 and Fedora 44. Native libraries are linked dynamically, so build on the system you run it on. Cargo needs internet access to fetch the locked crates.
 
 ## Device access
 
-Run the daemon as your normal desktop user. Do not run it as root. Install the rule once:
+Run the daemon as your desktop user, never as root. Install the udev rule once:
 
 ```sh
 sudo install -m 0644 udev/70-cv1touch.rules /etc/udev/rules.d/70-cv1touch.rules
 sudo udevadm control --reload-rules
 ```
 
-Reconnect the CV1 headset and sensors after reloading the rules. The rule grants the active local seat user access through logind ACLs to Oculus USB and hidraw devices. A remote-only or headless session may need administrator-managed device-group permissions instead; the provided rule intentionally does not make devices world-writable.
+Then reconnect the headset and sensors. The rule gives the user at the local seat access to the Oculus USB and hidraw devices through logind. A remote or headless session needs group permissions set up by an administrator instead.
 
-Use USB ports/controllers with enough bandwidth. If streams repeatedly stop or report incomplete frames, check the kernel USB log and try distributing sensors between USB controllers. Additional sensors do not help when their transfers cannot be sustained.
+Spread the sensors across USB controllers. If a sensor's video keeps stopping, `cv1touch doctor` says when it ran out of USB bandwidth.
 
 ## Install
 
-Start SteamVR once, so that it records where it is installed, then quit it and run `python3 scripts/install.py` from the repository root. If the installer does not find SteamVR, it says so before it builds anything. A clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) works; Git is not required to install from an archive. The installer builds locally against your system's native dependencies. It installs:
+Start SteamVR once so it records where it is installed, quit it, then run `python3 scripts/install.py` from a clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0). It installs:
 
-| Location | Purpose |
+| Location | Contents |
 | --- | --- |
-| `~/.local/bin/cv1touch`, `cv1touchd` | CLI and daemon |
-| `~/.local/lib/cv1touch` | Runtime library, driver package, installer manifest |
-| `$XDG_DATA_HOME/cv1touch/steamvr/cv1touch` | Driver registered with SteamVR, with its input profile; defaults to `~/.local/share` |
-| `$XDG_CONFIG_HOME/systemd/user/cv1touchd.service` | User service; defaults to `~/.config` |
+| `~/.local/bin/cv1touch`, `cv1touchd` | Command-line tool and daemon |
+| `~/.local/lib/cv1touch` | Engine library, driver package, install manifest |
+| `$XDG_DATA_HOME/cv1touch/steamvr/cv1touch` | The driver SteamVR loads (default `~/.local/share`) |
+| `$XDG_CONFIG_HOME/systemd/user/cv1touchd.service` | User service (default `~/.config`) |
 
-The installer refuses to overwrite unmanaged or modified installed files, including the registered SteamVR driver package. Driver ownership is recorded with SHA-256 hashes; a legacy package without ownership metadata is adopted only when both files exactly match the trusted previous installation. Existing driver conflicts are checked before the installer replaces prefix files; back up local changes and remove the conflicting package manually before retrying. For a manual deployment, use `--no-service` and/or `--no-steamvr`; `--prefix PATH` changes the binary/library installation prefix. `--no-build` reuses a release build, `--target-dir PATH` selects its Cargo output, and `--artifacts DIR` installs a prepared bundle. Run `python3 scripts/install.py --help` for all options. `cv1touch steamvr check` checks registered-driver ownership, and that SteamVR's Oculus Touch input profile can be read, without changing files or registration.
+It also turns on SteamVR's `activateMultipleDrivers` setting, keeping a backup of the previous settings. It refuses to overwrite files it did not install or that were changed since.
 
-The driver's input profile is made when the driver is installed, from SteamVR's own Oculus Touch profile (`drivers/oculus/resources/input/touch_profile.json` in the SteamVR directory). SteamVR shows the controllers as a controller type of their own, **Oculus Touch (cv1touch)**, because that is the only way to add a button SteamVR's Oculus Touch type does not have: the right controller's Oculus button. The profile is SteamVR's with that button added, the controller type made cv1touch's own, Oculus Touch set as its compatibility mode, so that each game's Oculus Touch bindings apply, and SteamVR's Oculus Touch remapping left out, because SteamVR ignores a compatibility mode beside one. The button's place on the binding picture is the left Menu button's, taken from that profile (the right-hand picture mirrors the left). The dashboard bindings that profile names are copied beside it when SteamVR has those files, because SteamVR looks for them there; a name with no file is left out, as SteamVR leaves it. The names SteamVR shows for the controller type and the button come from cv1touch's own small localization file. cv1touch ships none of SteamVR's or Oculus's files. A SteamVR update can change its profile, or the dashboard bindings copied beside it, while cv1touch's copy stays as it was: see [Upgrade](#upgrade) for what to do then.
+Options (`python3 scripts/install.py --help`):
 
-If SteamVR was not found, the installer stops before changing anything. Install SteamVR from Steam; if it is installed, start it once so it records where it is installed, or set `CV1TOUCH_STEAMVR` to its folder. Then run `python3 scripts/install.py` again. If the installer says SteamVR's Oculus Touch input profile is missing, have Steam verify SteamVR's files (its Properties, Installed Files), then run the installer again.
+- `--prefix PATH`: install the binaries and library somewhere other than `~/.local`.
+- `--no-service`: do not install or restart the systemd user service.
+- `--no-steamvr`: do not register the SteamVR driver.
+- `--no-build`, `--target-dir PATH`: reuse an existing release build.
+- `--artifacts DIR`: install a prepared bundle instead of building.
+- `--uninstall`: remove what the installer installed.
 
-SteamVR is discovered from its OpenVR path registry and common native Steam paths. Set `CV1TOUCH_STEAMVR` to the SteamVR runtime directory if needed, and `CV1TOUCH_STEAM_ROOT` to the Steam directory containing `config/steamvr.vrsettings` if discovery is ambiguous. Export these for installation and CLI commands; add them to a systemd user-service override when the daemon needs custom paths.
+If the installer cannot find SteamVR, set `CV1TOUCH_STEAMVR` to the SteamVR folder, and `CV1TOUCH_STEAM_ROOT` to the Steam folder that holds `config/steamvr.vrsettings`. If it says SteamVR's Oculus Touch input profile is missing, have Steam verify SteamVR's files and run it again.
+
+The driver's input profile is built at install time from SteamVR's own Oculus Touch profile. SteamVR shows the controllers as **Oculus Touch (cv1touch)**, which uses each game's Oculus Touch bindings and adds the right controller's Oculus button.
 
 ## Guided setup
 
-After installing, calibrate with the guide:
+Wake both controllers and make sure the daemon is running, then:
 
 ```sh
-cv1touch setup --check
-cv1touch setup --check --json
 cv1touch setup
-cv1touch setup --no-slip-check
-cv1touch setup --redo headset
-cv1touch setup --redo headset --quick
 ```
 
-`setup --check` is read-only: it lists each stage as done, not done, saved but not verified, needing redoing, or waiting on something, and starts nothing. A done stage means its saved settings still fit together; it does not measure tracking accuracy. Check that in SteamVR afterwards.
+Press Enter to start each stage, or `q` to quit. With your hands full, A on the right controller works as Enter. Timed steps start with one haptic pulse and beep and end with two. Setup remembers finished stages in `~/.local/state/cv1touch/setup.json`, so running it again continues where you left off. It never pairs controllers, changes firmware or permissions, or restarts services.
 
-Before you start: install the CLI and daemon from the same build, start the daemon, wake both already-paired controllers, and make sure every sensor shows frames. Headset alignment needs SteamVR running with the headset tracking. Setup never pairs controllers, resets hardware, changes firmware or permissions, or restarts services.
+1. **Sensor positions** (60 s): slowly wave both controllers around the whole play area, high and low, near and far from each sensor, turning your wrists so the rings face every way. Views shared by two sensors matter most. A good result also levels the floor.
+2. **Floor level** (only if the previous stage did not level it): 12 times, turn both controllers into a new position with the rings in view, hold still, press A, and keep still until the double beep (3 s).
+3. **Controller model** (5 s): keep both controllers awake. This lines up the controller drawn in VR with the real one.
+4. **Buttons and sticks**: release everything, pull both triggers fully, squeeze both grips fully, then circle both sticks against their edges. See [input calibration](input-calibration.md).
+5. **Headset alignment**: needs SteamVR running with your headset tracking. The guide checks the buttons and haptics first, then explains the whole procedure, since you will not see the screen:
+   1. Put on the headset and press the controllers firmly against its sides, left on the left, right on the right, without covering its sensors or cameras. Keep them from sliding or twisting.
+   2. Press A. A 10-second countdown of pulses follows; use it to settle the controllers back in place.
+   3. After two quick pulses, slowly turn on the spot: two full circles to the left, then two to the right, 5 to 10 s per circle.
+   4. After one pulse, look up and down and tilt your head toward each shoulder a few times.
+   5. One long pulse ends the recording. B cancels at any time.
 
-`cv1touch setup` shows the checks (only the failing ones are explained), the stage list, and a prompt for the next stage: Enter starts it, `q` quits. It runs only the stages that need work and remembers finished ones in `$XDG_STATE_HOME/cv1touch/setup.json` (default `~/.local/state/cv1touch/setup.json`), so rerunning it continues where you left off. Each finished stage prints one line with its headline result; solver output goes to a log next to the recordings, shown when a stage fails. A failed stage offers to try again right away; earlier stages stay done. Instructions are bold in a terminal; `NO_COLOR` or `TERM=dumb` turns that off (and a dumb terminal gets ASCII marks), and JSON reports stay plain.
+   If a controller turns on the headset by more than about 3 degrees, the recording stops with three pulses and the guide offers to try again. `cv1touch setup --no-slip-check` turns that check off.
 
-When every stage is done, `cv1touch setup` (on Windows, **Set up cv1touch** in the Start menu) lists the stages with a number each, how long each takes, and what has to be done again after it: redoing Sensor positions also takes Headset alignment again, because a new sensor calibration moves the space the headset was aligned in. Type a number and press Enter to do that stage again, or press Enter alone to finish. `cv1touch setup --redo STAGE` (`sensors`, `floor`, `model`, `buttons` or `headset`) does the same from the command line. Either way the stage is offered with redo and keep, for when something the guide cannot see has changed, such as a new SteamVR room setup; the saved result stays until the stage is redone, and quitting at the prompt changes nothing. Settings saved before you used the guide show as saved but not verified. `k` keeps such a stage as it is: do that only if tracking already looks right (sensor coverage, level, controller models, and the controllers' position against the SteamVR headset across the play area). Keeping records your judgement; it measures nothing. When in doubt, redo the stage.
+Other forms:
 
-Whenever your hands are full, A on the right controller does what Enter does, and timed steps are marked by a haptic pulse in both controllers and a beep from the speakers: one starts, two end. The stages:
+- `cv1touch setup --check` lists each stage's state without starting anything (`--json` for scripts).
+- `cv1touch setup --redo STAGE` redoes `sensors`, `floor`, `model`, `buttons` or `headset`. Once setup is complete, plain `cv1touch setup` also offers each stage by number. Redoing Sensor positions also requires Headset alignment again.
+- `cv1touch setup --redo headset --quick` is a 15-second alignment for a new headset or when the headset's tracking has moved: controllers anywhere on the headset, then look down and up, tilt toward each shoulder and look over each shoulder.
 
-- **Sensor positions**: works out where each of your Rift sensors is in the room. The sensors find their places by watching the lights in the controllers' rings, and moments when two sensors see a controller at once matter most. For 60 seconds, slowly wave both controllers around the whole play area: high and low, close to each sensor and far from it, turning your wrists so the rings face every way. A good result also levels the floor.
-- **Floor level** (only when the sensor positions did not already do it): finds which way is down, so the floor in VR is level. Each controller can feel gravity, but only while held perfectly still, and only accurately in many different positions. Twelve times: turn and tilt both controllers into a new position with their rings in view of the sensors, hold them still, press A, and keep them still until the double beep (3 seconds).
-- **Controller model**: lines up the controller you see in VR with the real one. Each controller reports where its lights are, and the guide moves SteamVR's 3D model to match. Nothing to aim or hold: keep both controllers awake for 5 seconds.
-- **Buttons and sticks**: measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads as a full pull. Let go of everything, pull both triggers all the way, squeeze both grips all the way, then circle both thumbsticks around their edges. Each step starts as soon as both hands are in position (Enter also starts it) and ends at the double beep.
-- **Headset alignment**: lines up the controllers' tracking with the headset's, so in VR the controllers appear exactly where your hands are. First a button and pulse check (press X, feel the pulse, press X again; the same with A), because with the headset on you will press A and go by haptic pulses. Then the guide shows the whole procedure, since you will not see the screen with the headset on: put on the headset; press the real controllers firmly against the outside of it, left controller on the left side, right on the right, hands off the rings and the headset's sensors or cameras, and from then on do not let them slide or twist on the headset (if one does, the calibration fails and you start the step again); press A on the right controller, and you feel a 10-second countdown via controller haptic pulses, one a second, while nothing is recorded yet: use it to press the controllers back into place in case pressing A moved them; two quick pulses start the recording: slowly turn your whole body around on the spot, two full circles to your left and then two to your right, 5 to 10 seconds per circle, until a single pulse; then look up and down and tilt your head toward each shoulder, as far as is comfortable, a few times each, until one long pulse, and take the headset off. What you see in the headset during this step does not matter. The recording ends by itself; you never press anything while holding the controllers to the headset, except B to cancel. While recording, the guide watches each controller against the headset: if one turns on it by more than about 3 degrees within a second, the recording stops with three quick pulses (as it does after B or any other problem; the screen says which), and the guide offers to try again with or without this slip check (`setup --no-slip-check` turns it off from the start, for when it keeps stopping careful recordings). A hold that shifts very slowly is tolerated rather than stopped, and a controller sliding without turning is not noticed; both still make the calibration fail at the end if the controllers did not stay put. If a controller falls asleep before the countdown, the guide names it and waits; once the countdown starts, a sleeping controller cancels the step. The recording measures the base station SteamVR tracks the headset from, and the guide names it. From the next time SteamVR starts, the cv1touch SteamVR driver has SteamVR start tracking the headset from that station (SteamVR's setting `driver_lighthouse.primarybasestation`), so the other stations need no recording of their own. It does this only when SteamVR sees more than one base station, and never changes a value of that setting you set yourself. If that station is switched off, SteamVR waits for it before it tracks the headset; when SteamVR is closed, the driver removes its setting, and after 30 seconds of waiting `cv1touch status` says to restart SteamVR, which then picks another station. To let SteamVR always pick the station itself, add `"pin_base_station": false` to `settings.json` in cv1touch's configuration folder (`~/.config/cv1touch` on Linux, `%LOCALAPPDATA%\cv1touch` on Windows); the driver then removes its setting. A headset that is not tracked by base stations (such as a Rift S or a Quest) has no station to measure.
+A stage saved before you used the guide shows as "saved earlier, not verified". Press `k` to keep it only if tracking already looks right; otherwise redo it.
 
-`cv1touch setup --redo headset --quick` is a short headset alignment, for lining the controllers up again after a change of headset or when the headset's own tracking has moved: the same steps, with the controllers anywhere on the headset, and a recording of about 15 seconds in which you look down and up, tilt your head toward each shoulder, then look over each shoulder. The recording ends only once you have looked and tilted far enough for the alignment; if the long pulse does not come, look further down and up and tilt your head further. If its result is refused, the next try is the full alignment. Every headset alignment says how far it moves the controllers where you play before it replaces the previous one, and adds a line to `alignment-history.jsonl` in cv1touch's state folder (`~/.local/state/cv1touch` on Linux), which `cv1touch report` includes: an alignment that moves them only a few millimetres means the headset's space had stayed where it was.
+Headset alignment measures the base station SteamVR tracks the headset from. When SteamVR sees more than one station, the driver sets SteamVR's `driver_lighthouse.primarybasestation` to that station from the next SteamVR start, and removes the setting when SteamVR closes. It never changes a value you set. To turn this off, add `"pin_base_station": false` to `~/.config/cv1touch/settings.json`.
 
-After setup, check both hands in SteamVR: position, buttons, haptics, recovery from occlusion and from sleep, and a daemon restart (see below). The guide has been validated on one installation with five sensors and one controller pair, on Linux. On Windows it is the same guide, run from the Start menu ([cv1touch on Windows](windows.md)), and no one has validated it yet.
-
-The manual commands below remain available for explicit recordings, inspection, alternative registration paths, and expert control.
-
-After an upgrade, automatic captures ask you to restart an older running daemon before preparing a capture. On Linux, use `systemctl --user restart cv1touchd`; on Windows, choose **Stop cv1touch**, then **Start cv1touch** in the Start menu. Update the CLI and daemon together: an older CLI can use an unfinished file if storage stalls beyond its five-second request timeout.
-
-Recordings keep 2 to 20 GiB of disk space free (5% of the disk, within those bounds) and stop at 8 GiB, or 16 GiB with `--frames`. If a recording ends early at either limit, the command says so and setup does not fit the shortened capture. If `record stop` says the file is still finishing, check `cv1touch status` and try the stop again once storage responds; use the file only after it reports completion. Existing recordings are kept.
-
-## Calibrate and align
-
-Camera calibration estimates the sensors' poses in a shared world. Registration then maps that world into the SteamVR tracking space. These are separate operations. A previously paired CV1 headset supplies the radio link; your other SteamVR headset supplies the reference pose.
-
-1. Start the service and wake both controllers. `cv1touch status --json` should show every connected sensor receiving frames. Ensure every sensor has a useful view of the play area and overlaps another sensor. `cv1touch status` is a continuously updating dashboard; Ctrl+C exits it.
-2. Run `cv1touch calibrate`. Follow the timed 60-second capture: move both controllers slowly throughout the space and turn them through varied orientations. Spend time in overlapping views. The solver rejects insufficient or inconsistent observations and preserves the previous calibration when it succeeds. A rejected solve is a request for a better capture, not a reason to use `--force` routinely.
-3. Level the world with gravity. Start a recording, then hold each controller still for at least 2 seconds in **at least 12 substantially different orientations**, including upside down and sideways. Move gently between holds, keeping optical visibility. A minute or two is usually enough. Each recording needs a file name not used before; the commands below keep it in cv1touch's state folder, `$XDG_STATE_HOME/cv1touch` (by default `~/.local/state/cv1touch`), where setup keeps its own recordings:
-
-   ```sh
-   dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"; mkdir -p "$dir"
-   cv1touch record start "$dir/manual-gravity.rec"
-   # Make the static holds, then:
-   cv1touch record stop
-   cv1touch calibrate gravity "$dir/manual-gravity.rec" --write
-   systemctl --user restart cv1touchd
-   ```
-
-   The gravity solver needs diverse, observable holds and reports an error if it cannot fit them. Keep the recording for diagnosis. Repeat gravity levelling after a new camera calibration.
-4. Start SteamVR with its own headset tracking normally. Run `cv1touch fit-render` using the calibration recording, or supply a recording path explicitly. This computes the visual-model offsets from the installed SteamVR meshes and the controllers' factory LED geometry.
-5. Run `cv1touch register --headset` and follow its capture instructions; it records, fits, saves, and reloads the alignment. For explicit control of the recording and fit, use:
-
-   ```sh
-   cv1touch eval-capture --free 150
-   ```
-
-   During the capture, hold or securely attach both Touch controllers to the headset so their relationship to it stays rigid. Follow the command's instructions about when to attach, move, and detach; the fitter isolates a rigid span from the surrounding handling. With the headset tracking, turn through two circles in each direction, then nod and tilt; keep the controllers visible to the CV1 sensors. The capture prints its output base path. Use that exact base, without guessing the newest recording:
-
-   ```sh
-   cv1touch register --follow BASE --reference hmd --write
-   cv1touch alignment reload
-   ```
-
-   Replace `BASE` with the printed path. The fit must have sufficient motion and agreement. If the two controllers move relative to the headset, repeat the capture. No separate tracked controller is required for this path.
-6. Run `cv1touch calibrate inputs`. Both hands share four phases: released triggers/grips and centered sticks, full trigger presses, full grip presses, then full thumbstick circles. Follow the prompts, press firmly at the normal mechanical stop, and move the stick against its gate through several complete circles. Settings apply immediately and survive restarts; SteamVR can stay open. See [input calibration](input-calibration.md) for reset and expert controls.
-7. Verify position and orientation in SteamVR. Run `cv1touch input-test` and follow its button prompts with a focused VR app running. The tool checks the exact supported SteamVR inputs and reports menu and thumb-rest delivery as a manual app check. The right Oculus button is a manual check too: bind it first (see below), since nothing is bound to it. Test haptics with a game or `cv1touch haptic left 0.1 100 0.5`. Check occlusion recovery, sleeping/waking, both hands, and a daemon restart before relying on the setup.
-
-A sensor that is moved, bumped or re-mounted takes care of itself while you play, as long as at least two other sensors stayed put: keep playing. Redo Sensor positions in `cv1touch setup` only when `cv1touch doctor` says to: when it has been unsure for several minutes whether a sensor moved, or found no new position for a moved one. A new SteamVR room setup or a substantial non-rigid base-station re-solve can require redoing Headset alignment in `cv1touch setup`.
-
-What the daemon does meanwhile: when the sensor stops seeing the controllers' LEDs where the others say they are, the daemon keeps tracking with it while it checks that the sensor is looking at the controller it thinks it is (each controller turning on its own by 30 degrees or more in its view settles that), and stops tracking with it only if the LEDs it then sees disagree. LEDs it has already matched to a controller that disagree with the others', or that sit consistently a little off, stop it being tracked with after two 5-second windows in a row, without that check. Either way, the daemon places it again from where the other sensors say the controllers are, and tracks with it as soon as two batches of frames agree on its new pose (typically a minute of the controllers moving in its view). The new pose is written into the calibration (the old file kept as a backup), and the daemon's log and `cv1touch doctor` say so. While fewer than two sensors agree with each other, they say cv1touch is still checking whether a sensor moved. `calibrate refine` and `calibrate place` remain for doing the same from a recording. See [troubleshooting](troubleshooting.md).
+After setup, check both hands in SteamVR. `cv1touch input-test` checks the buttons, triggers and sticks while a VR app has focus.
 
 ## Bind the right Oculus button
 
-The right controller's Oculus button can do whatever you choose, game by game. SteamVR shows the controllers as **Oculus Touch (cv1touch)**: a controller type of their own that uses each game's Oculus Touch bindings until you change one. Nothing is bound to the button at first, so every game behaves as before until you bind it:
+Nothing is bound to the right controller's Oculus button until you bind it, game by game:
 
-1. If the game uses OpenXR, as Pavlov does, start the game first and leave it running. Until it runs, SteamVR cannot load its controls: the binding page says "Unable to load action manifest" or stays on loading.
-2. In SteamVR, open **Settings**, then **Controllers**, then **Manage Controller Bindings**.
-3. Choose the game, and edit its current binding (or choose to make a custom one).
-4. Switch to the right hand. The Oculus button is listed as **Oculus Button**; choose it and pick what it should do.
-5. Save. SteamVR keeps the binding for that game and for these controllers.
+1. If the game uses OpenXR, start it first; otherwise its binding page says "Unable to load action manifest".
+2. In SteamVR, open **Settings**, **Controllers**, **Manage Controller Bindings**.
+3. Choose the game and edit its current binding.
+4. On the right hand, choose **Oculus Button** and pick an action. Save.
 
-The left controller's Menu button stays SteamVR's own: it opens the SteamVR menu. Older games that do not use SteamVR's bindings get nothing from the button unless their binding page maps it to one of the buttons they know.
+The left Menu button stays SteamVR's dashboard button.
+
+## Sensors that move
+
+A sensor that is bumped or moved is placed again automatically while at least two other sensors stay put. Keep playing with the controllers in its view; it takes about a minute of movement. The new pose is saved to the calibration with a backup of the old file. Redo Sensor positions only when `cv1touch doctor` says to.
 
 ## Add or remove sensors
 
-Connect or unplug sensors while the daemon runs. The daemon normally notices a settled USB change in about two seconds and adds a connected sensor without restarting the tracking engine. USB access, other pending sensors or a failed start can delay or prevent it. Its frames are used once its video is in step with the headset. While no engine runs (the headset is missing, or the daemon is changing tracking mode), the engine tries to open the sensor as it starts.
+Plug sensors in or out while the daemon runs; it notices within about two seconds. `cv1touch status` and `cv1touch doctor` say why a new sensor is waiting and what to do. There is no fixed sensor limit, only USB bandwidth and CPU. To keep a sensor closed, pass `--ignore-sensor SERIAL` to `cv1touchd` (repeatable).
 
-`cv1touch status` and `cv1touch doctor` show why a new sensor is waiting: the engine opening it, USB access not ready yet, or why the engine could not open it, with what to do. Check `cv1touch status --json`: `sensor_total` should match the number admitted, every sensor's `frames` counter should advance, and in calibrated mode a new sensor has `placed: 0` until calibrated. Without saved calibration, the daemon still uses provisional sensor placement. There is no fixed sensor-count limit. USB transport, memory, and processing capacity still apply; distribute cameras across available USB controllers and check the logs if an open or stream start fails. A device that was busy or not there yet is tried again a second later, up to three times; a sensor whose video could not start is not tried again until it is plugged in again, so move it to a different USB controller and the daemon starts it there. To leave particular cameras closed, pass `--ignore-sensor SERIAL` to the daemon; the option is repeatable, and serials match without regard to letter case. The same applies to camera serials typed into calibration commands and read from recordings. Re-placing an existing sensor keeps its saved spelling and, if it is the reference sensor, keeps it as the reference.
-
-For a fresh layout, repeat camera calibration, gravity levelling, and SteamVR registration as above. A sensor that merely moved needs nothing: the daemon places it again from the others (above). To add a new sensor while retaining an existing calibrated room, capture both controllers moving in the new sensor's view while the calibrated sensors also see them:
+To add a sensor to a calibrated room, record both controllers moving where it and the calibrated sensors can see them, then place it:
 
 ```sh
-dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"; mkdir -p "$dir"
-cv1touch record start "$dir/manual-add-sensor.rec"
-# Move both controllers with varied orientations in overlapping views, then:
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"
+cv1touch record start "$dir/add-sensor.rec"
+# Move both controllers through varied orientations, then:
 cv1touch record stop
-cv1touch calibrate place SERIAL "$dir/manual-add-sensor.rec"
+cv1touch calibrate place SERIAL "$dir/add-sensor.rec"
 ```
 
-Replace `SERIAL` with the new sensor's value from status. Inspect the fit first; repeat with `--write` only when the fit succeeds, then restart the daemon. This adds the sensor in the existing coordinate frame and preserves the other camera poses. Keep the capture and inspect tracking after the change. Removing a temporary sensor does not require deleting its calibration; disconnected entries remain available if you reconnect it. Reconnecting it reuses its saved calibration as soon as the daemon has opened it.
+`SERIAL` is the sensor's serial from `cv1touch status`. If the fit looks good, run the same command with `--write` and restart the daemon. For a new layout, redo Sensor positions instead. An unplugged sensor keeps its calibration for when it returns.
 
-The live status board lists every sensor. `camera_queue.dropped_frames` counts evictions from the bounded camera callback queues. `camera_queue.pending_frames_dropped` counts deferred frame copies evicted separately for each hand while waiting for its IMU samples; it can rise normally when a controller is idle or asleep, even with no callback backlog. Compare counter changes while both controllers are awake and moving. If drops persist during motion, inspect active-hand tracking, IMU/radio timing, and CPU load; stopped sensor frame counters also warrant checking USB transport.
+## Manual calibration
+
+`cv1touch help expert` lists every command. The stages of `cv1touch setup` map to these:
+
+| Stage | Command |
+| --- | --- |
+| Sensor positions | `cv1touch calibrate` (60 s capture and solve) |
+| Floor level | `cv1touch calibrate gravity REC --write` on a recording of at least 12 still holds of 2 s or more |
+| Controller model | `cv1touch fit-render [REC]` |
+| Buttons and sticks | `cv1touch calibrate inputs` |
+| Headset alignment | `cv1touch register --headset` |
+
+Solvers reject captures that are too short or inconsistent and keep the previous calibration. `--force` skips those checks; it is for diagnosis only. Restart the daemon after writing a calibration from the command line: `systemctl --user restart cv1touchd`.
 
 ## Upgrade
 
-**From v0.2.0 to v0.3.x:** update both the daemon and the SteamVR driver with the installer, then start SteamVR again. The shared-memory ABI changed from v3 to v4; mixing the two releases disconnects the controllers rather than reading incompatible poses. Calibration and settings are kept. Run `cv1touch doctor` and `cv1touch setup --check` after upgrading. The controllers now appear as **Oculus Touch (cv1touch)**; games still inherit Oculus Touch bindings, but custom bindings for the old controller type may need to be selected or recreated. See [binding the right Oculus button](#bind-the-right-oculus-button).
-
-Quit SteamVR and select the desired release before running the installer. For a tagged shallow checkout, run these commands from the repository root, replacing `v0.6.0` with the desired published tag:
+Quit SteamVR, select the release, and run the installer again:
 
 ```sh
 git fetch origin --tags
@@ -179,22 +155,22 @@ git checkout --detach v0.6.0
 python3 scripts/install.py
 ```
 
-For a source-archive installation, extract the desired release into a new directory and run `python3 scripts/install.py` there.
+For a source archive, extract the new release into a new folder and run the installer there. Calibration and settings are kept. The installer restarts the service so the new daemon runs (with `--no-service` it tells you how). Always update the daemon and the driver together.
 
-The installer replaces managed binaries, keeps calibration and settings, and restarts the cv1touchd service so that the new daemon runs (with `--no-service`, it says how to restart the daemon yourself). SteamVR loads the new driver on its next start. With `--no-steamvr`, SteamVR may be running: its controllers disconnect while the daemon restarts and come back once the new one is publishing, if its driver and the new daemon share the same shared-memory version. Keep a known-good release available if you need rollback; newer configuration schemas may need corresponding backups. A cv1touch from before the right Oculus button could be bound refuses the driver package a newer one installed: before going back to one, quit SteamVR and run `cv1touch steamvr uninstall` with the newer one. Its controllers are SteamVR's Oculus Touch again; bindings you made for Oculus Touch (cv1touch) stay saved in SteamVR, unused.
+After a SteamVR update, run `cv1touch doctor`. If its `input_profile` check says the profile is out of date, quit SteamVR and run `cv1touch steamvr install`.
 
-After SteamVR updates, run `cv1touch doctor`. If its `input_profile` check says cv1touch's copy of SteamVR's Oculus Touch profile is out of date, or that SteamVR's dashboard bindings for Oculus Touch changed, quit SteamVR and run `cv1touch steamvr install` (on Windows: choose Finish setting up cv1touch in the Start menu).
+To go back to a release from before the right Oculus button could be bound, first quit SteamVR and run `cv1touch steamvr uninstall` with the newer one.
 
 ## Remove
 
-Quit SteamVR, then:
+Quit SteamVR, then run with the same prefix and environment as the install:
 
 ```sh
 python3 scripts/install.py --uninstall
 ```
 
-Use the same prefix and environment overrides as installation. The installer unregisters the driver and removes its package (the input profile made for it included), removes the base-station setting the driver made in SteamVR's settings, disables/removes its managed service, and removes unmodified managed files. Calibration, recordings, and other SteamVR settings remain. `activateMultipleDrivers` remains enabled because other drivers may need it. Modified installed files are preserved and reported. Remove the udev rule manually only if no other Oculus tooling needs it.
+This unregisters the driver, removes the service and the files the installer owns, and removes the driver's base-station setting from SteamVR. It keeps calibration, recordings, changed files and `activateMultipleDrivers`. Remove the udev rule by hand if nothing else needs it.
 
-## Optional sensor viewer
+## Sensor viewer
 
-`tools/sensor-view` displays live raw sensor streams; `--annotated` shows blob labels. It requires PipeWire support at build time and GStreamer at runtime (`gst-launch-1.0`, PipeWire source, text overlay, and video sink plugins). Install `gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-x` on Debian/Ubuntu, or `gst-plugin-pipewire gst-plugins-base gst-plugins-good` on Arch. The viewer connects to streams only while open.
+`tools/sensor-view` shows live sensor views; `--annotated` labels the blobs. It needs GStreamer: `gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-x` on Debian or Ubuntu, or `gst-plugin-pipewire gst-plugins-base gst-plugins-good` on Arch.

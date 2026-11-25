@@ -1,47 +1,52 @@
 # cv1touch on Windows
 
-cv1touch adds original Oculus Rift CV1 Touch controllers to an existing SteamVR setup. There is one installer; no command-line knowledge, Python, developer tools, or separate Visual C++ runtime installation is needed.
-
-**Status:** untested on Windows hardware, but it should work. The build passes its tests, and the installer installs and uninstalls cleanly. If something is off, send a report (below). Before a first test, read the [first Windows test checklist](windows-first-test.md).
+One installer sets up everything. No command line, Python or developer tools are needed.
 
 ## What you need
 
-- An independently tracked headset already working in SteamVR. **This does not make the Rift CV1 display work.** The CV1 headset is only a USB radio receiver for the controllers; its HDMI cable is not needed.
-- A Rift CV1 headset and its original left/right Touch controllers, already paired to that headset, with charged batteries. Pairing is not implemented here. Rift S and Quest controllers are not supported.
-- At least two CV1 sensors with overlapping views of your play area, plugged directly into USB 3 ports where possible. One sensor is not recommended. Avoid putting every sensor on one hub.
-- Windows 11 (64-bit) with [SteamVR](https://store.steampowered.com/app/250820/SteamVR/) installed.
-- No active Oculus/Meta PC software: it can compete for the same USB devices. If your main headset needs that software, do not uninstall it; say so in the [issue tracker](https://github.com/michaelkrauty/steamvr-oculus-touch/issues) before testing ([issue #160](https://github.com/michaelkrauty/steamvr-oculus-touch/issues/160) is this setup).
-- Permission to approve Windows' administrator prompt for the sensor driver, or someone who can enter an administrator password. Keep the installer and SteamVR running as your normal user; only sensor-driver installation needs elevation.
+- Windows 11 x64 with [SteamVR](https://store.steampowered.com/app/250820/SteamVR/) and a headset SteamVR already tracks. The Rift CV1's display is not used: the CV1 headset is only the controllers' USB radio receiver, and its HDMI cable can stay unplugged.
+- The CV1 headset's original Touch controllers, already paired to it, with charged batteries.
+- Two or more CV1 sensors with overlapping views, on USB 3 ports where possible and not all on one hub.
+- Permission to approve one Windows administrator prompt, for the sensor driver.
+- No Oculus or Meta PC software running: it competes for the same USB devices. cv1touch gives the sensors Windows' WinUSB driver, replacing any other driver they had.
 
 ## Install
 
-1. Install SteamVR, start it once with your usual headset, and confirm that headset works. Then quit SteamVR. Plug in the CV1 headset's USB cable and every sensor.
-2. Download `cv1touch-setup-<version>.exe` from the [releases](https://github.com/michaelkrauty/steamvr-oculus-touch/releases) and run it. Windows may warn that it comes from an unknown publisher: cv1touch is not signed. It installs for you alone.
-3. Once during the install, Windows asks whether to allow a change (and, if your account is not an administrator's, for an administrator's password): that is `cv1touch sensors install`, which gives your sensors Windows' own USB driver ("WinUsb Device", which Windows ships and Microsoft signed). cv1touch reads the sensors through it. Nothing else is installed on your system, and the uninstaller takes it off again.
-4. The installer registers cv1touch with SteamVR and starts it. From then on it starts whenever you log in, without a window. If SteamVR is running, the installer asks you to quit it first.
+1. Start SteamVR once with your headset, then quit it. Plug in the CV1 headset's USB cable and every sensor.
+2. Download `cv1touch-setup-<version>.exe` from the [releases](https://github.com/michaelkrauty/steamvr-oculus-touch/releases) and run it. It installs for your account only, into `%LOCALAPPDATA%\Programs\cv1touch`.
+3. The installer is unsigned. If SmartScreen warns, choose **More info**, then **Run anyway**. Do not turn off antivirus, SmartScreen, driver signature enforcement or Secure Boot.
+4. Windows asks once for permission to change the system. This is `cv1touch sensors install`, giving each sensor WinUSB, the USB driver Microsoft ships with Windows. No other driver or certificate is installed.
+5. The installer registers the driver with SteamVR and starts cv1touch. From then on it starts at logon, without a window.
 
-   If something could not be done, the installer says what it was and what to do about it, for example to plug in a sensor or to allow Windows' prompt. Do that, then choose **Finish setting up cv1touch** in the Start menu. It tries again and keeps your calibration. Restart Windows if it asks you to.
-
-The installer is unsigned. Windows may show **More info → Run anyway** for a file downloaded from this repository. Do not disable antivirus, SmartScreen, driver-signature enforcement, or Secure Boot. If Windows does not offer a normal way to approve the download, stop and send a screenshot of the warning.
+If a step could not be done, the installer says what to do, such as plugging in a sensor or approving the prompt. Do that, then choose **Finish setting up cv1touch** in the Start menu. Restart Windows if it asks.
 
 ## Set up
 
-Wake both Touch controllers by pressing a face button, start SteamVR with your usual headset tracking, then choose **Set up cv1touch** in the Start menu (the installer offers this when driver setup succeeds). A text window guides you; you do not need to type commands. Read each instruction, press Enter when ready, and leave the window open. Allow about 10–20 minutes for the first setup, with room to move safely. Your sensors must remain fixed after calibration.
+Wake both controllers, start SteamVR with your headset tracking, and choose **Set up cv1touch** in the Start menu (the installer offers to start it). Follow the text window; it is the same guide as on Linux, described in [guided setup](setup.md#guided-setup). Allow 10 to 20 minutes and room to move. Keep the sensors fixed afterwards.
 
-The guide measures sensor positions, floor level, controller models, buttons/sticks, and headset alignment. During headset alignment you hold the controllers firmly against your usual headset and follow vibration cues. Do not attach them where they cover tracking sensors or cameras. If a step fails, it explains why and offers a retry; finished steps are kept. Once every step is done, **Set up cv1touch** lists the steps with a number each, so that you can do one again (for example when **Check cv1touch** says to redo Sensor positions): type its number and press Enter, or press Enter alone to finish. Until the guide is complete, **Check cv1touch** shows a `todo setup` line saying cv1touch is not set up yet; that is normal. [Setting up](setup.md) explains each step.
+Until setup is complete, **Check cv1touch** shows a `todo setup` line. That is expected.
 
-After setup, play: the controllers appear in SteamVR as soon as they are awake. SteamVR shows them as Oculus Touch (cv1touch), which uses each game's Oculus Touch bindings. To use the right controller's Oculus button in a game, bind it in SteamVR, with the game running: [Bind the right Oculus button](setup.md#bind-the-right-oculus-button).
+SteamVR shows the controllers as **Oculus Touch (cv1touch)** and uses each game's Oculus Touch bindings. To use the right Oculus button, [bind it](setup.md#bind-the-right-oculus-button).
 
-## When something is wrong
+## Start menu
 
-- **Check cv1touch** in the Start menu lists what cv1touch needs and whether it is in place: SteamVR, the sensors and their driver, the daemon.
-- **Send a cv1touch report** saves one zip file on your desktop and opens the folder. Send that file to the person helping you, together with what you were doing and a screenshot of the error. It includes installer/repair logs, daemon and SteamVR logs, and settings/calibration. **Review it before posting publicly:** calibration describes your room layout; logs can contain device serial numbers, your user-folder name and network addresses. Share it privately with your tester contact if preferred. Creating a report uploads nothing.
-- **Line up the controllers with your headset** does a short version of the headset step of setup: about 15 seconds of moving your head with the headset on, the full step if the short one does not work. Choose it after you change headsets, or when the controllers appear away from your hands, and follow the steps in its window. **Check cv1touch** says when SteamVR's headset is not the one the controllers were lined up with.
-- **Finish setting up cv1touch** gives the sensors their driver and registers with SteamVR again, for when the installer could not, or when **Check cv1touch** says the input profile is out of date after a SteamVR update.
-- **Stop cv1touch** and **Start cv1touch** stop and start the daemon by hand, and say when it is stopped or running. It otherwise starts at logon.
+| Entry | What it does |
+| --- | --- |
+| **Set up cv1touch** | Runs the setup guide. When setup is complete, lists the stages to redo. |
+| **Line up the controllers with your headset** | The 15-second headset alignment, for a new headset or when the controllers are away from your hands. |
+| **Check cv1touch** | `cv1touch doctor`: checks SteamVR, the sensors and their driver, and the daemon, and says what to fix. |
+| **Finish setting up cv1touch** | Installs the sensor driver and registers with SteamVR again. Use it when the installer could not, or after a SteamVR update when Check cv1touch says the input profile is out of date. |
+| **Send a cv1touch report** | Saves one zip file on your desktop with logs, settings and calibration. Nothing is uploaded. |
+| **Start cv1touch**, **Stop cv1touch** | Start or stop the daemon by hand. |
 
-The command line is there too, in `%LOCALAPPDATA%\Programs\cv1touch\bin`: `cv1touch doctor`, `cv1touch sensors`, `cv1touch status`, `cv1touch report`, `cv1touch stop`. Your settings and calibration live in `%LOCALAPPDATA%\cv1touch`, the daemon's log in `%LOCALAPPDATA%\cv1touch\state\logs\cv1touchd.log`.
+A report contains your room's calibration, and its logs can contain device serial numbers, your user folder name and network addresses. Review it before posting it publicly.
+
+The command-line tools are in `%LOCALAPPDATA%\Programs\cv1touch\bin`. `cv1touch sensors` shows whether each sensor has WinUSB; `cv1touch sensors remove` takes it off. Settings and calibration are in `%LOCALAPPDATA%\cv1touch`, and the daemon's log is `%LOCALAPPDATA%\cv1touch\state\logs\cv1touchd.log`.
 
 ## Uninstall
 
-Quit SteamVR and keep all sensors plugged in, then uninstall cv1touch from Windows' installed apps. It stops the daemon, unregisters it from SteamVR, removes the base-station setting its SteamVR driver made, and takes the connected sensors' driver off again (Windows asks once more). Approve that prompt; if cleanup cannot finish, read the message before closing the window. A disconnected sensor cannot be restored by this step: if you already uninstalled with it disconnected, reinstall cv1touch with that sensor connected, then uninstall again. Your settings and calibration stay in `%LOCALAPPDATA%\cv1touch`, in case you install it again; delete that folder to remove them.
+Quit SteamVR, keep every sensor plugged in, and uninstall cv1touch from Windows' installed apps. Approve the prompt to remove the sensors' WinUSB driver. Uninstalling stops the daemon, unregisters the driver from SteamVR and removes its base-station setting.
+
+A sensor that was unplugged keeps WinUSB. To remove it, reinstall cv1touch with that sensor plugged in, then uninstall again.
+
+Settings and calibration stay in `%LOCALAPPDATA%\cv1touch`. Delete that folder to remove them.
