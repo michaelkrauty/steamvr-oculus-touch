@@ -4,6 +4,17 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+### Added
+
+- `cv1touch pin-base-station off` stops the SteamVR driver from having SteamVR start tracking the headset from a measured base station, `on` turns it back on, and without a word it says which it is. It takes effect while the daemon runs and is saved in `settings.json`; while the daemon is not running it is written to that file directly. `cv1touch status --json` gives it as `pin_base_station`, next to `tilt_deg`.
+- `cv1touch report --json` prints one JSON object with where the report was saved, its size and what it holds, or why it could not be saved, instead of the usual lines. `--no-open` saves it without showing it in a window.
+- `cv1touch setup --events` runs the guided setup for a program that shows it: the same checks, stages and words, as one JSON object per line on standard output, with commands such as `run headset quick`, `retry` or `quit` on standard input. A on the right controller still starts a step where it does at a terminal, and closing its input stops the guide as Ctrl+C does.
+- On Windows, `cv1touch finish-setup --json` prints its result as one JSON object: whether it finished, whether Windows must restart first, each step's exit code and what is left to do.
+
+### Changed
+
+- `cv1touch doctor`, `cv1touch setup` and `cv1touch calibrate` say a sensor is active instead of streaming.
+
 ## [0.6.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) - 2026-11-24
 
 ### Added

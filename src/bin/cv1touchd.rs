@@ -5990,16 +5990,19 @@ fn status_json(d: &Daemon) -> String {
             })
         })
         .collect();
+    // a lock of its own: `base_pin_status` below takes it again
+    let pin_base_station = d.base_pin.lock().unwrap().watch.enabled;
     let mut queue = shared.queue;
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"pin_base_station\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         mode,
         tilt_deg(d),
+        pin_base_station,
         engine_ready,
         shared.input_calibration,
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
@@ -6229,6 +6232,15 @@ fn handle(d: &Daemon, line: &str) -> String {
                 republish_settings(d);
             }
             format!("ok tilt: {}{unsaved}", tilt_text(tilt_deg(d)))
+        }
+        Ok(Command::PinBaseStation(v)) => {
+            let mut unsaved = String::new();
+            if let Some(on) = v {
+                d.base_pin.lock().unwrap().watch.enabled = on;
+                unsaved = save_settings(d);
+            }
+            let on = d.base_pin.lock().unwrap().watch.enabled;
+            format!("ok {}{unsaved}", if on { "on" } else { "off" })
         }
         Ok(Command::AlignmentReload) => {
             // a shift measured against another registration does not apply to this one: until
@@ -13435,6 +13447,42 @@ mod tests {
         assert_eq!(
             settings::load(&d.settings_path).map(|s| s.tilt_deg),
             Ok(None)
+        );
+        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// `pin-base-station` shows and sets base-station pinning live, saves it beside the tilt
+    /// (neither drops the other), and the status shows it next to the tilt.
+    #[test]
+    fn base_station_pinning_is_set_live_saved_and_shown() {
+        let d = status_daemon();
+        let status = || -> serde_json::Value {
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap()
+        };
+        // the test daemon starts with it off
+        assert_eq!(handle(&d, "pin-base-station"), "ok off");
+        assert_eq!(status()["pin_base_station"], false);
+        assert_eq!(handle(&d, "pin-base-station on"), "ok on");
+        assert!(d.base_pin.lock().unwrap().watch.enabled);
+        assert_eq!(status()["pin_base_station"], true);
+        handle(&d, "tilt 10");
+        assert_eq!(handle(&d, "pin-base-station off"), "ok off");
+        assert!(!d.base_pin.lock().unwrap().watch.enabled);
+        assert_eq!(status()["pin_base_station"], false);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| (s.pin_base_station, s.tilt_deg)),
+            Ok((false, Some(10.0)))
+        );
+        assert_eq!(handle(&d, "pin-base-station"), "ok off");
+        assert_eq!(
+            handle(&d, "pin-base-station maybe"),
+            "err usage: pin-base-station [on|off]"
+        );
+        assert_eq!(handle(&d, "pin-base-station on"), "ok on");
+        assert_eq!(status()["pin_base_station"], true);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| s.pin_base_station),
+            Ok(true)
         );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }

@@ -8,6 +8,7 @@ use cv1touch::input_calibration;
 use cv1touch::setup::{self, Artifact, Checkpoint, Snapshot, Stage, State};
 use cv1touch::steamvr_log;
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -303,7 +304,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         } else if matches!(stage, Stage::Gravity | Stage::Registration)
             && second.as_ref().is_none_or(|v| v["mode"] != "calibrated")
         {
-            Some("load the saved camera calibration before this stage")
+            Some("load the saved sensor calibration before this stage")
         } else if matches!(stage, Stage::Render | Stage::Registration) && !runtime_ok {
             Some("SteamVR or cv1touch's SteamVR driver is missing")
         } else {
@@ -443,7 +444,7 @@ fn choice(prompt: &str, allowed: &[&str], hint: &str) -> Result<String, String> 
         if interrupted() {
             return Err("setup interrupted; completed steps are kept".into());
         }
-        match console::next_line(Duration::from_millis(100)) {
+        match next_line(Duration::from_millis(100)) {
             Line::Closed => {
                 return Err("setup requires an interactive terminal; input closed".into())
             }
@@ -491,6 +492,9 @@ impl StageLog {
 
     /// Prints `line` on the terminal, also from within `quiet`.
     fn say(&self, line: &str) {
+        if events::on() {
+            return events::status(line);
+        }
         let quiet = self.to_log.borrow_mut().take().is_some();
         let _ = writeln!(io::stdout(), "{line}");
         if quiet {
@@ -621,13 +625,17 @@ impl PressA {
 /// Shows `prompt` and waits for A on the right controller or Enter; q at the terminal stops.
 fn go_signal(prompt: &str) -> Result<(), String> {
     discard_typed_ahead();
-    human_action(prompt);
+    if events::on() {
+        events::prompt("start", prompt, &["go", "quit"], true);
+    } else {
+        human_action(prompt);
+    }
     let mut a = PressA::new();
     loop {
         if interrupted() {
             return Err("interrupted; nothing was recorded".into());
         }
-        match console::next_line(Duration::from_millis(20)) {
+        match next_line(Duration::from_millis(20)) {
             Line::Closed => {
                 return Err("setup requires an interactive terminal; input closed".into())
             }
@@ -647,7 +655,8 @@ fn go_signal(prompt: &str) -> Result<(), String> {
 /// A timed step: a cue, a countdown on one line, two cues at the end.
 fn timed_window(seconds: u64) -> Result<(), String> {
     cue(1);
-    let end = Instant::now() + Duration::from_secs(seconds);
+    let start = Instant::now();
+    let end = start + Duration::from_secs(seconds);
     loop {
         if interrupted() {
             println!();
@@ -657,12 +666,19 @@ fn timed_window(seconds: u64) -> Result<(), String> {
         if left.is_zero() {
             break;
         }
-        print!("\r  {:>3} s ", left.as_secs() + 1);
-        let _ = io::stdout().flush();
+        if events::on() {
+            let elapsed = Some(start.elapsed().as_secs_f64());
+            events::progress("capture", elapsed, Some(seconds as f64), "", Value::Null);
+        } else {
+            print!("\r  {:>3} s ", left.as_secs() + 1);
+            let _ = io::stdout().flush();
+        }
         thread::sleep(Duration::from_millis(200));
     }
-    print!("\r        \r");
-    let _ = io::stdout().flush();
+    if !events::on() {
+        print!("\r        \r");
+        let _ = io::stdout().flush();
+    }
     cue(2);
     Ok(())
 }
@@ -892,8 +908,9 @@ fn wait_reload_with(
 }
 
 fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
-    println!("Tracking restarts; keep the controllers awake.");
+    say("Tracking restarts; keep the controllers awake.");
     let start = std::time::Instant::now();
+    let mut ticker = events::Ticker::new(Duration::from_secs(1));
     wait_reload_with(
         before,
         expected_mode,
@@ -915,8 +932,38 @@ fn wait_reload(before: &Inspection, expected_mode: &str) -> Result<(), String> {
             Ok((status, raw, shm::now_ns()))
         },
         || start.elapsed(),
-        || thread::sleep(Duration::from_millis(100)),
+        || {
+            if ticker.due() {
+                let elapsed = Some(start.elapsed().as_secs_f64());
+                events::progress("reload", elapsed, Some(30.0), "", Value::Null);
+            }
+            thread::sleep(Duration::from_millis(100))
+        },
     )
+}
+
+/// A line the terminal shows plainly, or with `setup --events` a status event.
+fn say(line: &str) {
+    if events::on() {
+        events::status(line);
+    } else {
+        println!("{line}");
+    }
+}
+
+/// A wait for a controller button alone: a line at the terminal; with `setup --events` a prompt
+/// only `quit` answers besides the button.
+fn button_prompt(id: &str, message: &str) {
+    if events::on() {
+        events::prompt(id, message.trim(), &["quit"], true);
+    } else {
+        human_action(message);
+    }
+}
+
+/// A fit or solve has started; it shows nothing at the terminal.
+fn solving(detail: &str) {
+    events::progress("solve", None, None, detail, Value::Null);
 }
 
 /// Input older than this is stale: the controller stopped sending (asleep, or out of range).
@@ -1229,10 +1276,13 @@ fn confirm_registration_controls_with(
             "A",
         ),
     ] {
-        human_action(&format!("  Press {name}."));
+        button_prompt("button_check", &format!("  Press {name}."));
         press(hand, button, name)?;
         buzz(hand)?;
-        human_action(&format!("  Felt the pulse? Press {key} again."));
+        button_prompt(
+            "button_check",
+            &format!("  Felt the pulse? Press {key} again."),
+        );
         press(hand, button, name)?;
     }
     Ok(())
@@ -1249,8 +1299,14 @@ fn registration_countdown_with(
 ) -> Result<(), String> {
     let result = (|| {
         for remaining in (1..=10).rev() {
-            print!("{}", countdown_line(remaining));
-            let _ = io::stdout().flush();
+            if events::on() {
+                let elapsed = Some((10 - remaining) as f64);
+                let metrics = serde_json::json!({ "remaining_s": remaining });
+                events::progress("countdown", elapsed, Some(10.0), "", metrics);
+            } else {
+                print!("{}", countdown_line(remaining));
+                let _ = io::stdout().flush();
+            }
             tick(HAND_LEFT)?;
             tick(HAND_RIGHT)?;
             second()?;
@@ -1291,6 +1347,8 @@ pub(super) static SLIP_CHECK: AtomicBool = AtomicBool::new(true);
 static SLIPPED: AtomicBool = AtomicBool::new(false);
 /// `setup --redo headset --quick`: the short headset alignment, until a fit of it is refused.
 pub(super) static QUICK: AtomicBool = AtomicBool::new(false);
+/// `setup --events`: the guide for a program to show (`events`).
+pub(super) static EVENTS: AtomicBool = AtomicBool::new(false);
 
 /// `pulses` buzzes of `seconds` in both controllers, 0.1 s apart.
 fn registration_buzz(
@@ -1388,6 +1446,9 @@ impl CaptureFeedback for RegistrationFeedback<'_> {
         let result = self.check();
         self.noted(result)
     }
+    fn metrics(&self) -> Value {
+        serde_json::to_value(self.capture.progress()).unwrap_or_default()
+    }
     fn stopped(&mut self) -> Result<(), String> {
         // a recording stopped by an error has had its three buzzes
         if self.error.is_some() {
@@ -1463,10 +1524,11 @@ fn run_stage(
     let log = StageLog::new(stage);
     let code = match stage {
         Stage::Camera if preserve => {
-            println!("New sensors join the existing ones; keep those where they are.");
+            say("New sensors join the existing ones; keep those where they are.");
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
+            solving("Placing the new sensors");
             for serial in &inspection.unplaced {
                 if log.quiet(|| calibrate_place(serial, &rec, &file::default_path(), true)) != 0 {
                     return Err(log.failure("the new sensors could not be placed; your previous calibration is unchanged"));
@@ -1483,6 +1545,7 @@ fn run_stage(
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
+            solving("Working out where the sensors are");
             let solved =
                 match log.quiet(|| calibrate_solve_saved(&rec, &file::default_path(), false)) {
                     Ok(fingerprint) => {
@@ -1505,6 +1568,7 @@ fn run_stage(
             let rec = timed_capture(stage, checkpoint, true)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
+            solving("Working out which way is down");
             let compensate = setup::plan(&inspection.snapshot, &old)
                 .iter()
                 .any(|r| r.stage == Stage::Registration && r.state == State::Ready);
@@ -1521,6 +1585,7 @@ fn run_stage(
             let rec = timed_capture(stage, checkpoint, false)?;
             recordings.push(rec.clone());
             verify_capture(inspection)?;
+            solving("Fitting the controller model");
             log.quiet(|| fit_render(Some(&rec)))
         }
         Stage::Registration => {
@@ -1539,10 +1604,11 @@ fn run_stage(
                     .iter()
                     .all(|d| d.class != vr::CLASS_HMD || d.tracking_system == "lighthouse")
             });
-            println!(
-                "{}",
-                ui::headset_base_plan(tracked_from, reg.as_ref(), lighthouse)
-            );
+            say(&ui::headset_base_plan(
+                tracked_from,
+                reg.as_ref(),
+                lighthouse,
+            ));
             let (rec, base) = registration_capture_after_preparation(
                 checkpoint,
                 || {
@@ -1553,11 +1619,7 @@ fn run_stage(
                         |hand, button, name| wait_preparation_press(inspection, hand, button, name),
                         |hand| registration_haptic(hand, 0.12, 80., 0.35),
                     )?;
-                    human_action(if quick {
-                        QUICK_PREPARATION
-                    } else {
-                        REGISTRATION_PREPARATION
-                    });
+                    button_prompt("headset_start", instructions(stage, quick));
                     wait_preparation_press(
                         inspection,
                         HAND_RIGHT,
@@ -1588,7 +1650,9 @@ fn run_stage(
                     if interrupted() {
                         return Err("setup interrupted; nothing was recorded".into());
                     }
-                    print!("\r                            \r");
+                    if !events::on() {
+                        print!("\r                            \r");
+                    }
                     let mut feedback = RegistrationFeedback::new(
                         inspection,
                         SLIP_CHECK.load(Ordering::Relaxed),
@@ -1617,6 +1681,7 @@ fn run_stage(
             recordings.push(rec);
             recordings.push(base.with_extension("truth.json"));
             verify_capture(inspection)?;
+            solving("Lining up the controllers with the headset");
             let writer = Writer {
                 stage: if quick { "quick" } else { "full" },
                 say: &|line| log.say(line),
@@ -1630,12 +1695,12 @@ fn run_stage(
                 let reg = align::load_registration(&align::registration_path());
                 if let Some(reg) = reg.as_ref().ok().filter(|_| lighthouse) {
                     let layouts = align::load_layouts(&align::layouts_path()).of(reg.universe_id);
-                    println!("{}", ui::station_summary(reg, &reg.station_map(&layouts)));
+                    say(&ui::station_summary(reg, &reg.station_map(&layouts)));
                     let enabled = cv1touch::settings::load(&cv1touch::settings::default_path())
                         .map_or(true, |s| s.pin_base_station);
                     let keys = steamvr::pin_keys(&steamvr::vrsettings_path());
                     if let Some(plan) = ui::pin_plan(reg, keys, enabled) {
-                        println!("{plan}");
+                        say(&plan);
                     }
                 }
                 log.quiet(|| send_quiet("alignment reload"))
@@ -1701,6 +1766,333 @@ fn offer_again(stage: Stage, checkpoint: &mut Checkpoint) {
 /// capture ends by itself and a `record stop` would cut it short.
 const RECORDING_RUNNING: &str = "a recording is running: if you started it with cv1touch record start, stop it with cv1touch record stop; if setup, calibrate, eval-capture or register is recording, wait for it to finish";
 
+/// Refuses an unaddressable endpoint or an older running daemon before preparation, with the
+/// line to print. A daemon that is not running or is busy is for the guide's own checks to
+/// explain and retry, and every capture looks again before it starts.
+fn preflight() -> Result<(), String> {
+    let status = match status_json() {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            return Err(cannot_reach(&control::socket_path(), &error));
+        }
+        result => result.ok().flatten(),
+    };
+    if let Some(Err(error)) = status.map(|s| recording_capability(&s, cfg!(windows))) {
+        return Err(format!("cv1touch: {error}"));
+    }
+    Ok(())
+}
+
+/// Whether a stage's result saved earlier may be kept as it is instead of redone.
+fn can_keep(report: &setup::StageReport, inspection: &Inspection) -> bool {
+    matches!(report.state, State::Unknown | State::Stale)
+        && inspection.unplaced.is_empty()
+        && report.stage != Stage::Inputs
+}
+
+/// What a stage asks of the person, as the guide shows it before the stage's first prompt.
+fn instructions(stage: Stage, quick: bool) -> &'static str {
+    match stage {
+        Stage::Camera => CAMERA_MOTION,
+        Stage::Gravity => GRAVITY_HOLDS,
+        Stage::Render => RENDER_WAKE,
+        Stage::Registration if quick => QUICK_PREPARATION,
+        Stage::Registration => REGISTRATION_PREPARATION,
+        Stage::Inputs => INPUTS_GUIDE,
+    }
+}
+
+/// What the event guide does to the system, so that a test can stand in for it.
+trait Rig {
+    fn inspect(&mut self, checkpoint: &Checkpoint) -> Inspection;
+    /// Runs a stage; `quick`: the short headset alignment, which a refused fit turns off.
+    fn run(
+        &mut self,
+        stage: Stage,
+        quick: &mut bool,
+        inspection: &Inspection,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<(), String>;
+    /// Whether the last headset alignment stopped because a controller slipped.
+    fn slipped(&mut self) -> bool;
+    /// Stops watching for a slip, for the rest of the guide.
+    fn unwatch(&mut self);
+    fn persist(&mut self, checkpoint: &Checkpoint) -> Result<(), String>;
+    /// The file a stage installs, parsed.
+    fn installed(&mut self, stage: Stage) -> Option<Value>;
+}
+
+struct Live;
+
+impl Rig for Live {
+    fn inspect(&mut self, checkpoint: &Checkpoint) -> Inspection {
+        inspect(checkpoint)
+    }
+    fn run(
+        &mut self,
+        stage: Stage,
+        quick: &mut bool,
+        inspection: &Inspection,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<(), String> {
+        QUICK.store(*quick, Ordering::Relaxed);
+        let result = run_stage(stage, inspection, checkpoint);
+        *quick = QUICK.load(Ordering::Relaxed);
+        result
+    }
+    fn slipped(&mut self) -> bool {
+        SLIPPED.swap(false, Ordering::Relaxed)
+    }
+    fn unwatch(&mut self) {
+        SLIP_CHECK.store(false, Ordering::Relaxed);
+    }
+    fn persist(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
+        persist(checkpoint)
+    }
+    fn installed(&mut self, stage: Stage) -> Option<Value> {
+        installed(stage)
+    }
+}
+
+/// The `state` event: the checks and stages as `setup --check --json` reports them, with what
+/// the window needs to offer each stage. Whether setup is complete, too.
+fn state_event(inspection: &Inspection, checkpoint: &Checkpoint) -> (bool, Value) {
+    let (ready, reports, report) = report_json(inspection, checkpoint);
+    let views = check_views(inspection);
+    let checks_pass = ui::checks_pass(&views);
+    let stages: Vec<Value> = reports
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": events::stage_id(r.stage),
+                "title": ui::stage_name(r.stage),
+                "state": r.state,
+                "summary": ui::state_words(r),
+                "reason": r.reason,
+                "minutes": ui::stage_minutes(r.stage),
+                "can_run": checks_pass
+                    && r.state != State::Blocked
+                    && !inspection.snapshot.blocked.contains_key(&r.stage),
+                "can_keep": can_keep(r, inspection),
+                "quick_available": r.stage == Stage::Registration,
+            })
+        })
+        .collect();
+    let next = reports
+        .iter()
+        .find(|r| r.state != State::Ready)
+        .map(|r| events::stage_id(r.stage));
+    let (left_out, settling) = &inspection.moved;
+    let event = serde_json::json!({
+        "event": "state",
+        "ready": ready,
+        "checks": report["checks"],
+        "stages": stages,
+        "next": next,
+        "sensors": inspection.sensors.len(),
+        "daemon_running": !ui::daemon_down(&views),
+        "moved": {"left_out": left_out, "settling": settling},
+    });
+    (ready, event)
+}
+
+/// Waits at prompt `id` for a command `accept` takes; None once the guide is told to stop or its
+/// input ends.
+fn wait_command(
+    id: &str,
+    message: &str,
+    choices: &[&str],
+    accept: impl Fn(events::Command) -> bool,
+) -> Option<events::Command> {
+    events::prompt(id, message, choices, false);
+    loop {
+        if interrupted() {
+            return None;
+        }
+        if let Line::Typed(line) = next_line(Duration::from_millis(100)) {
+            match events::parse(&line) {
+                Ok(command) if accept(command) => return Some(command),
+                Ok(_) => events::rejected(
+                    &line,
+                    &format!("not at this prompt: {}", choices.join(", ")),
+                ),
+                Err(error) => events::rejected(&line, &error),
+            }
+        }
+    }
+}
+
+/// Why a stage cannot start now, as the guide says it; None when it can.
+fn not_ready(stage: Stage, inspection: &Inspection, checkpoint: &Checkpoint) -> Option<String> {
+    let views = check_views(inspection);
+    if let Some(check) = ui::first_failure(&views) {
+        return Some(check.detail.to_string());
+    }
+    let report = reports(inspection, checkpoint)
+        .into_iter()
+        .find(|r| r.stage == stage)?;
+    if report.state == State::Blocked {
+        return Some(ui::waiting_for(&report).to_string());
+    }
+    inspection.snapshot.blocked.get(&stage).cloned()
+}
+
+/// `setup --events`: the guide's stages, run on command. Each starts after the same checks as at
+/// the terminal, and a stage asked for with `--redo` runs first and ends the guide, as there.
+/// Whether setup is complete when the guide ends.
+fn drive_events(
+    rig: &mut impl Rig,
+    checkpoint: &mut Checkpoint,
+    redo: Option<Stage>,
+) -> Result<bool, String> {
+    let mut next = redo.map(|stage| (stage, QUICK.load(Ordering::Relaxed)));
+    loop {
+        let inspection = rig.inspect(checkpoint);
+        let (ready, state) = state_event(&inspection, checkpoint);
+        events::emit(state);
+        if interrupted() {
+            return Ok(ready);
+        }
+        let (stage, quick) = match next.take() {
+            Some(run) => run,
+            None if redo.is_some() => return Ok(ready),
+            None => {
+                let menu = wait_command(
+                    "menu",
+                    "Choose a stage.",
+                    &["go", "run", "keep", "recheck", "quit"],
+                    |c| {
+                        matches!(
+                            c,
+                            events::Command::Go
+                                | events::Command::Run(..)
+                                | events::Command::Keep(_)
+                                | events::Command::Recheck
+                        )
+                    },
+                );
+                match menu {
+                    None => return Ok(ready),
+                    Some(events::Command::Go) => {
+                        let first = reports(&inspection, checkpoint)
+                            .into_iter()
+                            .find(|r| r.state != State::Ready);
+                        match first {
+                            Some(r) => (r.stage, false),
+                            None => {
+                                events::rejected("go", "every stage is done");
+                                continue;
+                            }
+                        }
+                    }
+                    Some(events::Command::Run(stage, quick)) => (stage, quick),
+                    Some(events::Command::Keep(stage)) => {
+                        let report = reports(&inspection, checkpoint)
+                            .into_iter()
+                            .find(|r| r.stage == stage);
+                        if report.is_some_and(|r| can_keep(&r, &inspection)) {
+                            setup::adopt(stage, &inspection.snapshot, checkpoint)?;
+                            rig.persist(checkpoint)?;
+                            events::emit(serde_json::json!({"event": "stage_done",
+                                "stage": events::stage_id(stage), "summary": "kept"}));
+                        } else {
+                            events::rejected(
+                                &format!("keep {}", events::stage_id(stage)),
+                                "only a result saved earlier and not verified, or one an earlier step changed, can be kept",
+                            );
+                        }
+                        continue;
+                    }
+                    Some(_) => continue,
+                }
+            }
+        };
+        let mut quick = quick && stage == Stage::Registration;
+        let id = events::stage_id(stage);
+        let current = rig.inspect(checkpoint);
+        let result = match not_ready(stage, &current, checkpoint) {
+            Some(reason) => Err(reason),
+            None => {
+                events::emit(serde_json::json!({"event": "stage_start", "stage": id,
+                    "title": ui::stage_name(stage), "quick": quick,
+                    "instructions": instructions(stage, quick)}));
+                events::set_stage(Some(stage));
+                let result = rig.run(stage, &mut quick, &current, checkpoint);
+                events::set_stage(None);
+                result
+            }
+        };
+        let slipped = rig.slipped();
+        match result {
+            Ok(()) => {
+                let summary = ui::result_summary(stage, rig.installed(stage).as_ref());
+                events::emit(
+                    serde_json::json!({"event": "stage_done", "stage": id, "summary": summary}),
+                );
+            }
+            Err(error) => {
+                events::emit(serde_json::json!({"event": "stage_failed", "stage": id,
+                    "error": error, "slipped": slipped}));
+                if interrupted() {
+                    return Ok(false);
+                }
+                let mut choices = vec!["retry", "skip", "quit"];
+                if slipped {
+                    choices.insert(1, "unwatched");
+                }
+                let answer = wait_command(
+                    "retry",
+                    &format!("{} did not finish.", ui::stage_name(stage)),
+                    &choices,
+                    |c| {
+                        matches!(c, events::Command::Retry | events::Command::Skip)
+                            || (slipped && c == events::Command::Unwatched)
+                    },
+                );
+                match answer {
+                    None => return Ok(false),
+                    Some(events::Command::Unwatched) => {
+                        rig.unwatch();
+                        next = Some((stage, quick));
+                    }
+                    Some(events::Command::Retry) => next = Some((stage, quick)),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// `setup --events`, standard output kept for the events and the last one always `done`.
+fn run_events(redo: Option<Stage>) -> i32 {
+    let (out, _rest_to_stderr) = match console::reserve_stdout() {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            return 1;
+        }
+    };
+    events::start(Box::new(out), Box::new(console::next_line));
+    let mut ready = false;
+    let result = (|| -> Result<(), String> {
+        preflight().map_err(|e| e.trim_start_matches("cv1touch: ").to_string())?;
+        catch_interrupts();
+        std::fs::create_dir_all(state_dir()).map_err(|e| e.to_string())?;
+        let _lock = control::lock_single_instance(&state_dir().join("setup.lock"))
+            .map_err(|_| "another setup guide is running; finish it first".to_string())?;
+        let mut checkpoint = setup::load(&journal_path())
+            .map_err(|e| format!("setup journal: {e}"))?
+            .unwrap_or_default();
+        ready = drive_events(&mut Live, &mut checkpoint, redo)?;
+        Ok(())
+    })();
+    let mut done = serde_json::json!({"event": "done", "all_ready": ready});
+    if let Err(error) = &result {
+        done["error"] = error.as_str().into();
+    }
+    events::emit(done);
+    i32::from(!(ready && result.is_ok()))
+}
+
 /// Why the guide ended when the person quit it.
 fn stopped(checkpoint: &setup::Checkpoint) -> String {
     if checkpoint.completed.is_empty() {
@@ -1711,23 +2103,16 @@ fn stopped(checkpoint: &setup::Checkpoint) -> String {
 }
 
 pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
+    if !check_only && EVENTS.load(Ordering::Relaxed) {
+        return run_events(redo);
+    }
     if !check_only && !io::stdin().is_terminal() {
         eprintln!("cv1touch: setup needs an interactive terminal. Use setup --check [--json] for a read-only report.");
         return 2;
     }
-    // Refuse an unaddressable endpoint or an older running daemon before preparation. A daemon
-    // that is not running or is busy is for the guide's own checks to explain and retry, and
-    // every capture looks again before it starts.
     if !check_only {
-        let status = match status_json() {
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                eprintln!("{}", cannot_reach(&control::socket_path(), &error));
-                return 1;
-            }
-            result => result.ok().flatten(),
-        };
-        if let Some(Err(error)) = status.map(|s| recording_capability(&s, cfg!(windows))) {
-            eprintln!("cv1touch: {error}");
+        if let Err(error) = preflight() {
+            eprintln!("{error}");
             return 1;
         }
     }
@@ -1864,12 +2249,7 @@ pub(super) fn run(check_only: bool, json: bool, redo: Option<Stage>) -> i32 {
                 continue;
             }
             menu = false;
-            let can_adopt = matches!(report.state, State::Unknown | State::Stale)
-                && inspection.unplaced.is_empty()
-                && matches!(
-                    report.stage,
-                    Stage::Camera | Stage::Gravity | Stage::Render | Stage::Registration
-                );
+            let can_adopt = can_keep(report, &inspection);
             let offered: &[ui::Answer] = if can_adopt {
                 &[ui::Answer::Start, ui::Answer::Keep, ui::Answer::Quit]
             } else {
@@ -1980,6 +2360,298 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
+    /// Stands in for the system in `drive_events`: `inspection` is what every look finds, with
+    /// a sensor calibration once Sensor positions has run, and each run takes the next of
+    /// `results` ("wait for a stop": run until told to stop).
+    struct FakeRig {
+        inspection: fn() -> Inspection,
+        results: std::collections::VecDeque<Result<(), String>>,
+        runs: Vec<(Stage, bool)>,
+        looks: usize,
+        slipped: bool,
+        unwatched: bool,
+        persisted: usize,
+        calibrated: bool,
+    }
+
+    impl FakeRig {
+        fn new(inspection: fn() -> Inspection, results: &[Result<(), &str>]) -> FakeRig {
+            FakeRig {
+                inspection,
+                results: results.iter().map(|r| r.map_err(str::to_owned)).collect(),
+                runs: Vec::new(),
+                looks: 0,
+                slipped: false,
+                unwatched: false,
+                persisted: 0,
+                calibrated: false,
+            }
+        }
+    }
+
+    impl Rig for FakeRig {
+        fn inspect(&mut self, _: &Checkpoint) -> Inspection {
+            self.looks += 1;
+            assert!(self.looks < 100, "the guide never ended");
+            let mut inspection = (self.inspection)();
+            if self.calibrated {
+                inspection.snapshot.camera = Artifact::Valid("a".repeat(64));
+            }
+            inspection
+        }
+        fn run(
+            &mut self,
+            stage: Stage,
+            quick: &mut bool,
+            _: &Inspection,
+            _: &mut Checkpoint,
+        ) -> Result<(), String> {
+            self.runs.push((stage, *quick));
+            events::status("running");
+            let result = self.results.pop_front().expect("a result for every run");
+            if result.as_ref().is_err_and(|e| e == "wait for a stop") {
+                for _ in 0..10_000 {
+                    if interrupted() {
+                        return Err("setup interrupted; this step was not saved".into());
+                    }
+                }
+                panic!("a stop never reached the stage");
+            }
+            self.slipped = result.as_ref().is_err_and(|e| e.contains("slid"));
+            self.calibrated |= stage == Stage::Camera && result.is_ok();
+            // a refused quick alignment is followed by the full one
+            *quick &= result.is_ok();
+            result
+        }
+        fn slipped(&mut self) -> bool {
+            std::mem::take(&mut self.slipped)
+        }
+        fn unwatch(&mut self) {
+            self.unwatched = true;
+        }
+        fn persist(&mut self, _: &Checkpoint) -> Result<(), String> {
+            self.persisted += 1;
+            Ok(())
+        }
+        fn installed(&mut self, _: Stage) -> Option<Value> {
+            None
+        }
+    }
+
+    /// Nothing set up yet, every check passing.
+    fn fresh() -> Inspection {
+        let mut inspection = saved();
+        inspection.snapshot.camera = Artifact::Missing;
+        inspection.snapshot.registration = Artifact::Missing;
+        inspection.snapshot.render = Artifact::Missing;
+        inspection.snapshot.inputs = Artifact::Missing;
+        inspection
+    }
+
+    /// The events' kinds, each with the stage or prompt it names.
+    fn kinds(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| {
+                let name = e["event"].as_str().unwrap();
+                match name {
+                    "prompt" => format!("prompt {}", e["id"].as_str().unwrap()),
+                    "stage_start" | "stage_done" | "stage_failed" => {
+                        format!("{name} {}", e["stage"].as_str().unwrap())
+                    }
+                    _ => name.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// The event guide: every check and stage in each `state`, commands at the stage list, a
+    /// blocked stage refused with its reason, a failure offered again, and the end of its input
+    /// ending it.
+    #[test]
+    fn the_event_guide_runs_stages_on_command() {
+        let sink = events::tests::scripted(&[
+            "recheck",
+            "dance",
+            "run floor",
+            "skip",
+            "go",
+            "run headset quick",
+            "unwatched",
+            "keep model",
+            "retry",
+        ]);
+        let slid = "the left controller slid on the headset";
+        let mut rig = FakeRig::new(fresh, &[Ok(()), Err(slid), Ok(())]);
+        let mut checkpoint = Checkpoint::default();
+        let ready = drive_events(&mut rig, &mut checkpoint, None);
+        events::end();
+        assert_eq!(ready, Ok(false));
+        assert_eq!(
+            rig.runs,
+            [
+                (Stage::Camera, false),
+                (Stage::Registration, true),
+                (Stage::Registration, false)
+            ]
+        );
+        assert!(rig.unwatched);
+        let events = sink.events();
+        assert_eq!(
+            kinds(&events),
+            [
+                "state",
+                "prompt menu",
+                "state",
+                "prompt menu",
+                "rejected",
+                "stage_failed floor",
+                "prompt retry",
+                "state",
+                "prompt menu",
+                "stage_start sensors",
+                "status",
+                "stage_done sensors",
+                "state",
+                "prompt menu",
+                "stage_start headset",
+                "status",
+                "stage_failed headset",
+                "prompt retry",
+                "state",
+                "stage_start headset",
+                "status",
+                "stage_done headset",
+                "state",
+                "prompt menu",
+                "rejected",
+                "state",
+                "prompt menu",
+                "rejected",
+            ]
+        );
+        let state = &events[0];
+        let stages = state["stages"].as_array().unwrap();
+        let ids: Vec<&str> = stages.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["sensors", "floor", "model", "buttons", "headset"]);
+        assert_eq!(state["ready"], false);
+        assert_eq!(state["next"], "sensors");
+        assert_eq!(state["daemon_running"], true);
+        assert_eq!(state["sensors"], 1);
+        assert_eq!(stages[0]["state"], "missing");
+        assert_eq!(stages[0]["title"], "Sensor positions");
+        assert_eq!(stages[0]["can_run"], true);
+        assert_eq!(stages[1]["state"], "blocked");
+        assert_eq!(stages[1]["can_run"], false);
+        assert_eq!(stages[4]["quick_available"], true);
+        assert_eq!(stages[0]["quick_available"], false);
+        let floor = &events[5];
+        assert_eq!(floor["error"], "finish Sensor positions first");
+        assert_eq!(floor["slipped"], false);
+        assert_eq!(
+            events[6]["choices"],
+            serde_json::json!(["retry", "skip", "quit"])
+        );
+        let start = &events[14];
+        assert_eq!(start["quick"], true);
+        assert_eq!(start["title"], "Headset alignment");
+        assert_eq!(start["instructions"], QUICK_PREPARATION);
+        assert_eq!(events[15]["stage"], "headset", "events in a stage name it");
+        assert_eq!(events[16]["error"], slid);
+        assert_eq!(events[16]["slipped"], true);
+        assert_eq!(
+            events[17]["choices"],
+            serde_json::json!(["retry", "unwatched", "skip", "quit"])
+        );
+        assert_eq!(events[18]["stages"][0]["state"], "unknown");
+        assert_eq!(
+            events[19]["quick"], false,
+            "the full alignment follows a refusal"
+        );
+        assert_eq!(events[21]["summary"], "done");
+        assert_eq!(events[24]["command"], "keep model");
+        assert_eq!(events[27]["command"], "retry", "not at the stage list");
+    }
+
+    /// quit at the stage list, or abort while a stage runs, end the guide at once; a stage
+    /// asked for with --redo runs first and ends it.
+    #[test]
+    fn the_event_guide_stops_when_told_and_ends_after_a_redo() {
+        let sink = events::tests::scripted(&["quit", "go"]);
+        let mut rig = FakeRig::new(fresh, &[]);
+        assert_eq!(
+            drive_events(&mut rig, &mut Checkpoint::default(), None),
+            Ok(false)
+        );
+        events::end();
+        assert_eq!(kinds(&sink.events()), ["state", "prompt menu"]);
+        assert!(rig.runs.is_empty());
+
+        let sink = events::tests::scripted(&["run model", "!abort", "retry"]);
+        let mut rig = FakeRig::new(fresh, &[Err("wait for a stop")]);
+        assert_eq!(
+            drive_events(&mut rig, &mut Checkpoint::default(), None),
+            Ok(false)
+        );
+        events::end();
+        assert_eq!(
+            kinds(&sink.events()),
+            [
+                "state",
+                "prompt menu",
+                "stage_start model",
+                "status",
+                "stage_failed model"
+            ]
+        );
+
+        // never read: the guide ends after the stage
+        let sink = events::tests::scripted(&["quit"]);
+        let mut rig = FakeRig::new(saved, &[Ok(())]);
+        let ready = drive_events(&mut rig, &mut Checkpoint::default(), Some(Stage::Inputs));
+        events::end();
+        assert_eq!(rig.runs, [(Stage::Inputs, false)]);
+        assert_eq!(
+            kinds(&sink.events()),
+            [
+                "state",
+                "stage_start buttons",
+                "status",
+                "stage_done buttons",
+                "state"
+            ]
+        );
+        assert_eq!(ready, Ok(false), "a fake run records nothing");
+    }
+
+    /// A result saved earlier and not verified is kept on command, as k keeps it at a terminal.
+    #[test]
+    fn the_event_guide_keeps_a_saved_result() {
+        let sink = events::tests::scripted(&["keep buttons", "keep sensors"]);
+        let mut rig = FakeRig::new(saved, &[]);
+        let mut checkpoint = Checkpoint::default();
+        drive_events(&mut rig, &mut checkpoint, None).unwrap();
+        events::end();
+        let events = sink.events();
+        assert_eq!(
+            kinds(&events),
+            [
+                "state",
+                "prompt menu",
+                "rejected",
+                "state",
+                "prompt menu",
+                "stage_done sensors",
+                "state"
+            ]
+        );
+        assert_eq!(events[0]["stages"][0]["can_keep"], true);
+        assert_eq!(events[0]["stages"][3]["can_keep"], false);
+        assert_eq!(events[5]["summary"], "kept");
+        assert!(checkpoint.completed.contains_key(&Stage::Camera));
+        assert_eq!(rig.persisted, 1);
+    }
+
     fn saved() -> Inspection {
         let valid = || Artifact::Valid("a".repeat(64));
         Inspection {

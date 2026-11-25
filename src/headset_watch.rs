@@ -385,6 +385,26 @@ pub struct HeadsetCapture {
     span_ns: Option<(u64, u64)>,
     turned: bool,
     slipped: Option<(usize, f64)>,
+    /// The instants pushed so far.
+    pairs: usize,
+}
+
+/// How far a headset capture has got, for a display while it records.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Progress {
+    /// Headset poses taken, each with the controllers' at the same instant.
+    pub pairs: usize,
+    /// Seconds from the first pose to the latest.
+    pub seconds: f64,
+    /// Degrees turned to the left and to the right, and how far each needs.
+    pub turn_left_deg: f64,
+    pub turn_right_deg: f64,
+    pub needed_deg: f64,
+    /// The lowest and highest pitch (looking down, up) and roll (tilting right, left) so far,
+    /// degrees from level, and how far each side of level both need.
+    pub pitch_deg: Option<(f64, f64)>,
+    pub roll_deg: Option<(f64, f64)>,
+    pub nod_needed_deg: f64,
 }
 
 impl HeadsetCapture {
@@ -398,6 +418,23 @@ impl HeadsetCapture {
             span_ns: None,
             turned: quick,
             slipped: None,
+            pairs: 0,
+        }
+    }
+
+    pub fn progress(&self) -> Progress {
+        let c = &self.coverage;
+        Progress {
+            pairs: self.pairs,
+            seconds: self.span_ns.map_or(0.0, |(first, last)| {
+                last.saturating_sub(first) as f64 * 1e-9
+            }),
+            turn_left_deg: c.left_deg,
+            turn_right_deg: c.right_deg,
+            needed_deg: c.turn_deg,
+            pitch_deg: c.pitch,
+            roll_deg: c.roll,
+            nod_needed_deg: NOD_DEG / 2.0,
         }
     }
 
@@ -409,6 +446,7 @@ impl HeadsetCapture {
         touch: [Option<UnitQuaternion<f64>>; 2],
     ) {
         self.coverage.push(hmd);
+        self.pairs += 1;
         self.span_ns = Some((self.span_ns.map_or(t_ns, |s| s.0), t_ns));
         if let Some(fit) = self.fit.as_mut() {
             fit.push(t_ns, hmd);
@@ -748,6 +786,34 @@ mod tests {
             i += 1;
         }
         out
+    }
+
+    /// The progress shown while recording counts the poses and follows the turns and nods.
+    #[test]
+    fn progress_follows_the_head() {
+        for (quick, needed) in [(false, TURN_DEG), (true, QUICK_TURN_DEG)] {
+            let mut capture = HeadsetCapture::new(false, quick);
+            assert_eq!(capture.progress().pairs, 0);
+            assert_eq!(capture.progress().pitch_deg, None);
+            // 90 degrees to the left over 3 s, looking 20 degrees down
+            for i in 0..=1500u64 {
+                let t = i as f64 / 500.0;
+                let hmd = rot(Vector3::y(), 30.0 * t) * rot(Vector3::x(), -20.0);
+                capture.push(i * 2_000_000, hmd, [None; 2]);
+            }
+            let p = capture.progress();
+            assert_eq!(p.pairs, 1501);
+            assert!((p.seconds - 3.0).abs() < 1e-9, "{p:?}");
+            assert!((p.turn_left_deg - 90.0).abs() < 0.1, "{p:?}");
+            assert!(p.turn_right_deg < 0.1, "{p:?}");
+            assert_eq!(p.needed_deg, needed);
+            let (low, high) = p.pitch_deg.unwrap();
+            assert!(
+                (low + 20.0).abs() < 0.1 && (high + 20.0).abs() < 0.1,
+                "{p:?}"
+            );
+            assert_eq!(p.nod_needed_deg, NOD_DEG / 2.0);
+        }
     }
 
     #[test]

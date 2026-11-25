@@ -663,6 +663,23 @@ pub mod console {
     pub struct OutputRedirect {
         _guard: os::OutputRedirect,
     }
+
+    /// Standard output for one writer alone: a handle to it, with standard output itself sent
+    /// to standard error until the guard is dropped, so that nothing else this process or a
+    /// program it starts prints ends up among what the handle writes.
+    pub fn reserve_stdout() -> io::Result<(File, OutputRedirect)> {
+        use std::io::Write;
+        let _ = io::stdout().flush();
+        #[cfg(unix)]
+        let copy = |s: &dyn std::os::fd::AsFd| s.as_fd().try_clone_to_owned().map(File::from);
+        #[cfg(windows)]
+        let copy = |s: &dyn std::os::windows::io::AsHandle| {
+            s.as_handle().try_clone_to_owned().map(File::from)
+        };
+        let out = copy(&io::stdout())?;
+        let guard = redirect_output(&copy(&io::stderr())?)?;
+        Ok((out, guard))
+    }
 }
 
 pub mod shutdown {

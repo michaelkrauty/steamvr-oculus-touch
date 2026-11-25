@@ -452,45 +452,188 @@ const CONTENTS: &str = concat!(
     "Nothing else: no other recordings, and no other files."
 );
 
-pub(super) fn run(out: Option<PathBuf>) -> i32 {
+/// `report`'s flags, in any order: `--out PATH`, `--json`, `--no-open`; None for anything else.
+pub(super) fn flags(args: &[&str]) -> Option<(Option<PathBuf>, bool, bool)> {
+    let (mut out, mut json, mut open) = (None, false, true);
+    let mut args = args.iter();
+    while let Some(&arg) = args.next() {
+        match arg {
+            "--out" if out.is_none() => out = Some(PathBuf::from(args.next()?)),
+            "--json" if !json => json = true,
+            "--no-open" if open => open = false,
+            _ => return None,
+        }
+    }
+    Some((out, json, open))
+}
+
+/// `json`: one JSON object on stdout instead of the prose (`report --json`); `open`: show the
+/// saved file (not with `--no-open`).
+pub(super) fn run(out: Option<PathBuf>, json: bool, open: bool) -> i32 {
     let created = SystemTime::now();
     let named = out.is_some();
     let path = out.unwrap_or_else(|| default_path(created));
-    let shown = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-    println!("Collecting cv1touch's logs and settings into one file...");
-    let mut report = collect();
-    if let Err(e) = write(&path, created, &mut report) {
-        if e.kind() == io::ErrorKind::AlreadyExists {
+    if !json {
+        println!("Collecting cv1touch's logs and settings into one file...");
+    }
+    finish(
+        &path,
+        named,
+        json,
+        |path| write(path, created, &mut collect()),
+        |shown| open && platform::process::show_file(shown),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+}
+
+/// Saves the report at `path` with `save` and says how that went, on `out` and `err` or, with
+/// `json`, as one object on `out`; `show` shows the saved file. The exit code.
+fn finish(
+    path: &Path,
+    named: bool,
+    json: bool,
+    save: impl FnOnce(&Path) -> io::Result<()>,
+    show: impl FnOnce(&Path) -> bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
+    let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Err(e) = save(path) {
+        let error = if e.kind() == io::ErrorKind::AlreadyExists {
             let instead = if named {
                 "Name another file"
             } else {
                 "Run it again in a second, or name another file"
             };
-            eprintln!(
+            format!(
                 "There is already a file at {}, so the report was not saved. {instead}: cv1touch \
                  report --out PATH",
                 shown.display()
-            );
+            )
         } else {
-            eprintln!(
+            format!(
                 "The report could not be saved at {} ({e}). Name another place: cv1touch \
                  report --out PATH",
                 shown.display()
+            )
+        };
+        if json {
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::json!({"ok": false, "path": shown.display().to_string(), "error": error})
             );
+        } else {
+            let _ = writeln!(err, "{error}");
         }
         return 1;
     }
-    println!("Saved the report: {}", shown.display());
-    if platform::process::show_file(&shown) {
-        println!("A window shows it now.");
+    if json {
+        let bytes = std::fs::metadata(&shown).map_or(0, |m| m.len());
+        let opened = show(&shown);
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::json!({"ok": true, "path": shown.display().to_string(), "bytes": bytes, "opened": opened, "notice": CONTENTS})
+        );
+        return 0;
     }
-    println!("Send that file to whoever is helping you. {CONTENTS}");
+    let _ = writeln!(out, "Saved the report: {}", shown.display());
+    if show(&shown) {
+        let _ = writeln!(out, "A window shows it now.");
+    }
+    let _ = writeln!(out, "Send that file to whoever is helping you. {CONTENTS}");
     0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `report --json` prints one JSON object and nothing else, saying where the report is, how
+    /// big, and whether it was shown; `--no-open` shows nothing. A failed save is an object too.
+    #[test]
+    fn json_output_is_one_object_and_no_open_shows_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("report.zip");
+        let save = |p: &Path| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)?;
+            file.write_all(b"PK fake zip")
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = finish(&path, true, true, save, |_| false, &mut out, &mut err);
+        assert_eq!(code, 0);
+        assert!(err.is_empty());
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["path"], path.to_str().unwrap());
+        assert_eq!(value["bytes"], 11);
+        assert_eq!(value["opened"], false);
+        assert_eq!(value["notice"], CONTENTS);
+        assert_eq!(std::fs::read(&path).unwrap(), b"PK fake zip");
+        // a file already there is left alone, and the error is an object on stdout
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let shown = |_: &Path| -> bool { panic!("nothing saved, nothing shown") };
+        let code = finish(&path, true, true, save, shown, &mut out, &mut err);
+        assert_eq!(code, 1);
+        assert!(err.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["path"], path.to_str().unwrap());
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("There is already a file at "),
+            "{value}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"PK fake zip");
+    }
+
+    #[test]
+    fn flags_come_in_any_order_once_each() {
+        assert_eq!(flags(&[]), Some((None, false, true)));
+        assert_eq!(
+            flags(&["--no-open", "--out", "r.zip", "--json"]),
+            Some((Some(PathBuf::from("r.zip")), true, false))
+        );
+        for bad in [&["--out"][..], &["--json", "--json"], &["--open"], &["x"]] {
+            assert_eq!(flags(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Without `--json` the words are as they were, and the file is shown.
+    #[test]
+    fn prose_output_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("report.zip");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = finish(
+            &path,
+            true,
+            false,
+            |p| std::fs::write(p, b"x"),
+            |_| true,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "Saved the report: {}\nA window shows it now.\nSend that file to whoever is \
+                 helping you. {CONTENTS}\n",
+                path.display()
+            )
+        );
+        assert!(err.is_empty());
+    }
 
     #[test]
     fn a_long_log_keeps_its_end_from_a_line_start() {

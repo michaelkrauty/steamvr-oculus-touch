@@ -73,8 +73,25 @@ fn prepare(mut run: impl FnMut(Step) -> i32) -> (i32, Vec<&'static str>) {
     (code, left)
 }
 
+/// `finish-setup --json`'s one object: whether setup finished, whether Windows asks for a
+/// restart first, each step with its exit code, and what is left to do.
+#[cfg(any(windows, test))]
+fn json(code: i32, steps: &[(Step, i32)], left: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "ok": code == 0,
+        "reboot_needed": code == 3,
+        "steps": steps
+            .iter()
+            .map(|(step, exit)| serde_json::json!({"step": step.label(), "exit": exit}))
+            .collect::<Vec<_>>(),
+        "remaining": left,
+    })
+}
+
+/// `json`: one object on standard output instead of the steps' words (`finish-setup --json`);
+/// the log has them either way.
 #[cfg(windows)]
-pub(super) fn run() -> i32 {
+pub(super) fn run(json: bool) -> i32 {
     use super::*;
     use std::io::Write;
 
@@ -100,6 +117,7 @@ pub(super) fn run() -> i32 {
         .map_err(|e| e.to_string())?;
         let tool = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut log_error = false;
+        let mut steps = Vec::new();
         let (code, left) = prepare(|step| {
             let (program, args): (_, &[&str]) = match step {
                 Step::SteamVrStopped => (tool.clone(), &["steamvr", "check-stopped"]),
@@ -108,7 +126,9 @@ pub(super) fn run() -> i32 {
                 Step::SteamVr => (tool.clone(), &["steamvr", "install"]),
                 Step::Start => (tool.with_file_name("cv1touchd-quiet.exe"), &[]),
             };
-            println!("\n{}...", step.label());
+            if !json {
+                println!("\n{}...", step.label());
+            }
             let mut command = Command::new(&program);
             command.args(args);
             if step == Step::Start {
@@ -143,13 +163,20 @@ pub(super) fn run() -> i32 {
             {
                 code = STILL_RUNNING;
             }
-            print!("{text}");
+            if !json {
+                print!("{text}");
+            }
             log_error |= writeln!(log, "{}: exit {code}\n{text}", step.label()).is_err();
+            steps.push((step, code));
             code
         });
         log.sync_all().map_err(|e| e.to_string())?;
         if log_error {
             return Err("Could not save all setup diagnostics; check free disk space.".into());
+        }
+        if json {
+            println!("{}", self::json(code, &steps, &left));
+            return Ok(code);
         }
         if !left.is_empty() {
             println!("\n{INCOMPLETE}");
@@ -166,6 +193,12 @@ pub(super) fn run() -> i32 {
     };
     match work() {
         Ok(code) => code,
+        Err(error) if json => {
+            let mut value = self::json(1, &[], &[]);
+            value["error"] = error.into();
+            println!("{value}");
+            1
+        }
         Err(error) => {
             eprintln!("cv1touch: {error}");
             1
@@ -174,7 +207,7 @@ pub(super) fn run() -> i32 {
 }
 
 #[cfg(not(windows))]
-pub(super) fn run() -> i32 {
+pub(super) fn run(_json: bool) -> i32 {
     eprintln!(
         "cv1touch: finish-setup is for the Windows installer. On Linux, use scripts/install.py."
     );
@@ -204,6 +237,21 @@ mod tests {
             assert_eq!(called.last(), Some(&failed));
             assert!(!called.contains(&Step::Sensors));
         }
+    }
+
+    #[test]
+    fn json_says_what_finished_and_what_is_left() {
+        let (code, left) = prepare(|step| if step == Step::Sensors { 3 } else { 0 });
+        let steps = [(Step::Stop, 1), (Step::Sensors, 3)];
+        assert_eq!(
+            json(code, &steps, &left),
+            serde_json::json!({"ok": false, "reboot_needed": true,
+                "steps": [{"step": "Stopping cv1touch", "exit": 1},
+                          {"step": "Giving the sensors their driver", "exit": 3}],
+                "remaining": ["Restart Windows to finish giving the sensors their driver."]})
+        );
+        assert_eq!(json(0, &[], &[])["ok"], true);
+        assert_eq!(json(0, &[], &[])["reboot_needed"], false);
     }
 
     #[test]

@@ -343,7 +343,7 @@ fn with_sources(
         if calibrated.difference(&ignored).next().is_none() {
             return skip("no calibrated sensors are enabled");
         }
-        return pending("the tracking engine isn't running, so camera video couldn't be checked: check the headset's USB connection and power; check daemon logs for an engine open error");
+        return pending("the tracking engine isn't running, so sensor video couldn't be checked: check the headset's USB connection and power; check daemon logs for an engine open error");
     }
     if !status::has_received_frame_counters(current)
         && current["sensor_video_quality"] != true
@@ -416,7 +416,7 @@ fn with_sources(
             .zip(new.get(serial))
             .is_some_and(|(&a, &b)| b.advanced_from(a))
         {
-            detail.push(format!("{serial} is streaming"));
+            detail.push(format!("{serial} is active"));
         } else if let Some(notice) = sensor_waiting(current, serial) {
             explained.insert(serial.clone());
             detail.push(match notice {
@@ -690,7 +690,10 @@ mod tests {
         let old = snapshot(&[("CAMERA1", 40)]);
         let new = snapshot(&[("CAMERA1", 92)]);
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&new), Ok(&expected));
-        assert!(ok && detail.contains("CAMERA1 is streaming"), "{detail}");
+        assert!(
+            ok && detail.contains("CAMERA1 is active") && !detail.contains("streaming"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -763,7 +766,7 @@ mod tests {
         assert!(!ok && detail.contains("restarted"), "{detail}");
         let later = snapshot(&[("CAMERA1", 92)]);
         let (ok, detail) = check(Some(&expected), Some(&new), Some(&later), Ok(&expected));
-        assert!(ok && detail.contains("is streaming"), "{detail}");
+        assert!(ok && detail.contains("is active"), "{detail}");
     }
 
     #[test]
@@ -838,7 +841,7 @@ mod tests {
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&new), Ok(&[]));
         assert!(!ok && detail.contains("isn't connected"), "{detail}");
         assert!(
-            !detail.contains("streaming") && !detail.contains("bandwidth"),
+            !detail.contains("is active") && !detail.contains("bandwidth"),
             "{detail}"
         );
     }
@@ -860,8 +863,8 @@ mod tests {
             "alsoignored",
         ]);
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&new), Ok(&connected));
-        assert!(ok && detail.contains("is streaming"), "{detail}");
-        assert_eq!(detail.matches("is streaming").count(), 1, "{detail}");
+        assert!(ok && detail.contains("is active"), "{detail}");
+        assert_eq!(detail.matches("is active").count(), 1, "{detail}");
         assert_eq!(detail.matches("isn't calibrated").count(), 1, "{detail}");
         assert!(!detail.to_ascii_lowercase().contains("ignored"), "{detail}");
     }
@@ -923,7 +926,7 @@ mod tests {
         let zero = snapshot(&[("CAMERA1", 0)]);
         let ((ok, detail), reads, waits) = sampled(&[empty, zero.clone(), zero]);
         assert!(!ok && detail.contains("sending no video"), "{detail}");
-        assert!(!detail.contains("is streaming"), "{detail}");
+        assert!(!detail.contains("is active"), "{detail}");
         assert_eq!(reads, 3);
         assert_eq!(waits, vec![SAMPLE_INTERVAL; 2]);
     }
@@ -936,7 +939,7 @@ mod tests {
                 snapshot(&[("CAMERA1", 0)]),
                 snapshot(&[("CAMERA1", 20)]),
             ]);
-            assert!(ok && detail.contains("is streaming"), "{detail}");
+            assert!(ok && detail.contains("is active"), "{detail}");
             assert_eq!(reads, 3);
             assert_eq!(waits, vec![SAMPLE_INTERVAL; 2]);
         }
@@ -949,7 +952,7 @@ mod tests {
             .into();
         let ((ok, detail), reads, waits) = sampled(&values);
         assert!(!ok && detail.starts_with("not verified:"), "{detail}");
-        assert!(!detail.contains("is streaming"), "{detail}");
+        assert!(!detail.contains("is active"), "{detail}");
         assert_eq!(reads, MAX_SAMPLES);
         assert_eq!(waits, vec![SAMPLE_INTERVAL; MAX_SAMPLES - 1]);
     }
@@ -963,7 +966,7 @@ mod tests {
         new["sensors"][0]["frames_received"] = json!(92);
         let connected = cameras(&["CAMERA1"]);
         let (ok, detail) = check(None, Some(&old), Some(&new), Ok(&connected));
-        assert!(ok && detail.contains("is streaming"), "{detail}");
+        assert!(ok && detail.contains("is active"), "{detail}");
         assert!(!detail.contains("default calibration"), "{detail}");
     }
     fn probed(first: Option<&Value>, second: Option<&Value>) -> (Check, usize, usize) {
@@ -1093,7 +1096,7 @@ mod tests {
         current["sensor_streams"] =
             json!([{"serial": "CAMERA1", "error_kind": "likely_usb_bandwidth"}]);
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&expected));
-        assert!(ok && detail.contains("is streaming"), "{detail}");
+        assert!(ok && detail.contains("is active"), "{detail}");
         current["sensors"] = json!([]);
         current["sensor_total"] = json!(0);
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&current), Ok(&[]));
@@ -1116,7 +1119,7 @@ mod tests {
             "{detail}"
         );
         assert!(
-            !detail.contains("bandwidth") && !detail.contains("streaming"),
+            !detail.contains("bandwidth") && !detail.contains("is active"),
             "{detail}"
         );
     }
@@ -1190,7 +1193,7 @@ mod tests {
             !ok && report_detail.contains("isn't connected"),
             "{report_detail}"
         );
-        assert!(!board.contains("is streaming") && !report_detail.contains("is streaming"));
+        assert!(!board.contains("is active") && !report_detail.contains("is active"));
     }
 
     #[test]
@@ -1285,7 +1288,7 @@ mod tests {
     fn doctor_keeps_sampling_pending_cameras_while_another_camera_has_failed() {
         let expected = cameras(&["CAMERA1", "CAMERA2"]);
         for (counts, wanted) in [
-            (vec![100, 0, 20], "CAMERA2 is streaming"),
+            (vec![100, 0, 20], "CAMERA2 is active"),
             (vec![100, 90, 80, 70], "CAMERA2's video counter restarted"),
         ] {
             let mut reads = 0;
@@ -1333,7 +1336,7 @@ mod tests {
             value["sensors"][0]["frames_received"] = json!(40u64);
         }
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&new), Ok(&expected));
-        assert!(!ok && !detail.contains("is streaming"), "{detail}");
+        assert!(!ok && !detail.contains("is active"), "{detail}");
         assert!(detail.contains("sending no video"), "{detail}");
     }
 
@@ -1357,7 +1360,7 @@ mod tests {
         old["sensors"][0]["frames_received"] = json!(4_294_967_296u64);
         new["sensors"][0]["frames_received"] = json!(4_294_967_348u64);
         let (ok, detail) = check(Some(&expected), Some(&old), Some(&new), Ok(&expected));
-        assert!(ok && detail.contains("is streaming"), "{detail}");
+        assert!(ok && detail.contains("is active"), "{detail}");
     }
 
     #[test]
@@ -1462,7 +1465,7 @@ mod tests {
         let (ok, detail) = result.conclusion();
         assert!(ok, "{detail}");
         assert!(
-            detail.contains("CAMERA1 is streaming") && detail.contains("CAMERA2 isn't calibrated"),
+            detail.contains("CAMERA1 is active") && detail.contains("CAMERA2 isn't calibrated"),
             "{detail}"
         );
         assert!(!detail.contains("CAMERA3"), "{detail}");
@@ -1503,7 +1506,7 @@ mod tests {
                 "{detail}"
             );
             assert!(
-                !detail.contains("is streaming") && !detail.contains("sending no video"),
+                !detail.contains("is active") && !detail.contains("sending no video"),
                 "{detail}"
             );
             assert_eq!(reads, 4);
@@ -1549,7 +1552,7 @@ mod tests {
                 |interval| waits.push(interval),
                 |old, new| with_sources(|| unreachable!(), || Ok(cameras(&["CAMERA1"])), old, new),
             );
-            assert!(ok && detail == "CAMERA1 is streaming", "{detail}");
+            assert!(ok && detail == "CAMERA1 is active", "{detail}");
             assert_eq!(reads, 4);
             assert_eq!(waits, [Duration::from_secs(1); 3]);
         }
@@ -1774,8 +1777,7 @@ mod tests {
         new["sensors"].as_array_mut().unwrap().reverse();
         let (ok, detail) = check(None, Some(&old), Some(&new), Ok(&cameras));
         assert!(
-            ok && detail.contains("CAMERA1 is streaming")
-                && detail.contains("CAMERA2 is streaming"),
+            ok && detail.contains("CAMERA1 is active") && detail.contains("CAMERA2 is active"),
             "{detail}"
         );
         new["sensors"][0]["frames_decoded"] = json!(0);
@@ -1870,7 +1872,7 @@ mod tests {
             "{detail}"
         );
         assert!(
-            detail.contains("CAMERA1 is streaming") && detail.contains("CAMERA2 is streaming"),
+            detail.contains("CAMERA1 is active") && detail.contains("CAMERA2 is active"),
             "{detail}"
         );
         assert!(

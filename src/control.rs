@@ -55,6 +55,9 @@ pub enum Command {
     /// Degrees the controllers are shown pitched from their tracked pose, positive with the
     /// forward end up (None shows it).
     Tilt(Option<f64>),
+    /// Whether the SteamVR driver keeps SteamVR starting from a measured base station
+    /// (`settings::Settings::pin_base_station`; None shows it).
+    PinBaseStation(Option<bool>),
     /// Arm or disarm input injection for automated tests (None shows it). Armed, it disarms
     /// itself after a while.
     TestInject(Option<bool>),
@@ -344,6 +347,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 )
             }),
         ["tilt", ..] => Err("usage: tilt [DEGREES]".into()),
+        ["pin-base-station"] => Ok(Command::PinBaseStation(None)),
+        ["pin-base-station", "on"] => Ok(Command::PinBaseStation(Some(true))),
+        ["pin-base-station", "off"] => Ok(Command::PinBaseStation(Some(false))),
+        ["pin-base-station", ..] => Err("usage: pin-base-station [on|off]".into()),
         ["universe-watch"] => Ok(Command::UniverseWatch(None)),
         ["universe-watch", "on"] => Ok(Command::UniverseWatch(Some(true))),
         ["universe-watch", "off"] => Ok(Command::UniverseWatch(Some(false))),
@@ -947,6 +954,18 @@ mod tests {
     fn parse_alignment_reload() {
         assert_eq!(parse("alignment reload"), Ok(Command::AlignmentReload));
         assert_eq!(parse("tilt"), Ok(Command::Tilt(None)));
+        assert_eq!(parse("pin-base-station"), Ok(Command::PinBaseStation(None)));
+        assert_eq!(
+            parse("pin-base-station on"),
+            Ok(Command::PinBaseStation(Some(true)))
+        );
+        assert_eq!(
+            parse("pin-base-station off"),
+            Ok(Command::PinBaseStation(Some(false)))
+        );
+        for bad in ["pin-base-station yes", "pin-base-station on off"] {
+            assert_eq!(parse(bad), Err("usage: pin-base-station [on|off]".into()));
+        }
         assert_eq!(parse("tilt 10"), Ok(Command::Tilt(Some(10.0))));
         assert_eq!(parse("tilt -7.5"), Ok(Command::Tilt(Some(-7.5))));
         assert_eq!(

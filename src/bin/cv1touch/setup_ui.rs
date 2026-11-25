@@ -58,7 +58,7 @@ pub(super) fn stage_minutes(stage: Stage) -> &'static str {
     }
 }
 
-fn state_words(report: &StageReport) -> String {
+pub(super) fn state_words(report: &StageReport) -> String {
     match report.state {
         State::Ready => "done".into(),
         State::Missing => "not done".into(),
@@ -230,6 +230,11 @@ pub(super) fn checks(checks: &[CheckView], sensors: usize, g: &Glyphs) -> String
         ));
     }
     out
+}
+
+/// The first check shown to the person that fails.
+pub(super) fn first_failure<'a, 'b>(checks: &'a [CheckView<'b>]) -> Option<&'a CheckView<'b>> {
+    visible(checks).into_iter().find(|c| !c.ok)
 }
 
 /// Whether the checks that matter to the person all pass.
