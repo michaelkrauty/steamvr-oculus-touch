@@ -9,7 +9,7 @@ The daemon's log:
 
 ## Reporting a problem
 
-`cv1touch report` (on Windows, **Send a cv1touch report**) saves one zip file with a summary of the system and the `doctor` checks, the ends of the daemon's and SteamVR's logs, cv1touch's settings and calibration, and the newest three dropout recordings. Attach it to your issue with what you were doing. Review it first: calibration describes your room, and SteamVR's log can name your devices, user folder and network addresses.
+`cv1touch report` (on Windows, **Send a cv1touch report**) saves one zip file with a summary of the system and the `doctor` checks, the ends of the daemon's and SteamVR's logs, cv1touch's settings and calibration, and the newest three dropout logs. Attach it to your issue with what you were doing. Review it first: calibration describes your room, and SteamVR's log can name your devices, user folder and network addresses.
 
 ## Symptoms
 
@@ -47,6 +47,6 @@ The daemon's log:
 | | Linux | Windows |
 | --- | --- | --- |
 | Settings and calibration | `~/.config/cv1touch` | `%LOCALAPPDATA%\cv1touch` |
-| Recordings, setup state, learned IMU state | `~/.local/state/cv1touch` | `%LOCALAPPDATA%\cv1touch\state` |
+| Tracking logs, setup state, learned IMU state | `~/.local/state/cv1touch` | `%LOCALAPPDATA%\cv1touch\state` |
 
 Sensor calibration and alignment writes keep timestamped backups. Do not copy another user's calibration: it describes their room.

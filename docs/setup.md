@@ -41,7 +41,7 @@ Spread the sensors across USB controllers. If a sensor's video keeps stopping, `
 
 ## Install
 
-Start SteamVR once so it records where it is installed, quit it, then run `python3 scripts/install.py` from a clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0). It installs:
+Start SteamVR once so it writes where it is installed, quit it, then run `python3 scripts/install.py` from a clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0). It installs:
 
 | Location | Contents |
 | --- | --- |
@@ -84,9 +84,9 @@ Press Enter to start each stage, or `q` to quit. With your hands full, A on the 
    2. Press A. A 10-second countdown of pulses follows; use it to settle the controllers back in place.
    3. After two quick pulses, slowly turn on the spot: two full circles to the left, then two to the right, 5 to 10 s per circle.
    4. After one pulse, look up and down and tilt your head toward each shoulder a few times.
-   5. One long pulse ends the recording. B cancels at any time.
+   5. One long pulse ends logging. B cancels at any time.
 
-   If a controller turns on the headset by more than about 3 degrees, the recording stops with three pulses and the guide offers to try again. `cv1touch setup --no-slip-check` turns that check off.
+   If a controller turns on the headset by more than about 3 degrees, logging stops with three pulses and the guide offers to try again. `cv1touch setup --no-slip-check` turns that check off.
 
 Other forms:
 
@@ -119,7 +119,7 @@ A sensor that is bumped or moved is placed again automatically while at least tw
 
 Plug sensors in or out while the daemon runs; it notices within about two seconds. `cv1touch status` and `cv1touch doctor` say why a new sensor is waiting and what to do. There is no fixed sensor limit, only USB bandwidth and CPU. To keep a sensor closed, pass `--ignore-sensor SERIAL` to `cv1touchd` (repeatable).
 
-To add a sensor to a calibrated room, record both controllers moving where it and the calibrated sensors can see them, then place it:
+To add a sensor to a calibrated room, log both controllers moving where it and the calibrated sensors can see them, then place it:
 
 ```sh
 dir="${XDG_STATE_HOME:-$HOME/.local/state}/cv1touch"
@@ -138,7 +138,7 @@ cv1touch calibrate place SERIAL "$dir/add-sensor.rec"
 | Stage | Command |
 | --- | --- |
 | Sensor positions | `cv1touch calibrate` (60 s capture and solve) |
-| Floor level | `cv1touch calibrate gravity REC --write` on a recording of at least 12 still holds of 2 s or more |
+| Floor level | `cv1touch calibrate gravity LOG --write` on a tracking log of at least 12 still holds of 2 s or more |
 | Controller model | `cv1touch fit-render [REC]` |
 | Buttons and sticks | `cv1touch calibrate inputs` |
 | Headset alignment | `cv1touch register --headset` |
@@ -169,7 +169,7 @@ Quit SteamVR, then run with the same prefix and environment as the install:
 python3 scripts/install.py --uninstall
 ```
 
-This unregisters the driver, removes the service and the files the installer owns, and removes the driver's base-station setting from SteamVR. It keeps calibration, recordings, changed files and `activateMultipleDrivers`. Remove the udev rule by hand if nothing else needs it.
+This unregisters the driver, removes the service and the files the installer owns, and removes the driver's base-station setting from SteamVR. It keeps calibration, tracking logs, changed files and `activateMultipleDrivers`. Remove the udev rule by hand if nothing else needs it.
 
 ## Sensor viewer
 

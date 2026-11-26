@@ -18,7 +18,7 @@ A Rust daemon tracks the controllers from the CV1 sensors and the controllers' I
 
 **Windows:** download `cv1touch-setup-0.6.0.exe` from the [v0.6.0 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) and follow [cv1touch on Windows](docs/windows.md).
 
-**Linux:** start SteamVR once so it records where it is installed, quit it, install the [build dependencies](docs/setup.md#build-dependencies), then:
+**Linux:** start SteamVR once so it writes where it is installed, quit it, install the [build dependencies](docs/setup.md#build-dependencies), then:
 
 ```sh
 git clone --branch v0.6.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git

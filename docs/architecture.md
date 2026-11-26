@@ -11,7 +11,7 @@ Modified OpenHMD engine (C, third_party/openhmd)
 cv1touchd (Rust)
   LED matching, error-state Kalman filter, sensor checks
           │
-          ├── control socket, recordings
+          ├── control socket, tracking logs
           ▼
 Shared memory (common/cv1touch_shm.h)
           │
@@ -49,7 +49,7 @@ Published poses are the newest measurement, stamped with the time the controller
 
 - Poses are published in shared memory (`/cv1touch`, ABI version 4) using single-writer seqlocks, with a futex on Linux and an event on Windows to wake the driver. The driver rejects a mapping with another ABI version or a stale heartbeat. Its eight sensor slots are a diagnostic prefix, not a sensor limit.
 - The control socket is `$XDG_RUNTIME_DIR/cv1touch/control.sock` on Linux and a named pipe on Windows. Inside Steam's pressure-vessel container, which hides `$XDG_RUNTIME_DIR`, the driver uses a second socket at `/dev/shm/cv1touch-control-<uid>/control.sock`. Starting the daemon with `--runtime-dir` or `--shm-name` turns that second socket off.
-- Neither is a network interface. Any change to the ABI or the recording format must update both readers and writers, their compatibility tests and the changelog together.
+- Neither is a network interface. Any change to the ABI or the tracking log format must update both readers and writers, their compatibility tests and the changelog together.
 
 ## Sensors during play
 
@@ -59,9 +59,9 @@ Once static infrared light sources in the sensors' views have been learned with 
 
 Sensors are added and removed while the daemon runs. Each USB attachment gets one video-start attempt per engine; a sensor that failed to start needs to be plugged in again.
 
-## Recordings
+## Tracking logs
 
-`cv1touch record start PATH [--frames]` records radio reports, sensor observations and haptic commands; `--frames` adds raw images. A recording stops at 8 GiB (16 GiB with frames) and keeps 5% of the disk free, between 2 and 20 GiB. Replay one offline with `cv1touch track BASE`, and summarise it with `cv1touch rec-summary PATH`. Readers skip record types they do not know.
+`cv1touch record start PATH [--frames]` logs radio reports, sensor observations and haptic commands; `--frames` adds raw images. A tracking log stops at 8 GiB (16 GiB with frames) and keeps 5% of the disk free, between 2 and 20 GiB. Replay one offline with `cv1touch track BASE`, and summarise it with `cv1touch rec-summary PATH`. Readers skip entry types they do not know.
 
 ## Expert controls
 
@@ -78,4 +78,4 @@ cv1touchd --supervise [OPTIONS]
 - `CV1TOUCH_CPUS=2,4-6` restricts the daemon to those CPUs; by default it inherits the process's CPUs. On Linux it asks rtkit for real-time priority on its transport threads and runs normally if refused.
 - `settings.json` in the configuration folder holds `tilt_deg` (set by `cv1touch tilt`) and `pin_base_station`.
 - `cv1touch test-inject on` allows synthetic input (`cv1touch inject`) for ten minutes, for automated tests. It reaches whatever application has focus.
-- `cv1touch status --json` gives the full state: hands, every sensor with its frame and drop counters, startup and hot-plug status, and recording status.
+- `cv1touch status --json` gives the full state: hands, every sensor with its frame and drop counters, startup and hot-plug status, and logging status.
