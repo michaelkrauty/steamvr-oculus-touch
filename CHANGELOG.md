@@ -16,7 +16,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - The status window has a Settings tab: the controller angle, **Start tray icon when I log in**, on Linux the desktop entry and icons, quick shortcuts to align the controllers to the headset or calibrate buttons and sticks, and on Windows **Finish driver & SteamVR setup**, which runs `cv1touch finish-setup` and lists its steps.
 - The status window's "What to do" card has a button for its first problem where one fixes it: **Start daemon**, **Open setup**, **Align controllers to headset (15 s)**, **Calibrate sensors**, or on Windows **Finish Windows setup**.
 - **Save report** in the status window and **Save diagnostic report…** in the tray menu now save the report without opening a terminal, then show the file, its size and a note to review it before sharing, with **Open folder**.
-- `cv1touch-gui --version` (or `-V`) prints the GUI version. `cv1touch-gui --quit` closes its windows and tray icon without stopping the daemon.
+- `cv1touch-gui --open` starts the tray icon and opens the status window at once (used by the Start menu and desktop shortcuts). `cv1touch-gui --version` (or `-V`) prints the GUI version, and `cv1touch-gui --quit` closes its windows and tray icon without stopping the daemon.
 
 ### Changed
 

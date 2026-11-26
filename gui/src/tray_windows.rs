@@ -388,7 +388,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run(show_status: bool) -> Result<(), Box<dyn Error>> {
     unsafe {
         let mutex = CreateMutexW(ptr::null(), 1, wide(MUTEX).as_ptr());
         if mutex.is_null() {
@@ -465,6 +465,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 sensors: Window::new(Kind::Sensors),
             }));
         });
+        if show_status {
+            open_window();
+        }
         let mut msg = MSG::default();
         let result = loop {
             match GetMessageW(&mut msg, ptr::null_mut(), 0, 0) {

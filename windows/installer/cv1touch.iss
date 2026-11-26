@@ -73,7 +73,7 @@ Type: files; Name: "{group}\Start cv1touch.lnk"
 Type: files; Name: "{group}\Stop cv1touch.lnk"
 
 [Icons]
-Name: "{group}\cv1touch"; Filename: "{app}\bin\cv1touch-gui.exe"; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch-gui.exe"; Comment: "Open cv1touch"
+Name: "{group}\cv1touch"; Filename: "{app}\bin\cv1touch-gui.exe"; Parameters: "--open"; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\cv1touch-gui.exe"; Comment: "Open cv1touch"
 
 [Registry]
 ; Both start at logon, without opening windows.

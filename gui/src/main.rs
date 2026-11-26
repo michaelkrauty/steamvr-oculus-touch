@@ -26,6 +26,7 @@ Usage: cv1touch-gui [OPTION]
 Shows cv1touch's tray icon. Running it again opens the status window.
 
 Options:
+  --open               Start the tray icon and open the status window
   --window             Open the status window only
   --sensors            Open the live sensor views only
   --setup [--stage STAGE [--quick]]
@@ -41,7 +42,9 @@ Options:
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Command {
-    Tray,
+    Tray {
+        open: bool,
+    },
     Window(tray::Kind),
     Setup(setup_client::Request),
     #[cfg(target_os = "linux")]
@@ -52,7 +55,8 @@ enum Command {
 
 fn parse(args: &[String]) -> Result<Command, String> {
     Ok(match args.first().map(String::as_str) {
-        None => Command::Tray,
+        None => Command::Tray { open: false },
+        Some("--open") => Command::Tray { open: true },
         Some("--window") => Command::Window(tray::Kind::Status),
         // --cameras is the older name.
         Some("--sensors" | "--cameras") => Command::Window(tray::Kind::Sensors),
@@ -75,7 +79,7 @@ fn main() {
     let result = parse(&args)
         .map_err(Into::into)
         .and_then(|command| match command {
-            Command::Tray => tray::run(),
+            Command::Tray { open } => tray::run(open),
             Command::Window(kind) => tray::run_window(kind),
             Command::Setup(request) => {
                 setup_window::request(request);
@@ -110,7 +114,8 @@ mod tests {
             assert_eq!(parse(&[flag]), Ok(Command::Print(version.clone())));
         }
         assert_eq!(parse(&["--quit"]), Ok(Command::Quit));
-        assert_eq!(parse(&[]), Ok(Command::Tray));
+        assert_eq!(parse(&[]), Ok(Command::Tray { open: false }));
+        assert_eq!(parse(&["--open"]), Ok(Command::Tray { open: true }));
         assert_eq!(
             parse(&["--sensors"]),
             Ok(Command::Window(tray::Kind::Sensors))

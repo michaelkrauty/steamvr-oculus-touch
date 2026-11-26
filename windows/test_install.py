@@ -110,7 +110,7 @@ def check_shortcut(folder, gui):
     assert names == {"cv1touch.lnk"}, names
     link = shortcut(folder, "cv1touch")
     assert Path(link["target"]) == gui, link
-    assert link["arguments"] == "", link
+    assert link["arguments"] == "--open", link
     assert Path(link["directory"]) == gui.parent, link
 
 

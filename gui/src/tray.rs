@@ -680,8 +680,10 @@ mod linux {
         Err("Existing instance did not respond".into())
     }
 
-    pub fn run() -> Result<(), Box<dyn Error>> {
-        singleton(&runtime()?, "cv1touch-gui", serve)
+    pub fn run(open_window: bool) -> Result<(), Box<dyn Error>> {
+        singleton(&runtime()?, "cv1touch-gui", |socket| {
+            serve(socket, open_window)
+        })
     }
 
     pub(super) fn run_window(kind: Kind) -> Result<(), Box<dyn Error>> {
@@ -804,7 +806,7 @@ mod linux {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn serve(socket: UnixDatagram) -> Result<(), Box<dyn Error>> {
+    fn serve(socket: UnixDatagram, open_window: bool) -> Result<(), Box<dyn Error>> {
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let quit = Arc::new(AtomicBool::new(false));
         let window = Arc::new(Mutex::new(Window::new(Kind::Status)));
@@ -819,6 +821,9 @@ mod linux {
             quit: quit.clone(),
         }
         .spawn()?;
+        if open_window {
+            window.lock().unwrap().open();
+        }
         let (updates, _stop) = poll_health();
         let mut previous = Report::default();
         let mut shown = (false, false, false);
@@ -856,15 +861,15 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    linux::run()
+pub fn run(open_window: bool) -> Result<(), Box<dyn std::error::Error>> {
+    linux::run(open_window)
 }
 #[cfg(windows)]
 #[path = "tray_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    windows::run()
+pub fn run(open_window: bool) -> Result<(), Box<dyn std::error::Error>> {
+    windows::run(open_window)
 }
 
 #[cfg(test)]

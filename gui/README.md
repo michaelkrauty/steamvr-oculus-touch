@@ -11,7 +11,7 @@ cargo build --locked --release
 
 On Windows, open **cv1touch** from the Start menu to see the status window. The tray icon starts when you sign in and after an interactive install. If you build the GUI yourself, place `cv1touch-gui.exe` beside the installed cv1touch programs.
 
-Run `cv1touch-gui` to start the tray icon; running it again opens the status window. Click the icon to show or hide the window. The tray menu starts, restarts or stops the daemon, opens setup and saves a diagnostic report. A report can contain private information; review it before sharing it.
+Run `cv1touch-gui` to start the tray icon; running it again, or `cv1touch-gui --open`, opens the status window (starting the tray too if it is not running). Click the icon to show or hide the window. The tray menu starts, restarts or stops the daemon, opens setup and saves a diagnostic report. A report can contain private information; review it before sharing it.
 
 `cv1touch-gui --version` (or `-V`) prints the GUI version. `cv1touch-gui --quit` closes the GUI windows and removes the tray icon, leaving `cv1touchd` running.
 
