@@ -35,7 +35,7 @@ Open **cv1touch** from the Start menu, or click the tray icon, to see the status
 | Control | What it does |
 | --- | --- |
 | **Set up…** | Runs the setup guide and lists the stages you can redo. |
-| **Line up headset (15 s)…** in **Settings** | Redoes headset alignment for a new headset or when the controllers are away from your hands. |
+| **Align controllers to headset (15 s)…** in **Settings** | Redoes headset alignment for a new headset or when the controllers are away from your hands. |
 | **Overview** and **Stats** | See what needs attention in Overview and all diagnostic checks in Stats. |
 | **Finish driver & SteamVR setup** in **Settings** | Installs the sensor driver and registers with SteamVR again. Use it if the installer could not finish, or if the input profile is out of date after a SteamVR update. |
 | **Save report** | Saves one zip file with logs, settings and calibration and shows where it went. Nothing is uploaded. |

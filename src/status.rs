@@ -359,7 +359,7 @@ pub fn other_headset_note(value: &serde_json::Value) -> Option<String> {
         format!(
             "SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, {}, and follow its steps",
             if cfg!(windows) {
-                "open cv1touch from the Start menu, choose Line up headset (15 s)"
+                "open cv1touch from the Start menu, choose Align controllers to headset (15 s)"
             } else {
                 crate::track::repose::redo_headset(false)
             }
@@ -699,7 +699,7 @@ mod tests {
         let note = other_headset_note(&status("other".into())).unwrap();
         assert!(note.starts_with("SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, "));
         assert!(note.ends_with(if cfg!(windows) {
-            "open cv1touch from the Start menu, choose Line up headset (15 s), and follow its steps"
+            "open cv1touch from the Start menu, choose Align controllers to headset (15 s), and follow its steps"
         } else {
             "redo Headset alignment in cv1touch setup, and follow its steps"
         }));
