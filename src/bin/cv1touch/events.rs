@@ -213,6 +213,8 @@ pub(super) enum Command {
     Retry,
     Unwatched,
     Skip,
+    /// End headset capture early and fit what has been logged so far.
+    Finish,
 }
 
 pub(super) fn parse(line: &str) -> Result<Command, String> {
@@ -231,7 +233,8 @@ pub(super) fn parse(line: &str) -> Result<Command, String> {
         ["retry"] => Ok(Command::Retry),
         ["unwatched"] => Ok(Command::Unwatched),
         ["skip"] => Ok(Command::Skip),
-        _ => Err("unknown command: go, run STAGE [quick], keep STAGE, recheck, retry, unwatched, skip, quit".into()),
+        ["finish"] => Ok(Command::Finish),
+        _ => Err("unknown command: go, run STAGE [quick], keep STAGE, recheck, retry, unwatched, skip, finish, quit".into()),
     }
 }
 
@@ -374,6 +377,7 @@ pub(super) mod tests {
         assert_eq!(parse("retry"), Ok(Command::Retry));
         assert_eq!(parse("unwatched"), Ok(Command::Unwatched));
         assert_eq!(parse("skip"), Ok(Command::Skip));
+        assert_eq!(parse("finish"), Ok(Command::Finish));
         for bad in ["run floor quick", "run camera", "", "GO", "run"] {
             assert!(parse(bad).is_err(), "{bad}");
         }

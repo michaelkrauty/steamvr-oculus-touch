@@ -1180,6 +1180,29 @@ fn next_line(timeout: Duration) -> Line {
     }
 }
 
+/// Whether `line` read during headset capture ends logging early and keeps the data. At a
+/// terminal, any line or closed input ends it; with `setup --events`, only `finish` does
+/// (`quit`, `abort` and EOF set `events::stopped()` inside `next_line`), while any other command
+/// or blank line is rejected and capture continues.
+fn capture_line_stops(line: Line) -> bool {
+    match line {
+        Line::NotYet => false,
+        Line::Closed => !events::on(),
+        Line::Typed(_) if !events::on() => true,
+        Line::Typed(line) => match events::parse(&line) {
+            Ok(events::Command::Finish) => true,
+            Ok(_) => {
+                events::rejected(&line, "expected finish or quit");
+                false
+            }
+            Err(error) => {
+                events::rejected(&line, &error);
+                false
+            }
+        },
+    }
+}
+
 fn commit_fit(interrupted: bool, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     if interrupted {
         return Err("interrupted; fitted configuration was not installed".into());
@@ -3737,7 +3760,8 @@ fn capture_free_named_with_feedback(
             }
         }
         let wait = Duration::from_millis(if feedback.is_some() { 20 } else { 200 });
-        if next_line(wait) != Line::NotYet {
+        let stop_early = capture_line_stops(next_line(wait));
+        if stop_early || interrupted() {
             break;
         }
         let now = shm::now_ns();
@@ -9773,5 +9797,37 @@ mod tests {
             ..ok
         };
         assert!(touch_sample(&asleep, 1_050_000_000).is_none());
+    }
+
+    #[test]
+    fn event_capture_accepts_finish_and_rejects_other_commands() {
+        // Terminal mode keeps Enter-to-stop and EOF behavior.
+        assert!(!capture_line_stops(Line::NotYet));
+        assert!(capture_line_stops(Line::Typed(String::new())));
+        assert!(capture_line_stops(Line::Typed("recheck\n".into())));
+        assert!(capture_line_stops(Line::Closed));
+
+        // Event mode rejects unrelated commands and blank lines, accepts `finish`, and still
+        // routes `quit` through `events::stopped()`.
+        let sink = events::tests::scripted(&["recheck", "", "bogus", "finish", "quit"]);
+        let wait = Duration::from_millis(1);
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!events::stopped());
+        assert!(capture_line_stops(next_line(wait)));
+        assert!(!events::stopped());
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(events::stopped());
+        events::end();
+
+        let events = sink.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "rejected");
+        assert_eq!(events[0]["command"], "recheck");
+        assert_eq!(events[1]["event"], "rejected");
+        assert_eq!(events[1]["command"], "");
+        assert_eq!(events[2]["event"], "rejected");
+        assert_eq!(events[2]["command"], "bogus");
     }
 }

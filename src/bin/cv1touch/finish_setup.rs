@@ -77,9 +77,12 @@ fn prepare(mut run: impl FnMut(Step) -> i32) -> (i32, Vec<&'static str>) {
 /// restart first, each step with its exit code, and what is left to do.
 #[cfg(any(windows, test))]
 fn json(code: i32, steps: &[(Step, i32)], left: &[&str]) -> serde_json::Value {
+    let reboot_needed = steps
+        .iter()
+        .any(|&(step, exit)| step == Step::Sensors && exit == 3);
     serde_json::json!({
         "ok": code == 0,
-        "reboot_needed": code == 3,
+        "reboot_needed": reboot_needed,
         "steps": steps
             .iter()
             .map(|(step, exit)| serde_json::json!({"step": step.label(), "exit": exit}))
@@ -250,6 +253,23 @@ mod tests {
                           {"step": "Giving the sensors their driver", "exit": 3}],
                 "remaining": ["Restart Windows to finish giving the sensors their driver."]})
         );
+        // Restart stays required even when another step fails and forces exit code 1.
+        let (code, left) = prepare(|step| match step {
+            Step::Sensors => 3,
+            Step::SteamVr => 1,
+            _ => 0,
+        });
+        assert_eq!(code, 1);
+        let mixed_steps = [
+            (Step::SteamVrStopped, 0),
+            (Step::Stop, 0),
+            (Step::Sensors, 3),
+            (Step::SteamVr, 1),
+            (Step::Start, 0),
+        ];
+        let mixed = json(code, &mixed_steps, &left);
+        assert_eq!(mixed["ok"], false);
+        assert_eq!(mixed["reboot_needed"], true);
         assert_eq!(json(0, &[], &[])["ok"], true);
         assert_eq!(json(0, &[], &[])["reboot_needed"], false);
     }
