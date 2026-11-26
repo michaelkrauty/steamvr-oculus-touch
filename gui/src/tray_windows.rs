@@ -1,4 +1,7 @@
-use super::{handle, poll_health, Context, Kind, Message, Report, ServiceAction, Window};
+use super::{
+    handle, poll_health, save_report, show_setup, Context, Kind, Message, Report, ServiceAction,
+    Window,
+};
 use std::{
     cell::RefCell,
     error::Error,
@@ -32,7 +35,7 @@ const CLASS: &[u16] = &[
 ];
 struct Tray {
     window: Window,
-    cameras: Window,
+    sensors: Window,
     report: Report,
     updates: Receiver<Report>,
     action_send: Sender<Option<String>>,
@@ -56,9 +59,13 @@ fn events(kind: Kind) -> [&'static str; 2] {
             "Local\\cv1touch-gui-window",
             "Local\\cv1touch-gui-window-close",
         ],
-        Kind::Cameras => [
-            "Local\\cv1touch-gui-cameras",
-            "Local\\cv1touch-gui-cameras-close",
+        Kind::Sensors => [
+            "Local\\cv1touch-gui-sensors",
+            "Local\\cv1touch-gui-sensors-close",
+        ],
+        Kind::Setup => [
+            "Local\\cv1touch-gui-setup",
+            "Local\\cv1touch-gui-setup-close",
         ],
     }
 }
@@ -202,7 +209,8 @@ fn open_window() {
 fn toggle_window(kind: Kind) {
     with_tray(|tray| match kind {
         Kind::Status => tray.window.toggle(),
-        Kind::Cameras => tray.cameras.toggle(),
+        Kind::Sensors => tray.sensors.toggle(),
+        Kind::Setup => {}
     });
 }
 
@@ -235,7 +243,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_TIMER if w == POLL_TIMER => {
             if let Some(Some(report)) = with_tray(|tray| {
                 tray.window.reap();
-                tray.cameras.reap();
+                tray.sensors.reap();
                 if let Some(result) = tray.action_results.try_iter().last() {
                     tray.action_error = result;
                 }
@@ -257,7 +265,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         }
         TRAY if l as u32 == WM_RBUTTONUP => {
             let menu = CreatePopupMenu();
-            let (toggle, cameras, summary, report) = with_tray(|tray| {
+            let (toggle, sensors, summary, report) = with_tray(|tray| {
                 let summary = match &tray.action_error {
                     Some(error) => error.clone(),
                     None if crate::actions::busy() => "Working…".to_owned(),
@@ -265,14 +273,14 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 };
                 (
                     tray.window.toggle_label(),
-                    tray.cameras.toggle_label(),
+                    tray.sensors.toggle_label(),
                     summary,
                     tray.report.clone(),
                 )
             })
             .unwrap_or((
                 Kind::Status.labels()[0],
-                Kind::Cameras.labels()[0],
+                Kind::Sensors.labels()[0],
                 String::new(),
                 Report::default(),
             ));
@@ -286,7 +294,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             // Each entry's command is its position, from 1.
             let entries: [(u32, Option<&str>); 12] = [
                 (MF_STRING, Some(toggle)),
-                (MF_STRING, Some(cameras)),
+                (MF_STRING, Some(sensors)),
                 (MF_STRING | MF_GRAYED, Some(summary.as_str())),
                 (MF_SEPARATOR, None),
                 (
@@ -302,7 +310,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     Some(ServiceAction::Stop.label()),
                 ),
                 (MF_SEPARATOR, None),
-                (MF_STRING, Some("Run setup…")),
+                (MF_STRING, Some("Set up…")),
                 (MF_STRING, Some("Save diagnostic report…")),
                 (MF_SEPARATOR, None),
                 (MF_STRING, Some("Quit tray icon (cv1touchd keeps running)")),
@@ -335,15 +343,25 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_COMMAND => {
             match w & 0xffff {
                 1 => toggle_window(Kind::Status),
-                2 => toggle_window(Kind::Cameras),
+                2 => toggle_window(Kind::Sensors),
                 5 => control(ServiceAction::Start),
                 6 => control(ServiceAction::Restart),
                 7 => control(ServiceAction::Stop),
                 9 => {
-                    let _ = crate::actions::setup();
+                    if let Err(error) = show_setup(Default::default()) {
+                        with_tray(|tray| {
+                            tray.action_error = Some(format!("Could not open setup: {error}"))
+                        });
+                    }
                 }
                 10 => {
-                    let _ = crate::actions::report();
+                    with_tray(|tray| {
+                        tray.action_error = Some("Saving diagnostic report…".into());
+                        let send = tray.action_send.clone();
+                        save_report(move |line| {
+                            let _ = send.send(Some(line));
+                        });
+                    });
                 }
                 12 => {
                     DestroyWindow(hwnd);
@@ -435,7 +453,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 action_results,
                 action_error: None,
                 window: Window::new(Kind::Status),
-                cameras: Window::new(Kind::Cameras),
+                sensors: Window::new(Kind::Sensors),
             }));
         });
         let mut msg = MSG::default();

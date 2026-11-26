@@ -2,27 +2,33 @@
 // Copyright 2026 michaelkrauty
 
 use crate::{
-    actions::{self, ServiceAction},
+    actions::{self, Finish, Saved, ServiceAction},
     client::{Client, Update},
     config_stats::ConfigStats,
     icon::{self, Tint},
     model::{self, Daemon, Level, Snapshot},
+    setup_client::{Request, Stage},
 };
 use eframe::egui::{self, Color32, RichText, Ui};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+#[path = "settings_tab.rs"]
+mod settings_tab;
 #[path = "stats.rs"]
 mod stats;
+
+pub use settings_tab::Local;
 
 /// The window's app ID, which Wayland compositors match to a desktop entry of that name.
 pub const APP_ID: &str = "cv1touch-gui";
 
 /// The default window fits a healthy setup's overview snugly; it grows to fit more.
 pub const SIZE: [f32; 2] = [660.0, 410.0];
-/// The heights between which the window follows its overview, and the Stats tab's least.
+/// The heights between which the window follows its overview, and the least for the
+/// Stats and Settings tabs.
 const FIT: (f32, f32) = (320.0, 620.0);
-const STATS_HEIGHT: f32 = 560.0;
+const TALL_HEIGHT: f32 = 560.0;
 
 /// The window height at which the overview, `content` tall and seen through `visible` of a
 /// window `window` tall, fits with a little room to spare.
@@ -30,7 +36,7 @@ pub fn fit_height(window: f32, (content, visible): (f32, f32)) -> f32 {
     (window - visible + content + 10.0).clamp(FIT.0, FIT.1)
 }
 
-fn color(ui: &Ui, level: Level) -> Color32 {
+pub(crate) fn color(ui: &Ui, level: Level) -> Color32 {
     let dark = ui.visuals().dark_mode;
     match (level, dark) {
         (Level::Good, true) => Color32::from_rgb(52, 199, 123),
@@ -43,13 +49,13 @@ fn color(ui: &Ui, level: Level) -> Color32 {
     }
 }
 
-fn dot(ui: &mut Ui, level: Level) {
+pub(crate) fn dot(ui: &mut Ui, level: Level) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), 4.5, color(ui, level));
 }
 
-fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+pub(crate) fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
     let visuals = ui.visuals();
     egui::Frame::new()
         .fill(visuals.faint_bg_color)
@@ -62,11 +68,11 @@ fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R
         })
 }
 
-fn title(ui: &mut Ui, text: &str) {
+pub(crate) fn title(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).strong());
 }
 
-fn weak(text: impl Into<String>) -> RichText {
+pub(crate) fn weak(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).small().weak()
 }
 
@@ -79,20 +85,134 @@ pub enum Tab {
     #[default]
     Overview,
     Stats,
+    Settings,
 }
 
 impl Tab {
     // A later tab is one more entry here.
-    const ALL: [(Tab, &'static str); 2] = [(Tab::Overview, "Overview"), (Tab::Stats, "Stats")];
+    const ALL: [(Tab, &'static str); 3] = [
+        (Tab::Overview, "Overview"),
+        (Tab::Stats, "Stats"),
+        (Tab::Settings, "Settings"),
+    ];
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     Service(ServiceAction),
-    Setup,
+    /// Open the setup window, at a stage if one is named.
+    Setup(Request),
     Report,
+    OpenFolder,
+    DismissReport,
     Recheck,
-    Cameras,
+    Sensors,
+    /// Windows: `finish-setup`.
+    FinishSetup,
+    Tilt(f64),
+    Pin(bool),
+    Autostart(bool),
+    /// Linux: add or remove the desktop entry and icons.
+    Desktop(bool),
+}
+
+/// The diagnostic report saved from the footer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReportState {
+    Saving,
+    Saved(Saved),
+    Failed(String),
+}
+
+/// A one-click fix the "What to do" card offers for its first problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    StartDaemon,
+    FinishWindowsSetup,
+    OpenSetup,
+    LineUpHeadset,
+    CalibrateSensors,
+}
+
+impl Fix {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StartDaemon => "Start daemon",
+            Self::FinishWindowsSetup => "Finish Windows setup",
+            Self::OpenSetup => "Open setup",
+            Self::LineUpHeadset => "Line up headset (15 s)",
+            Self::CalibrateSensors => "Calibrate sensors",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::StartDaemon => ServiceAction::Start.tooltip(),
+            Self::FinishWindowsSetup => "Give the sensors their driver and add cv1touch to SteamVR, as the installer does. Close SteamVR first.",
+            Self::OpenSetup => "Open the guided setup, which walks you through the steps that are not done yet.",
+            Self::LineUpHeadset => "Wear the headset and hold both controllers to it for about 15 seconds, so that the controllers line up with SteamVR's headset tracking again.",
+            Self::CalibrateSensors => "Work out where every sensor is again, so that a moved or new sensor is used for tracking. Takes about 2 minutes.",
+        }
+    }
+
+    pub fn action(self) -> Action {
+        match self {
+            Self::StartDaemon => Action::Service(ServiceAction::Start),
+            Self::FinishWindowsSetup => Action::FinishSetup,
+            Self::OpenSetup => Action::Setup(Request::default()),
+            Self::LineUpHeadset => Action::Setup(Request::QUICK_HEADSET),
+            Self::CalibrateSensors => Action::Setup(Request::stage(Stage::Sensors)),
+        }
+    }
+}
+
+/// The fix for the most pressing problem in the status and checks, if one button fixes it.
+/// `windows` is whether the Windows-only steps apply.
+pub fn inline_fix(snap: &Snapshot, daemon: Daemon, windows: bool) -> Option<Fix> {
+    let checks = snap
+        .doctor
+        .as_ref()
+        .and_then(|d| d["checks"].as_array().cloned())
+        .unwrap_or_default();
+    let failed = |names: &[&str]| {
+        checks
+            .iter()
+            .any(|c| c["ok"] == false && names.contains(&c["name"].as_str().unwrap_or("")))
+    };
+    let status = snap.status.as_ref();
+    let alignment = status.map(|s| &s["alignment"]);
+    if daemon == Daemon::Stopped {
+        Some(Fix::StartDaemon)
+    } else if windows
+        && failed(&[
+            "sensor_streams",
+            "sensor_drivers",
+            "driver_assets",
+            "input_profile",
+        ])
+    {
+        Some(Fix::FinishWindowsSetup)
+    } else if checks.iter().any(|c| {
+        c["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("todo: "))
+    }) {
+        Some(Fix::OpenSetup)
+    } else if alignment.is_some_and(|a| a["headset"] == "other" || a["unmeasured_base"].is_string())
+    {
+        Some(Fix::LineUpHeadset)
+    } else if status
+        .and_then(|s| s["sensors"].as_array())
+        .is_some_and(|sensors| {
+            sensors
+                .iter()
+                .any(|s| s["pose"]["state"] == "given_up" || s["placed"].as_u64() == Some(0))
+        })
+    {
+        Some(Fix::CalibrateSensors)
+    } else {
+        None
+    }
 }
 
 /// The status icon in each colour, for the header.
@@ -122,6 +242,8 @@ pub struct View<'a> {
     pub daemon: Daemon,
     pub notice: Option<&'a (Level, String)>,
     pub icons: &'a Icons,
+    pub report: Option<&'a ReportState>,
+    pub local: &'a Local,
 }
 
 /// What one frame did: the button pressed, the icon's tint, and the tab's content and
@@ -162,12 +284,80 @@ struct App {
     doctor_at: Option<Instant>,
     action_tx: std::sync::mpsc::Sender<Result<(), String>>,
     action_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    report: Option<ReportState>,
+    local: Local,
+    done_tx: std::sync::mpsc::Sender<Done>,
+    done_rx: std::sync::mpsc::Receiver<Done>,
     tint: Tint,
     fit: Fit,
 }
 
+/// A background command's result.
+enum Done {
+    Report(Result<Saved, String>),
+    Finish(Finish),
+    Tilt(Result<(), String>),
+    Pin(Result<bool, String>),
+    Desktop(Result<(), String>),
+}
+
+fn finish_notice(finish: &Finish) -> (Level, String) {
+    match (&finish.error, finish.remaining.first()) {
+        (Some(error), _) => (Level::Bad, format!("Finish Windows setup failed: {error}")),
+        (None, Some(first)) => (
+            if finish.reboot_needed {
+                Level::Warning
+            } else {
+                Level::Bad
+            },
+            first.clone(),
+        ),
+        (None, None) if finish.ok => (Level::Good, "Windows setup finished.".into()),
+        (None, None) => (Level::Bad, "Finish Windows setup did not complete.".into()),
+    }
+}
+
 impl App {
     fn receive(&mut self) {
+        while let Ok(done) = self.done_rx.try_recv() {
+            let local = &mut self.local;
+            match done {
+                Done::Report(result) => {
+                    self.report = Some(match result {
+                        Ok(saved) => ReportState::Saved(saved),
+                        Err(error) => ReportState::Failed(error),
+                    })
+                }
+                Done::Finish(finish) => {
+                    self.notice = Some(finish_notice(&finish));
+                    local.finish = Some(Some(finish));
+                    self.client.refresh();
+                }
+                Done::Tilt(result) => {
+                    if let Err(error) = result {
+                        local.tilt = None;
+                        local.message = Some((Level::Bad, error));
+                    }
+                    self.client.poll();
+                }
+                Done::Pin(result) => {
+                    match result {
+                        Ok(on) => local.pin = Some((on, Instant::now())),
+                        Err(error) => {
+                            local.pin = None;
+                            local.message = Some((Level::Bad, error));
+                        }
+                    }
+                    self.client.poll();
+                }
+                Done::Desktop(result) => {
+                    local.desktop = settings_tab::desktop_installed();
+                    if let Err(error) = result {
+                        local.message = Some((Level::Bad, error));
+                    }
+                }
+            }
+        }
         while let Ok(result) = self.action_rx.try_recv() {
             match (result, &mut self.pending) {
                 (Ok(()), Some(pending)) => {
@@ -188,6 +378,7 @@ impl App {
             match update {
                 Update::Status(result, at) => {
                     self.status_at = Some(at);
+                    self.local.confirm(result.as_ref().ok());
                     self.snapshot.status(result, at);
                     if let Some(Pending {
                         action,
@@ -240,8 +431,28 @@ impl App {
         }
     }
 
+    /// Runs `work` off the GUI thread and receives its result as `done`.
+    fn background<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: impl FnOnce(T) -> Done + Send + 'static,
+        ctx: &egui::Context,
+    ) {
+        let tx = self.done_tx.clone();
+        let ctx = ctx.clone();
+        actions::background(work, move |result| {
+            let _ = tx.send(done(result));
+            ctx.request_repaint();
+        });
+    }
+
     fn act(&mut self, action: Action, ctx: &egui::Context) {
-        self.notice = None;
+        if matches!(
+            action,
+            Action::Service(_) | Action::Setup(_) | Action::Sensors | Action::Recheck
+        ) {
+            self.notice = None;
+        }
         let started = match action {
             Action::Service(service) => {
                 let tx = self.action_tx.clone();
@@ -258,9 +469,55 @@ impl App {
                 }
                 result
             }
-            Action::Setup => actions::setup(),
-            Action::Report => actions::report(),
-            Action::Cameras => crate::tray::show(crate::tray::Kind::Cameras),
+            Action::Setup(request) => crate::tray::show_setup(request),
+            Action::Sensors => crate::tray::show(crate::tray::Kind::Sensors),
+            Action::Report => {
+                if self.report != Some(ReportState::Saving) {
+                    self.report = Some(ReportState::Saving);
+                    self.background(actions::report, Done::Report, ctx);
+                }
+                Ok(())
+            }
+            Action::OpenFolder => match &self.report {
+                Some(ReportState::Saved(saved)) => actions::open_folder(&saved.path),
+                _ => Ok(()),
+            },
+            Action::DismissReport => {
+                self.report = None;
+                Ok(())
+            }
+            Action::FinishSetup => {
+                if self.local.finish != Some(None) {
+                    self.local.finish = Some(None);
+                    self.notice = Some((Level::Quiet, "Finishing Windows setup…".into()));
+                    self.background(actions::finish_setup, Done::Finish, ctx);
+                }
+                Ok(())
+            }
+            Action::Tilt(deg) => {
+                self.local.message = None;
+                self.local.tilt = Some((deg, Instant::now()));
+                self.background(move || actions::set_tilt(deg), Done::Tilt, ctx);
+                Ok(())
+            }
+            Action::Pin(on) => {
+                self.local.message = None;
+                self.local.pin = Some((on, Instant::now()));
+                self.background(move || actions::pin_base_station(on), Done::Pin, ctx);
+                Ok(())
+            }
+            Action::Autostart(on) => {
+                self.local.message = settings_tab::autostart::set(on)
+                    .err()
+                    .map(|e| (Level::Bad, format!("Could not change start at login: {e}")));
+                self.local.autostart = settings_tab::autostart::enabled();
+                Ok(())
+            }
+            Action::Desktop(on) => {
+                self.local.message = None;
+                self.background(move || settings_tab::set_desktop(on), Done::Desktop, ctx);
+                Ok(())
+            }
             Action::Recheck => {
                 self.client.refresh();
                 self.client.poll();
@@ -291,6 +548,8 @@ impl eframe::App for App {
             daemon: Daemon::from(&self.snapshot, self.pending.as_ref().map(|p| p.action)),
             notice: self.notice.as_ref(),
             icons: &self.icons,
+            report: self.report.as_ref(),
+            local: &self.local,
         };
         let checking = view.daemon == Daemon::Checking;
         let drawn = draw(ui, &view, &mut self.tab);
@@ -327,7 +586,7 @@ impl App {
         }
         let height = match self.tab {
             Tab::Overview => fit_height(size.y, content),
-            Tab::Stats => size.y.max(STATS_HEIGHT),
+            Tab::Stats | Tab::Settings => size.y.max(TALL_HEIGHT),
         };
         if (height - size.y).abs() > 6.0 {
             let requested = egui::vec2(size.x, height);
@@ -491,14 +750,15 @@ pub fn draw(ui: &mut Ui, view: &View, tab: &mut Tab) -> Drawn {
         .show(ui, |ui| header(ui, view, &problems, tab));
     egui::Panel::bottom("footer")
         .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(12, 8)))
-        .show(ui, |ui| action = footer(ui, view));
+        .show(ui, |ui| footer(ui, view, &mut action));
     let content = egui::CentralPanel::default()
         .show(ui, |ui| {
             let scroll = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match tab {
-                    Tab::Overview => overview_tab(ui, view, &problems),
+                    Tab::Overview => overview_tab(ui, view, &problems, &mut action),
                     Tab::Stats => stats::tab(ui, view),
+                    Tab::Settings => settings_tab::tab(ui, view, &mut action),
                 });
             (scroll.content_size.y, scroll.inner_rect.height())
         })
@@ -565,8 +825,64 @@ fn subtitle(view: &View) -> String {
     }
 }
 
-fn footer(ui: &mut Ui, view: &View) -> Option<Action> {
-    let mut action = None;
+/// The saved report's banner above the footer's buttons.
+fn report_banner(ui: &mut Ui, report: &ReportState, action: &mut Option<Action>) {
+    let (level, text) = match report {
+        ReportState::Saving => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label("Saving diagnostic report…");
+            });
+            return;
+        }
+        ReportState::Saved(saved) => (Level::Good, saved.summary()),
+        ReportState::Failed(error) => (Level::Bad, format!("Could not save the report: {error}")),
+    };
+    let tint = color(ui, level);
+    egui::Frame::new()
+        .fill(tint.gamma_multiply(0.12))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                dot(ui, level);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let label = ui.label(RichText::new(&text).color(tint));
+                    if let ReportState::Saved(saved) = report {
+                        label.on_hover_text(saved.path.display().to_string());
+                        ui.label(weak(
+                            "Review before sharing — contains calibration and logs.",
+                        ))
+                        .on_hover_text(&saved.notice);
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Dismiss this message")
+                        .clicked()
+                    {
+                        *action = Some(Action::DismissReport);
+                    }
+                    if matches!(report, ReportState::Saved(_))
+                        && ui
+                            .button("Open folder")
+                            .on_hover_text("Show the report in your file manager")
+                            .clicked()
+                    {
+                        *action = Some(Action::OpenFolder);
+                    }
+                });
+            });
+        });
+}
+
+fn footer(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
+    if let Some(report) = view.report {
+        report_banner(ui, report, action);
+    }
     if let Some((level, text)) = view.notice {
         ui.horizontal(|ui| {
             dot(ui, *level);
@@ -594,44 +910,57 @@ fn footer(ui: &mut Ui, view: &View) -> Option<Action> {
                             .on_hover_text(service.tooltip())
                             .clicked()
                     {
-                        action = Some(Action::Service(service));
+                        *action = Some(Action::Service(service));
                     }
                 }
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (label, value, tip) in [
+            let saving = view.report == Some(&ReportState::Saving);
+            for (label, value, tip, enabled) in [
                 (
                     "Recheck",
                     Action::Recheck,
-                    "Re-run cv1touch doctor diagnostics right now (normally runs every 30 s).",
+                    "Run cv1touch's checks again now (they run every 30 s by themselves).",
+                    true,
                 ),
                 (
-                    "Save report…",
+                    "Save report",
                     Action::Report,
-                    "Collect logs, config summary, and status into a diagnostic zip file for troubleshooting.",
+                    "Save one zip file with cv1touch's logs, settings and status, for someone helping you. Nothing is sent anywhere.",
+                    !saving,
                 ),
                 (
-                    "Run setup…",
-                    Action::Setup,
-                    "Open cv1touch setup in a terminal to calibrate sensors, align your headset, or redo a stage.",
+                    "Set up…",
+                    Action::Setup(Request::default()),
+                    "Open the guided setup: place the sensors, level the floor, fit the controller model, calibrate the buttons and line up the headset.",
+                    true,
                 ),
                 (
-                    "Cameras",
-                    Action::Cameras,
-                    "Open live infrared views from your sensors to aim them and check LED tracking.",
+                    "Sensor views",
+                    Action::Sensors,
+                    "Show what each sensor sees, live, to aim the sensors and check that they see the controllers.",
+                    true,
                 ),
             ] {
-                if ui.button(label).on_hover_text(tip).clicked() {
-                    action = Some(value);
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    *action = Some(value);
                 }
             }
         });
     });
-    action
 }
 
-fn overview_tab(ui: &mut Ui, view: &View, problems: &[(Level, String)]) {
+fn overview_tab(
+    ui: &mut Ui,
+    view: &View,
+    problems: &[(Level, String)],
+    action: &mut Option<Action>,
+) {
     let snap = view.snap;
     let mut alerts: Vec<(Level, String)> = Vec::new();
     if let Some(error) = &snap.doctor_error {
@@ -653,11 +982,23 @@ fn overview_tab(ui: &mut Ui, view: &View, problems: &[(Level, String)]) {
                 ui.set_width(ui.available_width());
                 let id = ui.make_persistent_id("more-problems");
                 let mut more = ui.data(|d| d.get_temp(id).unwrap_or(false));
+                let fix = inline_fix(snap, view.daemon, cfg!(windows));
                 ui.horizontal(|ui| {
                     dot(ui, level);
                     ui.label(RichText::new("What to do").strong().color(tint));
-                    if alerts.len() > 1 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(fix) = fix {
+                            let running =
+                                fix == Fix::FinishWindowsSetup && view.local.finish == Some(None);
+                            if ui
+                                .add_enabled(!running, egui::Button::new(fix.label()).small())
+                                .on_hover_text(fix.tooltip())
+                                .clicked()
+                            {
+                                *action = Some(fix.action());
+                            }
+                        }
+                        if alerts.len() > 1 {
                             let label = if more {
                                 "Show less".to_owned()
                             } else {
@@ -667,8 +1008,8 @@ fn overview_tab(ui: &mut Ui, view: &View, problems: &[(Level, String)]) {
                                 more = !more;
                                 ui.data_mut(|d| d.insert_temp(id, more));
                             }
-                        });
-                    }
+                        }
+                    });
                 });
                 ui.label(&alerts[0].1);
                 if more {
@@ -994,6 +1335,7 @@ pub fn run() {
             configure_style(&cc.egui_ctx);
             crate::tray::listen_for_activation(&cc.egui_ctx);
             let (action_tx, action_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
             Ok(Box::new(App {
                 client: Client::start(cc.egui_ctx.clone()),
                 snapshot: Snapshot::default(),
@@ -1006,6 +1348,10 @@ pub fn run() {
                 doctor_at: None,
                 action_tx,
                 action_rx,
+                report: None,
+                local: Local::load(),
+                done_tx,
+                done_rx,
                 tint: Tint::Stopped,
                 fit: Fit {
                     requested: SIZE.into(),
@@ -1097,6 +1443,70 @@ mod tests {
             alignment_warnings(&json!({"alignment":{"headset":"other","unmeasured_base":"LHB-1","base_pin":{"waiting_for":"LHB-2"}}})).len(),
             3
         );
+    }
+
+    #[test]
+    fn inline_fixes_follow_the_most_pressing_problem() {
+        let healthy = || {
+            let mut snap = Snapshot::default();
+            snap.status = Some(json!({"generation": 1, "engine_ready": true,
+                "alignment": {"headset": null, "unmeasured_base": null},
+                "hands": [], "sensors": [{"serial": "a", "placed": 1, "pose": null}]}));
+            snap.doctor = Some(json!({"daemon": {}, "checks": [
+                {"name": "daemon", "ok": true, "detail": "running"},
+                {"name": "sensor_streams", "ok": true, "detail": "fine"}]}));
+            snap
+        };
+        let fix = |snap: &Snapshot, windows| inline_fix(snap, Daemon::from(snap, None), windows);
+        assert_eq!(fix(&healthy(), true), None);
+        let mut snap = healthy();
+        snap.status(
+            Err(StatusError {
+                down: true,
+                message: "cv1touchd isn't running".into(),
+            }),
+            Instant::now(),
+        );
+        assert_eq!(fix(&snap, true), Some(Fix::StartDaemon));
+        let mut snap = healthy();
+        snap.doctor.as_mut().unwrap()["checks"][1]["ok"] = json!(false);
+        assert_eq!(fix(&snap, true), Some(Fix::FinishWindowsSetup));
+        assert_eq!(fix(&snap, false), None, "Linux has no finish-setup");
+        for name in ["driver_assets", "input_profile", "sensor_drivers"] {
+            let mut snap = healthy();
+            snap.doctor.as_mut().unwrap()["checks"][1] =
+                json!({"name": name, "ok": false, "detail": "x"});
+            assert_eq!(fix(&snap, true), Some(Fix::FinishWindowsSetup), "{name}");
+        }
+        let mut snap = healthy();
+        snap.doctor.as_mut().unwrap()["checks"][1]["detail"] = json!("todo: run setup");
+        assert_eq!(fix(&snap, true), Some(Fix::OpenSetup));
+        let mut snap = healthy();
+        snap.status.as_mut().unwrap()["alignment"]["headset"] = json!("other");
+        assert_eq!(fix(&snap, false), Some(Fix::LineUpHeadset));
+        let mut snap = healthy();
+        snap.status.as_mut().unwrap()["alignment"]["unmeasured_base"] = json!("LHB-TEST0002");
+        assert_eq!(fix(&snap, false), Some(Fix::LineUpHeadset));
+        assert_eq!(
+            Fix::LineUpHeadset.action(),
+            Action::Setup(Request::QUICK_HEADSET)
+        );
+        for sensor in [
+            json!({"serial": "a", "placed": 1, "pose": {"state": "given_up"}}),
+            json!({"serial": "a", "placed": 0, "pose": null}),
+        ] {
+            let mut snap = healthy();
+            snap.status.as_mut().unwrap()["sensors"][0] = sensor;
+            assert_eq!(fix(&snap, false), Some(Fix::CalibrateSensors));
+        }
+        assert_eq!(
+            Fix::CalibrateSensors.action(),
+            Action::Setup(Request::stage(Stage::Sensors))
+        );
+        // A sensor that is only being placed again needs nothing from the user.
+        let mut snap = healthy();
+        snap.status.as_mut().unwrap()["sensors"][0]["pose"] = json!({"state": "moved"});
+        assert_eq!(fix(&snap, false), None);
     }
 
     #[test]

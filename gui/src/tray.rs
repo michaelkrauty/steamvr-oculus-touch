@@ -1,4 +1,5 @@
-//! Notification-area process; the status and camera windows each run in their own process.
+//! Notification-area process; the status, sensor views and setup windows each run in their
+//! own process.
 
 use crate::{actions::ServiceAction, client::StatusResult, icon::Tint, model::Daemon};
 use eframe::egui::{Context, ViewportCommand};
@@ -29,14 +30,16 @@ enum Message {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Status,
-    Cameras,
+    Sensors,
+    Setup,
 }
 
 impl Kind {
     fn flag(self) -> &'static str {
         match self {
             Self::Status => "--window",
-            Self::Cameras => "--cameras",
+            Self::Sensors => "--sensors",
+            Self::Setup => "--setup",
         }
     }
 
@@ -44,20 +47,26 @@ impl Kind {
     fn labels(self) -> [&'static str; 2] {
         match self {
             Self::Status => ["Show status window", "Hide status window"],
-            Self::Cameras => ["Show cameras", "Hide cameras"],
+            Self::Sensors => ["Show sensor views", "Hide sensor views"],
+            Self::Setup => ["Set up…", "Set up…"],
         }
     }
 
     fn run(self) {
         match self {
             Self::Status => crate::window::run(),
-            Self::Cameras => crate::cameras::run(),
+            Self::Sensors => crate::cameras::run(),
+            Self::Setup => crate::setup_window::run(),
         }
     }
 
     fn spawn(self) -> std::io::Result<Child> {
+        self.spawn_with(&[self.flag()])
+    }
+
+    fn spawn_with(self, args: &[&str]) -> std::io::Result<Child> {
         let mut command = Command::new(std::env::current_exe()?);
-        command.arg(self.flag()).stdin(Stdio::null());
+        command.args(args).stdin(Stdio::null());
         #[cfg(target_os = "linux")]
         if let Some(token) = ksni::current_xdg_activation_token() {
             command.env("XDG_ACTIVATION_TOKEN", token);
@@ -68,11 +77,35 @@ impl Kind {
 
 /// Raise a window, or start it; for a window opening another.
 pub fn show(kind: Kind) -> std::io::Result<()> {
+    show_with(kind, &[kind.flag()])
+}
+
+/// Raise the setup window, or start it for `request`. A setup window already open keeps
+/// what it is doing.
+pub fn show_setup(request: crate::setup_client::Request) -> std::io::Result<()> {
+    show_with(Kind::Setup, &request.gui_args())
+}
+
+fn show_with(kind: Kind, args: &[&str]) -> std::io::Result<()> {
     if !platform::signal_window(kind, Message::Open) {
-        let mut child = kind.spawn()?;
+        let mut child = kind.spawn_with(args)?;
         thread::spawn(move || child.wait());
     }
     Ok(())
+}
+
+/// Saves a diagnostic report in the background and shows its folder; `done` gets the
+/// tray's line about it.
+fn save_report(done: impl FnOnce(String) + Send + 'static) {
+    crate::actions::background(crate::actions::report, |result| {
+        done(match result {
+            Ok(saved) => match crate::actions::open_folder(&saved.path) {
+                Ok(()) => saved.summary(),
+                Err(error) => format!("{}; could not show its folder: {error}", saved.summary()),
+            },
+            Err(error) => format!("Report failed: {error}"),
+        })
+    });
 }
 
 struct Window {
@@ -414,7 +447,7 @@ mod linux {
         action_message: Option<String>,
         action_updates: Sender<Option<String>>,
         window: Arc<Mutex<Window>>,
-        cameras: Arc<Mutex<Window>>,
+        sensors: Arc<Mutex<Window>>,
         quit: Arc<AtomicBool>,
     }
 
@@ -471,10 +504,10 @@ mod linux {
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             let toggle = self.window.lock().unwrap().toggle_label();
-            let cameras = self.cameras.lock().unwrap().toggle_label();
+            let sensors = self.sensors.lock().unwrap().toggle_label();
             let mut menu = vec![
                 item(toggle, true, |t| t.window.lock().unwrap().toggle()),
-                item(cameras, true, |t| t.cameras.lock().unwrap().toggle()),
+                item(sensors, true, |t| t.sensors.lock().unwrap().toggle()),
                 note(self.report.summary.clone(), true),
                 note(
                     self.action_message.clone().unwrap_or_default(),
@@ -493,15 +526,17 @@ mod linux {
             }
             menu.extend([
                 ksni::MenuItem::Separator,
-                item("Run setup…", true, |t| {
-                    if let Err(error) = crate::actions::setup() {
-                        t.action_message = Some(format!("Setup failed: {error}"));
+                item("Set up…", true, |t| {
+                    if let Err(error) = show_setup(Default::default()) {
+                        t.action_message = Some(format!("Could not open setup: {error}"));
                     }
                 }),
                 item("Save diagnostic report…", true, |t| {
-                    if let Err(error) = crate::actions::report() {
-                        t.action_message = Some(format!("Report failed: {error}"));
-                    }
+                    t.action_message = Some("Saving diagnostic report…".into());
+                    let updates = t.action_updates.clone();
+                    save_report(move |line| {
+                        let _ = updates.send(Some(line));
+                    });
                 }),
                 ksni::MenuItem::Separator,
                 item("Quit tray icon (cv1touchd keeps running)", true, |t| {
@@ -558,7 +593,8 @@ mod linux {
     fn name(kind: Kind) -> &'static str {
         match kind {
             Kind::Status => "cv1touch-window",
-            Kind::Cameras => "cv1touch-cameras",
+            Kind::Sensors => "cv1touch-sensors",
+            Kind::Setup => "cv1touch-setup",
         }
     }
 
@@ -677,14 +713,14 @@ mod linux {
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let quit = Arc::new(AtomicBool::new(false));
         let window = Arc::new(Mutex::new(Window::new(Kind::Status)));
-        let cameras = Arc::new(Mutex::new(Window::new(Kind::Cameras)));
+        let sensors = Arc::new(Mutex::new(Window::new(Kind::Sensors)));
         let (action_updates, action_results) = mpsc::channel();
         let handle = Tray {
             report: Report::default(),
             action_message: None,
             action_updates,
             window: window.clone(),
-            cameras: cameras.clone(),
+            sensors: sensors.clone(),
             quit: quit.clone(),
         }
         .spawn()?;
@@ -708,7 +744,7 @@ mod linux {
             // Refresh the menu when a window opens or closes or an action starts or ends.
             let now = (
                 window.lock().unwrap().is_open(),
-                cameras.lock().unwrap().is_open(),
+                sensors.lock().unwrap().is_open(),
                 crate::actions::busy(),
             );
             if now != shown {
@@ -852,7 +888,7 @@ mod tests {
     fn window_toggle_follows_the_window_process() {
         for (kind, [show, hide]) in [
             (Kind::Status, ["Show status window", "Hide status window"]),
-            (Kind::Cameras, ["Show cameras", "Hide cameras"]),
+            (Kind::Sensors, ["Show sensor views", "Hide sensor views"]),
         ] {
             let mut window = Window {
                 kind,

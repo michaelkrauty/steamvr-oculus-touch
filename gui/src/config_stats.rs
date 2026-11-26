@@ -15,6 +15,8 @@ pub struct ConfigStats {
     pub registration: Option<Value>,
     /// `render-offsets.json`: where the controller models sit on the tracked LEDs.
     pub render: Option<Value>,
+    /// `settings.json`: the controller angle and base-station pinning the daemon starts with.
+    pub settings: Option<Value>,
 }
 
 impl ConfigStats {
@@ -33,7 +35,24 @@ impl ConfigStats {
             calibration: read("calibration.json", "cv1touch-calibration"),
             registration: read("registration.json", "cv1touch-registration"),
             render: read("render-offsets.json", "cv1touch-render-offsets"),
+            settings: read("settings.json", "cv1touch-settings"),
         }
+    }
+
+    /// The saved controller angle, degrees; the daemon's default without a file.
+    pub fn tilt_deg(&self) -> f64 {
+        self.settings
+            .as_ref()
+            .and_then(|s| s["tilt_deg"].as_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// The saved base-station pinning: the file leaves it out when it is on.
+    pub fn pin_base_station(&self) -> bool {
+        self.settings
+            .as_ref()
+            .and_then(|s| s["pin_base_station"].as_bool())
+            .unwrap_or(true)
     }
 
     /// The median of the sensors' reprojection RMS in pixels, and how many sensors.

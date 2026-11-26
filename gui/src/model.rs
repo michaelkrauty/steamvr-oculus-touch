@@ -197,9 +197,7 @@ pub fn sensor(
         _ if video_rate == Some(0.0) && value["video_format"] == "jpeg" => {
             ("No video", "Frames arrive but none decode.", Level::Warning)
         }
-        _ if video_rate.is_some_and(|rate| rate > 0.0) => {
-            ("Streaming", "Video working.", Level::Good)
-        }
+        _ if video_rate.is_some_and(|rate| rate > 0.0) => ("Active", "Video working.", Level::Good),
         _ => (
             "Receiving",
             "Receiving frames; decoding not verified yet.",
@@ -382,7 +380,7 @@ mod tests {
         );
         assert_eq!(
             sensor(&json!({"placed":1}), Some(30.0), Some(30.0)).0,
-            "Streaming"
+            "Active"
         );
         let mut snap = Snapshot::default();
         let now = Instant::now();

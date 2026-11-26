@@ -35,7 +35,7 @@ fn files(data: &Path) -> Vec<PathBuf> {
 }
 
 /// `exe` as one argument of a desktop entry's `Exec` key.
-fn exec_arg(exe: &Path) -> String {
+pub(crate) fn exec_arg(exe: &Path) -> String {
     let exe = exe.to_string_lossy();
     let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+".contains(c);
     let arg = if exe.chars().all(plain) {
@@ -105,9 +105,30 @@ fn refresh(data: &Path) {
     }
 }
 
+fn current_data_home() -> io::Result<PathBuf> {
+    data_home(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// Whether the desktop entry is there.
+pub fn installed() -> bool {
+    current_data_home().is_ok_and(|data| files(&data).last().is_some_and(|p| p.is_file()))
+}
+
+/// Adds or removes the desktop entry and icons, as the Settings tab asks.
+pub fn set(install_it: bool) -> io::Result<()> {
+    let data = current_data_home()?;
+    if install_it {
+        install(&data, &std::env::current_exe()?)?;
+    } else {
+        uninstall(&data)?;
+    }
+    refresh(&data);
+    Ok(())
+}
+
 /// `--install-desktop` and `--uninstall-desktop`.
 pub fn run(install_it: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let data = data_home(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
+    let data = current_data_home()?;
     let paths = if install_it {
         install(&data, &std::env::current_exe()?)?
     } else {

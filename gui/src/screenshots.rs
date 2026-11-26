@@ -4,13 +4,16 @@
 // Set GUI_SCREENSHOTS_DIR to keep the PNGs.
 
 use crate::{
+    actions::Saved,
     actions::ServiceAction,
     cameras::{self, Settings, Textures},
     client::StatusError,
     config_stats::ConfigStats,
     model::{Daemon, Level, Snapshot},
     preview_client::{Blob, Device, Feed, Mode, PreviewError, PreviewSnapshot, SensorFrame},
-    window::{self, Icons, Tab, View},
+    setup_client::{tests as events, Guide, Hand},
+    setup_window,
+    window::{self, Icons, Local, ReportState, Tab, View},
 };
 use eframe::egui::{self, Color32, Pos2, Rect, TextureId};
 use serde_json::{json, Value};
@@ -70,7 +73,10 @@ fn render_boxes<R>(
         .nodes
         .iter()
         .filter_map(|(_, n)| n.label().or(n.value()).map(|l| (l.to_owned(), n.bounds())))
-        .collect();
+        .collect::<Boxes>();
+    for (label, _) in &labels {
+        assert_plain_words(label);
+    }
     let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
     let dims = ((size[0] * ppp) as usize, (size[1] * ppp) as usize);
     let pixels = rasterize(
@@ -81,6 +87,16 @@ fn render_boxes<R>(
         ppp,
     );
     (pixels, dims, result, labels)
+}
+
+/// The windows speak of sensors and say "active", never "camera" or "streaming": to people
+/// who do not know the hardware, those read as surveillance.
+fn assert_plain_words(text: &str) {
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("camera") && !lower.contains("streaming"),
+        "user-facing text says camera or streaming: {text:?}"
+    );
 }
 
 fn save(name: &str, pixels: &[u8], dims: (usize, usize)) {
@@ -128,7 +144,7 @@ fn playing() -> (Snapshot, ConfigStats) {
     };
     let status = json!({
         "generation": 4, "shm": "/cv1touch", "tracker": "Repose", "mode": "calibrated",
-        "tilt_deg": 0.0, "engine_ready": true,
+        "tilt_deg": 0.0, "pin_base_station": true, "engine_ready": true,
         "input_calibration": {"configured": true, "calibrated": [true, true], "error": null},
         "alignment": {"registration": true, "render": [true, true], "universe": 1234567890u64,
             "unmeasured_base": null, "headset": null,
@@ -172,16 +188,41 @@ fn playing() -> (Snapshot, ConfigStats) {
         ),
         render: Some(json!({"format": "cv1touch-render-offsets", "hands": [
             {"hand": "left", "rms_mm": 0.18, "leds": 22}, {"hand": "right", "rms_mm": 0.21, "leds": 22}]})),
+        settings: None,
     };
     (snap, config)
 }
 
-fn scenario(name: &str) -> (Snapshot, ConfigStats, Tab) {
+/// One state of the status window.
+struct Scene {
+    snap: Snapshot,
+    config: ConfigStats,
+    tab: Tab,
+    report: Option<ReportState>,
+    local: Local,
+}
+
+fn scenario(name: &str) -> Scene {
     let (mut snap, mut config) = playing();
     let status = snap.status.as_mut().unwrap();
     let mut tab = Tab::Overview;
+    let mut report = None;
+    let mut local = Local::default();
     match name {
         "overview-playing" => {}
+        "overview-report-saved" => {
+            report = Some(ReportState::Saved(Saved {
+                path: "/home/u/Desktop/cv1touch-report-2026-11-25-232800-UTC.zip".into(),
+                bytes: 1_430_000,
+                notice: "It holds:\n- cv1touch's logs, settings and calibration".into(),
+            }))
+        }
+        "settings-tab" => {
+            tab = Tab::Settings;
+            status["tilt_deg"] = json!(7.5);
+            local.autostart = Some(true);
+            local.desktop = Some(true);
+        }
         "stats-playing" => {
             tab = Tab::Stats;
             status["sensors"][0]["landmark_shift"] =
@@ -194,7 +235,7 @@ fn scenario(name: &str) -> (Snapshot, ConfigStats, Tab) {
             status["hands"][0]["battery_percent"] = json!(null);
             snap.hand_rates[0] = None;
         }
-        "overview-warning" => {
+        "overview-warning-inline-fix" => {
             status["alignment"]["headset"] = json!("other");
             status["sensors"][2]["pose"] = json!({"state": "moved", "since_ns": 1, "attempts": 2});
             status["sensors"][3]["agreement"]["median_px"] = json!(0.48);
@@ -231,10 +272,16 @@ fn scenario(name: &str) -> (Snapshot, ConfigStats, Tab) {
         }
         _ => unreachable!("{name}"),
     }
-    (snap, config, tab)
+    Scene {
+        snap,
+        config,
+        tab,
+        report,
+        local,
+    }
 }
 
-const SCENARIOS: [(&str, &[&str]); 6] = [
+const SCENARIOS: [(&str, &[&str]); 8] = [
     (
         "overview-playing",
         &[
@@ -244,15 +291,40 @@ const SCENARIOS: [(&str, &[&str]); 6] = [
             "52.0 fps",
             "0.14 px",
             "Tracking",
-            "Cameras",
+            "Sensor views",
+            "Active",
+        ],
+    ),
+    (
+        "overview-report-saved",
+        &[
+            "Saved cv1touch-report-2026-11-25-232800-UTC.zip (1.4 MB)",
+            "Review before sharing — contains calibration and logs.",
+            "Open folder",
+            "×",
+        ],
+    ),
+    (
+        "settings-tab",
+        &[
+            "Controller angle",
+            "Reset to 0°",
+            "Keep SteamVR starting from a measured base station",
+            "Start tray icon when I log in",
+            "Desktop shortcut and window icon",
+            "Run full setup…",
+            "Line up headset (15 s)…",
+            "Calibrate buttons & sticks…",
+            "Open sensor views…",
         ],
     ),
     ("overview-asleep", &["Asleep", "Press a button to wake it."]),
     (
-        "overview-warning",
+        "overview-warning-inline-fix",
         &[
             "Needs attention",
             "What to do",
+            "Line up headset (15 s)",
             "Other headset",
             "Moved",
             "14.2% loss",
@@ -277,18 +349,15 @@ const SCENARIOS: [(&str, &[&str]); 6] = [
     ),
 ];
 
-fn view<'a>(
-    snap: &'a Snapshot,
-    config: &'a ConfigStats,
-    icons: &'a Icons,
-    notice: Option<&'a (Level, String)>,
-) -> View<'a> {
+fn view<'a>(scene: &'a Scene, icons: &'a Icons, notice: Option<&'a (Level, String)>) -> View<'a> {
     View {
-        snap,
-        config,
-        daemon: Daemon::from(snap, None),
+        snap: &scene.snap,
+        config: &scene.config,
+        daemon: Daemon::from(&scene.snap, None),
         notice,
         icons,
+        report: scene.report.as_ref(),
+        local: &scene.local,
     }
 }
 
@@ -296,15 +365,14 @@ fn view<'a>(
 /// fits itself to; and the content and visible heights there.
 fn fitted(
     theme: egui::Theme,
-    snap: &Snapshot,
-    config: &ConfigStats,
+    scene: &Scene,
     notice: Option<&(Level, String)>,
 ) -> ([f32; 2], (f32, f32)) {
     let measure = |size: [f32; 2]| {
         let mut icons = None;
         render(theme, size, 1.0, |ui, ctx| {
             let icons = icons.get_or_insert_with(|| Icons::load(ctx));
-            window::draw(ui, &view(snap, config, icons, notice), &mut Tab::Overview)
+            window::draw(ui, &view(scene, icons, notice), &mut Tab::Overview)
         })
         .2
         .content
@@ -326,11 +394,12 @@ fn screenshots_show_each_state_and_the_overview_fits_without_scrolling_or_waste(
     );
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         for (name, expected) in SCENARIOS {
-            let (snap, config, tab) = scenario(name);
+            let scene = scenario(name);
+            let tab = scene.tab;
             // The overview must fit even with an error line in the footer.
             for notice in [None, Some(&notice)] {
                 let size = if tab == Tab::Overview {
-                    let (size, (content, visible)) = fitted(theme, &snap, &config, notice);
+                    let (size, (content, visible)) = fitted(theme, &scene, notice);
                     println!(
                         "{name}{} notice={}: window {} pt, content {content:.1} pt, visible {visible:.1} pt, spare {:.1} pt",
                         suffix(theme),
@@ -358,7 +427,7 @@ fn screenshots_show_each_state_and_the_overview_fits_without_scrolling_or_waste(
                 let mut draw_tab = tab;
                 let (pixels, dims, drawn, labels) = render(theme, size, PPP, |ui, ctx| {
                     let icons = icons.get_or_insert_with(|| Icons::load(ctx));
-                    window::draw(ui, &view(&snap, &config, icons, notice), &mut draw_tab)
+                    window::draw(ui, &view(&scene, icons, notice), &mut draw_tab)
                 });
                 for text in expected {
                     assert!(
@@ -385,15 +454,15 @@ fn screenshots_show_each_state_and_the_overview_fits_without_scrolling_or_waste(
                 if notice.is_some() {
                     continue;
                 }
-                if tab == Tab::Stats {
-                    // Stats scroll; render the whole of it for the record.
+                if tab != Tab::Overview {
+                    // Stats and Settings scroll; render the whole of it for the record.
                     let (content, visible) = drawn.content;
                     let tall = [size[0], size[1] + content - visible + 1.0];
                     let mut icons = None;
                     let mut draw_tab = tab;
                     let (pixels, dims, _, _) = render(theme, tall, PPP, |ui, ctx| {
                         let icons = icons.get_or_insert_with(|| Icons::load(ctx));
-                        window::draw(ui, &view(&snap, &config, icons, None), &mut draw_tab)
+                        window::draw(ui, &view(&scene, icons, None), &mut draw_tab)
                     });
                     save(&format!("{name}{}", suffix(theme)), &pixels, dims);
                 } else {
@@ -441,14 +510,15 @@ fn overlaps(boxes: &Boxes) -> Vec<(String, String)> {
 fn no_text_overlaps_in_any_state() {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         for (name, _) in SCENARIOS {
-            let (snap, config, tab) = scenario(name);
+            let scene = scenario(name);
+            let tab = scene.tab;
             let mut icons = None;
             let mut draw_tab = tab;
             // Tall enough that nothing scrolls under the header or footer.
-            let size = if tab == Tab::Stats {
+            let size = if tab != Tab::Overview {
                 [window::SIZE[0], 3200.0]
             } else {
-                fitted(theme, &snap, &config, None).0
+                fitted(theme, &scene, None).0
             };
             let (_, _, _, boxes) = render_boxes(
                 theme,
@@ -456,7 +526,7 @@ fn no_text_overlaps_in_any_state() {
                 1.0,
                 &mut |ui: &mut egui::Ui, ctx: &egui::Context| {
                     let icons = icons.get_or_insert_with(|| Icons::load(ctx));
-                    window::draw(ui, &view(&snap, &config, icons, None), &mut draw_tab)
+                    window::draw(ui, &view(&scene, icons, None), &mut draw_tab)
                 },
             );
             let overlaps = overlaps(&boxes);
@@ -473,7 +543,7 @@ fn no_text_overlaps_in_any_state() {
 
 #[test]
 fn busy_and_checking_daemons_offer_no_service_buttons() {
-    let (snap, config, _) = scenario("overview-playing");
+    let scene = scenario("overview-playing");
     for (daemon, shown) in [
         (Daemon::Busy(ServiceAction::Restart), "Restarting daemon…"),
         (Daemon::Checking, "Checking daemon…"),
@@ -483,7 +553,7 @@ fn busy_and_checking_daemons_offer_no_service_buttons() {
             let icons = icons.get_or_insert_with(|| Icons::load(ctx));
             let view = View {
                 daemon,
-                ..view(&snap, &config, icons, None)
+                ..view(&scene, icons, None)
             };
             window::draw(ui, &view, &mut Tab::Overview)
         });
@@ -735,7 +805,7 @@ fn shows(pixels: &[u8], color: Color32) -> bool {
 }
 
 #[test]
-fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
+fn sensor_view_screenshots_show_the_grid_zoom_and_every_empty_state() {
     let grid = Feed::Live(PreviewSnapshot {
         sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
     });
@@ -755,8 +825,8 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
     let (pixels, dims, mode, labels) = render_cameras(&grid, &mut settings, cameras::SIZE);
     assert_eq!(mode, Mode::All);
     for text in [
-        "Cameras",
-        "5 sensors streaming",
+        "Sensor views",
+        "5 sensors active",
         "Blobs & LEDs",
         "Enhance room",
         "HUD",
@@ -778,7 +848,7 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
     for color in [cameras::LEFT, cameras::RIGHT, cameras::CANVAS] {
         assert!(shows(&pixels, color), "no {color:?} in the grid");
     }
-    save("cameras-grid", &pixels, dims);
+    save("sensors-grid", &pixels, dims);
     // The overlays and HUD go with their toggles.
     let mut plain = Settings {
         blobs: false,
@@ -801,7 +871,7 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
     let (pixels, dims, mode, labels) = render_cameras(&zoom, &mut settings, cameras::SIZE);
     assert_eq!(mode, Mode::One(serial(1)));
     for text in [
-        "‹ All cameras",
+        "‹ All sensors",
         "Sensor 2 · …0002 · 640×480",
         "Sensor 2 · …0002 · 30 fps · 17 ms",
         "R 10/12",
@@ -813,7 +883,7 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
     }
     assert!(!labels.iter().any(|l| l.starts_with("Sensor 1")));
     assert!(shows(&pixels, cameras::RIGHT));
-    save("cameras-zoom", &pixels, dims);
+    save("sensors-zoom", &pixels, dims);
 
     let blobs_only = Feed::Live(PreviewSnapshot {
         sensors: vec![SensorFrame {
@@ -828,13 +898,13 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
     for (feed, name, text) in [
         (
             Feed::Failed(PreviewError::DaemonStopped),
-            Some("cameras-offline"),
+            Some("sensors-offline"),
             "cv1touch daemon is not running.",
         ),
         (
             Feed::Failed(PreviewError::UnsupportedDaemon),
             None,
-            "The running daemon does not support live camera previews yet.",
+            "The running daemon does not support live sensor views yet.",
         ),
         (
             Feed::Live(PreviewSnapshot::default()),
@@ -842,7 +912,7 @@ fn camera_screenshots_show_the_grid_zoom_and_every_empty_state() {
             "No sensors detected.",
         ),
         (Feed::Connecting, None, "Connecting to cv1touchd…"),
-        (blobs_only, None, "1 sensor streaming"),
+        (blobs_only, None, "1 sensor active"),
     ] {
         let (pixels, dims, _, labels) =
             render_cameras(&feed, &mut Settings::default(), cameras::SIZE);
@@ -909,7 +979,7 @@ fn clicking_a_tile_zooms_and_escape_returns_to_the_grid() {
 }
 
 #[test]
-fn the_camera_views_have_no_overlapping_text_down_to_the_least_size() {
+fn the_sensor_views_have_no_overlapping_text_down_to_the_least_size() {
     let grid = Feed::Live(PreviewSnapshot {
         sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
     });
@@ -938,6 +1008,318 @@ fn the_camera_views_have_no_overlapping_text_down_to_the_least_size() {
                 );
             }
             assert!(boxes.iter().any(|(l, _)| l.starts_with("Sensor 5")));
+        }
+    }
+}
+
+/// The setup window's states, from the contract's event lines.
+fn setup_scenes() -> Vec<(
+    &'static str,
+    Guide,
+    &'static [&'static str],
+    &'static [&'static str],
+)> {
+    use events::*;
+    vec![
+        (
+            "setup-menu",
+            guide(&[STATE, MENU]),
+            &[
+                "cv1touch setup",
+                "1 Sensors",
+                "5 Headset",
+                "Sensor views",
+                "Before you start",
+                "a controller is asleep or out of range: press a button on each controller",
+                "Sensor 2 moved and is being placed again by itself.",
+                "1  Sensor positions",
+                "Redo",
+                "Run",
+                "Keep saved",
+                "needs redoing (the sensors moved)",
+                "saved earlier, not verified",
+                "waiting: press a button on each controller",
+                "Continue setup",
+                "Recheck",
+                "Close",
+            ],
+            // The headset cannot run now, so its quick alignment is not offered.
+            &["Quick (15 s)", "Cancel"],
+        ),
+        (
+            "setup-start-prompt",
+            guide(&[STATE, MENU, SENSORS_START, START]),
+            &[
+                "Start capture",
+                "You can also press A on your right controller",
+                "Stand where the sensors can see you. Press A on the right controller (or Enter) to start.",
+                "Cancel",
+            ],
+            &["Record now", "Continue setup"],
+        ),
+        (
+            "setup-capture-progress",
+            guide(&[STATE, MENU, SENSORS_START, START, STATUS, CAPTURE]),
+            &[
+                "Sensor positions",
+                "This works out where each of your Rift sensors is. Hold both controllers and walk slowly around the play area for a minute, so that every sensor sees them.\n\nKeep the controllers awake: press a button now and then.",
+                "Walk slowly around the play area with both controllers.",
+                "36 s left",
+                "Cancel",
+            ],
+            &["Start capture", "Finish early"],
+        ),
+        (
+            "setup-headset-wait",
+            guide(&[STATE, MENU, HEADSET_START, HEADSET_PROMPT]),
+            &["On your controllers", "Cancel"],
+            &["Start capture", "Continue", "Record now", "Finish early"],
+        ),
+        (
+            "setup-headset-countdown",
+            guide(&[STATE, MENU, HEADSET_START, HEADSET_PROMPT, COUNTDOWN]),
+            &["7", "Cancel"],
+            &["Continue", "Finish early"],
+        ),
+        (
+            "setup-headset-progress",
+            guide(&[STATE, MENU, HEADSET_START, COUNTDOWN, HEADSET_CAPTURE]),
+            &[
+                "Recording",
+                "512° of 660°",
+                "95° of 660°",
+                "22° of 15°",
+                "812 poses over 18.7 s · stops by itself within 131 s",
+                "Finish early",
+                "Cancel",
+            ],
+            &["Start capture", "Continue"],
+        ),
+        (
+            "setup-buttons-live",
+            guide(&[STATE, MENU, BUTTONS_START, BUTTONS_STEP, TRIGGERS, INPUTS]),
+            &[
+                "Buttons and sticks",
+                "2/4 Pull both triggers all the way and hold them there until the double beep.",
+                "Record now",
+                "Trigger 91%",
+                "Trigger 62%",
+                "Left",
+                "Right",
+                "Cancel",
+            ],
+            &["Start capture", "You can also press A on your right controller"],
+        ),
+        (
+            "setup-retry",
+            guide(&[STATE, MENU, HEADSET_START, STAGE_FAILED, RETRY]),
+            &[
+                "Headset alignment did not finish.",
+                "the left controller slid on the headset (it turned 4°); your previous calibration is unchanged",
+                "Try again",
+                "Try without slip check",
+                "Skip",
+                "Cancel",
+            ],
+            &["Start capture", "Continue"],
+        ),
+        (
+            "setup-solve",
+            guide(&[STATE, MENU, SENSORS_START, CAPTURE, SOLVE]),
+            &["Working out where the sensors are", "Cancel"],
+            &["Start capture"],
+        ),
+        (
+            "setup-done",
+            guide(&[STATE, MENU, STAGE_DONE, DONE]),
+            &["Setup complete — ready to play!", "Floor: floor levelled: 0.4° correction", "Close"],
+            &["Cancel", "Continue setup"],
+        ),
+        (
+            "setup-done-error",
+            guide(&[DONE_ERROR]),
+            &["another setup guide is running; finish it first", "Close"],
+            &["Cancel"],
+        ),
+    ]
+}
+
+/// Live hands from the inputs tap, which take the place of the event's slower ones.
+const LIVE: [Hand; 2] = [
+    Hand {
+        connected: true,
+        trigger: 0.62,
+        grip: 0.1,
+        stick: [-0.2, 0.1],
+    },
+    Hand {
+        connected: true,
+        trigger: 0.91,
+        grip: 0.05,
+        stick: [0.4, 0.55],
+    },
+];
+
+#[test]
+fn setup_screens_follow_the_guide_and_offer_only_what_it_accepts() {
+    for (name, guide, shown, hidden) in setup_scenes() {
+        let live = (name == "setup-buttons-live").then_some(&LIVE);
+        let (pixels, dims, action, labels) =
+            render(egui::Theme::Dark, setup_window::SIZE, PPP, |ui, _| {
+                setup_window::draw(ui, &guide, live, false)
+            });
+        assert_eq!(action, None, "{name}");
+        for text in shown {
+            assert!(
+                labels.iter().any(|l| l == text),
+                "{name}: missing {text:?} in {labels:?}"
+            );
+        }
+        for text in hidden {
+            assert!(!labels.iter().any(|l| l == text), "{name}: offers {text:?}");
+        }
+        save(name, &pixels, dims);
+        // Tall enough that nothing scrolls under the header or footer.
+        for size in [setup_window::SIZE, setup_window::MIN_SIZE].map(|[w, _]| [w, 1400.0]) {
+            let (_, _, _, boxes) = render_boxes(
+                egui::Theme::Dark,
+                size,
+                1.0,
+                &mut |ui: &mut egui::Ui, _: &egui::Context| {
+                    setup_window::draw(ui, &guide, live, false)
+                },
+            );
+            let overlaps = overlaps(&boxes);
+            assert!(overlaps.is_empty(), "{name} {size:?}: {overlaps:?}");
+            for (label, r) in boxes.iter().filter_map(|(l, r)| Some((l, (*r)?))) {
+                assert!(
+                    r.x0 >= 0.0 && r.x1 <= size[0] as f64,
+                    "{name} {size:?}: {label:?} is cut off at {r:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn enter_goes_on_only_where_the_prompt_takes_go() {
+    use events::*;
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    };
+    for (lines, expected) in [
+        (
+            &[SENSORS_START, START][..],
+            Some(setup_window::SetupAction::Send("go".into())),
+        ),
+        (&[HEADSET_START, HEADSET_PROMPT], None),
+        (&[STATE, MENU], None),
+    ] {
+        let guide = guide(lines);
+        let ctx = egui::Context::default();
+        let mut action = None;
+        for events in [Vec::new(), vec![enter.clone()]] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, setup_window::SIZE.into())),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                action = setup_window::draw(ui, &guide, None, false)
+            })
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(action, expected, "{lines:?}");
+    }
+}
+
+/// Every window's text, rendered, and every text literal in the program's source: hover
+/// texts are not in the accessibility tree until shown.
+#[test]
+fn no_user_text_says_camera_or_streaming() {
+    let mut labels = Vec::new();
+    for (name, _) in SCENARIOS {
+        let scene = scenario(name);
+        let mut icons = None;
+        let mut tab = scene.tab;
+        labels.extend(
+            render(
+                egui::Theme::Dark,
+                [window::SIZE[0], 1600.0],
+                1.0,
+                |ui, ctx| {
+                    let icons = icons.get_or_insert_with(|| Icons::load(ctx));
+                    window::draw(ui, &view(&scene, icons, None), &mut tab)
+                },
+            )
+            .3,
+        );
+    }
+    let grid = Feed::Live(PreviewSnapshot {
+        sensors: (0..5).map(|i| camera_scene(i, 4)).collect(),
+    });
+    for feed in [
+        grid,
+        Feed::Failed(PreviewError::DaemonStopped),
+        Feed::Failed(PreviewError::UnsupportedDaemon),
+        Feed::Failed(PreviewError::Other("x".into())),
+        Feed::Connecting,
+    ] {
+        labels.extend(render_cameras(&feed, &mut Settings::default(), cameras::SIZE).3);
+    }
+    for (_, guide, _, _) in setup_scenes() {
+        labels.extend(
+            render(egui::Theme::Dark, setup_window::SIZE, 1.0, |ui, _| {
+                setup_window::draw(ui, &guide, Some(&LIVE), false)
+            })
+            .3,
+        );
+    }
+    assert!(labels.len() > 500, "{}", labels.len());
+    labels.iter().for_each(|l| assert_plain_words(l));
+    assert_plain_words(crate::HELP);
+    // Names of the program's own parts and of the daemon's JSON fields, which users never see.
+    let internal = [
+        "cameras::",
+        "mod cameras",
+        "camera_pos",
+        "camera_queue",
+        "\"--cameras\"",
+        "--cameras is the older name",
+    ];
+    for (file, source) in [
+        ("actions.rs", include_str!("actions.rs")),
+        ("cameras.rs", include_str!("cameras.rs")),
+        ("client.rs", include_str!("client.rs")),
+        ("config_stats.rs", include_str!("config_stats.rs")),
+        ("desktop.rs", include_str!("desktop.rs")),
+        ("main.rs", include_str!("main.rs")),
+        ("model.rs", include_str!("model.rs")),
+        ("preview_client.rs", include_str!("preview_client.rs")),
+        ("settings_tab.rs", include_str!("settings_tab.rs")),
+        ("setup_client.rs", include_str!("setup_client.rs")),
+        ("setup_window.rs", include_str!("setup_window.rs")),
+        ("stats.rs", include_str!("stats.rs")),
+        ("tray.rs", include_str!("tray.rs")),
+        ("tray_windows.rs", include_str!("tray_windows.rs")),
+        ("window.rs", include_str!("window.rs")),
+    ] {
+        for (n, line) in source.lines().enumerate() {
+            let mut line = line.to_lowercase();
+            for name in internal {
+                line = line.replace(name, "");
+            }
+            assert!(
+                !line.contains("camera") && !line.contains("streaming"),
+                "{file}:{}: {}",
+                n + 1,
+                source.lines().nth(n).unwrap().trim()
+            );
         }
     }
 }

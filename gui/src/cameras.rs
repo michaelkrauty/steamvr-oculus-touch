@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! The Cameras window: every sensor's live infrared image with its blobs, to aim the sensors
+//! The sensor views window: every sensor's live infrared image with its blobs, to aim the sensors
 //! and see which LEDs they match. Images flow only while the window is open.
 
 use crate::{
@@ -111,7 +111,7 @@ impl Textures {
                 }
                 None => {
                     let texture =
-                        ctx.load_texture(format!("camera-{}", sensor.serial), image, options);
+                        ctx.load_texture(format!("sensor-{}", sensor.serial), image, options);
                     self.0
                         .insert(sensor.serial.clone(), (sensor.frame_ns, enhance, texture));
                 }
@@ -175,16 +175,16 @@ pub fn draw(ui: &mut Ui, feed: &Feed, textures: &Textures, settings: &mut Settin
             ),
             Feed::Failed(PreviewError::UnsupportedDaemon) => message(
                 ui,
-                "The running daemon does not support live camera previews yet.",
+                "The running daemon does not support live sensor views yet.",
                 "Restart or update cv1touchd.",
             ),
             Feed::Failed(PreviewError::Other(error)) => {
-                message(ui, "Could not show the cameras.", error)
+                message(ui, "Could not show the sensor views.", error)
             }
             Feed::Live(_) if sensors.is_empty() => message(
                 ui,
                 "No sensors detected.",
-                "Plug in a CV1 sensor to view its camera feed.",
+                "Plug in a CV1 sensor to see what it sees.",
             ),
             Feed::Live(_) => match &settings.zoom {
                 Some(serial) => {
@@ -211,7 +211,7 @@ fn toolbar(ui: &mut Ui, feed: &Feed, sensors: &[SensorFrame], settings: &mut Set
         match settings.zoom.clone() {
             Some(serial) => {
                 if ui
-                    .button("‹ All cameras")
+                    .button("‹ All sensors")
                     .on_hover_text("Back to every sensor (Esc)")
                     .clicked()
                 {
@@ -232,13 +232,13 @@ fn toolbar(ui: &mut Ui, feed: &Feed, sensors: &[SensorFrame], settings: &mut Set
                     .on_hover_text(format!("Serial {serial}"));
             }
             None => {
-                ui.label(RichText::new("Cameras").size(18.0).strong());
+                ui.label(RichText::new("Sensor views").size(18.0).strong());
                 let status = match feed {
                     Feed::Live(_) if sensors.is_empty() => "No sensors".to_owned(),
-                    Feed::Live(_) if sensors.len() == 1 => "1 sensor streaming".to_owned(),
-                    Feed::Live(_) => format!("{} sensors streaming", sensors.len()),
+                    Feed::Live(_) if sensors.len() == 1 => "1 sensor active".to_owned(),
+                    Feed::Live(_) => format!("{} sensors active", sensors.len()),
                     Feed::Connecting => "Connecting…".to_owned(),
-                    Feed::Failed(_) => "Not streaming".to_owned(),
+                    Feed::Failed(_) => "Not active".to_owned(),
                 };
                 ui.label(RichText::new(status).weak());
             }
@@ -354,7 +354,7 @@ fn tile(
     } else {
         Sense::click()
     };
-    let mut response = ui.interact(rect, ui.scope_id().with(("camera", &sensor.serial)), sense);
+    let mut response = ui.interact(rect, ui.scope_id().with(("tile", &sensor.serial)), sense);
     if !zoomed {
         response = response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -566,7 +566,7 @@ pub fn run() {
         ..Default::default()
     };
     if let Err(error) = eframe::run_native(
-        "cv1touch cameras",
+        "cv1touch sensors",
         options,
         Box::new(|cc| {
             window::configure_style(&cc.egui_ctx);

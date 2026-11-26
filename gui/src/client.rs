@@ -182,10 +182,23 @@ pub(crate) fn invoke(subcommand: &str) -> Result<Value, String> {
     invoke_at(&executable(), subcommand, Duration::from_secs(10))
 }
 
-fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, String> {
+/// What a finished CLI run printed, and its exit code (None when a signal ended it).
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+/// Runs the CLI with `args` and no terminal, killing it after `timeout`.
+pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
+    run_at(&executable(), args, timeout)
+}
+
+pub(crate) fn run_at(path: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let name = args.first().copied().unwrap_or_default();
     let mut command = Command::new(path);
     command
-        .args([subcommand, "--json"])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -196,7 +209,7 @@ fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, 
     }
     let mut child = command
         .spawn()
-        .map_err(|e| format!("Could not run cv1touch {subcommand}: {e}"))?;
+        .map_err(|e| format!("Could not run cv1touch {name}: {e}"))?;
     // Drain both pipes concurrently so a verbose child cannot block before exit.
     let (tx, rx) = mpsc::channel();
     for (which, mut pipe) in [
@@ -225,12 +238,12 @@ fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, 
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("cv1touch {subcommand} timed out"));
+                return Err(format!("cv1touch {name} timed out"));
             }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("Could not wait for cv1touch {subcommand}: {e}"));
+                return Err(format!("Could not wait for cv1touch {name}: {e}"));
             }
         }
     };
@@ -238,17 +251,25 @@ fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, 
     for _ in 0..2 {
         let (which, result) = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| format!("cv1touch {subcommand} timed out reading output"))?;
-        streams[which] =
-            result.map_err(|e| format!("Could not read cv1touch {subcommand}: {e}"))?;
+            .map_err(|_| format!("cv1touch {name} timed out reading output"))?;
+        streams[which] = result.map_err(|e| format!("Could not read cv1touch {name}: {e}"))?;
     }
+    let [stdout, stderr] = streams;
+    Ok(Output {
+        code: status.code(),
+        stdout,
+        stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+    })
+}
+
+fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, String> {
+    let out = run_at(path, &[subcommand, "--json"], timeout)?;
     // doctor exits 1 when a check fails, but still returns a useful JSON report.
-    let value: Value = serde_json::from_slice(&streams[0]).map_err(|_| {
-        let detail = String::from_utf8_lossy(&streams[1]);
-        if detail.trim().is_empty() {
+    let value: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
+        if out.stderr.is_empty() {
             format!("cv1touch {subcommand} returned invalid data")
         } else {
-            detail.trim().to_owned()
+            out.stderr.clone()
         }
     })?;
     let valid = match subcommand {
@@ -258,9 +279,9 @@ fn invoke_at(path: &Path, subcommand: &str, timeout: Duration) -> Result<Value, 
                     && checks
                         .iter()
                         .all(|check| check["ok"].is_boolean() && check["detail"].is_string())
-            }) && (status.success() || status.code() == Some(1))
+            }) && matches!(out.code, Some(0 | 1))
         }
-        "status" => status.success() && valid_status(&value),
+        "status" => out.code == Some(0) && valid_status(&value),
         _ => false,
     };
     if !valid {

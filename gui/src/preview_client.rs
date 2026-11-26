@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! Live camera previews from cv1touchd's control endpoint (the `preview` command), polled
+//! Live sensor previews from cv1touchd's control endpoint (the `preview` command), polled
 //! on a worker thread so that reading and decoding never hold up the window.
 
 use serde_json::Value;
@@ -95,7 +95,7 @@ pub struct SensorFrame {
     pub fps: Option<f32>,
 }
 
-/// Every streaming sensor, in the daemon's sensor order.
+/// Every active sensor, in the daemon's sensor order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreviewSnapshot {
     pub sensors: Vec<SensorFrame>,
@@ -262,8 +262,7 @@ impl Preview {
         let shared = Arc::clone(&feed);
         thread::spawn(move || {
             let mut worker = Worker {
-                connect,
-                conn: None,
+                control: Control::new(connect),
                 order: Vec::new(),
                 order_at: None,
                 fps: HashMap::new(),
@@ -333,9 +332,14 @@ impl Drop for Preview {
     }
 }
 
-struct Worker {
+/// One kept connection to the daemon's control endpoint.
+pub struct Control {
     connect: Connect,
     conn: Option<BufReader<Box<dyn Stream>>>,
+}
+
+struct Worker {
+    control: Control,
     /// The daemon's sensor order (from `status`), so that tiles keep their place and number.
     order: Vec<String>,
     order_at: Option<Instant>,
@@ -349,10 +353,17 @@ const ORDER_INTERVAL: Duration = Duration::from_secs(2);
 /// reply after a pause has no frames yet.
 const STARTING: Duration = Duration::from_secs(1);
 
-impl Worker {
+impl Control {
+    pub fn new(connect: Connect) -> Self {
+        Self {
+            connect,
+            conn: None,
+        }
+    }
+
     /// One request and its reply line, reconnecting once when a kept connection has gone
     /// (the daemon restarted).
-    fn request(&mut self, line: &str) -> Result<String, PreviewError> {
+    pub fn request(&mut self, line: &str) -> Result<String, PreviewError> {
         let reused = self.conn.is_some();
         for retry in [reused, false] {
             if self.conn.is_none() {
@@ -386,6 +397,12 @@ impl Worker {
             }
         }
         unreachable!("the second attempt never retries")
+    }
+}
+
+impl Worker {
+    fn request(&mut self, line: &str) -> Result<String, PreviewError> {
+        self.control.request(line)
     }
 
     /// The next feed, or None while empty replies may only mean that previews are starting.
@@ -453,7 +470,7 @@ impl Worker {
 }
 
 #[cfg(unix)]
-fn connect() -> io::Result<Box<dyn Stream>> {
+pub fn connect() -> io::Result<Box<dyn Stream>> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
     let stream = std::os::unix::net::UnixStream::connect(
@@ -466,8 +483,13 @@ fn connect() -> io::Result<Box<dyn Stream>> {
 }
 
 #[cfg(windows)]
-fn connect() -> io::Result<Box<dyn Stream>> {
+pub fn connect() -> io::Result<Box<dyn Stream>> {
     pipe::Pipe::connect().map(|pipe| Box::new(pipe) as Box<dyn Stream>)
+}
+
+/// One request on a fresh connection, with its reply line.
+pub fn request_once(line: &str) -> Result<String, PreviewError> {
+    Control::new(Box::new(connect)).request(line)
 }
 
 #[cfg(windows)]
