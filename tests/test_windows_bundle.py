@@ -57,6 +57,23 @@ class WindowsBundleTests(unittest.TestCase):
         output = imports("kernel32.dll") + "DelayImport {\n  Name: VCRUNTIME140.dll\n}\n"
         self.assertEqual(audit.dependencies(output), ["kernel32.dll", "VCRUNTIME140.dll"])
 
+    def test_tray_app_with_inbox_imports_is_audited(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
+            bundle = Path(temporary)
+            gui = bundle / "bin/cv1touch-gui.exe"
+            gui.parent.mkdir()
+            gui.touch()
+            output = imports("advapi32.dll", "bcryptprimitives.dll", "combase.dll", "dwmapi.dll",
+                             "gdi32.dll", "imm32.dll", "kernel32.dll", "ntdll.dll", "ole32.dll",
+                             "oleaut32.dll", "OPENGL32.dll", "shell32.dll", "uiautomationcore.dll",
+                             "user32.dll", "uxtheme.dll", "api-ms-win-core-synch-l1-2-0.dll")
+            with patch.object(audit.subprocess, "check_output", return_value=output) as readobj:
+                audit.check(bundle, "readobj")
+                readobj.assert_called_once_with(["readobj", "--coff-imports", str(gui)], text=True)
+                readobj.return_value += "DelayImport {\n  Name: MSVCP140.dll\n}\n"
+                with self.assertRaisesRegex(ValueError, "cv1touch-gui.exe requires unshipped MSVCP140.dll"):
+                    audit.check(bundle, "readobj")
+
     def test_transitive_dependencies_must_be_adjacent_not_somewhere_on_the_host(self):
         with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
             bundle = Path(temporary)

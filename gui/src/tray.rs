@@ -163,6 +163,13 @@ impl Window {
 pub fn run_window(kind: Kind) -> Result<(), Box<dyn std::error::Error>> {
     platform::run_window(kind)
 }
+
+/// Closes the windows and ends the tray, which leaves cv1touchd running.
+pub fn quit() -> Result<(), Box<dyn std::error::Error>> {
+    close_windows();
+    platform::quit()
+}
+
 pub(super) fn close_windows() {
     for kind in [Kind::Status, Kind::Sensors, Kind::Setup] {
         platform::signal_window(kind, Message::Close);
@@ -582,14 +589,10 @@ mod linux {
             })
     }
 
-    fn send(path: &std::path::Path, message: Message) -> std::io::Result<()> {
+    fn send(path: &std::path::Path, message: &[u8]) -> std::io::Result<()> {
         let socket = UnixDatagram::unbound()?;
         socket.set_nonblocking(true)?;
-        let bytes: &[u8] = match message {
-            Message::Open => b"open",
-            Message::Close => b"close",
-        };
-        match socket.send_to(bytes, path) {
+        match socket.send_to(message, path) {
             Ok(_) => Ok(()),
             // A full receive queue already contains open requests.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
@@ -607,8 +610,39 @@ mod linux {
 
     pub(super) fn signal_window(kind: Kind, message: Message) -> bool {
         runtime()
-            .and_then(|dir| send(&dir.join(format!("{}.sock", name(kind))), message))
+            .and_then(|dir| {
+                let message: &[u8] = match message {
+                    Message::Open => b"open",
+                    Message::Close => b"close",
+                };
+                send(&dir.join(format!("{}.sock", name(kind))), message)
+            })
             .is_ok()
+    }
+
+    /// Whether a running instance holds `name`'s lock.
+    fn held(dir: &std::path::Path, name: &str) -> bool {
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("{name}.lock")))
+            .is_ok_and(|lock| unsafe { flock(lock.as_raw_fd(), 2 | 4) } != 0)
+    }
+
+    pub(super) fn quit() -> Result<(), Box<dyn Error>> {
+        stop(&runtime()?)
+    }
+
+    /// Asks the tray in `dir` to quit, and waits for it and the windows to exit.
+    fn stop(dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+        let _ = send(&dir.join("cv1touch-gui.sock"), b"quit");
+        let names = [Kind::Status, Kind::Sensors, Kind::Setup].map(name);
+        for _ in 0..60 {
+            if !names.iter().chain(&["cv1touch-gui"]).any(|n| held(dir, n)) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Err("cv1touch-gui is still running".into())
     }
 
     fn singleton(
@@ -638,7 +672,7 @@ mod linux {
             if error.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(error.into());
             }
-            if send(&socket_path, Message::Open).is_ok() {
+            if send(&socket_path, b"open").is_ok() {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(50));
@@ -718,7 +752,7 @@ mod linux {
             })
             .collect();
         for (path, _) in &sockets {
-            send(path, Message::Close).unwrap();
+            send(path, b"close").unwrap();
         }
         for (_, socket) in &sockets {
             let mut message = [0; 16];
@@ -734,14 +768,40 @@ mod linux {
         let path = std::env::temp_dir().join(format!("tray-close-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let socket = UnixDatagram::bind(&path).unwrap();
-        send(&path, Message::Close).unwrap();
-        send(&path, Message::Open).unwrap();
+        send(&path, b"close").unwrap();
+        send(&path, b"open").unwrap();
         let mut message = [0; 16];
         let n = socket.recv(&mut message).unwrap();
         assert_eq!(&message[..n], b"close");
         let n = socket.recv(&mut message).unwrap();
         assert_eq!(&message[..n], b"open");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn quit_ends_the_tray_and_waits_for_it() {
+        let dir = std::env::temp_dir().join(format!("tray-quit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        stop(&dir).unwrap(); // none running
+        let tray = thread::spawn({
+            let dir = dir.clone();
+            move || {
+                singleton(&dir, "cv1touch-gui", |socket| {
+                    let mut message = [0; 16];
+                    let n = socket.recv(&mut message)?;
+                    assert_eq!(&message[..n], b"quit");
+                    Ok(())
+                })
+                .unwrap()
+            }
+        });
+        while !dir.join("cv1touch-gui.sock").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop(&dir).unwrap();
+        tray.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn serve(socket: UnixDatagram) -> Result<(), Box<dyn Error>> {
@@ -771,10 +831,10 @@ mod linux {
                 handle.update(|t| t.report = report);
             }
             let mut message = [0; 16];
-            if let Ok(n) = socket.recv(&mut message) {
-                if &message[..n] == b"open" {
-                    window.lock().unwrap().open();
-                }
+            match socket.recv(&mut message).map(|n| &message[..n]) {
+                Ok(b"open") => window.lock().unwrap().open(),
+                Ok(b"quit") => quit.store(true, Ordering::Relaxed),
+                _ => {}
             }
             // Refresh the menu when a window opens or closes or an action starts or ends.
             let now = (

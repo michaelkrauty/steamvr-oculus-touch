@@ -46,6 +46,6 @@ The Windows installer ships binaries, which Linux leaves to the distribution's p
 | libusb | `libusb-1.0.dll`, its own DLL, so that it can be replaced by any compatible build; its source is at [libusb/libusb](https://github.com/libusb/libusb) under the version `windows-bundle.txt` names | LGPL-2.1-or-later (`libusb-copyright.txt`) |
 | libjpeg-turbo | statically linked into `openhmd-0.dll` | IJG, BSD-3-Clause and zlib (`libjpeg-turbo-copyright.txt`) |
 | hidapi | statically linked into `openhmd-0.dll` | BSD-3-Clause option (`hidapi-copyright.txt`) |
-| Rust crates | statically linked into `cv1touchd.exe`, `cv1touch.exe` and `cv1touchd-quiet.exe`, or used to build them | each crate's own, listed in `rust-crates.txt` with the texts in `rust\` (MIT, Apache-2.0, BSD-3-Clause and the like) |
+| Rust crates | statically linked into `cv1touchd.exe`, `cv1touch.exe`, `cv1touchd-quiet.exe` and `cv1touch-gui.exe`, or used to build them | each crate's own, listed in `rust-crates.txt` with the texts in `rust\` (MIT, Apache-2.0, BSD-3-Clause and the like) |
 
 SteamVR is installed separately. Its Oculus input profiles and controller meshes are referenced from that installation; no Oculus firmware, proprietary runtime, mesh, texture, input-profile asset, or SteamVR binary is redistributed here. Oculus, Touch, Meta, Steam, SteamVR, and OpenVR names are used to identify interoperability targets and do not imply endorsement.

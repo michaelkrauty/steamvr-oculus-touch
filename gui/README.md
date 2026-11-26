@@ -1,6 +1,6 @@
 # cv1touch GUI
 
-The optional `cv1touch-gui` program provides a tray icon and an on-demand status window. It requires an existing cv1touch installation. Quitting the tray closes any open GUI windows and leaves the daemon running.
+`cv1touch-gui` provides a tray icon and an on-demand status window. The [Windows installer](../docs/windows.md) includes it; on Linux it is optional and requires an existing cv1touch installation. Quitting the tray closes any open GUI windows and leaves the daemon running.
 
 Build it separately from the headless programs with Rust 1.95 or newer:
 
@@ -9,7 +9,11 @@ cd gui
 cargo build --locked --release
 ```
 
-On Windows, place `cv1touch-gui.exe` beside the installed cv1touch programs. Run `cv1touch-gui` to start the tray icon; running it again opens the status window. Click the icon to show or hide the window. The tray menu starts, restarts or stops the daemon, opens setup and saves a diagnostic report. A report can contain private information; review it before sharing it.
+On Windows, open **cv1touch** from the Start menu to see the status window. The tray icon starts when you sign in and after an interactive install. If you build the GUI yourself, place `cv1touch-gui.exe` beside the installed cv1touch programs.
+
+Run `cv1touch-gui` to start the tray icon; running it again opens the status window. Click the icon to show or hide the window. The tray menu starts, restarts or stops the daemon, opens setup and saves a diagnostic report. A report can contain private information; review it before sharing it.
+
+`cv1touch-gui --version` (or `-V`) prints the GUI version. `cv1touch-gui --quit` closes the GUI windows and removes the tray icon, leaving `cv1touchd` running.
 
 The window's Overview tab shows the controllers, sensors and calibration at a glance, with advice when something needs attention and a button that fixes it where one can. The Stats tab lists the daemon's tracking counters, each sensor's video and agreement figures, the saved calibration's fit quality and every diagnostic check; hover over any of them for what it means. The Settings tab sets the controller angle and whether the tray icon starts when you log in, and offers shortcuts to align the controllers to the headset or calibrate buttons and sticks. **Save report** saves the diagnostic report and shows where it went.
 

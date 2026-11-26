@@ -225,8 +225,7 @@ fn from_snapshots(
 }
 
 #[cfg(windows)]
-pub(super) const RESTART: &str =
-    "then restart the daemon: choose Stop cv1touch, then Start cv1touch in the Start menu";
+pub(super) const RESTART: &str = "then open cv1touch from the Start menu and choose Restart daemon";
 #[cfg(not(windows))]
 pub(super) const RESTART: &str = "then restart the daemon: systemctl --user restart cv1touchd";
 /// The running daemon adds a sensor plugged in while it runs.
@@ -1391,7 +1390,12 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("restart") && !line.contains("FAIL") && !line.contains("isn't connected"),
+            line.contains(if cfg!(windows) {
+                "open cv1touch from the Start menu and choose Restart daemon"
+            } else {
+                "systemctl --user restart cv1touchd"
+            }) && !line.contains("FAIL")
+                && !line.contains("isn't connected"),
             "{line}"
         );
         assert_eq!((fallback_reads, usb_lists), (0, 0));

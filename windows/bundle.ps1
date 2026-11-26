@@ -4,8 +4,8 @@ Collects a Windows release build of cv1touch into the flat bundle the installer 
 
 .DESCRIPTION
 The same files scripts/install.py stages on Linux, laid out as the installed program is:
-bin\ (cv1touchd.exe, cv1touch.exe, cv1touchd-quiet.exe and the engine's DLLs, which build.rs
-puts beside the executables), lib\cv1touch\ (the SteamVR driver and its manifest, which
+bin\ (cv1touchd.exe, cv1touch.exe, cv1touchd-quiet.exe, cv1touch-gui.exe and the engine's DLLs,
+which build.rs puts beside the executables), lib\cv1touch\ (the SteamVR driver and its manifest, which
 `cv1touch steamvr install` copies from there), and the licences: the repository's, and for what a
 Windows build links in and Linux leaves to the distribution, the vcpkg ports' copyright files
 with their versions (third_party\licenses\<port>-copyright.txt, windows-bundle.txt) and the Rust
@@ -14,6 +14,9 @@ Stops at the first missing file.
 
 .PARAMETER Target
 Cargo's target directory, holding release\ from `cargo build --release --bins`.
+
+.PARAMETER GuiTarget
+The GUI's separate Cargo target directory (gui\target by default), holding release\cv1touch-gui.exe.
 
 .PARAMETER Deps
 The vcpkg ports the engine was built with ($env:CV1TOUCH_DEPS, an x-install-root triplet
@@ -25,10 +28,12 @@ The bundle directory; replaced if it exists. Must not contain the repository.
 param(
     [string]$Target = (Join-Path $PSScriptRoot '..\target'),
     [string]$Deps = $env:CV1TOUCH_DEPS,
-    [string]$Out = (Join-Path $PSScriptRoot '..\target\bundle')
+    [string]$Out = (Join-Path $PSScriptRoot '..\target\bundle'),
+    [string]$GuiTarget
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if (-not $GuiTarget) { $GuiTarget = Join-Path $root 'gui\target' }
 $release = Join-Path $Target 'release'
 $marker = Join-Path $release 'cv1touch-native-dir'
 if (-not (Test-Path $marker)) { throw "no release build with the engine: $marker is missing" }
@@ -56,6 +61,7 @@ function Take([string]$From, [string]$To) {
 foreach ($exe in 'cv1touchd.exe', 'cv1touch.exe', 'cv1touchd-quiet.exe') {
     Take (Join-Path $release $exe) (Join-Path $Out "bin\$exe")
 }
+Take (Join-Path $GuiTarget 'release\cv1touch-gui.exe') (Join-Path $Out 'bin\cv1touch-gui.exe')
 foreach ($dll in 'openhmd-0.dll', 'libusb-1.0.dll') {
     Take (Join-Path $release $dll) (Join-Path $Out "bin\$dll")
 }
@@ -91,15 +97,18 @@ Set-Content -Path (Join-Path $Out 'third_party\licenses\windows-bundle.txt') -Va
 # terms ask for the notice and the text, not only the name.
 Push-Location $root
 try {
-    $metadata = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    $packages = foreach ($manifest in 'Cargo.toml', 'gui\Cargo.toml') {
+        $metadata = cargo metadata --manifest-path $manifest --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed for $manifest" }
+        $inGraph = @{}
+        foreach ($node in $metadata.resolve.nodes) { $inGraph[$node.id] = $true }
+        $metadata.packages | Where-Object { $_.source -and $inGraph[$_.id] }
+    }
 } finally {
     Pop-Location
 }
-$inGraph = @{}
-foreach ($node in $metadata.resolve.nodes) { $inGraph[$node.id] = $true }
-$crates = @('The Rust crates the Windows build uses (Cargo.lock pins them): linked into the executables, or building them. Each line names the licence the crate declares; its licence files, where the crate ships them, are in rust\<crate>-<version>\ beside this file.', '')
-foreach ($crate in ($metadata.packages | Where-Object { $_.source -and $inGraph[$_.id] } | Sort-Object name, version)) {
+$crates = @('The Rust crates the Windows build uses (pinned in Cargo.lock and gui\Cargo.lock): linked into the executables, or building them. Each line names the licence the crate declares; its licence files, where the crate ships them, are in rust\<crate>-<version>\ beside this file.', '')
+foreach ($crate in ($packages | Sort-Object name, version -Unique)) {
     $terms = if ($crate.license) { $crate.license } else { "see $($crate.repository)" }
     $files = Get-ChildItem (Split-Path $crate.manifest_path) -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|NOTICE)' }
     $where = if ($files) { " (rust\$($crate.name)-$($crate.version)\)" } else { ' (no licence file in the crate)' }

@@ -347,7 +347,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
 
 fn daemon_start_advice() -> &'static str {
     if cfg!(windows) {
-        "cv1touch isn't running: choose Start cv1touch in the Start menu; if it still fails, choose Send a cv1touch report"
+        "cv1touch isn't running: open cv1touch from the Start menu and choose Start daemon; if it still fails, choose Save report"
     } else {
         "cv1touchd isn't running: start it with systemctl --user start cv1touchd"
     }

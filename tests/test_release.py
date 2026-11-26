@@ -32,6 +32,8 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_build_and_citation_versions_agree(self):
         versions = {
             "Cargo.lock": capture(r'^name = "cv1touch"\nversion = "([^"]+)"$', "Cargo.lock"),
+            "gui/Cargo.toml": capture(r'^version = "([^"]+)"$', "gui/Cargo.toml"),
+            "gui/Cargo.lock": capture(r'^name = "cv1touch-gui"\nversion = "([^"]+)"$', "gui/Cargo.lock"),
             "meson.build": capture(r"^  version: '([^']+)',", "meson.build"),
             "vcpkg.json": json.loads(read("vcpkg.json"))["version-string"],
             "CITATION.cff": capture(r'^version: "([^"]+)"$', "CITATION.cff"),

@@ -553,7 +553,7 @@ pub fn remove_owned_driver(dir: &Path) -> Result<(), String> {
 
 /// How to put the driver package's input profile right, once SteamVR has what it needs.
 #[cfg(windows)]
-pub const REINSTALL: &str = "quit SteamVR and choose Finish setting up cv1touch in the Start menu";
+pub const REINSTALL: &str = "quit SteamVR, open cv1touch from the Start menu, and choose Finish driver & SteamVR setup in Settings";
 #[cfg(not(windows))]
 pub const REINSTALL: &str = "quit SteamVR and run `cv1touch steamvr install`";
 /// `scripts/install.py` runs `steamvr check` before cv1touch is on PATH, so the command above

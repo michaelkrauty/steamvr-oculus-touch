@@ -5,7 +5,7 @@
 
 This intentionally uses the runner's per-user install, Start menu and Run registration.
 Never run it on a user's configured PC. It validates missing prerequisites and recovery,
-not calibration, real SteamVR, UAC interaction, or USB streaming.
+not calibration, real SteamVR, UAC interaction, or live sensor views.
 """
 
 import argparse
@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -46,12 +47,12 @@ def until(predicate, explanation, timeout=30):
         time.sleep(0.2)
 
 
-def run_entry():
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-        try:
-            return winreg.QueryValueEx(key, "cv1touch")[0]
-        except FileNotFoundError:
-            return None
+def run_entry(name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except FileNotFoundError:
+        return None
 
 
 def powershell(script, **kwargs):
@@ -104,15 +105,13 @@ def shortcut(folder, name):
         "@{target=$s.TargetPath; arguments=$s.Arguments; directory=$s.WorkingDirectory} | ConvertTo-Json", env=env))
 
 
-def run_shortcut(link, expected=0):
-    # /k is for a person to read the result; /c closes the test shell afterward. Preserve
-    # the installed command string verbatim otherwise, including cmd's nested quoting.
-    arguments = link["arguments"].replace("/k ", "/c ", 1)
-    command = f'"{link["target"]}" {arguments}'
-    result = subprocess.run(command, cwd=link["directory"], capture_output=True,
-                            timeout=90, text=True, encoding="utf-8", errors="replace")
-    assert result.returncode == expected, (command, result.returncode, result.stdout, result.stderr)
-    return result.stdout
+def check_shortcut(folder, gui):
+    names = {p.name for p in folder.glob("*.lnk")}
+    assert names == {"cv1touch.lnk"}, names
+    link = shortcut(folder, "cv1touch")
+    assert Path(link["target"]) == gui, link
+    assert link["arguments"] == "", link
+    assert Path(link["directory"]) == gui.parent, link
 
 
 def main(installer, work):
@@ -133,6 +132,7 @@ def main(installer, work):
         print(f"Install/upgrade/uninstall cycle {cycle + 1}: {app}", flush=True)
         tool = app / "bin/cv1touch.exe"
         quiet = app / "bin/cv1touchd-quiet.exe"
+        gui = app / "bin/cv1touch-gui.exe"
         uninstall = app / "unins000.exe"
         install_args = [installer, *flags, f"/DIR={app}", f"/LOG={work / f'install-{cycle}.log'}"]
         run_installer(install_args)
@@ -142,8 +142,14 @@ def main(installer, work):
         print("Installed; checking daemon and shortcuts", flush=True)
         try:
             assert "cv1touch " in run([tool, "--version"])
-            assert run_entry() == f'"{quiet}"'
+            assert gui.is_file()
+            assert "cv1touch-gui " in run([gui, "--version"])
+            assert run_entry("cv1touch") == f'"{quiet}"'
+            assert run_entry("cv1touch-gui") == f'"{gui}"'
             until(lambda: status(tool) is not None, "installed daemon did not answer")
+            generation = status(tool)["generation"]
+            run([gui, "--quit"], timeout=15)
+            assert status(tool)["generation"] == generation, "quitting the GUI stopped tracking"
             assert settings.read_bytes() == saved
             assert (logs / "finish-setup.log").is_file()
             assert (logs / "installer.log").is_file()
@@ -151,16 +157,10 @@ def main(installer, work):
             install_log = (work / f"install-{cycle}.log").read_text(encoding="utf-8-sig")
             assert "Setup is incomplete:" in install_log and "- The sensors did not get their driver." in install_log
 
-            # Check the actual Start-menu command quoting, not a hand-recreated CLI command.
-            for name in ("Set up cv1touch", "Line up the controllers with your headset",
-                         "Check cv1touch", "Finish setting up cv1touch",
-                         "Send a cv1touch report", "Start cv1touch", "Stop cv1touch"):
-                shortcut(shortcuts, name)
-            line_up = shortcut(shortcuts, "Line up the controllers with your headset")["arguments"]
-            assert line_up.endswith('cv1touch.exe" setup --redo headset --quick"'), line_up
-            check = run_shortcut(shortcut(shortcuts, "Check cv1touch"), expected=1)
+            check_shortcut(shortcuts, gui)
+            check = run([tool, "doctor"], expected=1)
             assert "FAIL" in check and "sensor" in check
-            repair = run_shortcut(shortcut(shortcuts, "Finish setting up cv1touch"), expected=1)
+            repair = run([tool, "finish-setup"], expected=1)
             assert "Setup is incomplete:" in repair and "- The sensors did not get their driver." in repair, repair
             until(lambda: status(tool) is not None, "repair did not restart the daemon")
             assert (logs / "finish-setup.previous.log").is_file()
@@ -170,11 +170,10 @@ def main(installer, work):
             for _ in range(2):
                 start(quiet)
             assert status(tool)["generation"] == generation
-            run_shortcut(shortcut(shortcuts, "Stop cv1touch"))
-            until(lambda: status(tool) is None, "Stop shortcut did not stop the daemon")
-            started = run_shortcut(shortcut(shortcuts, "Start cv1touch"))
-            assert "cv1touch is running." in started, started
-            until(lambda: status(tool) is not None, "Start shortcut did not restart the daemon")
+            run([tool, "stop"])
+            until(lambda: status(tool) is None, "stop did not stop the daemon")
+            start(quiet)
+            until(lambda: status(tool) is not None, "quiet launch did not restart the daemon")
 
             setup = json.loads(run([tool, "setup", "--check", "--json"], expected=1))
             assert setup, "missing setup diagnostic JSON"
@@ -230,15 +229,19 @@ def main(installer, work):
 
             # Upgrade with the previous daemon running, preserving the same user settings.
             generation = status(tool)["generation"]
+            shutil.copyfile(shortcuts / "cv1touch.lnk", shortcuts / "Check cv1touch.lnk")
             run_installer(install_args)
             until(lambda: (s := status(tool)) is not None and s["generation"] != generation,
                   "upgrade left the old daemon running")
             assert settings.read_bytes() == saved
+            check_shortcut(shortcuts, gui)
 
             generation = status(tool)["generation"]
             cancel_uninstall(uninstall)
             assert status(tool)["generation"] == generation, "canceling uninstall stopped tracking"
-            assert tool.exists() and run_entry()
+            assert tool.is_file() and gui.is_file()
+            assert run_entry("cv1touch") == f'"{quiet}"'
+            assert run_entry("cv1touch-gui") == f'"{gui}"'
 
             # A fake vrserver exercises the real process preflight. It is a test-only .NET
             # sleeper, not SteamVR and not evidence that the real runtime loads our driver.
@@ -254,9 +257,11 @@ def main(installer, work):
                     run_installer(install_args, expected=7)
                     assert hashlib.sha256(tool.read_bytes()).digest() == before
                     assert status(tool) is not None, "blocked upgrade stopped tracking"
-                    # Cancellation must leave the install in place, including the Run entry.
+                    # Blocking uninstall must leave the install and both Run entries in place.
                     result = subprocess.run([str(uninstall), *flags], timeout=60)
-                    assert result.returncode != 0 and tool.is_file() and run_entry()
+                    assert result.returncode != 0 and tool.is_file() and gui.is_file()
+                    assert run_entry("cv1touch") == f'"{quiet}"'
+                    assert run_entry("cv1touch-gui") == f'"{gui}"'
                 finally:
                     process.terminate()
                     process.wait(timeout=10)
@@ -264,7 +269,8 @@ def main(installer, work):
             if uninstall.exists():
                 run_installer([uninstall, *flags, f"/LOG={work / f'uninstall-{cycle}.log'}"])
                 until(lambda: not app.exists(), "uninstaller left application files behind")
-        assert run_entry() is None
+        assert run_entry("cv1touch") is None
+        assert run_entry("cv1touch-gui") is None
         assert settings.read_bytes() == saved, "uninstaller removed personal settings"
         assert not shortcuts.exists(), "uninstaller left Start-menu shortcuts"
         assert (logs / "uninstaller.log").is_file()

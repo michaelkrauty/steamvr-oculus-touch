@@ -18,8 +18,8 @@ use windows_sys::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         Threading::{
-            CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForMultipleObjects,
-            EVENT_MODIFY_STATE, INFINITE,
+            CreateEventW, CreateMutexW, OpenEventW, OpenMutexW, SetEvent, WaitForMultipleObjects,
+            EVENT_MODIFY_STATE, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
         },
     },
     UI::{Shell::*, WindowsAndMessaging::*},
@@ -29,6 +29,9 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 const TRAY: u32 = WM_APP + 1;
 const OPEN: u32 = WM_APP + 2;
+/// From `--quit`: closes the windows and ends the tray.
+const QUIT: u32 = WM_APP + 3;
+const MUTEX: &str = "Local\\cv1touch-gui-tray";
 const POLL_TIMER: usize = 1;
 const CLASS: &[u16] = &[
     99, 118, 49, 116, 111, 117, 99, 104, 45, 116, 114, 97, 121, 0,
@@ -240,6 +243,11 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             open_window();
             0
         }
+        QUIT => {
+            close_windows();
+            DestroyWindow(hwnd);
+            0
+        }
         WM_TIMER if w == POLL_TIMER => {
             if let Some(Some(report)) = with_tray(|tray| {
                 tray.window.reap();
@@ -382,7 +390,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 }
 pub fn run() -> Result<(), Box<dyn Error>> {
     unsafe {
-        let mutex = CreateMutexW(ptr::null(), 1, wide("Local\\cv1touch-gui-tray").as_ptr());
+        let mutex = CreateMutexW(ptr::null(), 1, wide(MUTEX).as_ptr());
         if mutex.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -476,4 +484,35 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         CloseHandle(mutex);
         result
     }
+}
+
+/// Asks this session's tray to quit, and waits for it and the windows to exit.
+pub(super) fn quit() -> Result<(), Box<dyn Error>> {
+    unsafe {
+        let tray = FindWindowW(CLASS.as_ptr(), ptr::null());
+        if !tray.is_null() {
+            PostMessageW(tray, QUIT, 0, 0);
+        }
+        for _ in 0..60 {
+            let running = !FindWindowW(CLASS.as_ptr(), ptr::null()).is_null()
+                || exists(OpenMutexW, MUTEX)
+                || [Kind::Status, Kind::Sensors, Kind::Setup]
+                    .into_iter()
+                    .any(|kind| exists(OpenEventW, events(kind)[0]));
+            if !running {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err("cv1touch-gui is still running".into())
+}
+
+/// Whether a process of this session holds the named object that `open` opens.
+unsafe fn exists(
+    open: unsafe extern "system" fn(u32, windows_sys::core::BOOL, *const u16) -> HANDLE,
+    name: &str,
+) -> bool {
+    let handle = open(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(name).as_ptr());
+    !handle.is_null() && CloseHandle(handle) != 0
 }
