@@ -56,6 +56,13 @@ pub fn busy() -> bool {
     BUSY.load(Ordering::Acquire)
 }
 
+/// Serializes unit tests that mutate or assert on the process-global `BUSY` flag.
+#[cfg(test)]
+pub(crate) fn busy_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Start one control operation, or return an immediate error if one is already in flight
 /// or its worker cannot be started. The callback receives the eventual command result.
 /// Send it to the window/tray event loop rather than updating UI from the worker.
@@ -357,6 +364,7 @@ mod tests {
 
     #[test]
     fn control_reports_failure_and_rejects_overlap() {
+        let _busy_guard = busy_test_lock();
         let (release, wait) = mpsc::channel();
         let (send, receive) = mpsc::channel();
         run_control(

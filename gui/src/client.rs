@@ -348,10 +348,19 @@ mod tests {
         let error = socket_status(&path).unwrap_err();
         assert!(!error.down, "{error:?}");
         server.join().unwrap();
-        // The socket file outlives its listener: connecting is refused.
+        // The socket file outlives its listener: connecting is refused. Wait for any concurrent
+        // test's forked child to exec and close its inherited CLOEXEC copy of the listener fd.
         let _ = std::fs::remove_file(&path);
         drop(UnixListener::bind(&path).unwrap());
-        assert!(socket_status(&path).unwrap_err().down);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+        let error = socket_status(&path).unwrap_err();
+        assert!(error.down, "{error:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

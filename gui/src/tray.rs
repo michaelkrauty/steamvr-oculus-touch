@@ -877,6 +877,7 @@ mod tests {
 
     #[test]
     fn report_gates_service_actions_by_daemon_state() {
+        let _busy_guard = crate::actions::busy_test_lock();
         let now = Instant::now();
         let mut state = HealthState::default();
         let offered = |report: &Report| {
