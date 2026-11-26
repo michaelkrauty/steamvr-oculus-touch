@@ -539,7 +539,41 @@ impl Drop for SetupClient {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        restore_tracking_after_kill();
     }
+}
+
+/// Restores tracking if killing the setup child left `cv1touchd` in sensor-capture mode.
+fn restore_tracking_after_kill() {
+    let calibration = crate::config_stats::calibration_path();
+    restore_tracking_with(
+        |line| crate::preview_client::request_once(line).ok(),
+        calibration.as_deref(),
+    );
+}
+
+fn restore_tracking_with(mut send: impl FnMut(&str) -> Option<String>, calibration: Option<&Path>) {
+    let Some(reply) = send("status\n") else {
+        return;
+    };
+    let Some(json) = reply.trim_end().strip_prefix("ok ") else {
+        return;
+    };
+    let Ok(status) = serde_json::from_str::<Value>(json) else {
+        return;
+    };
+    if status["mode"].as_str() != Some("capture") {
+        return;
+    }
+    if let Some(path) = calibration.filter(|p| p.is_absolute() && p.is_file()) {
+        if let Ok(quoted) = serde_json::to_string(path) {
+            let cmd = format!("calibration load {quoted}\n");
+            if send(&cmd).is_some_and(|r| r.starts_with("ok")) {
+                return;
+            }
+        }
+    }
+    let _ = send("calibration provisional\n");
 }
 
 /// One controller's analog inputs, raw factory values.
@@ -937,5 +971,85 @@ printf '%s\n' '{{"event":"done","all_ready":false}}'"#
                 std::env::temp_dir().join(format!("cv1touch-setup-{name}-{}", std::process::id())),
             );
         }
+    }
+
+    #[test]
+    fn restore_tracking_recovers_capture_mode_without_touching_tracking() {
+        let dir = std::env::temp_dir().join(format!("cv1touch-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cal = dir.join("calibration.json");
+        std::fs::write(&cal, "{}").unwrap();
+
+        // Already tracking: do not touch the daemon's mode.
+        let mut sent = Vec::new();
+        restore_tracking_with(
+            |cmd| {
+                sent.push(cmd.to_owned());
+                Some("ok {\"mode\":\"calibrated\"}\n".into())
+            },
+            Some(&cal),
+        );
+        assert_eq!(sent, ["status\n"]);
+
+        // Stuck in capture with a saved calibration: reload it.
+        sent.clear();
+        restore_tracking_with(
+            |cmd| {
+                sent.push(cmd.to_owned());
+                Some(if cmd == "status\n" {
+                    "ok {\"mode\":\"capture\"}\n".into()
+                } else {
+                    "ok\n".into()
+                })
+            },
+            Some(&cal),
+        );
+        let expected_load = format!(
+            "calibration load {}\n",
+            serde_json::to_string(&cal).unwrap()
+        );
+        assert_eq!(sent, ["status\n", expected_load.as_str()]);
+
+        // Stuck in capture when reload fails: fall back to provisional tracking.
+        sent.clear();
+        restore_tracking_with(
+            |cmd| {
+                sent.push(cmd.to_owned());
+                Some(if cmd == "status\n" {
+                    "ok {\"mode\":\"capture\"}\n".into()
+                } else if cmd.starts_with("calibration load ") {
+                    "err invalid calibration\n".into()
+                } else {
+                    "ok\n".into()
+                })
+            },
+            Some(&cal),
+        );
+        assert_eq!(
+            sent,
+            [
+                "status\n",
+                expected_load.as_str(),
+                "calibration provisional\n",
+            ]
+        );
+
+        // Stuck in capture with no saved calibration file: provisional tracking directly.
+        let missing = dir.join("missing.json");
+        sent.clear();
+        restore_tracking_with(
+            |cmd| {
+                sent.push(cmd.to_owned());
+                Some(if cmd == "status\n" {
+                    "ok {\"mode\":\"capture\"}\n".into()
+                } else {
+                    "ok\n".into()
+                })
+            },
+            Some(&missing),
+        );
+        assert_eq!(sent, ["status\n", "calibration provisional\n"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

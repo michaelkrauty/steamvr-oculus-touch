@@ -195,7 +195,15 @@ pub fn draw(ui: &mut Ui, feed: &Feed, textures: &Textures, settings: &mut Settin
                     let rect = ui.available_rect_before_wrap();
                     match found {
                         Some((i, sensor)) => {
-                            tile(ui, rect, i, sensor, textures, settings, true);
+                            tile(
+                                ui,
+                                rect,
+                                sensor_number(i, sensor),
+                                sensor,
+                                textures,
+                                settings,
+                                true,
+                            );
                         }
                         None => message(ui, "Waiting for frames…", ""),
                     }
@@ -217,15 +225,23 @@ fn toolbar(ui: &mut Ui, feed: &Feed, sensors: &[SensorFrame], settings: &mut Set
                 {
                     settings.zoom = None;
                 }
-                let label = match sensors.iter().position(|s| s.serial == serial) {
-                    Some(i) if sensors[i].width > 0 => format!(
+                let label = match sensors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.serial == serial)
+                {
+                    Some((i, sensor)) if sensor.width > 0 => format!(
                         "Sensor {} · {} · {}×{}",
-                        i + 1,
+                        sensor_number(i, sensor),
                         short_serial(&serial),
-                        sensors[i].width,
-                        sensors[i].height
+                        sensor.width,
+                        sensor.height
                     ),
-                    Some(i) => format!("Sensor {} · {}", i + 1, short_serial(&serial)),
+                    Some((i, sensor)) => format!(
+                        "Sensor {} · {}",
+                        sensor_number(i, sensor),
+                        short_serial(&serial)
+                    ),
                     None => format!("Sensor {}", short_serial(&serial)),
                 };
                 ui.label(RichText::new(label).size(16.0).strong())
@@ -319,7 +335,17 @@ fn grid(ui: &mut Ui, sensors: &[SensorFrame], textures: &Textures, settings: &mu
             top + row as f32 * (size.y + gap) + size.y / 2.0,
         );
         let rect = Rect::from_center_size(center, size);
-        if tile(ui, rect, i, sensor, textures, settings, false).clicked() {
+        if tile(
+            ui,
+            rect,
+            sensor_number(i, sensor),
+            sensor,
+            textures,
+            settings,
+            false,
+        )
+        .clicked()
+        {
             settings.zoom = Some(sensor.serial.clone());
         }
     }
@@ -334,10 +360,15 @@ fn fit(cell: Vec2, aspect: f32) -> Vec2 {
     }
 }
 
+/// The 1-based sensor number from the daemon's full list, falling back to slice position.
+fn sensor_number(index: usize, sensor: &SensorFrame) -> usize {
+    sensor.number.unwrap_or(index + 1)
+}
+
 fn tile(
     ui: &mut Ui,
     area: Rect,
-    index: usize,
+    number: usize,
     sensor: &SensorFrame,
     textures: &Textures,
     settings: &Settings,
@@ -414,7 +445,7 @@ fn tile(
         }
     }
     if settings.hud {
-        hud(ui, rect, index, sensor);
+        hud(ui, rect, number, sensor);
     }
     response
 }
@@ -444,7 +475,7 @@ fn pill(
     ui.put(rect, egui::Label::new(galley).selectable(false))
 }
 
-fn hud(ui: &mut Ui, rect: Rect, index: usize, sensor: &SensorFrame) {
+fn hud(ui: &mut Ui, rect: Rect, number: usize, sensor: &SensorFrame) {
     let dark = Color32::from_rgba_unmultiplied(8, 10, 14, 190);
     let inset = rect.shrink(6.0);
     let glare = (sensor.bright_permille >= GLARE_PERMILLE).then(|| {
@@ -462,7 +493,7 @@ fn hud(ui: &mut Ui, rect: Rect, index: usize, sensor: &SensorFrame) {
     let fps = sensor
         .fps
         .map_or("– fps".to_owned(), |fps| format!("{fps:.0} fps"));
-    let number = format!("Sensor {}", index + 1);
+    let number = format!("Sensor {number}");
     let labels = [
         format!(
             "{number} · {} · {fps} · {} ms",

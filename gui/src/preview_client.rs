@@ -93,6 +93,8 @@ pub struct SensorFrame {
     pub devices: Vec<Device>,
     /// Distinct frames a second over the last second, once known.
     pub fps: Option<f32>,
+    /// 1-based position in the daemon's sensor list, once known.
+    pub number: Option<usize>,
 }
 
 /// Every active sensor, in the daemon's sensor order.
@@ -453,11 +455,10 @@ impl Worker {
                 serial,
             )
         });
-        for sensor in &mut snapshot.sensors {
-            let fps = self
-                .fps
-                .entry(sensor.serial.to_ascii_uppercase())
-                .or_default();
+        for (fallback, sensor) in snapshot.sensors.iter_mut().enumerate() {
+            let serial = sensor.serial.to_ascii_uppercase();
+            sensor.number = Some(order.iter().position(|s| *s == serial).unwrap_or(fallback) + 1);
+            let fps = self.fps.entry(serial).or_default();
             sensor.fps = fps.push(sensor.frame_ns);
         }
         Some(Feed::Live(snapshot))
@@ -777,6 +778,7 @@ pub(crate) mod tests {
                                     .to_owned()
                             }
                             "preview stop" => "ok\n".to_owned(),
+                            "preview S1 2" => reply(&[sensor("S1")]),
                             _ => reply(&[sensor("S1"), sensor("s2")]),
                         };
                         let _ = lines_tx.send(line);
@@ -800,7 +802,7 @@ pub(crate) mod tests {
         next("status");
         next("preview 4");
         next("preview 4");
-        let (_, feed) = preview.latest(0).unwrap();
+        let (mut seen, feed) = preview.latest(0).unwrap();
         let Feed::Live(snapshot) = feed else {
             panic!("{feed:?}")
         };
@@ -809,12 +811,26 @@ pub(crate) mod tests {
             snapshot
                 .sensors
                 .iter()
-                .map(|s| s.serial.as_str())
+                .map(|s| (s.serial.as_str(), s.number))
                 .collect::<Vec<_>>(),
-            ["s2", "S1"]
+            [("s2", Some(1)), ("S1", Some(2))]
         );
         preview.set_mode(Mode::One("S1".into()));
         next("preview S1 2");
+        let started = Instant::now();
+        let zoomed = loop {
+            if let Some((next_seen, Feed::Live(snap))) = preview.latest(seen) {
+                seen = next_seen;
+                if snap.sensors.len() == 1 {
+                    break snap;
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        };
+        // Zooming into the second sensor keeps its number from the full list.
+        assert_eq!(zoomed.sensors[0].serial, "S1");
+        assert_eq!(zoomed.sensors[0].number, Some(2));
         // Paused: one stop, then nothing until the window is back.
         preview.set_mode(Mode::Paused);
         next("preview stop");

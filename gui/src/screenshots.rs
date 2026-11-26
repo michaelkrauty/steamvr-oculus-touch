@@ -779,6 +779,7 @@ fn camera_scene(i: usize, scale: u32) -> SensorFrame {
         blobs,
         devices,
         fps: Some(if scale == 2 { 29.6 } else { 15.0 }),
+        number: Some(i + 1),
     }
 }
 
@@ -861,8 +862,9 @@ fn sensor_view_screenshots_show_the_grid_zoom_and_every_empty_state() {
         .any(|l| l.starts_with("Sensor 1") || l.starts_with("IR glare")));
     assert!(!shows(&pixels, cameras::LEFT) && !shows(&pixels, cameras::RIGHT));
 
+    // Mode::One returns only the selected sensor; its number must stay 2, not reset to 1.
     let zoom = Feed::Live(PreviewSnapshot {
-        sensors: vec![camera_scene(0, 4), camera_scene(1, 2)],
+        sensors: vec![camera_scene(1, 2)],
     });
     let mut settings = Settings {
         zoom: Some(serial(1)),

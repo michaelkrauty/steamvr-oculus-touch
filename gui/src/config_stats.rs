@@ -102,6 +102,11 @@ impl ConfigStats {
     }
 }
 
+/// The saved room calibration file, as the daemon resolves it.
+pub fn calibration_path() -> Option<PathBuf> {
+    dir().map(|d| d.join("calibration.json"))
+}
+
 /// cv1touch's configuration directory, as the daemon resolves it.
 fn dir() -> Option<PathBuf> {
     let var = |name| {
