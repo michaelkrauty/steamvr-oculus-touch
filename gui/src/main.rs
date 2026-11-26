@@ -89,7 +89,9 @@ fn main() {
             Command::Desktop(install) => desktop::run(install),
             Command::Quit => tray::quit(),
             Command::Print(text) => {
-                println!("{text}");
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{text}").and_then(|()| out.flush());
                 Ok(())
             }
         });

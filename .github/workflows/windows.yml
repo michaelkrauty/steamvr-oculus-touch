@@ -207,8 +207,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cv1touchd exit $LASTEXITCODE" }
           & target\bundle\bin\cv1touch.exe --version
           if ($LASTEXITCODE -ne 0) { throw "cv1touch exit $LASTEXITCODE" }
-          $v = & target\bundle\bin\cv1touch-gui.exe --version
-          if ($LASTEXITCODE -ne 0 -or "$v" -notlike '*cv1touch-gui *') { throw "cv1touch-gui exit ${LASTEXITCODE}: $v" }
+          python -c "from pathlib import Path; import subprocess; out = subprocess.check_output([Path('target/bundle/bin/cv1touch-gui.exe'), '--version'], text=True); assert 'cv1touch-gui ' in out, repr(out); print(out.strip())"
+          if ($LASTEXITCODE -ne 0) { throw "cv1touch-gui --version exit $LASTEXITCODE" }
       - name: Pack
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
