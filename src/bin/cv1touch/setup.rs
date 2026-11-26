@@ -296,7 +296,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         } else if second.as_ref().is_some_and(|v| v["engine_ready"] == false) {
             Some("tracking is starting up; wait a few seconds")
         } else if recording || !normal_mode {
-            Some("cv1touchd is busy with a recording or another calibration")
+            Some("cv1touchd is busy with a tracking log or another calibration")
         } else if !fresh {
             Some("press a button on each controller")
         } else if stage != Stage::Inputs && !streaming {
@@ -633,7 +633,7 @@ fn go_signal(prompt: &str) -> Result<(), String> {
     let mut a = PressA::new();
     loop {
         if interrupted() {
-            return Err("interrupted; nothing was recorded".into());
+            return Err("interrupted; nothing was logged".into());
         }
         match next_line(Duration::from_millis(20)) {
             Line::Closed => {
@@ -641,7 +641,7 @@ fn go_signal(prompt: &str) -> Result<(), String> {
             }
             Line::Typed(line) => match start_line(&line) {
                 Some(true) => return Ok(()),
-                Some(false) => return Err("stopped; nothing was recorded".into()),
+                Some(false) => return Err("stopped; nothing was logged".into()),
                 None => println!("  (Enter or A starts, q quits)"),
             },
             Line::NotYet => {}
@@ -722,7 +722,7 @@ fn timed_capture(
     result?;
     if !stopped_ok {
         return Err(format!(
-            "recording did not stop successfully; own-path cleanup will retry: {}",
+            "logging did not stop successfully; own-path cleanup will retry: {}",
             stopped.unwrap_or_else(|error| error)
         ));
     }
@@ -749,18 +749,17 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
     let raw = raw_inputs()?;
     input_identities_match(&raw, ids)?;
     PairedInputPhase::new([0, 0]).observe(&raw, ids, shm::now_ns())?;
-    let status = read_status().map_err(|error| error.to_string())?.ok_or(
-        "cv1touchd stopped responding after the recording; check it is running and try again",
-    )?;
+    let status = read_status()
+        .map_err(|error| error.to_string())?
+        .ok_or("cv1touchd stopped responding after logging; check it is running and try again")?;
     if inspection.generation.is_none() || status["generation"].as_u64() != inspection.generation {
         return Err(
-            "cv1touchd restarted during the recording; your previous calibration is unchanged"
-                .into(),
+            "cv1touchd restarted during logging; your previous calibration is unchanged".into(),
         );
     }
     if status["recording"] != false {
         return Err(
-            "another recording is still running; stop it (cv1touch record stop) and try again"
+            "another tracking log is still running; stop it (cv1touch record stop) and try again"
                 .into(),
         );
     }
@@ -768,7 +767,7 @@ fn verify_capture(inspection: &Inspection) -> Result<(), String> {
         let now = setup::fingerprint(&file::default_path()).map_err(|e| e.to_string())?;
         if &now != before {
             return Err(
-                "the sensor calibration changed during the recording; your previous calibration is unchanged"
+                "the sensor calibration changed during logging; your previous calibration is unchanged"
                     .into(),
             );
         }
@@ -1019,7 +1018,7 @@ impl ButtonEdges {
                 !sample.connected || now_ns - sample.received_host_ns > FRESH_INPUT_NS;
             if hand == HAND_RIGHT && !self.waiting[hand] && buttons & cv1touch::hand::BTN_B != 0 {
                 return Err(
-                    "registration cancelled with B on the right controller; no recording started"
+                    "registration cancelled with B on the right controller; no logging started"
                         .into(),
                 );
             }
@@ -1087,14 +1086,14 @@ Read all of this now: you won't see this screen with the headset on.
      controllers must not slide or twist on the headset: if one does, the calibration fails and
      you start this step again.
   3. Press A on the right controller with your thumb. You'll feel a 10-second countdown via
-     controller haptic pulses, one a second. Nothing is recorded yet: use the 10 seconds to
+     controller haptic pulses, one a second. Nothing is logged yet: use the 10 seconds to
      press both controllers firmly back into place, in case pressing A moved them.
-  4. Two quick pulses: recording starts. Slowly turn your whole body around on the spot:
+  4. Two quick pulses: logging starts. Slowly turn your whole body around on the spot:
      two full circles to your left, then two to your right, 5 to 10 seconds per circle.
      Keep turning until you feel a single pulse.
   5. Then look up and down, and tilt your head toward each shoulder, as far as is comfortable,
      a few times each, until you feel one long pulse: done. Take off the headset.
-If you feel three quick pulses instead, the recording stopped early (a controller slid on the
+If you feel three quick pulses instead, logging stopped early (a controller slid on the
 headset, you pressed B, or something else went wrong): take off the headset and read this
 screen. B on the right controller cancels at any time. What you see in the headset during this
 step doesn't matter.";
@@ -1110,14 +1109,14 @@ Read all of this now: you won't see this screen with the headset on.
      sensors. From now until the end, the controllers must not slide or twist on the headset:
      if one does, the calibration fails and you start this step again.
   3. Press A on the right controller with your thumb. You'll feel a 10-second countdown via
-     controller haptic pulses, one a second. Nothing is recorded yet: use the 10 seconds to
+     controller haptic pulses, one a second. Nothing is logged yet: use the 10 seconds to
      press both controllers firmly back into place, in case pressing A moved them.
-  4. Two quick pulses: recording starts. Look down and up, tilt your head toward each shoulder,
+  4. Two quick pulses: logging starts. Look down and up, tilt your head toward each shoulder,
      then look over your left shoulder and over your right shoulder (turn your body too if
      that is easier), as far as is comfortable, until you feel one long pulse: done. Take off
      the headset. Going on longer does no harm. If no long pulse comes, look further down and
      up and tilt your head further.
-If you feel three quick pulses instead, the recording stopped early (a controller slid on the
+If you feel three quick pulses instead, logging stopped early (a controller slid on the
 headset, you pressed B, or something else went wrong): take off the headset and read this
 screen. If the result is refused, the next try is the full alignment, about a minute long.
 B on the right controller cancels at any time. What you see in the headset during this
@@ -1239,7 +1238,7 @@ fn wait_preparation_press(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    Err("no button press within 5 minutes; nothing was recorded".into())
+    Err("no button press within 5 minutes; nothing was logged".into())
 }
 
 /// The line to show when the controllers' readiness changes: which one fell asleep, or, once
@@ -1290,7 +1289,7 @@ fn confirm_registration_controls_with(
 
 /// The countdown's line on screen, `remaining` seconds before the recording starts.
 fn countdown_line(remaining: usize) -> String {
-    format!("\r  recording starts in {remaining:>2} s ")
+    format!("\r  logging starts in {remaining:>2} s ")
 }
 
 fn registration_countdown_with(
@@ -1468,14 +1467,14 @@ fn verify_registration_preparation(before: &Inspection, after: &Inspection) -> R
     verify_fitted_dependencies(Stage::Registration, before, after)?;
     if let Some(reason) = after.snapshot.blocked.get(&Stage::Registration) {
         return Err(format!(
-            "registration preparation is not ready: {reason}; no recording started"
+            "registration preparation is not ready: {reason}; no logging started"
         ));
     }
     if !matches!(after.snapshot.camera, Artifact::Valid(_))
         || !after.unplaced.is_empty()
         || after.sensors != before.sensors
     {
-        return Err("the sensors changed meanwhile (one connected, disconnected or recalibrated); nothing was recorded".into());
+        return Err("the sensors changed meanwhile (one connected, disconnected or recalibrated); nothing was logged".into());
     }
     Ok(())
 }
@@ -1510,7 +1509,7 @@ fn run_stage(
 ) -> Result<(), String> {
     if matches!(stage, Stage::Camera | Stage::Gravity) && inspection.engine_ready.is_none() {
         return Err(
-            "this cv1touchd is older than cv1touch; install both from the same build (nothing was recorded)".into(),
+            "this cv1touchd is older than cv1touch; install both from the same build (nothing was logged)".into(),
         );
     }
     let old = checkpoint.clone();
@@ -1631,13 +1630,13 @@ fn run_stage(
                 |checkpoint| {
                     let current = inspect(checkpoint);
                     if interrupted() {
-                        return Err("setup interrupted; nothing was recorded".into());
+                        return Err("setup interrupted; nothing was logged".into());
                     }
                     verify_registration_preparation(inspection, &current)
                 },
                 |checkpoint| {
                     if interrupted() {
-                        return Err("setup interrupted; nothing was recorded".into());
+                        return Err("setup interrupted; nothing was logged".into());
                     }
                     let rec = capture_path(stage, checkpoint)?;
                     let base = rec.with_extension("");
@@ -1648,7 +1647,7 @@ fn run_stage(
                         .push(base.with_extension("truth.json"));
                     persist(checkpoint)?;
                     if interrupted() {
-                        return Err("setup interrupted; nothing was recorded".into());
+                        return Err("setup interrupted; nothing was logged".into());
                     }
                     if !events::on() {
                         print!("\r                            \r");
@@ -1661,9 +1660,9 @@ fn run_stage(
                     let captured = capture_free_named_with_feedback(
                         if quick { 60 } else { 150 },
                         if quick {
-                            "Recording: look down and up, tilt your head, then look over each shoulder, until the long pulse. B cancels."
+                            "Logging: look down and up, tilt your head, then look over each shoulder, until the long pulse. B cancels."
                         } else {
-                            "Recording: two circles left, two right; after the single pulse, look up and down and tilt your head until the long pulse. B cancels."
+                            "Logging: two circles left, two right; after the single pulse, look up and down and tilt your head until the long pulse. B cancels."
                         },
                         false,
                         Some(&base),
@@ -1672,7 +1671,9 @@ fn run_stage(
                     SLIPPED.store(feedback.capture.slipped(), Ordering::Relaxed);
                     captured.map_err(|code| {
                         feedback.error.take().unwrap_or_else(|| {
-                            format!("the recording failed ({code}); your previous calibration is unchanged")
+                            format!(
+                                "logging failed ({code}); your previous calibration is unchanged"
+                            )
                         })
                     })?;
                     Ok((rec, base))
@@ -1764,7 +1765,7 @@ fn offer_again(stage: Stage, checkpoint: &mut Checkpoint) {
 /// What the idle check says while a recording runs. The daemon's status does not say which client
 /// started it: a `record start` capture runs until `record stop`, while another cv1touch command's
 /// capture ends by itself and a `record stop` would cut it short.
-const RECORDING_RUNNING: &str = "a recording is running: if you started it with cv1touch record start, stop it with cv1touch record stop; if setup, calibrate, eval-capture or register is recording, wait for it to finish";
+const RECORDING_RUNNING: &str = "a tracking log is running: if you started it with cv1touch record start, stop it with cv1touch record stop; if setup, calibrate, eval-capture or register is logging, wait for it to finish";
 
 /// Refuses an unaddressable endpoint or an older running daemon before preparation, with the
 /// line to print. A daemon that is not running or is busy is for the guide's own checks to
@@ -2801,7 +2802,7 @@ mod tests {
                                 Ok(())
                             }
                         },
-                        || Err("cancelled during the countdown; nothing was recorded".into()),
+                        || Err("cancelled during the countdown; nothing was logged".into()),
                     )
                 },
                 |_| Ok(()),
@@ -2947,8 +2948,8 @@ mod tests {
             "the headset's sensors or cameras",
             "the calibration fails",
             "10-second countdown via controller haptic pulses",
-            "Nothing is recorded yet",
-            "Two quick pulses: recording starts",
+            "Nothing is logged yet",
+            "Two quick pulses: logging starts",
             "two full circles to your left, then two to your right",
             "seconds per circle",
             "single pulse",
@@ -2969,7 +2970,7 @@ mod tests {
             assert!(!REGISTRATION_PREPARATION.contains(vague), "{vague}");
         }
         assert!(!countdown_line(3).contains("still"));
-        assert_eq!(countdown_line(3), "\r  recording starts in  3 s ");
+        assert_eq!(countdown_line(3), "\r  logging starts in  3 s ");
         // it finishes by itself: pressing anything while holding the controllers to the
         // headset risks moving them
         assert!(!REGISTRATION_PREPARATION.contains("to finish"));
@@ -2988,8 +2989,8 @@ mod tests {
             "anywhere on it",
             "the calibration fails",
             "10-second countdown via controller haptic pulses",
-            "Nothing is recorded yet",
-            "Two quick pulses: recording starts",
+            "Nothing is logged yet",
+            "Two quick pulses: logging starts",
             "Look down and up",
             "tilt your head toward each shoulder",
             "look over your left shoulder and over your right shoulder",

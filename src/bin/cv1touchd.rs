@@ -6893,7 +6893,7 @@ fn finish_recording_startup(
         .and_then(|status| status.error);
     let error = error.or(late_error).or(final_error);
     if status.path.is_some() && !status.finished {
-        log("startup recording is still waiting for storage; file may be incomplete");
+        log("startup logging is still waiting for storage; file may be incomplete");
     }
     endpoints.remove();
     d.shm.retire();
@@ -6904,7 +6904,7 @@ fn finish_recording_startup(
 fn finish_recording_shutdown(rec: &Recorder) {
     if let Some(status) = rec.stop_timeout(None, RECORD_SHUTDOWN_WAIT) {
         if !status.finished {
-            log("recording is still waiting for storage; file may be incomplete");
+            log("logging is still waiting for storage; file may be incomplete");
         }
     }
 }
@@ -19826,7 +19826,7 @@ mod tests {
             assert!(output.status.success(), "{kind}: {text}");
             let diagnostics: Vec<_> = text
                 .lines()
-                .filter(|line| line.starts_with("cv1touchd: recording "))
+                .filter(|line| line.starts_with("cv1touchd: logging "))
                 .collect();
             assert_eq!(diagnostics.len(), 1, "{kind}: {text}");
             if kind == "pending" {
@@ -20053,14 +20053,14 @@ mod tests {
             let diagnostics: Vec<_> = text
                 .lines()
                 .filter(|line| {
-                    line.contains("recording failed:")
+                    line.contains("logging failed:")
                         || line.starts_with("cv1touchd: open ")
                         || line.starts_with("cv1touchd: write ")
                 })
                 .collect();
             assert_eq!(diagnostics.len(), 1, "duplicate startup error: {text}");
             assert!(
-                diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                diagnostics[0].starts_with("cv1touchd: logging failed:"),
                 "writer must own its diagnostic: {text}"
             );
             assert!(
@@ -20205,7 +20205,7 @@ mod tests {
             (
                 "pending",
                 0,
-                "startup recording is still waiting for storage; file may be incomplete",
+                "startup logging is still waiting for storage; file may be incomplete",
             ),
             ("complete", 0, "cv1touchd: stopped"),
         ] {
@@ -20278,13 +20278,13 @@ mod tests {
             );
             if expected_code == 1 {
                 assert!(
-                    diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                    diagnostics[0].starts_with("cv1touchd: logging failed:"),
                     "{kind}: writer must report before close: {text}"
                 );
             }
             if kind == "complete" {
                 assert!(
-                    !text.contains("file may be incomplete") && !text.contains("recording failed"),
+                    !text.contains("file may be incomplete") && !text.contains("logging failed"),
                     "{text}"
                 );
             }
@@ -20596,7 +20596,7 @@ mod tests {
             .unwrap();
         d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
         let reply = handle(&d, &control::record_stop_if_line(&path).unwrap());
-        assert!(reply.starts_with("err recording ended early:"), "{reply}");
+        assert!(reply.starts_with("err logging ended early:"), "{reply}");
         assert!(
             reply.contains("1.00 GiB free; keeping 2.00 GiB free"),
             "{reply}"

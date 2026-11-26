@@ -443,13 +443,13 @@ fn default_name(created: SystemTime) -> String {
 /// What the report holds, for the person sending it.
 const CONTENTS: &str = concat!(
     "It holds:\n",
-    "- cv1touch's logs, settings and calibration, and its record of headset alignments (the ",
+    "- cv1touch's logs, settings and calibration, and its saved headset alignments (the ",
     "calibration says where your sensors stand in your room);\n",
     "- SteamVR's log, which also names your other VR devices, your user folder and your ",
     "network addresses;\n",
     "- the Oculus devices plugged in, and your system's version;\n",
-    "- what the controllers' radio sent around their last dropouts (no camera images).\n",
-    "Nothing else: no other recordings, and no other files."
+    "- what the controllers' radio sent around their last dropouts (no sensor images).\n",
+    "Nothing else: no other tracking logs, and no other files."
 );
 
 /// `report`'s flags, in any order: `--out PATH`, `--json`, `--no-open`; None for anything else.

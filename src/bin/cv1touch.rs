@@ -1252,7 +1252,7 @@ fn pace_windows(phases: &[String]) -> Result<Vec<(String, u64, u64)>, i32> {
                 return Err(130);
             }
             print!(
-                "\r  recording... {:5.1} s left ",
+                "\r  logging... {:5.1} s left ",
                 (end_target - shm::now_ns()) as f64 / 1e9
             );
             let _ = io::stdout().flush();
@@ -1499,7 +1499,7 @@ fn calibrate(out: &Path) -> i32 {
     }
     if paced != 0 {
         eprintln!(
-            "cv1touch: calibration interrupted (recording kept at {})",
+            "cv1touch: calibration interrupted (log kept at {})",
             rec.display()
         );
         restore_mode(out);
@@ -1517,7 +1517,7 @@ fn fit_render(rec: Option<&Path>) -> i32 {
         Some(r) => r,
         None => {
             eprintln!(
-                "cv1touch: no recording given and none in {}",
+                "cv1touch: no tracking log given and none in {}",
                 state_dir().display()
             );
             return 1;
@@ -1687,7 +1687,7 @@ fn touch_reader() -> Result<ShmReader, String> {
     let name = status["shm"].as_str().unwrap_or(shm::DEFAULT_NAME);
     let reader = ShmReader::open(name).map_err(|e| format!("cannot read controller poses: {e}"))?;
     if status["generation"].as_u64() != Some(reader.generation()) {
-        return Err("cv1touchd restarted; no recording started".into());
+        return Err("cv1touchd restarted; no logging started".into());
     }
     Ok(reader)
 }
@@ -2242,10 +2242,7 @@ fn eval_capture() -> i32 {
     let windows = match paced {
         Ok(w) => w,
         Err(code) => {
-            eprintln!(
-                "cv1touch: interrupted (recording kept at {})",
-                rec.display()
-            );
+            eprintln!("cv1touch: interrupted (log kept at {})", rec.display());
             return code;
         }
     };
@@ -2527,7 +2524,7 @@ fn start_line(line: &str) -> Option<bool> {
 }
 
 /// The setup guide's introduction to input calibration.
-const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
+const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts measuring (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
 
 /// The four input calibration steps, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2641,7 +2638,7 @@ fn input_gate(step: CalStep) -> Result<(), String> {
             Line::Typed(line) => match start_line(&line) {
                 Some(true) => return Ok(()),
                 Some(false) => return Err("input calibration stopped; no calibration saved".into()),
-                None => println!("      (Enter records now, q quits)"),
+                None => println!("      (Enter measures now, q quits)"),
             },
             Line::NotYet => {}
         }
@@ -2657,7 +2654,7 @@ fn input_gate(step: CalStep) -> Result<(), String> {
         }
         if !hinted && start.elapsed() > Duration::from_secs(8) {
             hinted = true;
-            println!("      (not detected yet: press Enter to record anyway)");
+            println!("      (not detected yet: press Enter to measure anyway)");
         }
     }
 }
@@ -3424,9 +3421,7 @@ fn guided_record_start_with(
     reconcile: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     if cancelled() {
-        return Err(
-            "capture interrupted before record-start dispatch; no recording started".into(),
-        );
+        return Err("capture interrupted before log-start dispatch; no logging started".into());
     }
     let response = request();
     if response.as_ref().is_ok_and(|reply| reply.trim() == "ok") {
@@ -3442,7 +3437,7 @@ fn guided_record_start_with(
         .unwrap_or_else(|| "missing or malformed record-start acknowledgement".into());
     reconcile().map_err(|cleanup| format!("{error}; scoped recorder cleanup failed: {cleanup}"))?;
     Err(format!(
-        "{error}; own recording safely stopped if it started"
+        "{error}; own tracking log safely stopped if it started"
     ))
 }
 
@@ -3465,9 +3460,9 @@ impl ScopedRecordingGuard {
         let reply = request(&self.command, RECORD_STOP_TIMEOUT)?;
         if !reply.starts_with("ok stopped ") {
             return Err(if reply.trim() == "ok not-matching" {
-                "recording completion was already acknowledged by another client; capture was not used".into()
+                "tracking log completion was already acknowledged by another client; capture was not used".into()
             } else {
-                format!("recording did not complete: {reply}")
+                format!("logging did not complete: {reply}")
             });
         }
         self.armed = false;
@@ -3498,7 +3493,7 @@ fn recording_capability(status: &serde_json::Value, windows: bool) -> Result<(),
     } else {
         "systemctl --user restart cv1touchd"
     };
-    Err(format!("the cv1touch daemon is older than this cv1touch and can't confirm recordings; restart it: {restart}"))
+    Err(format!("the cv1touch daemon is older than this cv1touch and can't confirm tracking logs; restart it: {restart}"))
 }
 
 fn recording_daemon_status(
@@ -3506,11 +3501,11 @@ fn recording_daemon_status(
     windows: bool,
 ) -> Result<serde_json::Value, String> {
     let status = status
-        .ok_or_else(|| "cannot reach the cv1touch daemon; start it before recording".to_string())?;
+        .ok_or_else(|| "cannot reach the cv1touch daemon; start it before logging".to_string())?;
     recording_capability(&status, windows)?;
     if status["recording"] != false || status["recording_status"]["pending"] == true {
         return Err(
-            "another recording is in progress; run cv1touch record stop before starting a capture"
+            "another tracking log is in progress; run cv1touch record stop before starting a capture"
                 .into(),
         );
     }
@@ -3655,7 +3650,7 @@ fn capture_free_named_with_feedback(
     // the Touches as cv1touchd tracks them, for the feedback: SteamVR's copy may be paused
     let (reader, frames_out, frames_in) = if feedback.is_some() {
         let reader = touch_reader().map_err(|error| {
-            eprintln!("cv1touch: {error}; no recording started");
+            eprintln!("cv1touch: {error}; no logging started");
             1
         })?;
         let (tx, rx) = std::sync::mpsc::channel::<PoseFrame>();
@@ -3715,7 +3710,7 @@ fn capture_free_named_with_feedback(
     discard_typed_ahead();
     if chatty {
         println!(
-            "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
+            "logging {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
             rec.display()
         );
     }
@@ -3801,7 +3796,7 @@ fn capture_free_named_with_feedback(
     else {
         let _ = writeln!(
             io::stderr(),
-            "cv1touch: no reference controller or headset was tracked (recording kept at {})",
+            "cv1touch: no reference controller or headset was tracked (log kept at {})",
             rec.display()
         );
         return Err(1);
@@ -5027,7 +5022,7 @@ fn capture_measurements(
         .iter()
         .any(|m| m.calibration_unix_s == calibration_unix_s)
     {
-        return Err(format!("{why}: no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+        return Err(format!("{why}: no station measured, so the registration is unchanged and keeps the stations measured before; log again"));
     }
     println!("{why}: no station measured");
     Ok((None, Vec::new()))
@@ -5073,7 +5068,7 @@ fn initial_registration(universe_id: u64) -> align::Registration {
 
 fn register_headset() -> i32 {
     let base = match capture_free(150,
-        "Headset registration: the recording runs from now, for up to 150 s; the fit keeps only the stretch in\n\
+        "Headset registration: logging runs from now, for up to 150 s; the fit keeps only the stretch in\n\
          which both Touches moved rigidly with the headset, so take your time. Press each Touch firmly to a side\n\
          of the headset, away from its tracking surface. Turn two slow circles each way, then nod and tilt your\n\
          head repeatedly. Keep the Touches attached for the entire motion; release them, then press Enter.\n\
@@ -8849,7 +8844,10 @@ mod tests {
                 Ok(format!("ok {old}"))
             },
         );
-        assert!(result.err().unwrap().contains("can't confirm recordings"));
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("can't confirm tracking logs"));
         assert_eq!(requests, ["status"]);
         let new = serde_json::json!({"recording_scoped_stop":true,"recording_durable_stop":true,"recording":false});
         assert!(recording_daemon_status(Some(new), false).is_ok());
@@ -9574,7 +9572,7 @@ mod tests {
         let refused = capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100).unwrap_err();
         assert_eq!(
             refused,
-            "SteamVR moved base station LHB-TEST-A, which it tracked LHR-TEST from, by up to 3.0 mm, 0.00 deg during the capture: no station measured, so the registration is unchanged and keeps the stations measured before; record again"
+            "SteamVR moved base station LHB-TEST-A, which it tracked LHR-TEST from, by up to 3.0 mm, 0.00 deg during the capture: no station measured, so the registration is unchanged and keeps the stations measured before; log again"
         );
         // nothing to keep: written as before, measuring none
         for previous in [
@@ -9596,7 +9594,7 @@ mod tests {
         for base in [Some("LHB-TEST-C"), None] {
             assert!(capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100)
                 .unwrap_err()
-                .ends_with("no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+                .ends_with("no station measured, so the registration is unchanged and keeps the stations measured before; log again"));
         }
         // the base left still: measured, beside the earlier one
         let (now, kept) =
