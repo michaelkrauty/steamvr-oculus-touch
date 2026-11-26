@@ -632,10 +632,13 @@ mod linux {
         stop(&runtime()?)
     }
 
-    /// Asks the tray in `dir` to quit, and waits for it and the windows to exit.
+    /// Asks the tray and any open windows in `dir` to quit, and waits for them to exit.
     fn stop(dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
         let _ = send(&dir.join("cv1touch-gui.sock"), b"quit");
         let names = [Kind::Status, Kind::Sensors, Kind::Setup].map(name);
+        for name in names {
+            let _ = send(&dir.join(format!("{name}.sock")), b"close");
+        }
         for _ in 0..60 {
             if !names.iter().chain(&["cv1touch-gui"]).any(|n| held(dir, n)) {
                 return Ok(());
@@ -801,8 +804,24 @@ mod linux {
         while !dir.join("cv1touch-gui.sock").exists() {
             thread::sleep(Duration::from_millis(10));
         }
+        let window = thread::spawn({
+            let dir = dir.clone();
+            move || {
+                singleton(&dir, name(Kind::Status), |socket| {
+                    let mut message = [0; 16];
+                    let n = socket.recv(&mut message)?;
+                    assert_eq!(&message[..n], b"close");
+                    Ok(())
+                })
+                .unwrap()
+            }
+        });
+        while !dir.join(format!("{}.sock", name(Kind::Status))).exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
         stop(&dir).unwrap();
         tray.join().unwrap();
+        window.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

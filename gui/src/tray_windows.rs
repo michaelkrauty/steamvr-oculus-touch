@@ -489,8 +489,9 @@ pub fn run(show_status: bool) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Asks this session's tray to quit, and waits for it and the windows to exit.
+/// Asks this session's tray and any open windows to quit, and waits for them to exit.
 pub(super) fn quit() -> Result<(), Box<dyn Error>> {
+    close_windows();
     unsafe {
         let tray = FindWindowW(CLASS.as_ptr(), ptr::null());
         if !tray.is_null() {
