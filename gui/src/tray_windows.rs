@@ -1,6 +1,6 @@
 use super::{
-    handle, poll_health, save_report, show_setup, Context, Kind, Message, Report, ServiceAction,
-    Window,
+    close_windows, handle, poll_health, save_report, show_setup, Context, Kind, Message, Report,
+    ServiceAction, Window,
 };
 use std::{
     cell::RefCell,
@@ -313,7 +313,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 (MF_STRING, Some("Set up…")),
                 (MF_STRING, Some("Save diagnostic report…")),
                 (MF_SEPARATOR, None),
-                (MF_STRING, Some("Quit tray icon (cv1touchd keeps running)")),
+                (MF_STRING, Some("Quit (cv1touchd keeps running)")),
             ];
             for (i, (flags, label)) in entries.iter().enumerate() {
                 let text = label.map(wide);
@@ -364,6 +364,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     });
                 }
                 12 => {
+                    close_windows();
                     DestroyWindow(hwnd);
                 }
                 _ => {}

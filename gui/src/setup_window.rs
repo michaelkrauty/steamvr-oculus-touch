@@ -72,7 +72,7 @@ pub fn prompt_buttons(prompt: &Prompt) -> Vec<(&'static str, &'static str)> {
     for choice in &prompt.choices {
         let button = match (choice.as_str(), prompt.id.as_str()) {
             ("go", "start") => ("Start capture", "go"),
-            ("go", "rest" | "triggers" | "grips" | "sticks") => ("Record now", "go"),
+            ("go", "rest" | "triggers" | "grips" | "sticks") => ("Measure now", "go"),
             ("go", "menu") => continue,
             ("go", _) => ("Continue", "go"),
             ("retry", _) => ("Try again", "retry"),
@@ -264,7 +264,7 @@ fn footer(ui: &mut Ui, guide: &Guide, action: &mut Option<SetupAction>) {
                 }
             }
         }
-        let recording = guide.active_stage() == Some("headset")
+        let logging = guide.active_stage() == Some("headset")
             && guide.progress.as_ref().is_some_and(|p| p.phase == "capture");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -274,11 +274,11 @@ fn footer(ui: &mut Ui, guide: &Guide, action: &mut Option<SetupAction>) {
             {
                 send(action, "quit");
             }
-            // Any line but a stop ends the headset recording early and keeps it.
-            if recording
+            // Any line but a stop ends headset logging early and keeps it.
+            if logging
                 && ui
                     .button("Finish early")
-                    .on_hover_text("End the recording now and line up with what it has. It ends by itself once you have turned, nodded and tilted enough.")
+                    .on_hover_text("Stop logging now and align with what it has. It ends by itself once you have turned, nodded and tilted enough.")
                     .clicked()
             {
                 send(action, "finish");
@@ -487,7 +487,7 @@ fn stage_view(ui: &mut Ui, guide: &Guide, live: Option<&Hands>) {
                 let left = progress.metrics["remaining_s"].as_u64().unwrap_or(0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new(left.to_string()).size(64.0).strong());
-                    ui.label(weak("Recording starts when the count ends"));
+                    ui.label(weak("Logging starts when the count ends"));
                 });
             }
             "capture" if id == "headset" => headset_gauges(ui, &progress.metrics, fraction),
@@ -525,7 +525,7 @@ fn stage_view(ui: &mut Ui, guide: &Guide, live: Option<&Hands>) {
                 Some((elapsed, total)) if total > 0.0 => {
                     ui.add(
                         egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0) as f32)
-                            .text("Recording…")
+                            .text("Logging…")
                             .corner_radius(4),
                     );
                 }
@@ -557,7 +557,7 @@ fn action_card(ui: &mut Ui, tint: egui::Color32, add: impl FnOnce(&mut Ui)) {
         });
 }
 
-/// The headset recording's turning, nodding and tilting so far.
+/// The headset alignment's turning, nodding and tilting so far.
 fn headset_gauges(ui: &mut Ui, m: &Value, fraction: Option<(f64, f64)>) {
     let needed = m["needed_deg"].as_f64().unwrap_or(0.0);
     let nod = m["nod_needed_deg"].as_f64().unwrap_or(15.0);
@@ -581,7 +581,7 @@ fn headset_gauges(ui: &mut Ui, m: &Value, fraction: Option<(f64, f64)>) {
         });
     };
     card(ui, |ui| {
-        title(ui, "Recording");
+        title(ui, "Logging");
         for (name, key) in [
             ("Turn left", "turn_left_deg"),
             ("Turn right", "turn_right_deg"),
@@ -871,7 +871,7 @@ mod tests {
         use crate::setup_client::tests::*;
         assert_eq!(prompt(START).choices, ["go", "quit"]);
         assert_eq!(prompt_buttons(&prompt(START)), [("Start capture", "go")]);
-        assert_eq!(prompt_buttons(&prompt(TRIGGERS)), [("Record now", "go")]);
+        assert_eq!(prompt_buttons(&prompt(TRIGGERS)), [("Measure now", "go")]);
         // The headset waits for A on the controller: nothing to click but Cancel.
         assert!(prompt_buttons(&prompt(HEADSET_PROMPT)).is_empty());
         assert_eq!(

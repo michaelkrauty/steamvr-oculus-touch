@@ -61,7 +61,7 @@ fn tip(key: &str) -> &'static str {
         "Left model offset" | "Right model offset" => "How well the controller's 3D model lines up with its tracked LEDs, as an RMS in millimetres, and how many LEDs the fit used. Lower is better.",
         "Left input" | "Right input" => "Whether the controller's trigger, grip and thumbstick ranges use your input calibration or the factory values.",
         // Daemon.
-        "Mode" => "What the daemon tracks with: calibrated is the saved room calibration, provisional a rough placement of the sensors before there is one, and capture is setup recording calibration data.",
+        "Mode" => "What the daemon tracks with: calibrated is the saved room calibration, provisional a rough placement of the sensors before there is one, and capture is setup logging calibration data.",
         "Tracker" => "Whose controller poses the daemon publishes: cv1touch's own tracker (Rust) or OpenHMD's.",
         "Tilt" => "The angle the controllers are tilted by as games see them (positive: front end up). Set with cv1touch tilt; tracking itself is unchanged.",
         "Shared memory" => "The shared memory name through which the daemon hands poses to the SteamVR driver.",
@@ -71,7 +71,7 @@ fn tip(key: &str) -> &'static str {
         "Dropped clocks" => "Sensor timing samples dropped before they could be used. It should stay at or near 0.",
         "Unknown frames" => "Frames from a sensor the tracker had not admitted, such as one just unplugged. It should stay at or near 0.",
         "Pending dropped" => "Frames the tracking pipeline dropped while they waited. It should stay at or near 0.",
-        "Recording" => "A recording of tracking data the daemon is making, for diagnosis.",
+        "Logging" => "A tracking log the daemon is writing, for diagnosis.",
         _ => "",
     }
 }
@@ -495,16 +495,22 @@ pub(super) fn tab(ui: &mut Ui, view: &View) {
                 ("Unknown frames", num(&q["unknown_frames"], 0)),
                 ("Pending dropped", num(&q["pending_frames_dropped"], 0)),
             ];
-            let recording = &status["recording_status"];
-            if recording["state"].as_str().is_some_and(|s| s != "idle") {
-                rows.push((
-                    "Recording",
-                    recording["message"]
-                        .as_str()
-                        .or(recording["state"].as_str())
-                        .unwrap_or("–")
-                        .to_owned(),
-                ));
+            let log = &status["recording_status"];
+            if log["state"].as_str().is_some_and(|s| s != "idle") {
+                let raw = log["message"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or(log["state"].as_str())
+                    .unwrap_or("–");
+                let text = raw
+                    .strip_prefix("Recording")
+                    .map(|rest| format!("Logging{rest}"))
+                    .or_else(|| {
+                        raw.strip_prefix("recording")
+                            .map(|rest| format!("logging{rest}"))
+                    })
+                    .unwrap_or_else(|| raw.to_owned());
+                rows.push(("Logging", text));
             }
             kv(ui, &rows);
         });
@@ -595,7 +601,7 @@ mod tests {
         for key in [
             "Optical rate",
             "Landmark shift",
-            "Recording",
+            "Logging",
             "Pending dropped",
             "searched",
         ] {

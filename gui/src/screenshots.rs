@@ -94,8 +94,11 @@ fn render_boxes<R>(
 fn assert_plain_words(text: &str) {
     let lower = text.to_lowercase();
     assert!(
-        !lower.contains("camera") && !lower.contains("streaming"),
-        "user-facing text says camera or streaming: {text:?}"
+        !lower.contains("camera")
+            && !lower.contains("streaming")
+            && !lower.contains("recording")
+            && !lower.contains("record now"),
+        "user-facing text says camera, streaming or recording: {text:?}"
     );
 }
 
@@ -149,7 +152,7 @@ fn playing() -> (Snapshot, ConfigStats) {
         "alignment": {"registration": true, "render": [true, true], "universe": 1234567890u64,
             "unmeasured_base": null, "headset": null,
             "base_pin": {"base": "LHB-TEST0001", "owner": "cv1touch", "waiting_for": null}},
-        "recording_status": {"state": "idle", "message": "Not recording"},
+        "recording_status": {"state": "idle", "message": ""},
         "hands": [hand("left", 85, 0.4, 52_000), hand("right", 90, 0.6, 51_400)],
         "sensors": sensors, "sensors_unsure": 0,
         "sensor_hotplug": {"pending": 0, "scan_error": null},
@@ -228,7 +231,7 @@ fn scenario(name: &str) -> Scene {
             status["sensors"][0]["landmark_shift"] =
                 json!({"dx": 0.12, "dy": -0.05, "landmarks": 14});
             status["recording_status"] =
-                json!({"state": "recording", "message": "Recording to a file"});
+                json!({"state": "recording", "message": "Logging to a file"});
         }
         "overview-asleep" => {
             status["hands"][0]["flags"] = json!(17);
@@ -309,13 +312,10 @@ const SCENARIOS: [(&str, &[&str]); 8] = [
         &[
             "Controller angle",
             "Reset to 0°",
-            "Keep SteamVR starting from a measured base station",
             "Start tray icon when I log in",
             "Desktop shortcut and window icon",
-            "Run full setup…",
-            "Line up headset (15 s)…",
+            "Align controllers to headset (15 s)…",
             "Calibrate buttons & sticks…",
-            "Open sensor views…",
         ],
     ),
     ("overview-asleep", &["Asleep", "Press a button to wake it."]),
@@ -324,7 +324,7 @@ const SCENARIOS: [(&str, &[&str]); 8] = [
         &[
             "Needs attention",
             "What to do",
-            "Line up headset (15 s)",
+            "Align controllers to headset (15 s)",
             "Other headset",
             "Moved",
             "14.2% loss",
@@ -344,7 +344,7 @@ const SCENARIOS: [(&str, &[&str]); 8] = [
             "alt setting 2",
             "OK",
             "Landmark shift",
-            "Recording to a file",
+            "Logging to a file",
         ],
     ),
 ];
@@ -455,7 +455,7 @@ fn screenshots_show_each_state_and_the_overview_fits_without_scrolling_or_waste(
                     continue;
                 }
                 if tab != Tab::Overview {
-                    // Stats and Settings scroll; render the whole of it for the record.
+                    // Stats and Settings scroll; render the whole tab so nothing clips.
                     let (content, visible) = drawn.content;
                     let tall = [size[0], size[1] + content - visible + 1.0];
                     let mut icons = None;
@@ -1057,7 +1057,7 @@ fn setup_scenes() -> Vec<(
                 "Stand where the sensors can see you. Press A on the right controller (or Enter) to start.",
                 "Cancel",
             ],
-            &["Record now", "Continue setup"],
+            &["Measure now", "Continue setup"],
         ),
         (
             "setup-capture-progress",
@@ -1075,7 +1075,7 @@ fn setup_scenes() -> Vec<(
             "setup-headset-wait",
             guide(&[STATE, MENU, HEADSET_START, HEADSET_PROMPT]),
             &["On your controllers", "Cancel"],
-            &["Start capture", "Continue", "Record now", "Finish early"],
+            &["Start capture", "Continue", "Measure now", "Finish early"],
         ),
         (
             "setup-headset-countdown",
@@ -1087,7 +1087,7 @@ fn setup_scenes() -> Vec<(
             "setup-headset-progress",
             guide(&[STATE, MENU, HEADSET_START, COUNTDOWN, HEADSET_CAPTURE]),
             &[
-                "Recording",
+                "Logging",
                 "512° of 660°",
                 "95° of 660°",
                 "22° of 15°",
@@ -1103,7 +1103,7 @@ fn setup_scenes() -> Vec<(
             &[
                 "Buttons and sticks",
                 "2/4 Pull both triggers all the way and hold them there until the double beep.",
-                "Record now",
+                "Measure now",
                 "Trigger 91%",
                 "Trigger 62%",
                 "Left",
@@ -1293,6 +1293,8 @@ fn no_user_text_says_camera_or_streaming() {
         "camera_queue",
         "\"--cameras\"",
         "--cameras is the older name",
+        "recording_status",
+        "strip_prefix(\"recording\")",
     ];
     for (file, source) in [
         ("actions.rs", include_str!("actions.rs")),
@@ -1317,7 +1319,10 @@ fn no_user_text_says_camera_or_streaming() {
                 line = line.replace(name, "");
             }
             assert!(
-                !line.contains("camera") && !line.contains("streaming"),
+                !line.contains("camera")
+                    && !line.contains("streaming")
+                    && !line.contains("recording")
+                    && !line.contains("record now"),
                 "{file}:{}: {}",
                 n + 1,
                 source.lines().nth(n).unwrap().trim()

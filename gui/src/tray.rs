@@ -163,6 +163,12 @@ impl Window {
 pub fn run_window(kind: Kind) -> Result<(), Box<dyn std::error::Error>> {
     platform::run_window(kind)
 }
+pub(super) fn close_windows() {
+    for kind in [Kind::Status, Kind::Sensors, Kind::Setup] {
+        platform::signal_window(kind, Message::Close);
+    }
+}
+
 pub fn listen_for_activation(ctx: &Context) {
     platform::listen_for_activation(ctx);
 }
@@ -172,6 +178,7 @@ fn handle(ctx: &Context, message: Message) {
         Message::Open => raise_window(ctx),
         Message::Close => ctx.send_viewport_cmd(ViewportCommand::Close),
     }
+    ctx.request_repaint();
 }
 
 fn raise_window(ctx: &Context) {
@@ -539,7 +546,7 @@ mod linux {
                     });
                 }),
                 ksni::MenuItem::Separator,
-                item("Quit tray icon (cv1touchd keeps running)", true, |t| {
+                item("Quit (cv1touchd keeps running)", true, |t| {
                     t.quit.store(true, Ordering::Relaxed)
                 }),
             ]);
@@ -695,6 +702,34 @@ mod linux {
 
     #[cfg(test)]
     #[test]
+    fn closing_all_windows_signals_every_window_kind() {
+        let dir = std::env::temp_dir().join(format!("tray-close-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sockets: Vec<_> = [Kind::Status, Kind::Sensors, Kind::Setup]
+            .into_iter()
+            .map(|kind| {
+                let path = dir.join(format!("{}.sock", name(kind)));
+                let _ = std::fs::remove_file(&path);
+                let socket = UnixDatagram::bind(&path).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                (path, socket)
+            })
+            .collect();
+        for (path, _) in &sockets {
+            send(path, Message::Close).unwrap();
+        }
+        for (_, socket) in &sockets {
+            let mut message = [0; 16];
+            let n = socket.recv(&mut message).unwrap();
+            assert_eq!(&message[..n], b"close");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
     fn close_reaches_the_window_socket() {
         let path = std::env::temp_dir().join(format!("tray-close-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -751,6 +786,9 @@ mod linux {
                 shown = now;
                 handle.update(|_| {});
             }
+        }
+        if quit.load(Ordering::Relaxed) {
+            close_windows();
         }
         handle.shutdown().wait();
         Ok(())

@@ -47,14 +47,6 @@ impl ConfigStats {
             .unwrap_or(0.0)
     }
 
-    /// The saved base-station pinning: the file leaves it out when it is on.
-    pub fn pin_base_station(&self) -> bool {
-        self.settings
-            .as_ref()
-            .and_then(|s| s["pin_base_station"].as_bool())
-            .unwrap_or(true)
-    }
-
     /// The median of the sensors' reprojection RMS in pixels, and how many sensors.
     pub fn sensor_fit(&self) -> Option<(f64, usize)> {
         let mut rms: Vec<f64> = self.calibration.as_ref()?["sensors"]

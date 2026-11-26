@@ -105,12 +105,10 @@ pub enum Action {
     Report,
     OpenFolder,
     DismissReport,
-    Recheck,
     Sensors,
     /// Windows: `finish-setup`.
     FinishSetup,
     Tilt(f64),
-    Pin(bool),
     Autostart(bool),
     /// Linux: add or remove the desktop entry and icons.
     Desktop(bool),
@@ -140,7 +138,7 @@ impl Fix {
             Self::StartDaemon => "Start daemon",
             Self::FinishWindowsSetup => "Finish Windows setup",
             Self::OpenSetup => "Open setup",
-            Self::LineUpHeadset => "Line up headset (15 s)",
+            Self::LineUpHeadset => "Align controllers to headset (15 s)",
             Self::CalibrateSensors => "Calibrate sensors",
         }
     }
@@ -150,7 +148,7 @@ impl Fix {
             Self::StartDaemon => ServiceAction::Start.tooltip(),
             Self::FinishWindowsSetup => "Give the sensors their driver and add cv1touch to SteamVR, as the installer does. Close SteamVR first.",
             Self::OpenSetup => "Open the guided setup, which walks you through the steps that are not done yet.",
-            Self::LineUpHeadset => "Wear the headset and hold both controllers to it for about 15 seconds, so that the controllers line up with SteamVR's headset tracking again.",
+            Self::LineUpHeadset => "Wear the headset and hold both controllers to it for about 15 seconds to align the controllers with SteamVR's headset tracking.",
             Self::CalibrateSensors => "Work out where every sensor is again, so that a moved or new sensor is used for tracking. Takes about 2 minutes.",
         }
     }
@@ -297,7 +295,6 @@ enum Done {
     Report(Result<Saved, String>),
     Finish(Finish),
     Tilt(Result<(), String>),
-    Pin(Result<bool, String>),
     Desktop(Result<(), String>),
 }
 
@@ -337,16 +334,6 @@ impl App {
                     if let Err(error) = result {
                         local.tilt = None;
                         local.message = Some((Level::Bad, error));
-                    }
-                    self.client.poll();
-                }
-                Done::Pin(result) => {
-                    match result {
-                        Ok(on) => local.pin = Some((on, Instant::now())),
-                        Err(error) => {
-                            local.pin = None;
-                            local.message = Some((Level::Bad, error));
-                        }
                     }
                     self.client.poll();
                 }
@@ -449,7 +436,7 @@ impl App {
     fn act(&mut self, action: Action, ctx: &egui::Context) {
         if matches!(
             action,
-            Action::Service(_) | Action::Setup(_) | Action::Sensors | Action::Recheck
+            Action::Service(_) | Action::Setup(_) | Action::Sensors
         ) {
             self.notice = None;
         }
@@ -500,12 +487,6 @@ impl App {
                 self.background(move || actions::set_tilt(deg), Done::Tilt, ctx);
                 Ok(())
             }
-            Action::Pin(on) => {
-                self.local.message = None;
-                self.local.pin = Some((on, Instant::now()));
-                self.background(move || actions::pin_base_station(on), Done::Pin, ctx);
-                Ok(())
-            }
             Action::Autostart(on) => {
                 self.local.message = settings_tab::autostart::set(on)
                     .err()
@@ -516,11 +497,6 @@ impl App {
             Action::Desktop(on) => {
                 self.local.message = None;
                 self.background(move || settings_tab::set_desktop(on), Done::Desktop, ctx);
-                Ok(())
-            }
-            Action::Recheck => {
-                self.client.refresh();
-                self.client.poll();
                 Ok(())
             }
         };
@@ -918,12 +894,6 @@ fn footer(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let saving = view.report == Some(&ReportState::Saving);
             for (label, value, tip, enabled) in [
-                (
-                    "Recheck",
-                    Action::Recheck,
-                    "Run cv1touch's checks again now (they run every 30 s by themselves).",
-                    true,
-                ),
                 (
                     "Save report",
                     Action::Report,

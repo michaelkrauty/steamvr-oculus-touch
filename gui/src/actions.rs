@@ -325,37 +325,6 @@ fn unsaved(line: &str) -> Option<&str> {
     Some(line[start..].trim_end().trim_end_matches(')'))
 }
 
-/// `pin-base-station on|off`'s output: the setting now, or why it did not change.
-pub fn parse_pin(out: &Output) -> Result<bool, String> {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.trim();
-    let on = if line.starts_with("Base-station pinning: on") {
-        true
-    } else if line.starts_with("Base-station pinning: off") {
-        false
-    } else if out.stderr.is_empty() || out.code == Some(2) {
-        return Err(TOO_OLD.to_owned());
-    } else {
-        return Err(out.stderr.trim_start_matches("cv1touch: ").to_owned());
-    };
-    match unsaved(line) {
-        Some(error) if out.code == Some(0) => Err(format!(
-            "Pinning is {} for now, but it could not be saved: {error}",
-            if on { "on" } else { "off" }
-        )),
-        None if out.code == Some(0) => Ok(on),
-        _ => Err(out.stderr.clone()),
-    }
-}
-
-/// Turns base-station pinning on or off, with the daemon running or not.
-pub fn pin_base_station(on: bool) -> Result<bool, String> {
-    parse_pin(&client::run(
-        &["pin-base-station", if on { "on" } else { "off" }],
-        Duration::from_secs(10),
-    )?)
-}
-
 /// The daemon's reply to `tilt DEGREES`.
 pub fn parse_tilt(reply: &str) -> Result<(), String> {
     let reply = reply.trim();
@@ -459,34 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_and_tilt_replies_report_what_applied() {
-        assert_eq!(
-            parse_pin(&output(0, "Base-station pinning: on (SteamVR starts tracking the headset from a base station headset alignment measured)\n", "")),
-            Ok(true)
-        );
-        assert_eq!(
-            parse_pin(&output(
-                0,
-                "Base-station pinning: off (SteamVR picks the base station itself)\n",
-                ""
-            )),
-            Ok(false)
-        );
-        let unsaved = parse_pin(&output(
-            0,
-            "Base-station pinning: off (SteamVR picks the base station itself) (not saved: disk full)\n",
-            "",
-        ))
-        .unwrap_err();
-        assert!(
-            unsaved.contains("off for now") && unsaved.ends_with("disk full"),
-            "{unsaved}"
-        );
-        assert_eq!(
-            parse_pin(&output(1, "", "cv1touch: cv1touchd: err unknown command")),
-            Err("cv1touchd: err unknown command".to_owned())
-        );
-        assert_eq!(parse_pin(&output(2, "", "usage")), Err(TOO_OLD.to_owned()));
+    fn tilt_replies_report_what_applied() {
         assert_eq!(
             parse_tilt("ok tilt: the controllers are shown as tracked (no tilt)\n"),
             Ok(())
@@ -545,11 +487,6 @@ mod tests {
             unsafe { std::env::set_var(var, home.join(dir)) };
         }
         let run = |args: &[&str]| client::run_at(&cli, args, Duration::from_secs(60)).unwrap();
-        // Pinning without a daemon writes settings.json, as the Settings tab reads it.
-        assert_eq!(parse_pin(&run(&["pin-base-station", "off"])), Ok(false));
-        let config = crate::config_stats::ConfigStats::load_from(&home.join(".config/cv1touch"));
-        assert!(!config.pin_base_station());
-        assert_eq!(parse_pin(&run(&["pin-base-station", "on"])), Ok(true));
         assert_eq!(
             set_tilt(5.0).unwrap_err(),
             "cv1touchd isn't running: start it to change the angle."

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! The Settings tab: the controller angle, base-station pinning, desktop integration and
-//! shortcuts into setup. Every change goes through the daemon or the CLI, which save it.
+//! The Settings tab: the controller angle, desktop integration and quick maintenance
+//! shortcuts. Every change goes through the daemon or the CLI, which save it.
 
 use super::*;
 
@@ -15,7 +15,6 @@ pub struct Local {
     pub desktop: Option<bool>,
     /// A value just asked for, shown until the daemon's status confirms it.
     pub tilt: Option<(f64, Instant)>,
-    pub pin: Option<(bool, Instant)>,
     /// The last change's error.
     pub message: Option<(Level, String)>,
     /// `finish-setup`: Some(None) while it runs, then its result.
@@ -45,11 +44,6 @@ impl Local {
         }) {
             self.tilt = None;
         }
-        if self.pin.is_some_and(|(on, at)| {
-            status["pin_base_station"].as_bool() == Some(on) || at.elapsed() > CONFIRM
-        }) {
-            self.pin = None;
-        }
     }
 }
 
@@ -62,17 +56,7 @@ fn tilt(view: &View) -> f64 {
         .unwrap_or_else(|| view.config.tilt_deg())
 }
 
-/// Pinning as shown: as just set, the daemon's (absent from older ones), or the saved one.
-fn pin(view: &View) -> bool {
-    view.local
-        .pin
-        .map(|p| p.0)
-        .or_else(|| view.snap.status.as_ref()?["pin_base_station"].as_bool())
-        .unwrap_or_else(|| view.config.pin_base_station())
-}
-
 const TILT_TIP: &str = "How far the controllers are shown pitched from how they are tracked, with the front end up for positive angles. Some games hold a tool or a gun at an angle that feels wrong; tilting the controllers here changes how it sits in your hand. 0° shows them exactly as tracked.";
-const PIN_TIP: &str = "SteamVR picks one base station to start tracking the headset from. When it picks one the headset alignment did not measure, the controllers can sit a little off from your hands in that session. With this on, cv1touch keeps SteamVR starting from a base station it measured, so the controllers line up the same way every time. SteamVR follows from its next start.";
 const AUTOSTART_TIP: &str = "Start cv1touch's tray icon when you log in, so that its status and menu are always one click away. The tracking itself does not need it.";
 
 pub(super) fn tab(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
@@ -120,20 +104,6 @@ pub(super) fn tab(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
         }
     });
     card(ui, |ui| {
-        title(ui, "SteamVR");
-        let mut on = pin(view);
-        if ui
-            .checkbox(
-                &mut on,
-                "Keep SteamVR starting from a measured base station",
-            )
-            .on_hover_text(PIN_TIP)
-            .changed()
-        {
-            *action = Some(Action::Pin(on));
-        }
-    });
-    card(ui, |ui| {
         title(ui, "Desktop");
         match local.autostart {
             Some(mut on) => {
@@ -169,28 +139,18 @@ pub(super) fn tab(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
         }
     });
     card(ui, |ui| {
-        title(ui, "Setup and maintenance");
+        title(ui, "Maintenance");
         ui.horizontal_wrapped(|ui| {
             let mut shortcuts = vec![
                 (
-                    "Run full setup…",
-                    Action::Setup(Request::default()),
-                    "Open the guided setup with every stage: sensors, floor, controller model, buttons and headset.",
-                ),
-                (
-                    "Line up headset (15 s)…",
+                    "Align controllers to headset (15 s)…",
                     Action::Setup(Request::QUICK_HEADSET),
-                    "The short headset alignment: wear the headset with both controllers held to it for about 15 seconds.",
+                    "Wear the headset and hold both controllers to it for about 15 seconds to align the controllers with SteamVR's headset tracking.",
                 ),
                 (
                     "Calibrate buttons & sticks…",
                     Action::Setup(Request::stage(Stage::Buttons)),
                     "Measure your triggers, grips and sticks at rest and at their limits, so that games read their full range.",
-                ),
-                (
-                    "Open sensor views…",
-                    Action::Sensors,
-                    "Show what each sensor sees, live, to aim the sensors.",
                 ),
             ];
             if cfg!(windows) {
@@ -448,17 +408,16 @@ mod tests {
     fn a_value_just_set_shows_until_the_status_has_it() {
         let mut local = Local {
             tilt: Some((5.0, Instant::now())),
-            pin: Some((false, Instant::now())),
             ..Default::default()
         };
-        local.confirm(Some(&json!({"tilt_deg": 0.0, "pin_base_station": true})));
-        assert!(local.tilt.is_some() && local.pin.is_some());
-        local.confirm(Some(&json!({"tilt_deg": 5.0, "pin_base_station": false})));
-        assert!(local.tilt.is_none() && local.pin.is_none());
-        local.pin = Some((false, Instant::now() - CONFIRM - Duration::from_secs(1)));
-        local.confirm(Some(&json!({"pin_base_station": true})));
+        local.confirm(Some(&json!({"tilt_deg": 0.0})));
+        assert!(local.tilt.is_some());
+        local.confirm(Some(&json!({"tilt_deg": 5.0})));
+        assert!(local.tilt.is_none());
+        local.tilt = Some((5.0, Instant::now() - CONFIRM - Duration::from_secs(1)));
+        local.confirm(Some(&json!({"tilt_deg": 0.0})));
         assert!(
-            local.pin.is_none(),
+            local.tilt.is_none(),
             "a stale request gives way to the status"
         );
     }
@@ -479,22 +438,16 @@ mod tests {
                 report: None,
                 local,
             };
-            (pin(&view), tilt(&view))
+            tilt(&view)
         };
         // No daemon and no file: the daemon's defaults.
-        assert_eq!(shown(&snap, &config, &local), (true, 0.0));
-        config.settings = Some(
-            json!({"format": "cv1touch-settings", "tilt_deg": -7.5, "pin_base_station": false}),
-        );
-        assert_eq!(shown(&snap, &config, &local), (false, -7.5));
-        snap.status = Some(json!({"tilt_deg": 3.0, "pin_base_station": true}));
-        assert_eq!(shown(&snap, &config, &local), (true, 3.0));
-        // An older daemon leaves pinning out: the saved value stands.
+        assert_eq!(shown(&snap, &config, &local), 0.0);
+        config.settings = Some(json!({"format": "cv1touch-settings", "tilt_deg": -7.5}));
+        assert_eq!(shown(&snap, &config, &local), -7.5);
         snap.status = Some(json!({"tilt_deg": 3.0}));
-        assert_eq!(shown(&snap, &config, &local), (false, 3.0));
-        local.pin = Some((true, Instant::now()));
+        assert_eq!(shown(&snap, &config, &local), 3.0);
         local.tilt = Some((10.5, Instant::now()));
-        assert_eq!(shown(&snap, &config, &local), (true, 10.5));
+        assert_eq!(shown(&snap, &config, &local), 10.5);
     }
 
     #[cfg(target_os = "linux")]
