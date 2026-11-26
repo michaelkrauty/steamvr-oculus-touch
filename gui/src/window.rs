@@ -302,7 +302,7 @@ fn finish_notice(finish: &Finish) -> (Level, String) {
     match (&finish.error, finish.remaining.first()) {
         (Some(error), _) => (Level::Bad, format!("Finish Windows setup failed: {error}")),
         (None, Some(first)) => (
-            if finish.reboot_needed {
+            if finish.reboot_needed && finish.remaining.len() == 1 {
                 Level::Warning
             } else {
                 Level::Bad
@@ -1485,5 +1485,26 @@ mod tests {
         assert_eq!(agreement_level(0.36), Level::Warning);
         assert_eq!(agreement_level(0.61), Level::Bad);
         assert_eq!(short_serial("SENSOR-0001"), "…0001");
+    }
+
+    #[test]
+    fn finish_notice_treats_reboot_plus_other_failure_as_bad() {
+        let reboot_only = Finish {
+            ok: false,
+            reboot_needed: true,
+            remaining: vec!["Restart Windows.".into()],
+            ..Default::default()
+        };
+        assert_eq!(finish_notice(&reboot_only).0, Level::Warning);
+        let reboot_and_failed = Finish {
+            ok: false,
+            reboot_needed: true,
+            remaining: vec![
+                "Restart Windows.".into(),
+                "cv1touch could not add itself to SteamVR.".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(finish_notice(&reboot_and_failed).0, Level::Bad);
     }
 }

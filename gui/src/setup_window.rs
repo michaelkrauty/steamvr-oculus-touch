@@ -274,7 +274,7 @@ fn footer(ui: &mut Ui, guide: &Guide, action: &mut Option<SetupAction>) {
             {
                 send(action, "quit");
             }
-            // Any line but a stop ends headset logging early and keeps it.
+            // "finish" ends headset logging early and keeps the measurements so far.
             if logging
                 && ui
                     .button("Finish early")
