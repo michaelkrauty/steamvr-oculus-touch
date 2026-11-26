@@ -183,6 +183,55 @@ pub fn estimate_lag(samples: &[Sample], hand: usize, max_shift: usize) -> (isize
     best
 }
 
+/// Frame-independent lag estimate between timed `(t_ns, reference, touch)` poses using angular
+/// speed correlation. Positive `shift` means the reference stream trails the Touch stream by
+/// `shift` samples (so `reference[k + shift]` matches `touch[k]`).
+pub fn estimate_timed_lag(
+    pairs: &[(u64, Isometry3<f64>, Isometry3<f64>)],
+    max_shift: usize,
+) -> (isize, f64) {
+    let speeds = |use_ref: bool| -> Vec<f64> {
+        pairs
+            .windows(2)
+            .map(|w| {
+                let dt = w[1].0.saturating_sub(w[0].0) as f64 * 1e-9;
+                if dt > 0.0 {
+                    let (a, b) = if use_ref {
+                        (&w[0].1, &w[1].1)
+                    } else {
+                        (&w[0].2, &w[1].2)
+                    };
+                    a.rotation.angle_to(&b.rotation) / dt
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    };
+    let r = speeds(true);
+    let t = speeds(false);
+    let mut best = (0isize, f64::MIN);
+    for shift in -(max_shift as isize)..=(max_shift as isize) {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for (k, &touch_speed) in t.iter().enumerate() {
+            let j = k as isize + shift;
+            if j < 0 || j as usize >= r.len() || touch_speed.is_nan() || r[j as usize].is_nan() {
+                continue;
+            }
+            a.push(touch_speed);
+            b.push(r[j as usize]);
+        }
+        if a.len() < 25 {
+            continue;
+        }
+        let c = correlation(&a, &b);
+        if c > best.1 {
+            best = (shift, c);
+        }
+    }
+    best
+}
+
 /// (reference at k, Touch at k + shift) for every k where both exist.
 pub fn shifted_pairs(
     samples: &[Sample],
@@ -1273,5 +1322,37 @@ mod tests {
             extrapolate(&st, 900_000_000).translation.vector,
             Vector3::new(1.0, 2.0, 3.0)
         ); // never backwards
+    }
+
+    #[test]
+    fn estimate_timed_lag_recovers_wireless_stream_delay() {
+        // Simulate a headset stream trailing CV1 Touch by +60 ms (3 samples at 20 ms).
+        let dt_ns = 20_000_000u64;
+        let lag_s = 0.060f64;
+        let pose_at = |t_s: f64| {
+            let yaw = 0.9 * (1.3 * t_s).sin() + 0.4 * (2.7 * t_s).cos();
+            let pitch = 0.5 * (1.9 * t_s).sin();
+            let roll = 0.3 * (0.8 * t_s).cos();
+            Isometry3::from_parts(
+                Translation3::new(0.2 * t_s.sin(), 1.5, 0.2 * t_s.cos()),
+                UnitQuaternion::from_euler_angles(roll, pitch, yaw),
+            )
+        };
+        let x = x_true();
+        let y = y_true();
+        let pairs: Vec<_> = (0..400)
+            .map(|k| {
+                let t_ns = 1_000_000_000 + k * dt_ns;
+                let t_s = k as f64 * 0.02;
+                // Physical motion at t_s appears in Touch at t_s and in HMD at t_s + lag_s,
+                // so at timestamp t_s the HMD holds the physical pose from t_s - lag_s.
+                let hmd = x * pose_at(t_s - lag_s) * y.inverse();
+                let touch = pose_at(t_s);
+                (t_ns, hmd, touch)
+            })
+            .collect();
+        let (shift, corr) = estimate_timed_lag(&pairs, 5);
+        assert_eq!(shift, 3);
+        assert!(corr > 0.98, "corr={corr}");
     }
 }

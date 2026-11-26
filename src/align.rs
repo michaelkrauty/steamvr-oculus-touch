@@ -103,6 +103,19 @@ pub struct Headset {
     pub universe_id: u64,
 }
 
+/// How SteamVR's live headset compares with a saved registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadsetMatch {
+    /// Same headset (or another Lighthouse headset sharing base stations) and compatible space.
+    Same,
+    /// A different headset, or a different tracking system (for example Lighthouse vs inside-out,
+    /// or Steam Link vs Virtual Desktop on the same headset).
+    Other,
+    /// The same non-Lighthouse headset, but SteamVR reports a different non-zero universe ID
+    /// (for example after a boundary reset or new session).
+    UniverseChanged,
+}
+
 /// A base station's pose in the cv1touch world, measured by a registration: SteamVR tracked the
 /// reference from that station during the capture, so the fit put the station where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,13 +370,43 @@ impl Registration {
     /// Whether SteamVR's headset now is another than the one this registration lined the
     /// controllers up with. After a reference base stations tracked, any headset they track shares
     /// its space, so only one they do not track is another; after any other reference, a headset
-    /// with another serial is.
+    /// with another serial or another known tracking system is.
     pub fn other_headset(&self, headset: &Headset) -> bool {
         if lighthouse_tracked(&self.reference_system, &self.reference) {
             !lighthouse_tracked(&headset.system, &headset.serial)
         } else {
             headset.serial != self.reference
+                || (!self.reference_system.is_empty()
+                    && !headset.system.is_empty()
+                    && headset.system != self.reference_system)
         }
+    }
+
+    /// How SteamVR's live headset compares with this registration: another headset, the same
+    /// non-Lighthouse headset in a new SteamVR universe, or matching.
+    pub fn headset_match(&self, headset: &Headset) -> HeadsetMatch {
+        if self.other_headset(headset) {
+            HeadsetMatch::Other
+        } else if !lighthouse_tracked(&self.reference_system, &self.reference)
+            && self.universe_id != 0
+            && headset.universe_id != 0
+            && headset.universe_id != self.universe_id
+        {
+            HeadsetMatch::UniverseChanged
+        } else {
+            HeadsetMatch::Same
+        }
+    }
+
+    /// The SteamVR universe ID to publish for this registration: the live headset's non-zero
+    /// universe ID while SteamVR reports one (so the controllers remain visible in the active
+    /// headset's tracking space even when a non-Lighthouse driver starts a new universe or had
+    /// none at setup), otherwise the registration's saved universe ID.
+    pub fn effective_universe_id(&self, headset: Option<&Headset>) -> u64 {
+        headset
+            .map(|h| h.universe_id)
+            .filter(|&u| u != 0)
+            .unwrap_or(self.universe_id)
     }
 
     /// Whether the universe watch follows the base stations: only those of a registration whose
@@ -1702,6 +1745,64 @@ mod tests {
         assert!(!mixed.other_headset(&rift_s));
         // no stations: nothing to follow
         assert!(!registration().follows_stations(None));
+
+        // Non-Lighthouse headset: same serial under another SteamVR driver (e.g. Steam Link vs
+        // Virtual Desktop) counts as another headset; same serial and driver in a new non-zero
+        // universe is flagged as UniverseChanged while effective_universe_id follows the live ID.
+        let quest_vrlink = Registration {
+            reference: "QUEST-3".into(),
+            reference_system: "vrlink".into(),
+            universe_id: 31,
+            ..registration()
+        };
+        let same_quest = Headset {
+            serial: "QUEST-3".into(),
+            system: "vrlink".into(),
+            universe_id: 31,
+        };
+        let new_universe = Headset {
+            universe_id: 32,
+            ..same_quest.clone()
+        };
+        let zero_universe = Headset {
+            universe_id: 0,
+            ..same_quest.clone()
+        };
+        let via_vd = Headset {
+            system: "oculus".into(),
+            ..same_quest.clone()
+        };
+        assert_eq!(quest_vrlink.headset_match(&same_quest), HeadsetMatch::Same);
+        assert_eq!(
+            quest_vrlink.headset_match(&new_universe),
+            HeadsetMatch::UniverseChanged
+        );
+        assert!(!quest_vrlink.other_headset(&new_universe));
+        assert_eq!(quest_vrlink.effective_universe_id(Some(&new_universe)), 32);
+        assert_eq!(
+            quest_vrlink.headset_match(&zero_universe),
+            HeadsetMatch::Same
+        );
+        assert_eq!(quest_vrlink.effective_universe_id(Some(&zero_universe)), 31);
+        assert_eq!(quest_vrlink.effective_universe_id(None), 31);
+        assert!(quest_vrlink.other_headset(&via_vd));
+        assert_eq!(quest_vrlink.headset_match(&via_vd), HeadsetMatch::Other);
+        // A registration saved with universe_id 0 adopts the live non-zero universe without warning.
+        let unindexed = Registration {
+            universe_id: 0,
+            ..quest_vrlink.clone()
+        };
+        assert_eq!(unindexed.headset_match(&same_quest), HeadsetMatch::Same);
+        assert_eq!(unindexed.effective_universe_id(Some(&same_quest)), 31);
+        // A Lighthouse registration whose universe ID changed stays Same (stations follow it),
+        // while effective_universe_id still adopts the live non-zero universe.
+        let lh_new_u = Headset {
+            serial: "LHR-TEST-OTHER".into(),
+            system: "lighthouse".into(),
+            universe_id: 99,
+        };
+        assert_eq!(lighthouse.headset_match(&lh_new_u), HeadsetMatch::Same);
+        assert_eq!(lighthouse.effective_universe_id(Some(&lh_new_u)), 99);
     }
 
     #[test]

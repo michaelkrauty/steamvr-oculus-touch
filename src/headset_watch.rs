@@ -42,6 +42,32 @@ const WARMUP_DEG: f64 = 90.0;
 /// Consecutive judged windows (one per sample) over `SLIP_DEG` that make a slip: 0.8 s, so a
 /// brief tracking glitch, which comes back, is not one.
 const PERSIST: usize = 8;
+/// Raw pose buffer cadence (10 ms) used to evaluate constant-lag hypotheses via SLERP.
+const RAW_STEP_NS: u64 = 10_000_000;
+/// Maximum constant timing offset (±100 ms) between headset and Touch pose streams tolerated by
+/// the slip check (covers wireless links such as Quest via Steam Link / Virtual Desktop / ALVR).
+const MAX_LAG_NS: u64 = 100_000_000;
+/// Constant-lag hypotheses (ns) spaced every 20 ms across `[-MAX_LAG_NS, +MAX_LAG_NS]`, keeping
+/// the residual lag error of the closest hypothesis within 10 ms.
+const LAGS_NS: [i64; 11] = [
+    -100_000_000,
+    -80_000_000,
+    -60_000_000,
+    -40_000_000,
+    -20_000_000,
+    0,
+    20_000_000,
+    40_000_000,
+    60_000_000,
+    80_000_000,
+    100_000_000,
+];
+/// Pre-window RMS discrepancy margin (degrees) above the best-fitting lag hypothesis within which
+/// a lag hypothesis stays competitive. Tight enough that wrong-lag lanes drop out once the head
+/// accelerates, wide enough that tied lanes during constant-speed turns all participate.
+const PLAUSIBLE_RMS_MARGIN_DEG: f64 = 0.30;
+/// Gaps longer than this reset the raw interpolation buffer so SLERP never bridges a dropout.
+const MAX_RAW_GAP_NS: u64 = 500_000_000;
 
 /// Quaternion as [w, x, y, z], the scalar part made non-negative (q and -q are one rotation).
 fn wxyz(q: &UnitQuaternion<f64>) -> Vector4<f64> {
@@ -67,17 +93,25 @@ fn right(p: &Vector4<f64>) -> Matrix4<f64> {
 
 /// The fixed offset X best explaining increments accumulated as `m` (a·X = X·b for each).
 fn fit(m: &Matrix4<f64>) -> UnitQuaternion<f64> {
+    fit_with_eig(m).0
+}
+
+/// `fit(m)` together with its smallest eigenvalue (the faded sum of squared quaternion residuals).
+fn fit_with_eig(m: &Matrix4<f64>) -> (UnitQuaternion<f64>, f64) {
     let eig = SymmetricEigen::new(*m);
-    let (i, _) = eig
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .fold(
-            (0, f64::INFINITY),
-            |best, (i, &v)| if v < best.1 { (i, v) } else { best },
-        );
+    let (i, min_eig) =
+        eig.eigenvalues
+            .iter()
+            .enumerate()
+            .fold(
+                (0, f64::INFINITY),
+                |best, (i, &v)| if v < best.1 { (i, v) } else { best },
+            );
     let v = eig.eigenvectors.column(i);
-    UnitQuaternion::from_quaternion(Quaternion::new(v[0], v[1], v[2], v[3]))
+    (
+        UnitQuaternion::from_quaternion(Quaternion::new(v[0], v[1], v[2], v[3])),
+        min_eig,
+    )
 }
 
 fn constraint(a: &UnitQuaternion<f64>, b: &UnitQuaternion<f64>) -> Matrix4<f64> {
@@ -90,80 +124,76 @@ fn usable(turn: f64) -> bool {
     (MIN_TURN_DEG..=MAX_TURN_DEG).contains(&turn)
 }
 
-/// Whether one controller stays fixed to the headset during a capture.
-///
-/// Each 1 s window is judged against the offset fitted from what came before it: with A and B
-/// the headset's and the controller's turn over the window (body frames), (X⁻¹·A·X)⁻¹·B is the
-/// controller's shift against the headset within the window. The fit leaves the window's own
-/// increments out until the window has passed, so a slip can't pull the fit along before it is
-/// judged; the window's own increment does join the fit when judging it, which pins what the
-/// past can't (after turning only about one axis, the offset's twist about it is still open).
-pub struct RigidWatch {
+/// SLERP-interpolate either the headset or controller quaternion from `raw` at `t_ns`.
+fn sample_quat(
+    raw: &VecDeque<(u64, UnitQuaternion<f64>, UnitQuaternion<f64>)>,
+    t_ns: u64,
+    pick: impl Fn(&(u64, UnitQuaternion<f64>, UnitQuaternion<f64>)) -> UnitQuaternion<f64>,
+) -> UnitQuaternion<f64> {
+    let idx = raw.partition_point(|(t, ..)| *t < t_ns);
+    if idx == 0 {
+        return pick(&raw[0]);
+    }
+    if idx >= raw.len() {
+        return pick(raw.back().expect("raw is non-empty"));
+    }
+    if raw[idx].0 == t_ns {
+        return pick(&raw[idx]);
+    }
+    let (t0, q0) = (raw[idx - 1].0, pick(&raw[idx - 1]));
+    let (t1, q1) = (raw[idx].0, pick(&raw[idx]));
+    let alpha = (t_ns - t0) as f64 / (t1 - t0) as f64;
+    q0.slerp(&q1, alpha)
+}
+
+/// One constant-lag hypothesis inside `RigidWatch`.
+struct LagLane {
     samples: VecDeque<(UnitQuaternion<f64>, UnitQuaternion<f64>)>,
-    next_ns: u64,
     count: usize,
     /// Fit increments waiting for their window to pass: (sample count when they join, the
     /// constraint, degrees turned).
     pending: VecDeque<(usize, Matrix4<f64>, f64)>,
     m: Matrix4<f64>,
+    m_weight: f64,
+    rms_deg: f64,
     turned_deg: f64,
-    over: usize,
-    worst_deg: f64,
 }
 
-impl Default for RigidWatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RigidWatch {
-    pub fn new() -> RigidWatch {
-        RigidWatch {
+impl LagLane {
+    fn new() -> LagLane {
+        LagLane {
             samples: VecDeque::new(),
-            next_ns: 0,
             count: 0,
             pending: VecDeque::new(),
             m: Matrix4::zeros(),
+            m_weight: 0.0,
+            rms_deg: 0.0,
             turned_deg: 0.0,
-            over: 0,
-            worst_deg: 0.0,
         }
     }
 
-    /// Whether a shift is showing but not yet held long enough to count as a slip.
-    pub fn unsettled(&self) -> bool {
-        (1..PERSIST).contains(&self.over)
-    }
-
-    /// The headset's and the controller's orientation at the same instant `t_ns`. Some(degrees)
-    /// once the controller has shifted against the headset by more than `SLIP_DEG` for
-    /// `PERSIST` samples in a row; then on every later call.
-    pub fn push(
-        &mut self,
-        t_ns: u64,
-        hmd: UnitQuaternion<f64>,
-        touch: UnitQuaternion<f64>,
-    ) -> Option<f64> {
-        if self.over >= PERSIST {
-            return Some(self.worst_deg);
-        }
-        if t_ns < self.next_ns {
-            return None;
-        }
-        self.next_ns = t_ns + STEP_NS;
+    fn step(&mut self, hmd: UnitQuaternion<f64>, touch: UnitQuaternion<f64>) -> Option<f64> {
         self.count += 1;
         self.samples.push_back((hmd, touch));
         if self.samples.len() > JUDGE_SPAN + 1 {
             self.samples.pop_front();
         }
+        let mut m_changed = false;
         while let Some((due, c, turn)) = self.pending.front() {
             if *due > self.count {
                 break;
             }
             self.m = self.m * FADE + c;
+            self.m_weight = self.m_weight * FADE + 1.0;
             self.turned_deg += turn / FIT_SPAN as f64;
             self.pending.pop_front();
+            m_changed = true;
+        }
+        if m_changed && self.m_weight > 0.0 {
+            let (_, min_eig) = fit_with_eig(&self.m);
+            // ‖(left(a) - right(b))·x‖ = 2·sin(θ/4) ≈ θ/2 rad, so 2·√(min_eig / weight) is the RMS
+            // rotational residual in radians.
+            self.rms_deg = 2.0 * (min_eig / self.m_weight).max(0.0).sqrt().to_degrees();
         }
         let n = self.samples.len();
         let increment = |from: usize| {
@@ -187,7 +217,130 @@ impl RigidWatch {
         } else {
             fit(&self.m)
         };
-        let shift = ((x.inverse() * a * x).inverse() * b).angle().to_degrees();
+        Some(((x.inverse() * a * x).inverse() * b).angle().to_degrees())
+    }
+}
+
+/// Whether one controller stays fixed to the headset during a capture.
+///
+/// Each 1 s window is judged against the offset fitted from what came before it: with A and B
+/// the headset's and the controller's turn over the window (body frames), (X⁻¹·A·X)⁻¹·B is the
+/// controller's shift against the headset within the window. The fit leaves the window's own
+/// increments out until the window has passed, so a slip can't pull the fit along before it is
+/// judged; the window's own increment does join the fit when judging it, which pins what the
+/// past can't (after turning only about one axis, the offset's twist about it is still open).
+///
+/// To tolerate constant transport lag between a wireless headset (e.g. Quest over Steam Link,
+/// Virtual Desktop or ALVR) and USB CV1 controllers, the watcher evaluates a bank of constant
+/// lag hypotheses across `[-MAX_LAG_NS, +MAX_LAG_NS]` with causal pairing (delaying only the
+/// leading stream) and takes the smallest shift among hypotheses consistent with the prior motion.
+pub struct RigidWatch {
+    raw: VecDeque<(u64, UnitQuaternion<f64>, UnitQuaternion<f64>)>,
+    next_ns: u64,
+    lanes: [LagLane; LAGS_NS.len()],
+    over: usize,
+    worst_deg: f64,
+}
+
+impl Default for RigidWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RigidWatch {
+    pub fn new() -> RigidWatch {
+        RigidWatch {
+            raw: VecDeque::new(),
+            next_ns: 0,
+            lanes: std::array::from_fn(|_| LagLane::new()),
+            over: 0,
+            worst_deg: 0.0,
+        }
+    }
+
+    /// Whether a shift is showing but not yet held long enough to count as a slip.
+    pub fn unsettled(&self) -> bool {
+        (1..PERSIST).contains(&self.over)
+    }
+
+    /// The headset's and the controller's orientation at the same instant `t_ns`. Some(degrees)
+    /// once the controller has shifted against the headset by more than `SLIP_DEG` for
+    /// `PERSIST` samples in a row; then on every later call.
+    pub fn push(
+        &mut self,
+        t_ns: u64,
+        hmd: UnitQuaternion<f64>,
+        touch: UnitQuaternion<f64>,
+    ) -> Option<f64> {
+        if self.over >= PERSIST {
+            return Some(self.worst_deg);
+        }
+        if let Some(&(last_t, ..)) = self.raw.back() {
+            if t_ns <= last_t {
+                return None;
+            }
+            if t_ns - last_t > MAX_RAW_GAP_NS {
+                self.raw.clear();
+            }
+        }
+        let should_eval = t_ns >= self.next_ns;
+        if should_eval
+            || self
+                .raw
+                .back()
+                .is_none_or(|(t, ..)| t_ns >= t + RAW_STEP_NS)
+        {
+            self.raw.push_back((t_ns, hmd, touch));
+        }
+        if !should_eval {
+            return None;
+        }
+        let earliest_needed = t_ns.checked_sub(MAX_LAG_NS)?;
+        if self.raw.front().is_none_or(|(t, ..)| *t > earliest_needed) {
+            return None;
+        }
+        self.next_ns = t_ns + STEP_NS;
+        let mut shifts = [None; LAGS_NS.len()];
+        let mut all_warmed = true;
+        for (idx, (lane, &lag_ns)) in self.lanes.iter_mut().zip(&LAGS_NS).enumerate() {
+            // Positive lag_ns means the HMD trails Touch: pair HMD at t_ns with Touch at
+            // t_ns - lag_ns. Negative lag_ns means Touch trails HMD: pair HMD at t_ns + lag_ns
+            // with Touch at t_ns. Neither direction adds latency to the trailing stream.
+            let t_hmd = if lag_ns < 0 {
+                t_ns - lag_ns.unsigned_abs()
+            } else {
+                t_ns
+            };
+            let t_touch = if lag_ns > 0 {
+                t_ns - lag_ns as u64
+            } else {
+                t_ns
+            };
+            let h_eval = sample_quat(&self.raw, t_hmd, |s| s.1);
+            let c_eval = sample_quat(&self.raw, t_touch, |s| s.2);
+            shifts[idx] = lane.step(h_eval, c_eval);
+            all_warmed &= shifts[idx].is_some();
+        }
+        while self.raw.len() >= 2 && self.raw[1].0 <= earliest_needed {
+            self.raw.pop_front();
+        }
+        if !all_warmed {
+            return None;
+        }
+        let min_rms = self
+            .lanes
+            .iter()
+            .map(|l| l.rms_deg)
+            .fold(f64::INFINITY, f64::min);
+        let limit = min_rms + PLAUSIBLE_RMS_MARGIN_DEG;
+        let shift = self
+            .lanes
+            .iter()
+            .zip(shifts)
+            .filter(|(l, _)| l.rms_deg <= limit)
+            .filter_map(|(_, s)| s)
+            .fold(f64::INFINITY, f64::min);
         if shift > SLIP_DEG {
             self.over += 1;
             self.worst_deg = self.worst_deg.max(shift);
@@ -1075,5 +1228,73 @@ mod tests {
             matches!(got.last().unwrap().1, Cue::Slipped(0, _)),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn wireless_headset_lag_does_not_falsely_trip_slip_check_and_still_catches_real_slips() {
+        let world = rot(Vector3::new(0.3, 1.0, -0.2), 25.0);
+        let offset = rot(Vector3::new(1.0, 0.2, 0.5), 70.0);
+        let run_lag = |lag_s: f64, slip: &dyn Fn(f64) -> UnitQuaternion<f64>| {
+            let mut w = RigidWatch::new();
+            let mut i = 0u64;
+            while (i as f64) / 500.0 < 48.0 {
+                let t = i as f64 / 500.0;
+                // Positive lag_s: HMD lags behind Touch by lag_s (e.g. Quest 3 over Wi-Fi).
+                let h = head(t - lag_s);
+                let c = world * head(t) * offset * slip(t) * jitter(i);
+                if let Some(deg) = w.push((t * 1e9) as u64, h, c) {
+                    return Some((t, deg));
+                }
+                i += 1;
+            }
+            None
+        };
+        for lag_s in [0.060, 0.070, 0.090, -0.060] {
+            assert_eq!(
+                run_lag(lag_s, &still),
+                None,
+                "false slip with constant headset lag {lag_s} s"
+            );
+            let (t, deg) = run_lag(lag_s, &|t| {
+                if t >= 20.0 {
+                    rot(Vector3::new(1.0, -0.5, 0.4), 6.0)
+                } else {
+                    UnitQuaternion::identity()
+                }
+            })
+            .unwrap_or_else(|| panic!("missed real slip under headset lag {lag_s} s"));
+            assert!((20.0..22.0).contains(&t), "lag={lag_s}: caught at {t} s");
+            assert!(deg > SLIP_DEG, "lag={lag_s}: deg={deg}");
+        }
+        // Quick capture under +60 ms wireless lag: no false slip when held, real slip still caught.
+        let run_quick = |slip: &dyn Fn(f64) -> UnitQuaternion<f64>| {
+            let mut w = RigidWatch::new();
+            let mut i = 0u64;
+            while (i as f64) / 500.0 < 15.0 {
+                let t = i as f64 / 500.0;
+                let h = quick_head((t - 0.060).max(0.0) / 1.4, 1.0);
+                let c = world * quick_head(t / 1.4, 1.0) * offset * slip(t) * jitter(i);
+                if let Some(deg) = w.push((t * 1e9) as u64, h, c) {
+                    return Some((t, deg));
+                }
+                i += 1;
+            }
+            None
+        };
+        assert_eq!(
+            run_quick(&still),
+            None,
+            "false slip on quick wireless capture"
+        );
+        let (t, deg) = run_quick(&|t| {
+            if t >= 6.0 {
+                rot(Vector3::x(), 6.0)
+            } else {
+                UnitQuaternion::identity()
+            }
+        })
+        .expect("missed real slip on quick wireless capture");
+        assert!((6.0..8.0).contains(&t), "quick wireless caught at {t} s");
+        assert!(deg > SLIP_DEG, "quick wireless deg={deg}");
     }
 }

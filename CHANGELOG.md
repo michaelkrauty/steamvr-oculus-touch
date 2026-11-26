@@ -23,6 +23,7 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - The Windows installer includes the tray app and its executable icon. Open **cv1touch** from the Start menu to see its status window; this one entry replaces the seven old shortcuts, which are removed on upgrade. The tray icon starts at sign-in and after an interactive install. The installer closes the tray app before an upgrade or uninstall.
 - On Windows, the GUI verifies that the sensor preview pipe belongs to the current user before reading it.
 - `cv1touch doctor`, `cv1touch setup` and `cv1touch calibrate` describe sensors that are sending frames as active.
+- For headsets without base stations (such as Quest over Steam Link, Virtual Desktop or ALVR, Rift S, PSVR2 or WMR), cv1touchd now follows the headset's live SteamVR universe ID so the controllers stay visible if the headset starts a new tracking space, detects when the same headset connects through a different SteamVR driver, and warns in `cv1touch status`, `cv1touch doctor` and `cv1touch-gui` (with an inline quick-alignment button) when the tracking space changes. Headset alignment now ignores cv1touch's own controllers and unrelated tracking systems when reading the capture's universe ID, refreshes the universe ID at the end of a capture if it started at zero, and compensates for up to 100 ms of relative pose lag on wireless headsets during both the slip check and the fit.
 
 ## [0.6.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) - 2026-11-24
 

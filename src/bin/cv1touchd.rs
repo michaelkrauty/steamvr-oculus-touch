@@ -258,9 +258,12 @@ struct Daemon {
     /// SteamVR's headset as the SteamVR driver last reported it (`headset`), with when it arrived
     /// (shm clock).
     driver_headset: Mutex<Option<(u64, align::Headset)>>,
-    /// Whether that headset is another than the registration's
-    /// (`align::Registration::other_headset`), for `status`.
-    other_headset: AtomicBool,
+    /// How SteamVR's headset compares with the registration
+    /// (`align::Registration::headset_match`): 0 = same/none, 1 = other, 2 = universe_changed.
+    headset_match: std::sync::atomic::AtomicU8,
+    /// Live non-zero SteamVR headset universe ID while SteamVR reports one, or 0 to use the
+    /// registration's saved universe ID.
+    live_universe: std::sync::atomic::AtomicU64,
     /// The base-station pin (see `BasePin`).
     base_pin: Mutex<BasePin>,
     /// Held while the alignment is published, so that the tilt published is the newest (see
@@ -1373,8 +1376,12 @@ fn tilt_text(deg: f64) -> String {
 
 /// Publishes `alignment` with the daemon's tilt. One at a time, the tilt read while publishing: a
 /// reload or the universe watch cannot put back a tilt a `tilt` request has just changed.
-fn publish_alignment(d: &Daemon, alignment: shm::Alignment) {
+fn publish_alignment(d: &Daemon, mut alignment: shm::Alignment) {
     let _one = d.alignment_publish.lock().unwrap();
+    let live_u = d.live_universe.load(Ordering::Acquire);
+    if live_u != 0 {
+        alignment.universe_id = live_u;
+    }
     // `alignment` carries the render offsets as fitted: what the tilt turns from now on
     *d.fitted_render_orient.lock().unwrap() = alignment.render_orient;
     d.shm.publish_alignment(&with_daemon_tilt(d, alignment));
@@ -1622,8 +1629,24 @@ fn headset_report(d: &Daemon, headset: align::Headset, start: bool) -> Option<St
     line
 }
 
+fn headset_match_code(m: align::HeadsetMatch) -> u8 {
+    match m {
+        align::HeadsetMatch::Same => 0,
+        align::HeadsetMatch::Other => 1,
+        align::HeadsetMatch::UniverseChanged => 2,
+    }
+}
+
+fn headset_match_json(code: u8) -> &'static str {
+    match code {
+        1 => "\"other\"",
+        2 => "\"universe_changed\"",
+        _ => "null",
+    }
+}
+
 /// SteamVR's headset, while the driver's report of it is fresh; none from a driver that does not
-/// report it, or with SteamVR closed. Notes for `status` whether it is another than `reg`'s.
+/// report it, or with SteamVR closed. Notes for `status` how it compares with `reg`.
 fn reported_headset(d: &Daemon, reg: Option<&align::Registration>) -> Option<align::Headset> {
     let headset = d
         .driver_headset
@@ -1632,11 +1655,50 @@ fn reported_headset(d: &Daemon, reg: Option<&align::Registration>) -> Option<ali
         .clone()
         .filter(|(at, _)| shm::now_ns().saturating_sub(*at) < DRIVER_STATIONS_FRESH_NS)
         .map(|(_, h)| h);
-    let other = reg
+    let state = reg
         .zip(headset.as_ref())
-        .is_some_and(|(r, h)| r.other_headset(h));
-    d.other_headset.store(other, Ordering::Release);
+        .map_or(align::HeadsetMatch::Same, |(r, h)| r.headset_match(h));
+    d.headset_match
+        .store(headset_match_code(state), Ordering::Release);
     headset
+}
+
+/// Keeps the published shared-memory universe ID synced to SteamVR's live headset whenever the
+/// driver reports a non-zero universe ID, and reverts to the registration's saved universe ID
+/// when SteamVR closes. Returns a log line only when moving controllers to a different universe.
+fn sync_live_universe(
+    d: &Daemon,
+    reg: Option<&align::Registration>,
+    headset: Option<&align::Headset>,
+) -> Option<String> {
+    let live_u = headset
+        .map(|h| h.universe_id)
+        .filter(|&u| u != 0)
+        .unwrap_or(0);
+    let want = reg.map_or(live_u, |r| r.effective_universe_id(headset));
+    let _one = d.alignment_publish.lock().unwrap();
+    d.live_universe.store(live_u, Ordering::Release);
+    let mut al = d.shm.alignment().unwrap_or_default();
+    if al.universe_id == want {
+        return None;
+    }
+    al.universe_id = want;
+    d.shm.publish_alignment(&al);
+    let r = reg?;
+    if want == 0 || want == r.universe_id {
+        return None;
+    }
+    let h = headset?;
+    Some(match r.headset_match(h) {
+        align::HeadsetMatch::UniverseChanged => format!(
+            "universe watch: headset tracking space changed (universe id {} -> {}); controllers moved to universe {} (re-align if offset)",
+            r.universe_id, want, want
+        ),
+        _ => format!(
+            "universe watch: controllers moved to headset universe id {} (registration was {})",
+            want, r.universe_id
+        ),
+    })
 }
 
 /// Keeps the registration on the headset as SteamVR tracks it. SteamVR tracks the headset in the
@@ -1680,7 +1742,11 @@ fn universe_watch(d: Arc<Daemon>) {
         if !d.universe_watch_on.load(Ordering::Acquire) {
             say(String::new());
             unmeasured(None);
-            d.other_headset.store(false, Ordering::Release);
+            d.headset_match.store(0, Ordering::Release);
+            if d.live_universe.load(Ordering::Acquire) != 0 {
+                let reg = align::load_registration(&align::registration_path()).ok();
+                let _ = sync_live_universe(&d, reg.as_ref(), None);
+            }
             // nothing known of SteamVR's log: the pin is neither set nor removed meanwhile
             let none = cv1touch::steamvr_log::Bases::default();
             d.base_pin
@@ -1725,6 +1791,9 @@ fn universe_watch(d: Arc<Daemon>) {
                 .map_or_else(|_| Vec::new(), |r| base_pin::measured(&r.measured));
         }
         let headset = reported_headset(&d, reg.as_ref().ok());
+        if let Some(line) = sync_live_universe(&d, reg.as_ref().ok(), headset.as_ref()) {
+            log(line);
+        }
         let Ok(reg) = reg else {
             unmeasured(None);
             continue;
@@ -6010,11 +6079,7 @@ fn status_json(d: &Daemon) -> String {
         al.valid & ffi::CV1T_ALIGN_RENDER_RIGHT != 0,
         al.universe_id,
         serde_json::to_string(&*d.universe_unmeasured.lock().unwrap()).unwrap(),
-        if d.other_headset.load(Ordering::Acquire) {
-            "\"other\""
-        } else {
-            "null"
-        },
+        headset_match_json(d.headset_match.load(Ordering::Acquire)),
         base_pin_status(d),
         recording_json,
         recording.state == recorder::State::Recording,
@@ -6161,6 +6226,8 @@ fn handle(d: &Daemon, line: &str) -> String {
         Ok(Command::Headset { headset, start }) => {
             if let Some(line) = headset_report(d, headset, start) {
                 log(line);
+                d.universe_recheck.store(true, Ordering::Release);
+                d.wake_sleepers();
             }
             "ok".into()
         }
@@ -7171,7 +7238,8 @@ fn main() {
         universe_following: Mutex::new(String::new()),
         universe_unmeasured: Mutex::new(None),
         driver_headset: Mutex::new(None),
-        other_headset: AtomicBool::new(false),
+        headset_match: std::sync::atomic::AtomicU8::new(0),
+        live_universe: std::sync::atomic::AtomicU64::new(0),
         base_pin: Mutex::new(BasePin {
             watch: base_pin::Watch::new(settings.pin_base_station),
             ..Default::default()
@@ -8976,6 +9044,39 @@ mod tests {
         d.driver_headset.lock().unwrap().as_mut().unwrap().0 -= DRIVER_STATIONS_FRESH_NS;
         assert_eq!(reported_headset(&d, Some(&reg)), None);
         assert_eq!(note(&d), serde_json::Value::Null);
+
+        // Non-Lighthouse headset whose universe ID changes: SHM moves to the live universe ID so
+        // controllers stay visible in SteamVR, status notes "universe_changed", and closing
+        // SteamVR reverts SHM cleanly back to the registration's saved universe ID.
+        let quest_reg: align::Registration = serde_json::from_value(serde_json::json!({
+            "format": align::REGISTRATION_FORMAT, "version": align::VERSION, "created_unix_s": 2,
+            "lighthouse_from_world": {"orient_xyzw": [0, 0, 0, 1], "pos": [0, 0, 0]},
+            "universe_id": 31, "touch": "left", "reference": "QUEST-3",
+            "reference_system": "vrlink", "pairs": 1, "pos_rms_mm": 1, "rot_rms_deg": 1,
+            "stations": [],
+        }))
+        .unwrap();
+        publish_alignment(&d, align::alignment(Some(&quest_reg), None));
+        assert_eq!(d.shm.alignment().unwrap().universe_id, 31);
+        assert_eq!(handle(&d, "headset start 32 vrlink QUEST-3"), "ok");
+        assert!(d.universe_recheck.swap(false, Ordering::AcqRel));
+        let h = reported_headset(&d, Some(&quest_reg));
+        assert_eq!(note(&d), "universe_changed");
+        let log_line = sync_live_universe(&d, Some(&quest_reg), h.as_ref()).unwrap();
+        assert!(log_line.contains("31 -> 32"), "{log_line}");
+        assert_eq!(d.shm.alignment().unwrap().universe_id, 32);
+        // Calling again with no change does not spam the log.
+        assert_eq!(sync_live_universe(&d, Some(&quest_reg), h.as_ref()), None);
+        // SteamVR closed: reverts to the saved universe ID and clears the warning.
+        d.driver_headset.lock().unwrap().as_mut().unwrap().0 -= DRIVER_STATIONS_FRESH_NS;
+        let gone = reported_headset(&d, Some(&quest_reg));
+        assert_eq!(gone, None);
+        assert_eq!(note(&d), serde_json::Value::Null);
+        assert_eq!(
+            sync_live_universe(&d, Some(&quest_reg), gone.as_ref()),
+            None
+        );
+        assert_eq!(d.shm.alignment().unwrap().universe_id, 31);
     }
 
     /// The driver's `pin` report gets what to write, at most once per change, and `status` shows
@@ -9268,7 +9369,8 @@ mod tests {
             universe_following: Mutex::new(String::new()),
             universe_unmeasured: Mutex::new(None),
             driver_headset: Mutex::new(None),
-            other_headset: AtomicBool::new(false),
+            headset_match: std::sync::atomic::AtomicU8::new(0),
+            live_universe: std::sync::atomic::AtomicU64::new(0),
             base_pin: Mutex::new(BasePin::default()),
             alignment_publish: Mutex::new(()),
             settings_path: std::env::temp_dir()
