@@ -11,6 +11,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 ### Changed
 
 - `cv1touch calibrate refine` now refits all connected sensors jointly in a single replay pass using tracker-associated multi-sensor observations (working on ordinary play sessions without requiring cold-search labels), anchors the refit rigidly onto the prior calibration across all sensors (excluding a single moved outlier sensor when three or more sensors participate), and accepts changes only when chronological held-out reprojection RMS improves without regressing individual sensors.
+- `cv1touchd` now runs background session-fresh joint sensor refits during ordinary play once enough varied multi-sensor motion is observed, adjusting all connected sensors together in memory (anchored to the loaded calibration) without interrupting tracking or overwriting `calibration.json` for small thermal or mount drift. When three or more sensors participate and a single sensor stands out with clear pose and pixel evidence of having physically moved, only that sensor's new pose is saved to `calibration.json`.
+- Raised the single-sensor small-bias fallback threshold in `cv1touchd` from `0.6` px to `1.2` px so coverage-dependent sub-pixel residual shifts no longer pull sensors out of tracking for cold-search re-placement while background joint refit handles small drift directly.
 
 ## [0.7.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) - 2026-11-26
 

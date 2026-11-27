@@ -32,7 +32,7 @@ pub const STAYED_MISS_SHARE: f64 = 0.2;
 pub const STAYED_MEDIAN_PX: f64 = 1.0;
 /// A sensor whose residual offset is at least this, and this many times the others', moved (a
 /// little). Needs two other sensors that stayed to compare with.
-pub const MOVED_BIAS_PX: f64 = 0.6;
+pub const MOVED_BIAS_PX: f64 = 1.2;
 pub const MOVED_BIAS_RATIO: f64 = 2.5;
 /// Windows in a row a sensor must be judged moved before it is.
 pub const CONSECUTIVE: u32 = 2;
@@ -416,6 +416,15 @@ impl Monitor {
             self.inspecting = None;
             self.stopping.insert(serial.to_string());
         }
+    }
+
+    /// Clears `serial`'s agreement window baseline and consecutive-window streak after its pose
+    /// was adjusted in place (for instance by a session joint refit), without entering a cooldown
+    /// or disturbing active inspections or placements.
+    pub fn reset_agreement(&mut self, serial: &str) {
+        self.over.remove(serial);
+        self.last.remove(serial);
+        self.unseen.remove(serial);
     }
 
     /// A detached sensor has no remaining agreement window, inspection, verdict, placement or
@@ -1494,17 +1503,21 @@ mod tests {
     #[test]
     fn a_nudged_sensor_stands_out_by_its_offset() {
         let mut m = Monitor::new(WINDOW_NS);
-        let out = run(&mut m, 2, |w| (100 * w, 0, 0.9, 0.9));
+        let out = run(&mut m, 2, |w| (100 * w, 0, 1.4, 1.4));
         assert_eq!(
             out[2],
             [moved_in_windows(
                 "D",
-                on_hand(0, last_window(100, 0, Some((0.9, 0.9))))
+                on_hand(0, last_window(100, 0, Some((1.4, 1.4))))
             )]
         );
-        // a smaller offset is noise; one the others share as much is no move either
+        // a sub-pixel / coverage-sized offset (below MOVED_BIAS_PX) is left to joint refit rather
+        // than demoting one sensor into a cold search; one the others share is no move either
         let mut m = Monitor::new(WINDOW_NS);
         let out = run(&mut m, 3, |w| (100 * w, 0, 0.5, 0.45));
+        assert!(out.iter().all(|c| c.is_empty()), "{out:?}");
+        let mut m = Monitor::new(WINDOW_NS);
+        let out = run(&mut m, 3, |w| (100 * w, 0, 0.85, 0.80));
         assert!(out.iter().all(|c| c.is_empty()), "{out:?}");
         let mut m = Monitor::new(WINDOW_NS);
         let shared = |w: u64| {
@@ -1512,7 +1525,7 @@ mod tests {
                 sensor("A", 100 * w, 5 * w, 0.8, 0.7),
                 sensor("B", 100 * w, 4 * w, 0.8, 0.75),
                 sensor("C", 90 * w, 6 * w, 0.9, 0.65),
-                sensor("D", 100 * w, 0, 0.9, 0.9),
+                sensor("D", 100 * w, 0, 1.4, 1.4),
             ]
         };
         let out: Vec<_> = (0..=3)
@@ -1726,12 +1739,12 @@ mod tests {
             let agreement = vec![
                 sensor("A", 222 * w, 0, 0.23, 0.15),
                 sensor("B", 233 * w, 0, 0.21, 0.14),
-                sensor("D", 100 * w, 5 * w, 1.1, 0.95),
+                sensor("D", 100 * w, 5 * w, 1.4, 1.35),
             ];
             let want = if w == 2 {
                 vec![moved_in_windows(
                     "D",
-                    on_hand(0, last_window(100, 5, Some((1.1, 0.95)))),
+                    on_hand(0, last_window(100, 5, Some((1.4, 1.35)))),
                 )]
             } else {
                 vec![]
@@ -1927,7 +1940,7 @@ mod tests {
                 let mut agreement = vec![
                     sensor("A", 100 * w, 0, 0.1, 0.1),
                     sensor("B", 100 * w, 0, 0.1, 0.1),
-                    visibility("C", (100 * w, 200.min(100 * w)), (seen, 0), 0.9, 0.9),
+                    visibility("C", (100 * w, 200.min(100 * w)), (seen, 0), 1.4, 1.4),
                 ];
                 if hand == 1 {
                     for (_, hands) in &mut agreement {
@@ -1962,7 +1975,7 @@ mod tests {
                         2 => vec![Change::Inspect("C".into())],
                         6 => vec![moved_in_windows(
                             "C",
-                            on_hand(hand, last_window(100, 0, Some((0.9, 0.9))))
+                            on_hand(hand, last_window(100, 0, Some((1.4, 1.4))))
                         )],
                         _ => vec![],
                     },
@@ -1983,7 +1996,7 @@ mod tests {
                 let mut agreement = vec![
                     sensor("A", 100 * w, 0, 0.1, 0.1),
                     sensor("B", 100 * w, 0, 0.1, 0.1),
-                    visibility("C", (100 * w, 200.min(100 * w)), (seen, 0), 0.9, 0.9),
+                    visibility("C", (100 * w, 200.min(100 * w)), (seen, 0), 1.4, 1.4),
                 ];
                 if hand == 1 {
                     for (_, hands) in &mut agreement {
@@ -2033,7 +2046,7 @@ mod tests {
                         2 => vec![Change::Inspect("C".into())],
                         6 => vec![moved_in_windows(
                             "C",
-                            on_hand(hand, last_window(100, 0, Some((0.9, 0.9))))
+                            on_hand(hand, last_window(100, 0, Some((1.4, 1.4))))
                         )],
                         _ => vec![],
                     },
@@ -2058,8 +2071,8 @@ mod tests {
                             "C",
                             (100 * w, 200.min(100 * w)),
                             (100 * w.saturating_sub(2), 0),
-                            0.9,
-                            0.9,
+                            1.4,
+                            1.4,
                         ),
                     ];
                     if hand == 1 {
@@ -2133,7 +2146,7 @@ mod tests {
                             let checks = if ending == 0 { 1100 } else { 100 };
                             vec![moved_in_windows(
                                 "C",
-                                on_hand(hand, last_window(checks, 0, Some((0.9, 0.9)))),
+                                on_hand(hand, last_window(checks, 0, Some((1.4, 1.4)))),
                             )]
                         } else {
                             vec![]
@@ -2154,7 +2167,7 @@ mod tests {
         m.observed_evidence("A", &epochs);
         for w in 0..=1 {
             assert!(m
-                .update(1 + w * WINDOW_NS, &room(w, |w| (100 * w, 0, 0.9, 0.9)))
+                .update(1 + w * WINDOW_NS, &room(w, |w| (100 * w, 0, 1.4, 1.4)))
                 .is_empty());
         }
         assert_eq!(m.over["D"], 1);
@@ -2162,11 +2175,11 @@ mod tests {
         m.observed_evidence("A", &epochs);
         for w in 2..=4 {
             assert_eq!(
-                m.update(1 + w * WINDOW_NS, &room(w, |w| (100 * w, 0, 0.9, 0.9))),
+                m.update(1 + w * WINDOW_NS, &room(w, |w| (100 * w, 0, 1.4, 1.4))),
                 if w == 4 {
                     vec![moved_in_windows(
                         "D",
-                        on_hand(0, last_window(100, 0, Some((0.9, 0.9)))),
+                        on_hand(0, last_window(100, 0, Some((1.4, 1.4)))),
                     )]
                 } else {
                     vec![]
@@ -2785,8 +2798,8 @@ mod tests {
                     "C",
                     (100 * w, 200.min(100 * w)),
                     (matched, 0),
-                    if w >= 4 { 1.2 } else { 0.3 },
-                    if w >= 4 { 1.0 } else { 0.1 },
+                    if w >= 4 { 1.4 } else { 0.3 },
+                    if w >= 4 { 1.4 } else { 0.1 },
                 ),
             ];
             let want = match w {
@@ -2794,7 +2807,7 @@ mod tests {
                 3 => vec![Change::Agreed("C".into())],
                 5 => vec![moved_in_windows(
                     "C",
-                    on_hand(0, last_window(100, 0, Some((1.2, 1.0)))),
+                    on_hand(0, last_window(100, 0, Some((1.4, 1.4)))),
                 )],
                 _ => vec![],
             };
