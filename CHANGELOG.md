@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 ## Unreleased
 
+## [0.7.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) - 2026-11-26
+
 ### Added
 
 - `cv1touch pin-base-station off` stops the SteamVR driver from having SteamVR start tracking the headset from a measured base station, `on` turns it back on, and without a word it says which it is. It takes effect while the daemon runs and is saved in `settings.json`; while the daemon is not running it is written to that file directly. `cv1touch status --json` gives it as `pin_base_station`, next to `tilt_deg`.
