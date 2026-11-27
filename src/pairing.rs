@@ -349,8 +349,9 @@ pub fn pair(
 pub enum Offer {
     /// It is paired to this headset already, in its own place: nothing to write.
     AlreadyPaired,
-    /// Pairing it takes its place on this headset from `replaces` (the address there, if any).
-    Pair { replaces: Option<u32> },
+    /// Pairing writes this headset's radio address into the device without unpairing any other
+    /// controller already answering in the same slot (`also_paired`).
+    Pair { also_paired: Option<u32> },
 }
 
 /// `b` against this headset (`headset`) and what answers in its place there now (`current`).
@@ -358,7 +359,9 @@ pub fn offer(b: &Broadcast, headset: [u8; 5], current: Option<u32>) -> Offer {
     if b.paired_to == headset && current == Some(b.address) {
         Offer::AlreadyPaired
     } else {
-        Offer::Pair { replaces: current }
+        Offer::Pair {
+            also_paired: current,
+        }
     }
 }
 
@@ -609,25 +612,25 @@ mod tests {
     }
 
     #[test]
-    fn a_device_already_paired_here_is_left_alone_and_a_new_one_names_what_it_replaces() {
+    fn a_device_already_paired_here_is_left_alone_and_a_new_one_names_any_other_in_that_slot() {
         let mut b = broadcast(Device::LeftTouch, 0x1111);
         b.paired_to = HEADSET;
         assert_eq!(offer(&b, HEADSET, Some(0x1111)), Offer::AlreadyPaired);
-        // points at this headset, but the headset holds another left controller
+        // points at this headset, but another left controller answered in this slot
         assert_eq!(
             offer(&b, HEADSET, Some(0x2222)),
             Offer::Pair {
-                replaces: Some(0x2222)
+                also_paired: Some(0x2222)
             }
         );
         // paired to another headset, nothing answering in this place here
         b.paired_to = [9; 5];
-        assert_eq!(offer(&b, HEADSET, None), Offer::Pair { replaces: None });
+        assert_eq!(offer(&b, HEADSET, None), Offer::Pair { also_paired: None });
         // the same device, reported paired to another headset, is still offered
         assert_eq!(
             offer(&b, HEADSET, Some(0x1111)),
             Offer::Pair {
-                replaces: Some(0x1111)
+                also_paired: Some(0x1111)
             }
         );
     }

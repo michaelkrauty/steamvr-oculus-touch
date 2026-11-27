@@ -43,8 +43,9 @@ const HOW_TO_ASK: &str = "To make a device ask to be paired, hold these until it
   left controller:   Menu (☰) and Y
   right controller:  Oculus button and B
   remote:            Oculus button and the middle (select) button
-Keep every other controller switched off or asleep: a second left or right controller asking at
-the same time would be just as welcome to the headset.";
+Keep every other controller asleep or remove its battery: pairing writes this headset's radio
+address into the controller without unpairing any previous one, and two controllers of the same
+hand awake at the same time will collide on the radio.";
 
 fn open_control() -> Result<FeatureDevice, String> {
     let path =
@@ -266,6 +267,17 @@ fn describe(b: &Broadcast, headset: &str) -> String {
     )
 }
 
+fn pair_question(device: pairing::Device, also_paired: Option<u32>) -> String {
+    match also_paired {
+        Some(old) => format!(
+            "  Pair it? Another {} ({old:08x}) is already paired to this headset; pairing does not \
+             unpair it, so keep the unused one asleep or remove its battery. Enter: pair  s: skip",
+            device.name()
+        ),
+        None => "  Pair it? Enter: pair  s: skip".into(),
+    }
+}
+
 pub(super) fn run(mode: Mode) -> i32 {
     match work(mode) {
         Ok(()) => 0,
@@ -308,8 +320,8 @@ fn work(mode: Mode) -> Result<(), String> {
 
     if mode != (Mode::Check { json: true }) {
         human_action(
-            "Wake both controllers and the remote (press any button on each) so they answer, then \
-             press Enter.",
+            "Wake both controllers (press any button on each; if checking the remote, tap a button \
+             on it right as you press Enter since it sleeps quickly), then press Enter.",
         );
         if read_prompt_line()?.is_none() {
             return Ok(());
@@ -386,15 +398,8 @@ fn work(mode: Mode) -> Result<(), String> {
                 println!("  already paired to this headset in that place: nothing to do");
                 Ok(true)
             }
-            Offer::Pair { replaces } => {
-                let question = match replaces {
-                    Some(old) => format!(
-                        "  Pair it? It takes the place of {} {old:08x} on this headset. \
-                         Enter: pair  s: skip",
-                        b.device.name()
-                    ),
-                    None => "  Pair it? Enter: pair  s: skip".into(),
-                };
+            Offer::Pair { also_paired } => {
+                let question = pair_question(b.device, also_paired);
                 human_action(&question);
                 let Some(answer) = read_prompt_line()? else {
                     println!("  skipped");
@@ -454,5 +459,14 @@ mod tests {
         assert_eq!(flags(&["--normal"]), Some(Mode::Normal));
         assert_eq!(flags(&["--json"]), None);
         assert_eq!(flags(&["--bogus"]), None);
+    }
+
+    #[test]
+    fn pair_question_warns_when_another_controller_shares_the_slot() {
+        let plain = pair_question(pairing::Device::LeftTouch, None);
+        assert_eq!(plain, "  Pair it? Enter: pair  s: skip");
+        let shared = pair_question(pairing::Device::LeftTouch, Some(0xe976_a15d));
+        assert!(shared.contains("e976a15d"));
+        assert!(shared.contains("does not unpair it"));
     }
 }
