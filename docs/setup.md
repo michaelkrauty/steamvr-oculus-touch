@@ -41,7 +41,7 @@ Spread the sensors across USB controllers. If a sensor's video keeps stopping, `
 
 ## Install
 
-Start SteamVR once so it writes where it is installed, quit it, then run `python3 scripts/install.py` from a clone of the `v0.6.0` tag or an extracted [v0.6.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0). It installs:
+Start SteamVR once so it writes where it is installed, quit it, then run `python3 scripts/install.py` from a clone of the `v0.7.0` tag or an extracted [v0.7.0 source archive](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0). It installs:
 
 | Location | Contents |
 | --- | --- |
@@ -160,7 +160,7 @@ Quit SteamVR, select the release, and run the installer again:
 
 ```sh
 git fetch origin --tags
-git checkout --detach v0.6.0
+git checkout --detach v0.7.0
 python3 scripts/install.py
 ```
 

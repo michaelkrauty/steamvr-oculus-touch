@@ -47,7 +47,7 @@ Build the GUI separately with Rust 1.95 or newer. Then bundle it with the driver
 cargo build --locked --release --bins
 cargo build --manifest-path gui/Cargo.toml --locked --release
 powershell -ExecutionPolicy Bypass -File windows\bundle.ps1
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.6.0 "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.7.0 "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
 ```
 
 `windows\bundle.ps1` collects the install into `target\bundle`, including `cv1touch-gui.exe`. Its `-GuiTarget` option defaults to `gui\target`; set it if the GUI build uses another target directory. Inno Setup 6 writes the installer to `target\installer`. `python windows/check_bundle.py target/bundle` rejects DLL dependencies the bundle does not ship.

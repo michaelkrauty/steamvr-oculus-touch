@@ -4,7 +4,7 @@ A release is an annotated `vMAJOR.MINOR.PATCH` tag and a GitHub release. Linux s
 
 ## Prepare
 
-1. Set the version in `Cargo.toml`, the `cv1touch` entry of `Cargo.lock`, `meson.build`, `vcpkg.json` and `CITATION.cff` (with the release date and URL).
+1. Set the version in `Cargo.toml`, the `cv1touch` entry of `Cargo.lock`, `gui/Cargo.toml`, the `cv1touch-gui` entry of `gui/Cargo.lock`, `meson.build`, `vcpkg.json` and `CITATION.cff` (with the release date and URL).
 2. Move the `Unreleased` entries of `CHANGELOG.md` under a dated release heading, leaving `Unreleased` empty. Update the version in `README.md`, `docs/setup.md`, `docs/building-windows.md` and `windows/installer/cv1touch.iss`. `python3 -m unittest discover -s tests -p test_release.py` checks that they agree.
 3. Run `scripts/check.sh`, push the release commit, and wait for both **Linux checks** and **Windows checks** to pass on that exact commit. Skipped, queued or awaiting-approval checks are not passes. Hardware checks are manual.
 
@@ -13,7 +13,7 @@ A release is an annotated `vMAJOR.MINOR.PATCH` tag and a GitHub release. Linux s
 Tag the validated commit and push the tag. Never move a published tag.
 
 ```sh
-version=0.6.0
+version=0.7.0
 tag=v$version
 git tag -a "$tag" -m "$tag"
 git push origin "$tag"

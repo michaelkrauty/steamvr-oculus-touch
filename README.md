@@ -4,7 +4,7 @@ Use original Oculus Rift CV1 Touch controllers in SteamVR on Linux and Windows, 
 
 A Rust daemon tracks the controllers from the CV1 sensors and the controllers' IMUs, and a native SteamVR driver gives SteamVR their poses, buttons, capacitive touch, triggers, sticks and haptics.
 
-**Status:** v0.6.0. Tested and working on Linux. Untested on Windows, but it should work. This project is independent of Meta, Oculus and Valve.
+**Status:** v0.7.0. Tested and working on Linux. Untested on Windows, but it should work. This project is independent of Meta, Oculus and Valve.
 
 ## What you need
 
@@ -16,12 +16,12 @@ A Rust daemon tracks the controllers from the CV1 sensors and the controllers' I
 
 ## Install
 
-**Windows:** download `cv1touch-setup-0.6.0.exe` from the [v0.6.0 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) and follow [cv1touch on Windows](docs/windows.md).
+**Windows:** download `cv1touch-setup-0.7.0.exe` from the [v0.7.0 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) and follow [cv1touch on Windows](docs/windows.md).
 
 **Linux:** start SteamVR once so it writes where it is installed, quit it, install the [build dependencies](docs/setup.md#build-dependencies), then:
 
 ```sh
-git clone --branch v0.6.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
+git clone --branch v0.7.0 --depth 1 https://github.com/michaelkrauty/steamvr-oculus-touch.git
 cd steamvr-oculus-touch
 python3 scripts/install.py
 ```
