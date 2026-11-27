@@ -83,7 +83,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pin-base-station", "pin-base-station [on|off]   (SteamVR starts tracking the headset from a base station headset alignment measured; on by default)"),
     ("report", "report [--out PATH] [--json] [--no-open]   (one file with the logs and settings, for someone helping you)"),
     ("stop", "stop   (stops the daemon, and its supervisor, and waits until they have ended)"),
-    ("pair", "pair [--check [--json] | --listen | --normal]   (pair Touch controllers or the remote to the CV1 headset)"),
+    ("pair", "pair [--check [--json] | --listen | --normal]   (pair Touch controllers to the CV1 headset)"),
     ("sensors", "sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)"),
     ("finish-setup", "finish-setup [--json]   (Windows: the sensors' driver and the SteamVR registration, as the installer does them)"),
     ("calibration", "calibration capture|provisional|load PATH"),
@@ -131,7 +131,7 @@ fn user_help() -> String {
     format!(
         "cv1touch: Oculus Rift CV1 Touch controllers in SteamVR.\n\n\
          \x20 cv1touch setup         set everything up, step by step; run this first\n\
-         \x20 cv1touch pair          pair Touch controllers or the remote to the CV1 headset\n\
+         \x20 cv1touch pair          pair Touch controllers to the CV1 headset\n\
          \x20 cv1touch doctor        check the installation and say what to fix\n\
          \x20 cv1touch status        show the sensors and controllers, updated live\n\
          \x20 cv1touch input-test    check the buttons, triggers and sticks while SteamVR runs\n\

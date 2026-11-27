@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
 
-//! `cv1touch pair`: pairing Touch controllers and the remote to the CV1 headset, with no Oculus
+//! `cv1touch pair`: pairing Touch controllers to the CV1 headset, with no Oculus
 //! software. The protocol lives in the library (`cv1touch::pairing`); this is the person's side.
 
 use super::*;
@@ -14,7 +14,7 @@ pub(super) enum Mode {
     Check { json: bool },
     /// Pairing mode: list what asks to be paired; pair nothing.
     Listen,
-    /// Pairing mode: offer to pair each device that asks.
+    /// Pairing mode: offer to pair each controller that asks.
     Pair,
     /// Return a headset left in pairing mode back to normal mode.
     Normal,
@@ -39,10 +39,9 @@ const RADIO_INTERFACE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long pairing mode listens when nobody ends it.
 const LISTEN_LIMIT: Duration = Duration::from_secs(180);
 
-const HOW_TO_ASK: &str = "To make a device ask to be paired, hold these until its light blinks:
+const HOW_TO_ASK: &str = "To make a controller ask to be paired, hold these until its light blinks:
   left controller:   Menu (☰) and Y
   right controller:  Oculus button and B
-  remote:            Oculus button and the middle (select) button
 Keep every other controller asleep or remove its battery: pairing writes this headset's radio
 address into the controller without unpairing any previous one, and two controllers of the same
 hand awake at the same time will collide on the radio.";
@@ -226,12 +225,11 @@ fn listen(
             Line::Typed(_) | Line::Closed => return Ok(()),
             Line::NotYet => {}
         }
-        let woke = radio
+        let _woke = radio
             .wait(&waker, Some(Duration::from_millis(100)))
             .map_err(|e| format!("reading the headset's radio: {e}"))?;
-        if !woke.report {
-            continue;
-        }
+        // Always drain after wait: on Linux a hung-up hidraw fd wakes poll with
+        // POLLHUP/POLLERR rather than POLLIN and reports the disconnect on try_read.
         while let Some(n) = radio
             .try_read(&mut buf)
             .map_err(|e| format!("reading the headset's radio: {e}"))?
@@ -319,10 +317,7 @@ fn work(mode: Mode) -> Result<(), String> {
     }
 
     if mode != (Mode::Check { json: true }) {
-        human_action(
-            "Wake both controllers (press any button on each; if checking the remote, tap a button \
-             on it right as you press Enter since it sleeps quickly), then press Enter.",
-        );
+        human_action("Wake both controllers (press any button on each), then press Enter.");
         if read_prompt_line()?.is_none() {
             return Ok(());
         }
@@ -385,7 +380,7 @@ fn work(mode: Mode) -> Result<(), String> {
     };
     let mut guard = BackToNormal(Some(dev));
     let mut radio = open_radio()?;
-    human_action("Pairing mode is on. Ask with each device now; press Enter when done.");
+    human_action("Pairing mode is on. Ask with each controller now; press Enter when done.");
     let mut paired = Vec::new();
     let result = listen(&mut radio, LISTEN_LIMIT, |b| {
         println!("{}", describe(b, &before.headset));
@@ -412,7 +407,7 @@ fn work(mode: Mode) -> Result<(), String> {
                 let dev = guard.0.as_mut().ok_or("the headset is gone")?;
                 pairing::pair(dev, b, headset_address)
                     .map_err(|e| format!("pairing the {} failed: {e}", b.device.name()))?;
-                println!("  paired (ask with another device, or press Enter when done)");
+                println!("  paired (ask with another controller, or press Enter when done)");
                 current_slots.insert(b.device.code(), b.address);
                 paired.push(b.clone());
                 Ok(true)
@@ -427,7 +422,7 @@ fn work(mode: Mode) -> Result<(), String> {
     result?;
     if !paired.is_empty() {
         human_action(
-            "Press a button on the paired device(s) to wake them, then press Enter to verify.",
+            "Press a button on the paired controller(s) to wake them, then press Enter to verify.",
         );
         let _ = read_prompt_line();
     }

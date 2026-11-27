@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
-//! Pairing Touch controllers and the remote to a CV1 headset with our own code: no Oculus software.
+//! Pairing Touch controllers to a CV1 headset with our own code: no Oculus software.
 //!
 //! The headset's radio is driven through two feature reports on its first HID interface: 0x1a
 //! starts a radio command (three bytes, then polled until the busy bit clears) and 0x1b carries
@@ -48,20 +48,18 @@ impl FeatureReports for FeatureDevice {
     }
 }
 
-/// What can be paired to a CV1 headset, in the radio's own numbering.
+/// Which Touch controller, in the radio's own numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Device {
-    Remote,
     LeftTouch,
     RightTouch,
 }
 
 impl Device {
-    pub const ALL: [Device; 3] = [Device::Remote, Device::LeftTouch, Device::RightTouch];
+    pub const ALL: [Device; 2] = [Device::LeftTouch, Device::RightTouch];
 
     pub fn code(self) -> u8 {
         match self {
-            Device::Remote => 1,
             Device::LeftTouch => 2,
             Device::RightTouch => 3,
         }
@@ -74,7 +72,6 @@ impl Device {
     /// The second parameter of the pairing configuration (a channel or slot, by ouvrt's guess).
     fn channel(self) -> u16 {
         match self {
-            Device::Remote => 750,
             Device::LeftTouch => 1000,
             Device::RightTouch => 1250,
         }
@@ -82,7 +79,6 @@ impl Device {
 
     pub fn name(self) -> &'static str {
         match self {
-            Device::Remote => "remote",
             Device::LeftTouch => "left controller",
             Device::RightTouch => "right controller",
         }
@@ -125,7 +121,7 @@ impl From<io::Error> for RadioError {
     }
 }
 
-/// A controller (or the remote) as the headset's radio reports it.
+/// A controller as the headset's radio reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerInfo {
     pub device: Device,
@@ -135,7 +131,7 @@ pub struct ControllerInfo {
     pub firmware: String,
 }
 
-/// A device asking to be paired, from a pairing-mode broadcast.
+/// A controller asking to be paired, from a pairing-mode broadcast.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Broadcast {
     pub device: Device,
@@ -593,19 +589,18 @@ mod tests {
         let mut left_fw = [0u8; PAYLOAD];
         left_fw[14..20].copy_from_slice(b"1.15.0");
         h.results.insert([0x03, 0x82, 2], left_fw);
-        h.silent.push([0x03, 0x88, 1]);
         h.silent.push([0x03, 0x88, 3]);
 
         let rec = record(&mut h, 1_700_000_000).unwrap();
         assert_eq!(rec.format, "cv1touch-pairing");
         assert_eq!(rec.headset, "a9 1f aa ed d1");
         assert_eq!(rec.boot_mode, "normal");
-        assert!(rec.devices[0].info.is_none());
-        let left = rec.devices[1].info.as_ref().unwrap();
+        assert_eq!(rec.devices.len(), 2);
+        let left = rec.devices[0].info.as_ref().unwrap();
         assert_eq!(left.address, 0x0102_0304);
         assert_eq!(left.serial, "WMTD1234567890");
         assert_eq!(left.firmware, "1.15.0");
-        assert!(rec.devices[2].info.is_none());
+        assert!(rec.devices[1].info.is_none());
 
         let json = serde_json::to_string_pretty(&rec).unwrap();
         assert_eq!(serde_json::from_str::<Record>(&json).unwrap(), rec);
@@ -654,10 +649,6 @@ mod tests {
         assert!(w[2].1[1..].iter().all(|&b| b == 0));
         assert_eq!(w[3].0, [0x04, 0x08, 0x05]);
         assert_eq!(w[3].1, [0; PAYLOAD]);
-        assert_eq!(
-            pairing_writes(Device::Remote, 1, HEADSET)[1].1[12..14],
-            750u16.to_le_bytes()
-        );
         assert_eq!(
             pairing_writes(Device::RightTouch, 1, HEADSET)[1].1[12..14],
             1250u16.to_le_bytes()
