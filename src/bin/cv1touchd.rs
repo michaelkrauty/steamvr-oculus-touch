@@ -30,6 +30,7 @@ use cv1touch::flight_writer;
 use cv1touch::frame_queue::FrameQueue;
 use cv1touch::hand::{GapCause, GapEvent, Hand, HandConfig};
 use cv1touch::platform::{self, hid, ipc, shutdown, system};
+use cv1touch::preview::PreviewHub;
 use cv1touch::recorder::{self, Recorder};
 use cv1touch::sensor_hotplug;
 use cv1touch::shm::{self, ControllerState, SensorStatus, ShmWriter, HAND_LEFT, HAND_RIGHT};
@@ -303,6 +304,8 @@ struct Daemon {
     engine_offline: AtomicBool,
     /// First stop in this reopen, before waiting for workers. Retries retain this boundary.
     engine_stopped_ns: std::sync::atomic::AtomicU64,
+    /// The sensors' images for a client that shows them (control `preview`).
+    preview: PreviewHub,
 }
 
 impl Daemon {
@@ -817,6 +820,9 @@ impl EngineSink for Daemon {
             );
             self.wake_radio();
         }
+        if self.preview.leased() {
+            self.preview.on_frame(info, blobs, shm::now_ns());
+        }
     }
 
     fn image(
@@ -829,6 +835,10 @@ impl EngineSink for Daemon {
     ) {
         self.rec
             .write_frame(info, width, height, stride, pixels, RAW_FRAME_FLOOR);
+        if self.preview.leased() {
+            self.preview
+                .on_image(info, width, height, stride, pixels, shm::now_ns());
+        }
     }
 
     fn report(&self, source: i32, ts: u64, data: &[u8]) {
@@ -4091,6 +4101,7 @@ struct RadioSensors<'a> {
 fn all_sensor_images_wanted(d: &Daemon, started: u64, now: u64) -> bool {
     let timeout = HandConfig::default().connect_timeout_ns;
     d.rec.active()
+        || d.preview.active(now)
         || *d.mode.lock().unwrap() != "calibrated"
         || (0..2).any(|h| {
             d.radio_activity
@@ -4412,7 +4423,7 @@ fn radio_main(
         let idle_ms = if !d.track_in.lock().unwrap().has_frames() {
             let now = shm::now_ns();
             let timers = [next_stats, sensors.reposing.next_tick, biases.next_save];
-            radio_deadline(&link.hands, &own, now, timers)
+            radio_deadline(&link.hands, &own, &d.preview, now, timers)
                 .saturating_sub(now)
                 .div_ceil(1_000_000)
         } else {
@@ -4579,9 +4590,16 @@ fn radio_main(
 /// When the radio thread next has timed work with no report or frame to wake it: each hand it
 /// publishes is republished, or expired, `RADIO_REFRESH_NS` after its last publish, and a hand
 /// it asked for is looked at as often until the engine lets go; then the earliest of `timers`
-/// (statistics, repose tick, bias save). The landmark watch closes its windows and takes its
-/// results on the pass the repose tick (`REPOSE_TICK_NS`) brings at the latest.
-fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u64; 3]) -> u64 {
+/// (statistics, repose tick, bias save), and the end of a preview lease, when the images it
+/// wanted are given up. The landmark watch closes its windows and takes its results on the pass
+/// the repose tick (`REPOSE_TICK_NS`) brings at the latest.
+fn radio_deadline(
+    hands: &HandOwnership,
+    own: &RadioHands,
+    preview: &PreviewHub,
+    now: u64,
+    timers: [u64; 3],
+) -> u64 {
     [HAND_LEFT, HAND_RIGHT]
         .into_iter()
         .filter_map(|h| {
@@ -4594,6 +4612,7 @@ fn radio_deadline(hands: &HandOwnership, own: &RadioHands, now: u64, timers: [u6
             }
         })
         .chain(timers)
+        .chain(preview.lease_until(now))
         .min()
         .unwrap_or(u64::MAX)
 }
@@ -5971,16 +5990,19 @@ fn status_json(d: &Daemon) -> String {
             })
         })
         .collect();
+    // a lock of its own: `base_pin_status` below takes it again
+    let pin_base_station = d.base_pin.lock().unwrap().watch.enabled;
     let mut queue = shared.queue;
     queue["pending_frames_dropped"] =
         serde_json::json!(d.pending_frames_dropped.load(Ordering::Relaxed));
     format!(
-        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
+        "ok {{\"generation\":{},\"shm\":{},\"tracker\":\"{:?}\",\"mode\":\"{}\",\"tilt_deg\":{},\"pin_base_station\":{},\"engine_ready\":{},\"input_calibration\":{},\"alignment\":{{\"registration\":{},\"render\":[{},{}],\"universe\":{},\"unmeasured_base\":{},\"headset\":{},\"base_pin\":{}}},\"recording_scoped_stop\":true,\"recording_durable_stop\":true,\"recording_status\":{},\"recording\":{},\"recorded\":{},\"dropped\":{},\"write_errors\":{},\"hands\":[{}],\"sensors\":{},\"sensors_unsure\":{},\"sensor_hotplug\":{},\"sensor_frames_received\":true,\"sensor_video_quality\":true,\"sensor_total\":{},\"sensor_shm_count\":{},\"sensor_shm_truncated\":{},\"camera_queue\":{},\"ignored_sensors\":{},\"calibrated_sensors\":{},\"sensor_streams\":{}}}",
         d.shm.generation(),
         serde_json::to_string(d.shm.name()).unwrap(),
         d.tracker,
         mode,
         tilt_deg(d),
+        pin_base_station,
         engine_ready,
         shared.input_calibration,
         al.valid & ffi::CV1T_ALIGN_LIGHTHOUSE != 0,
@@ -6121,6 +6143,21 @@ fn handle(d: &Daemon, line: &str) -> String {
             "ok".into()
         }
         Ok(Command::Pin(keys, quit)) => pin_reply(d, keys, quit),
+        Ok(Command::Preview { serial, scale }) => {
+            let now = shm::now_ns();
+            let starting = !d.preview.active(now);
+            let reply = d.preview.snapshot_json(serial.as_deref(), scale, now);
+            if starting {
+                // the radio thread asks for every sensor's images now
+                d.wake_radio();
+            }
+            format!("ok {reply}")
+        }
+        Ok(Command::PreviewStop) => {
+            d.preview.stop();
+            d.wake_radio();
+            "ok".into()
+        }
         Ok(Command::Headset { headset, start }) => {
             if let Some(line) = headset_report(d, headset, start) {
                 log(line);
@@ -6195,6 +6232,15 @@ fn handle(d: &Daemon, line: &str) -> String {
                 republish_settings(d);
             }
             format!("ok tilt: {}{unsaved}", tilt_text(tilt_deg(d)))
+        }
+        Ok(Command::PinBaseStation(v)) => {
+            let mut unsaved = String::new();
+            if let Some(on) = v {
+                d.base_pin.lock().unwrap().watch.enabled = on;
+                unsaved = save_settings(d);
+            }
+            let on = d.base_pin.lock().unwrap().watch.enabled;
+            format!("ok {}{unsaved}", if on { "on" } else { "off" })
         }
         Ok(Command::AlignmentReload) => {
             // a shift measured against another registration does not apply to this one: until
@@ -6847,7 +6893,7 @@ fn finish_recording_startup(
         .and_then(|status| status.error);
     let error = error.or(late_error).or(final_error);
     if status.path.is_some() && !status.finished {
-        log("startup recording is still waiting for storage; file may be incomplete");
+        log("startup logging is still waiting for storage; file may be incomplete");
     }
     endpoints.remove();
     d.shm.retire();
@@ -6858,7 +6904,7 @@ fn finish_recording_startup(
 fn finish_recording_shutdown(rec: &Recorder) {
     if let Some(status) = rec.stop_timeout(None, RECORD_SHUTDOWN_WAIT) {
         if !status.finished {
-            log("recording is still waiting for storage; file may be incomplete");
+            log("logging is still waiting for storage; file may be incomplete");
         }
     }
 }
@@ -7155,6 +7201,7 @@ fn main() {
         ],
         engine_offline: AtomicBool::new(true),
         engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
+        preview: Default::default(),
     });
     let endpoints = ControlEndpoints {
         runtime: sock_path.clone(),
@@ -9253,6 +9300,7 @@ mod tests {
             ],
             engine_offline: AtomicBool::new(false),
             engine_stopped_ns: std::sync::atomic::AtomicU64::new(0),
+            preview: Default::default(),
         }
     }
 
@@ -11545,6 +11593,62 @@ mod tests {
         assert!(all_sensor_images_wanted(&d, start, awake + 1));
     }
 
+    #[test]
+    fn a_preview_wants_every_image_until_its_lease_ends_or_it_stops() {
+        let d = status_daemon();
+        let timeout = HandConfig::default().connect_timeout_ns;
+        let start = 100;
+        use engine::RadioReader::Engine;
+        d.activity(Engine, 1, start, start, true, 0.0);
+        d.activity(Engine, 2, start, start, true, 0.0);
+        let now = start + timeout;
+        assert!(!all_sensor_images_wanted(&d, start, now), "both asleep");
+        d.preview.snapshot_json(None, 4, now);
+        let lease = cv1touch::preview::PREVIEW_LEASE_NS;
+        assert!(all_sensor_images_wanted(&d, start, now));
+        assert!(all_sensor_images_wanted(&d, start, now + lease - 1));
+        assert!(!all_sensor_images_wanted(&d, start, now + lease));
+        d.preview.snapshot_json(Some("SENSOR1"), 2, now + 1);
+        assert!(all_sensor_images_wanted(&d, start, now + 2));
+        d.preview.stop();
+        assert!(!all_sensor_images_wanted(&d, start, now + 2));
+    }
+
+    #[test]
+    fn preview_replies_with_the_images_and_stop_ends_it() {
+        let d = status_daemon();
+        let turn = Mutex::new(());
+        let reply = handle_control(&d, "preview", &turn);
+        let json: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(json["active"], true);
+        assert_eq!(json["sensors"], serde_json::json!([]));
+        let mut info = engine::FrameInfo {
+            frame_start_host_ns: shm::now_ns(),
+            ..Default::default()
+        };
+        for (c, b) in info.serial.iter_mut().zip(b"SENSOR1") {
+            *c = *b as std::ffi::c_char;
+        }
+        d.image(&info, 8, 8, 8, &[200; 64]);
+        d.frame(&info, 1, &[]);
+        let reply = handle_control(&d, "preview SENSOR1 2", &turn);
+        let json: serde_json::Value =
+            serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+        assert_eq!(json["sensors"][0]["serial"], "SENSOR1");
+        assert_eq!(
+            json["sensors"][0]["width"], 2,
+            "taken at the scale asked for before"
+        );
+        assert_eq!(json["sensors"][0]["max_pixel"], 200);
+        assert!(handle_control(&d, "preview 2", &turn).starts_with("err "));
+        assert_eq!(handle_control(&d, "preview stop", &turn), "ok");
+        assert!(!d.preview.active(shm::now_ns()));
+        d.image(&info, 8, 8, 8, &[200; 64]);
+        let reply = handle_control(&d, "preview", &turn);
+        assert!(reply.contains(r#""sensors":[]"#), "{reply}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn idle_hmd_reports_wake_the_radio_in_batches_without_losing_clocks() {
@@ -13343,6 +13447,42 @@ mod tests {
         assert_eq!(
             settings::load(&d.settings_path).map(|s| s.tilt_deg),
             Ok(None)
+        );
+        let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
+    }
+
+    /// `pin-base-station` shows and sets base-station pinning live, saves it beside the tilt
+    /// (neither drops the other), and the status shows it next to the tilt.
+    #[test]
+    fn base_station_pinning_is_set_live_saved_and_shown() {
+        let d = status_daemon();
+        let status = || -> serde_json::Value {
+            serde_json::from_str(status_json(&d).strip_prefix("ok ").unwrap()).unwrap()
+        };
+        // the test daemon starts with it off
+        assert_eq!(handle(&d, "pin-base-station"), "ok off");
+        assert_eq!(status()["pin_base_station"], false);
+        assert_eq!(handle(&d, "pin-base-station on"), "ok on");
+        assert!(d.base_pin.lock().unwrap().watch.enabled);
+        assert_eq!(status()["pin_base_station"], true);
+        handle(&d, "tilt 10");
+        assert_eq!(handle(&d, "pin-base-station off"), "ok off");
+        assert!(!d.base_pin.lock().unwrap().watch.enabled);
+        assert_eq!(status()["pin_base_station"], false);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| (s.pin_base_station, s.tilt_deg)),
+            Ok((false, Some(10.0)))
+        );
+        assert_eq!(handle(&d, "pin-base-station"), "ok off");
+        assert_eq!(
+            handle(&d, "pin-base-station maybe"),
+            "err usage: pin-base-station [on|off]"
+        );
+        assert_eq!(handle(&d, "pin-base-station on"), "ok on");
+        assert_eq!(status()["pin_base_station"], true);
+        assert_eq!(
+            settings::load(&d.settings_path).map(|s| s.pin_base_station),
+            Ok(true)
         );
         let _ = std::fs::remove_dir_all(d.settings_path.parent().unwrap());
     }
@@ -17728,7 +17868,7 @@ mod tests {
             );
             // waiting for the engine's sample, the radio thread sleeps until its next refresh
             assert_eq!(
-                radio_deadline(&link.hands, &own, now + at, [u64::MAX; 3]),
+                radio_deadline(&link.hands, &own, &d.preview, now + at, [u64::MAX; 3]),
                 now + at + RADIO_REFRESH_NS
             );
         }
@@ -18655,25 +18795,47 @@ mod tests {
             last_publish: [995 * ms, 990 * ms],
             ..Default::default()
         };
+        let preview = PreviewHub::default();
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1250 * ms,
             "idle: statistics"
         );
+        let idle = [u64::MAX; 3];
+        preview.snapshot_json(None, 4, now);
+        let lease_end = now + cv1touch::preview::PREVIEW_LEASE_NS;
+        assert_eq!(
+            radio_deadline(&hands, &own, &preview, now, idle),
+            lease_end,
+            "a preview lease's end, to give up its images"
+        );
+        assert_eq!(
+            radio_deadline(&hands, &own, &preview, lease_end, idle),
+            u64::MAX,
+            "an ended lease is not waited for again"
+        );
+        preview.stop();
+        assert_eq!(radio_deadline(&hands, &own, &preview, now, idle), u64::MAX);
         hands.request(HAND_RIGHT);
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1020 * ms,
             "a hand the engine has yet to let go"
         );
         assert!(!hands.engine_publishes(HAND_RIGHT));
         assert_eq!(
-            radio_deadline(&hands, &own, now, timers),
+            radio_deadline(&hands, &own, &preview, now, timers),
             1010 * ms,
             "a published hand's refresh"
         );
         assert_eq!(
-            radio_deadline(&hands, &own, now, [999 * ms, 2000 * ms, 31_000 * ms]),
+            radio_deadline(
+                &hands,
+                &own,
+                &preview,
+                now,
+                [999 * ms, 2000 * ms, 31_000 * ms]
+            ),
             999 * ms,
             "an overdue timer"
         );
@@ -19664,7 +19826,7 @@ mod tests {
             assert!(output.status.success(), "{kind}: {text}");
             let diagnostics: Vec<_> = text
                 .lines()
-                .filter(|line| line.starts_with("cv1touchd: recording "))
+                .filter(|line| line.starts_with("cv1touchd: logging "))
                 .collect();
             assert_eq!(diagnostics.len(), 1, "{kind}: {text}");
             if kind == "pending" {
@@ -19891,14 +20053,14 @@ mod tests {
             let diagnostics: Vec<_> = text
                 .lines()
                 .filter(|line| {
-                    line.contains("recording failed:")
+                    line.contains("logging failed:")
                         || line.starts_with("cv1touchd: open ")
                         || line.starts_with("cv1touchd: write ")
                 })
                 .collect();
             assert_eq!(diagnostics.len(), 1, "duplicate startup error: {text}");
             assert!(
-                diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                diagnostics[0].starts_with("cv1touchd: logging failed:"),
                 "writer must own its diagnostic: {text}"
             );
             assert!(
@@ -20043,7 +20205,7 @@ mod tests {
             (
                 "pending",
                 0,
-                "startup recording is still waiting for storage; file may be incomplete",
+                "startup logging is still waiting for storage; file may be incomplete",
             ),
             ("complete", 0, "cv1touchd: stopped"),
         ] {
@@ -20116,13 +20278,13 @@ mod tests {
             );
             if expected_code == 1 {
                 assert!(
-                    diagnostics[0].starts_with("cv1touchd: recording failed:"),
+                    diagnostics[0].starts_with("cv1touchd: logging failed:"),
                     "{kind}: writer must report before close: {text}"
                 );
             }
             if kind == "complete" {
                 assert!(
-                    !text.contains("file may be incomplete") && !text.contains("recording failed"),
+                    !text.contains("file may be incomplete") && !text.contains("logging failed"),
                     "{text}"
                 );
             }
@@ -20434,7 +20596,7 @@ mod tests {
             .unwrap();
         d.rec.write(recorder::HAPTIC, 2, &[&[0u8; 16]]);
         let reply = handle(&d, &control::record_stop_if_line(&path).unwrap());
-        assert!(reply.starts_with("err recording ended early:"), "{reply}");
+        assert!(reply.starts_with("err logging ended early:"), "{reply}");
         assert!(
             reply.contains("1.00 GiB free; keeping 2.00 GiB free"),
             "{reply}"

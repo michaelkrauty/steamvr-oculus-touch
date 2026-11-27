@@ -24,6 +24,7 @@ pub mod input_calibration;
 mod log_lines;
 pub mod modes;
 pub mod platform;
+pub mod preview;
 pub mod recorder;
 pub mod register;
 pub mod rendermodel;

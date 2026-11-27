@@ -277,7 +277,7 @@ impl Status {
     pub fn message(&self) -> String {
         if let Some(error) = &self.error {
             return format!(
-                "recording failed: {error}{}",
+                "logging failed: {error}{}",
                 if self.finished {
                     ""
                 } else {
@@ -287,7 +287,7 @@ impl Status {
         }
         if let Some(reason) = &self.reason {
             return format!(
-                "recording ended early: {reason}; {}",
+                "logging ended early: {reason}; {}",
                 if self.finished {
                     "file is complete and synced"
                 } else {
@@ -296,14 +296,14 @@ impl Status {
             );
         }
         if !self.finished && self.state == State::Finishing {
-            return "recording is still finishing; waiting for storage; check status and try record stop again".into();
+            return "logging is still finishing; waiting for storage; check status and try record stop again".into();
         }
         match self.state {
             State::Idle => String::new(),
-            State::Starting => "recording is opening its file".into(),
-            State::Recording => "recording".into(),
-            State::Complete => "recording is complete and synced".into(),
-            _ => "recording is still finishing".into(),
+            State::Starting => "logging is opening its file".into(),
+            State::Recording => "logging".into(),
+            State::Complete => "logging is complete and synced".into(),
+            _ => "logging is still finishing".into(),
         }
     }
 }
@@ -772,7 +772,7 @@ impl Recorder {
                 let message = if ring.finished {
                     "previous recording ended; run record stop to see its result before starting another"
                 } else if ring.stop {
-                    "recording is still finishing; check status and stop it before starting another"
+                    "logging is still finishing; check status and stop it before starting another"
                 } else {
                     "already recording"
                 };
@@ -861,7 +861,7 @@ impl Recorder {
                 if let Some(error) = failure {
                     // The writer owns its diagnostic, including if closing the file stalls.
                     // Report a header failure before publishing its outcome to startup.
-                    shared.report_diagnostic(&format!("recording failed: {error}"));
+                    shared.report_diagnostic(&format!("logging failed: {error}"));
                     if let Some((_, ready)) = starting.take() {
                         let _ = ready.send(Err(error));
                     }

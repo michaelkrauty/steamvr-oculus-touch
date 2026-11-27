@@ -91,12 +91,13 @@ Press Enter to start each stage, or `q` to quit. With your hands full, A on the 
 Other forms:
 
 - `cv1touch setup --check` lists each stage's state without starting anything (`--json` for scripts).
+- `cv1touch setup --events` runs the same guide for a graphical front end: one JSON object per line on standard output and line commands such as `run sensors` or `quit` on standard input.
 - `cv1touch setup --redo STAGE` redoes `sensors`, `floor`, `model`, `buttons` or `headset`. Once setup is complete, plain `cv1touch setup` also offers each stage by number. Redoing Sensor positions also requires Headset alignment again.
 - `cv1touch setup --redo headset --quick` is a 15-second alignment for a new headset or when the headset's tracking has moved: controllers anywhere on the headset, then look down and up, tilt toward each shoulder and look over each shoulder.
 
 A stage saved before you used the guide shows as "saved earlier, not verified". Press `k` to keep it only if tracking already looks right; otherwise redo it.
 
-Headset alignment measures the base station SteamVR tracks the headset from. When SteamVR sees more than one station, the driver sets SteamVR's `driver_lighthouse.primarybasestation` to that station from the next SteamVR start, and removes the setting when SteamVR closes. It never changes a value you set. To turn this off, add `"pin_base_station": false` to `~/.config/cv1touch/settings.json`.
+Headset alignment measures the base station SteamVR tracks the headset from. When SteamVR sees more than one station, the driver sets SteamVR's `driver_lighthouse.primarybasestation` to that station from the next SteamVR start, and removes the setting when SteamVR closes. It never changes a value you set. To turn this off, run `cv1touch pin-base-station off` (or add `"pin_base_station": false` to `~/.config/cv1touch/settings.json`); `cv1touch pin-base-station on` turns it back on.
 
 After setup, check both hands in SteamVR. `cv1touch input-test` checks the buttons, triggers and sticks while a VR app has focus.
 

@@ -28,6 +28,8 @@ use cv1touch::status;
 use cv1touch::summary::{self, Window};
 use cv1touch::{align, eval, register, rendermodel, steamvr, track, vr};
 
+#[path = "cv1touch/events.rs"]
+mod events;
 #[path = "cv1touch/finish_setup.rs"]
 mod finish_setup;
 #[path = "cv1touch/setup.rs"]
@@ -61,21 +63,26 @@ fn human_text(message: &str) -> String {
 }
 
 fn human_action(message: &str) {
-    println!("{}", human_text(message));
+    if events::on() {
+        events::status(message.trim());
+    } else {
+        println!("{}", human_text(message));
+    }
 }
 
 /// Every command by its first word, with its usage. `cv1touch help expert`
 /// lists them all and `cv1touch COMMAND --help` shows one command's lines.
 const COMMANDS: &[(&str, &str)] = &[
-    ("setup", "setup [--no-slip-check] [--redo sensors|floor|model|buttons|headset [--quick]] | setup --check [--json]"),
+    ("setup", "setup [--events] [--no-slip-check] [--redo sensors|floor|model|buttons|headset [--quick]] | setup --check [--json]"),
     ("doctor", "doctor [--json]"),
     ("status", "status [--shm NAME] | status --json"),
     ("input-test", "input-test"),
     ("tilt", "tilt [DEGREES]"),
-    ("report", "report [--out PATH]   (one file with the logs and settings, for someone helping you)"),
+    ("pin-base-station", "pin-base-station [on|off]   (SteamVR starts tracking the headset from a base station headset alignment measured; on by default)"),
+    ("report", "report [--out PATH] [--json] [--no-open]   (one file with the logs and settings, for someone helping you)"),
     ("stop", "stop   (stops the daemon, and its supervisor, and waits until they have ended)"),
     ("sensors", "sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)"),
-    ("finish-setup", "finish-setup   (Windows: the sensors' driver and the SteamVR registration, as the installer does them)"),
+    ("finish-setup", "finish-setup [--json]   (Windows: the sensors' driver and the SteamVR registration, as the installer does them)"),
     ("calibration", "calibration capture|provisional|load PATH"),
     ("alignment", "alignment reload"),
     ("haptic", "haptic left|right DURATION_S FREQUENCY_HZ AMPLITUDE"),
@@ -324,6 +331,62 @@ fn send(line: &str) -> i32 {
             1
         }
     }
+}
+
+/// `cv1touch pin-base-station [on|off]`: shown or set through the daemon, which applies and
+/// saves it at once, or, while the daemon isn't running, in the settings file it reads when it
+/// starts. Either way SteamVR follows from its next start.
+fn pin_base_station(set: Option<bool>) -> i32 {
+    let request = |line: &str| daemon_request(line, Duration::from_secs(5));
+    match pin_base_station_with(set, &cv1touch::settings::default_path(), request) {
+        Ok(text) => {
+            println!("{text}");
+            0
+        }
+        Err(error) => {
+            eprintln!("cv1touch: {error}");
+            1
+        }
+    }
+}
+
+fn pin_base_station_with(
+    set: Option<bool>,
+    path: &Path,
+    request: impl FnOnce(&str) -> io::Result<String>,
+) -> Result<String, String> {
+    let line = match set {
+        None => "pin-base-station".to_string(),
+        Some(on) => format!("pin-base-station {}", if on { "on" } else { "off" }),
+    };
+    let (on, note) = match request(&line) {
+        Ok(reply) => match reply.strip_prefix("ok ") {
+            Some(rest) if rest.starts_with("on") || rest.starts_with("off") => {
+                let on = rest.starts_with("on");
+                (on, rest[if on { 2 } else { 3 }..].to_string())
+            }
+            _ => return Err(format!("cv1touchd: {reply}")),
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let mut settings = cv1touch::settings::load(path)?;
+            if let Some(on) = set {
+                settings.pin_base_station = on;
+                cv1touch::settings::save(path, &settings)?;
+            }
+            (settings.pin_base_station, String::new())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(if on {
+        format!("Base-station pinning: on (SteamVR starts tracking the headset from a base station headset alignment measured){note}")
+    } else {
+        format!("Base-station pinning: off (SteamVR picks the base station itself){note}")
+    })
 }
 
 /// `cv1touch stop`'s exit code when the daemon, or its supervisor, still runs 10 s after it was
@@ -1103,8 +1166,41 @@ fn catch_interrupts() {
     console::catch_interrupts();
 }
 
+/// Also when `setup --events` was told to stop, or its input ended.
 fn interrupted() -> bool {
-    console::interrupted()
+    console::interrupted() || events::stopped()
+}
+
+/// The next line typed, or with `setup --events` the next command, waiting up to `timeout`.
+fn next_line(timeout: Duration) -> Line {
+    if events::on() {
+        events::next_line(timeout)
+    } else {
+        console::next_line(timeout)
+    }
+}
+
+/// Whether `line` read during headset capture ends logging early and keeps the data. At a
+/// terminal, any line or closed input ends it; with `setup --events`, only `finish` does
+/// (`quit`, `abort` and EOF set `events::stopped()` inside `next_line`), while any other command
+/// or blank line is rejected and capture continues.
+fn capture_line_stops(line: Line) -> bool {
+    match line {
+        Line::NotYet => false,
+        Line::Closed => !events::on(),
+        Line::Typed(_) if !events::on() => true,
+        Line::Typed(line) => match events::parse(&line) {
+            Ok(events::Command::Finish) => true,
+            Ok(_) => {
+                events::rejected(&line, "expected finish or quit");
+                false
+            }
+            Err(error) => {
+                events::rejected(&line, &error);
+                false
+            }
+        },
+    }
 }
 
 fn commit_fit(interrupted: bool, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
@@ -1179,7 +1275,7 @@ fn pace_windows(phases: &[String]) -> Result<Vec<(String, u64, u64)>, i32> {
                 return Err(130);
             }
             print!(
-                "\r  recording... {:5.1} s left ",
+                "\r  logging... {:5.1} s left ",
                 (end_target - shm::now_ns()) as f64 / 1e9
             );
             let _ = io::stdout().flush();
@@ -1272,7 +1368,7 @@ fn wait_for_mode(mode: &str, timeout: Duration) -> Result<usize, String> {
         }
     }
     Err(format!(
-        "cv1touchd did not reach {mode} mode with all sensors streaming within {} s",
+        "cv1touchd did not reach {mode} mode with all sensors active within {} s",
         timeout.as_secs()
     ))
 }
@@ -1305,7 +1401,7 @@ fn calibrate_solve_saved(rec: &Path, out: &Path, force: bool) -> Result<String, 
         if !missing.is_empty() && !force {
             eprintln!(
                 "cv1touch: not installing: sensor(s) {} are in the current calibration but not in this capture (not open?). \
-                 Re-run with every sensor streaming, or add --force to drop them",
+                 Re-run with every sensor active, or add --force to drop them",
                 missing.join(", ")
             );
             return Err(1);
@@ -1396,7 +1492,7 @@ fn calibrate(out: &Path) -> i32 {
         return 1;
     }
     match wait_for_mode("capture", Duration::from_secs(30)) {
-        Ok(n) => println!("{n} sensors streaming in capture mode."),
+        Ok(n) => println!("{n} sensors active in capture mode."),
         Err(e) => {
             eprintln!("cv1touch: {e}");
             restore_mode(out);
@@ -1426,7 +1522,7 @@ fn calibrate(out: &Path) -> i32 {
     }
     if paced != 0 {
         eprintln!(
-            "cv1touch: calibration interrupted (recording kept at {})",
+            "cv1touch: calibration interrupted (log kept at {})",
             rec.display()
         );
         restore_mode(out);
@@ -1444,7 +1540,7 @@ fn fit_render(rec: Option<&Path>) -> i32 {
         Some(r) => r,
         None => {
             eprintln!(
-                "cv1touch: no recording given and none in {}",
+                "cv1touch: no tracking log given and none in {}",
                 state_dir().display()
             );
             return 1;
@@ -1614,7 +1710,7 @@ fn touch_reader() -> Result<ShmReader, String> {
     let name = status["shm"].as_str().unwrap_or(shm::DEFAULT_NAME);
     let reader = ShmReader::open(name).map_err(|e| format!("cannot read controller poses: {e}"))?;
     if status["generation"].as_u64() != Some(reader.generation()) {
-        return Err("cv1touchd restarted; no recording started".into());
+        return Err("cv1touchd restarted; no logging started".into());
     }
     Ok(reader)
 }
@@ -2169,10 +2265,7 @@ fn eval_capture() -> i32 {
     let windows = match paced {
         Ok(w) => w,
         Err(code) => {
-            eprintln!(
-                "cv1touch: interrupted (recording kept at {})",
-                rec.display()
-            );
+            eprintln!("cv1touch: interrupted (log kept at {})", rec.display());
             return code;
         }
     };
@@ -2433,11 +2526,19 @@ fn measured_inputs(
 /// Drops whatever was typed before a prompt, so an Enter pressed during a capture cannot answer
 /// the next question or start the next step.
 fn discard_typed_ahead() {
-    console::discard_typed_ahead();
+    if events::on() {
+        events::discard();
+    } else {
+        console::discard_typed_ahead();
+    }
 }
 
 /// A line typed at a start prompt: Some(true) Enter starts, Some(false) quit, None ask again.
+/// With `setup --events`, `go` starts (a stop never reaches here).
 fn start_line(line: &str) -> Option<bool> {
+    if events::on() {
+        return (events::parse(line) == Ok(events::Command::Go)).then_some(true);
+    }
     match line.trim().to_ascii_lowercase().as_str() {
         "" => Some(true),
         "q" | "quit" | "exit" => Some(false),
@@ -2446,7 +2547,7 @@ fn start_line(line: &str) -> Option<bool> {
 }
 
 /// The setup guide's introduction to input calibration.
-const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts recording (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
+const INPUTS_GUIDE: &str = "This measures how far each trigger, grip and thumbstick moves, so in SteamVR a full pull reads\nas a full pull.\nEach step starts measuring (one beep) as soon as both hands are in position (Enter also starts\nit) and ends at the double beep.";
 
 /// The four input calibration steps, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2464,6 +2565,16 @@ impl CalStep {
         CalStep::Grips,
         CalStep::Sticks,
     ];
+
+    /// Its name in `setup --events`.
+    fn id(self) -> &'static str {
+        match self {
+            CalStep::Rest => "rest",
+            CalStep::Triggers => "triggers",
+            CalStep::Grips => "grips",
+            CalStep::Sticks => "sticks",
+        }
+    }
 
     /// Seconds recorded and the fewest fresh samples each hand must give.
     fn length(self) -> (u64, usize) {
@@ -2534,32 +2645,53 @@ impl InPosition {
 /// that never reach the expected travel).
 fn input_gate(step: CalStep) -> Result<(), String> {
     discard_typed_ahead();
+    events::prompt(step.id(), step.guided(), &["go", "quit"], false);
     let start = Instant::now();
     let mut gate = InPosition::default();
     let mut hinted = false;
+    let mut ticker = events::Ticker::new(EVENT_PERIOD);
     loop {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
-        match console::next_line(Duration::from_millis(30)) {
+        match next_line(Duration::from_millis(30)) {
             Line::Closed => {
                 return Err("input calibration needs an interactive terminal; input closed".into())
             }
             Line::Typed(line) => match start_line(&line) {
                 Some(true) => return Ok(()),
                 Some(false) => return Err("input calibration stopped; no calibration saved".into()),
-                None => println!("      (Enter records now, q quits)"),
+                None => println!("      (Enter measures now, q quits)"),
             },
             Line::NotYet => {}
         }
-        if gate.update(step, &raw_inputs()?, shm::now_ns()) {
+        let raw = raw_inputs()?;
+        let ready = gate.update(step, &raw, shm::now_ns());
+        if events::on() && (ready || ticker.due()) {
+            let mut metrics = input_metrics(&raw);
+            metrics["in_position"] = ready.into();
+            events::progress("inputs", None, None, step.id(), metrics);
+        }
+        if ready {
             return Ok(());
         }
         if !hinted && start.elapsed() > Duration::from_secs(8) {
             hinted = true;
-            println!("      (not detected yet: press Enter to record anyway)");
+            println!("      (not detected yet: press Enter to measure anyway)");
         }
     }
+}
+
+/// How often `setup --events` reports a step that changes continuously.
+const EVENT_PERIOD: Duration = Duration::from_millis(250);
+
+/// Both hands' raw controls, for `setup --events` to show.
+fn input_metrics(raw: &RawInputs) -> serde_json::Value {
+    let hand = |h: &RawInput| {
+        serde_json::json!({"connected": h.connected, "trigger": h.trigger, "grip": h.grip,
+            "stick": h.stick})
+    };
+    serde_json::json!({"left": hand(&raw.hands[HAND_LEFT]), "right": hand(&raw.hands[HAND_RIGHT])})
 }
 
 /// `pulses` short buzzes from both controllers and as many beeps from the speakers: one starts a timed step, two
@@ -2586,7 +2718,7 @@ fn input_enter(prompt: &str) -> Result<(), String> {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
-        match console::next_line(Duration::from_millis(100)) {
+        match next_line(Duration::from_millis(100)) {
             Line::Closed => {
                 return Err(
                     "input calibration requires Enter confirmation; standard input is closed"
@@ -2600,23 +2732,37 @@ fn input_enter(prompt: &str) -> Result<(), String> {
 }
 
 fn collect_inputs(
+    step: CalStep,
     identities: &[String; 2],
     last_ns: &mut [u64; 2],
-    seconds: u64,
-    minimum: usize,
     quiet: bool,
 ) -> Result<[Vec<RawInput>; 2], String> {
+    let (seconds, minimum) = step.length();
     if !quiet {
         println!("Sampling both hands for {seconds} seconds...");
     }
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(seconds);
     let mut phase = PairedInputPhase::new(*last_ns);
+    let mut ticker = events::Ticker::new(EVENT_PERIOD);
     while Instant::now() < deadline {
         if interrupted() {
             return Err("input calibration cancelled; no calibration saved".into());
         }
         let tick = Instant::now();
-        phase.observe(&raw_inputs()?, identities, shm::now_ns())?;
+        let raw = raw_inputs()?;
+        phase.observe(&raw, identities, shm::now_ns())?;
+        if events::on() && ticker.due() {
+            let elapsed = start.elapsed().as_secs_f64();
+            let total = Some(seconds as f64);
+            events::progress(
+                "inputs",
+                Some(elapsed),
+                total,
+                step.id(),
+                input_metrics(&raw),
+            );
+        }
         thread::sleep(Duration::from_millis(50).saturating_sub(tick.elapsed()));
     }
     *last_ns = phase.last_ns();
@@ -2805,7 +2951,6 @@ fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Res
         let mut phases: [[Vec<RawInput>; 4]; 2] =
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
         for (phase, step) in CalStep::ALL.into_iter().enumerate() {
-            let (seconds, minimum) = step.length();
             if guided {
                 human_action(&format!("  {}/4 {}", phase + 1, step.guided()));
                 input_gate(step)?;
@@ -2813,7 +2958,7 @@ fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Res
             } else {
                 input_enter(step.prompt())?;
             }
-            let samples = collect_inputs(&identities, &mut last_ns, seconds, minimum, guided)?;
+            let samples = collect_inputs(step, &identities, &mut last_ns, guided)?;
             if guided {
                 cue(2);
             }
@@ -3299,9 +3444,7 @@ fn guided_record_start_with(
     reconcile: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     if cancelled() {
-        return Err(
-            "capture interrupted before record-start dispatch; no recording started".into(),
-        );
+        return Err("capture interrupted before log-start dispatch; no logging started".into());
     }
     let response = request();
     if response.as_ref().is_ok_and(|reply| reply.trim() == "ok") {
@@ -3317,7 +3460,7 @@ fn guided_record_start_with(
         .unwrap_or_else(|| "missing or malformed record-start acknowledgement".into());
     reconcile().map_err(|cleanup| format!("{error}; scoped recorder cleanup failed: {cleanup}"))?;
     Err(format!(
-        "{error}; own recording safely stopped if it started"
+        "{error}; own tracking log safely stopped if it started"
     ))
 }
 
@@ -3340,9 +3483,9 @@ impl ScopedRecordingGuard {
         let reply = request(&self.command, RECORD_STOP_TIMEOUT)?;
         if !reply.starts_with("ok stopped ") {
             return Err(if reply.trim() == "ok not-matching" {
-                "recording completion was already acknowledged by another client; capture was not used".into()
+                "tracking log completion was already acknowledged by another client; capture was not used".into()
             } else {
-                format!("recording did not complete: {reply}")
+                format!("logging did not complete: {reply}")
             });
         }
         self.armed = false;
@@ -3373,7 +3516,7 @@ fn recording_capability(status: &serde_json::Value, windows: bool) -> Result<(),
     } else {
         "systemctl --user restart cv1touchd"
     };
-    Err(format!("the cv1touch daemon is older than this cv1touch and can't confirm recordings; restart it: {restart}"))
+    Err(format!("the cv1touch daemon is older than this cv1touch and can't confirm tracking logs; restart it: {restart}"))
 }
 
 fn recording_daemon_status(
@@ -3381,11 +3524,11 @@ fn recording_daemon_status(
     windows: bool,
 ) -> Result<serde_json::Value, String> {
     let status = status
-        .ok_or_else(|| "cannot reach the cv1touch daemon; start it before recording".to_string())?;
+        .ok_or_else(|| "cannot reach the cv1touch daemon; start it before logging".to_string())?;
     recording_capability(&status, windows)?;
     if status["recording"] != false || status["recording_status"]["pending"] == true {
         return Err(
-            "another recording is in progress; run cv1touch record stop before starting a capture"
+            "another tracking log is in progress; run cv1touch record stop before starting a capture"
                 .into(),
         );
     }
@@ -3477,6 +3620,10 @@ trait CaptureFeedback {
     fn started(&mut self) -> Result<(), String>;
     fn poll(&mut self) -> Result<bool, String>;
     fn stopped(&mut self) -> Result<(), String>;
+    /// How far the capture has got, for `setup --events` to show.
+    fn metrics(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 fn capture_free_named(
@@ -3526,7 +3673,7 @@ fn capture_free_named_with_feedback(
     // the Touches as cv1touchd tracks them, for the feedback: SteamVR's copy may be paused
     let (reader, frames_out, frames_in) = if feedback.is_some() {
         let reader = touch_reader().map_err(|error| {
-            eprintln!("cv1touch: {error}; no recording started");
+            eprintln!("cv1touch: {error}; no logging started");
             1
         })?;
         let (tx, rx) = std::sync::mpsc::channel::<PoseFrame>();
@@ -3586,7 +3733,7 @@ fn capture_free_named_with_feedback(
     discard_typed_ahead();
     if chatty {
         println!(
-            "recording {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
+            "logging {} (stops on Enter or Ctrl+C, keeping the data, or after {max_s} s)",
             rec.display()
         );
     }
@@ -3594,6 +3741,7 @@ fn capture_free_named_with_feedback(
     let mut feedback_error = feedback.as_mut().and_then(|hook| hook.started().err());
     let deadline = start + max_s * 1_000_000_000;
     let mut last_print = 0u64;
+    let mut ticker = events::Ticker::new(EVENT_PERIOD);
     loop {
         if interrupted() || feedback_error.is_some() {
             break;
@@ -3612,14 +3760,23 @@ fn capture_free_named_with_feedback(
             }
         }
         let wait = Duration::from_millis(if feedback.is_some() { 20 } else { 200 });
-        if console::next_line(wait) != Line::NotYet {
+        let stop_early = capture_line_stops(next_line(wait));
+        if stop_early || interrupted() {
             break;
         }
         let now = shm::now_ns();
         if now >= deadline {
             break;
         }
-        if now - last_print >= 1_000_000_000 {
+        if events::on() {
+            if ticker.due() {
+                let metrics = feedback
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, |f| f.metrics());
+                let elapsed = (now - start) as f64 * 1e-9;
+                events::progress("capture", Some(elapsed), Some(max_s as f64), "", metrics);
+            }
+        } else if now - last_print >= 1_000_000_000 {
             last_print = now;
             let _ = write!(io::stdout(), "\r  {:5.1} s   ", (now - start) as f64 * 1e-9);
             let _ = io::stdout().flush();
@@ -3663,7 +3820,7 @@ fn capture_free_named_with_feedback(
     else {
         let _ = writeln!(
             io::stderr(),
-            "cv1touch: no reference controller or headset was tracked (recording kept at {})",
+            "cv1touch: no reference controller or headset was tracked (log kept at {})",
             rec.display()
         );
         return Err(1);
@@ -4889,7 +5046,7 @@ fn capture_measurements(
         .iter()
         .any(|m| m.calibration_unix_s == calibration_unix_s)
     {
-        return Err(format!("{why}: no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+        return Err(format!("{why}: no station measured, so the registration is unchanged and keeps the stations measured before; log again"));
     }
     println!("{why}: no station measured");
     Ok((None, Vec::new()))
@@ -4935,7 +5092,7 @@ fn initial_registration(universe_id: u64) -> align::Registration {
 
 fn register_headset() -> i32 {
     let base = match capture_free(150,
-        "Headset registration: the recording runs from now, for up to 150 s; the fit keeps only the stretch in\n\
+        "Headset registration: logging runs from now, for up to 150 s; the fit keeps only the stretch in\n\
          which both Touches moved rigidly with the headset, so take your time. Press each Touch firmly to a side\n\
          of the headset, away from its tracking surface. Turn two slow circles each way, then nod and tilt your\n\
          head repeatedly. Keep the Touches attached for the entire motion; release them, then press Enter.\n\
@@ -6785,7 +6942,14 @@ fn consistency_cmd(rec: &Path, cal: &Path) -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `setup --events` takes setup's other flags, in any place
+    if words.first() == Some(&"setup") && !words.contains(&"--check") {
+        if let Some(at) = words.iter().position(|w| *w == "--events") {
+            words.remove(at);
+            guided_setup::EVENTS.store(true, Ordering::Relaxed);
+        }
+    }
     if let Some((code, text)) = help(&words) {
         if code == 0 {
             print!("{text}");
@@ -6835,13 +6999,16 @@ fn main() {
         ["doctor", "--json"] => doctor(true),
         ["alignment", "reload"] => send("alignment reload"),
         ["stop"] => stop(),
-        ["report"] => report::run(None),
+        ["report", flags @ ..] if report::flags(flags).is_some() => {
+            let (out, json, open) = report::flags(flags).unwrap();
+            report::run(out, json, open)
+        }
         ["sensors"] => sensors::status(),
         ["sensors", "install"] => sensors::install(),
         ["sensors", "remove"] => sensors::remove(),
-        ["finish-setup"] => finish_setup::run(),
+        ["finish-setup"] => finish_setup::run(false),
+        ["finish-setup", "--json"] => finish_setup::run(true),
         ["steamvr", "check-stopped"] => steamvr_stopped(),
-        ["report", "--out", path] => report::run(Some(PathBuf::from(path))),
         ["calibration", "capture"] => send("calibration capture"),
         ["calibration", "provisional"] => send("calibration provisional"),
         ["calibration", "load", path] => {
@@ -6982,6 +7149,9 @@ fn main() {
         ["universe-watch", on @ ("on" | "off")] => send(&format!("universe-watch {on}")),
         ["tilt"] => send("tilt"),
         ["tilt", deg] => send(&format!("tilt {deg}")),
+        ["pin-base-station"] => pin_base_station(None),
+        ["pin-base-station", "on"] => pin_base_station(Some(true)),
+        ["pin-base-station", "off"] => pin_base_station(Some(false)),
         ["vr-pulse", index] => vr_pulse(index, "300"),
         ["vr-pulse", index, ms] => vr_pulse(index, ms),
         ["fit-render"] => fit_render(None),
@@ -6995,6 +7165,64 @@ fn main() {
 }
 #[cfg(test)]
 mod tests {
+    /// Through a running daemon the command is passed on and its reply worded; with none it is
+    /// read from or written to the settings file, keeping the tilt; anything else is an error.
+    #[test]
+    fn pin_base_station_goes_through_the_daemon_or_the_settings_file() {
+        use std::io;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let mut sent = String::new();
+        let text = super::pin_base_station_with(Some(false), &path, |line| {
+            sent = line.to_string();
+            Ok("ok off".into())
+        })
+        .unwrap();
+        assert_eq!(sent, "pin-base-station off");
+        assert!(text.starts_with("Base-station pinning: off"), "{text}");
+        assert!(!path.exists(), "the daemon saves it, not the command");
+        let text =
+            super::pin_base_station_with(
+                None,
+                &path,
+                |_| Ok("ok on (not saved: disk full)".into()),
+            )
+            .unwrap();
+        assert!(
+            text.starts_with("Base-station pinning: on")
+                && text.ends_with(" (not saved: disk full)"),
+            "{text}"
+        );
+        let down = |_: &str| Err(io::Error::new(io::ErrorKind::ConnectionRefused, "down"));
+        cv1touch::settings::save(
+            &path,
+            &cv1touch::settings::Settings {
+                tilt_deg: Some(5.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = super::pin_base_station_with(Some(false), &path, down).unwrap();
+        assert!(text.starts_with("Base-station pinning: off"), "{text}");
+        assert_eq!(
+            cv1touch::settings::load(&path).map(|s| (s.pin_base_station, s.tilt_deg)),
+            Ok((false, Some(5.0)))
+        );
+        let text = super::pin_base_station_with(None, &path, down).unwrap();
+        assert!(text.starts_with("Base-station pinning: off"), "{text}");
+        assert!(
+            super::pin_base_station_with(None, &path, |_| Ok("err unknown command".into()))
+                .is_err()
+        );
+        let busy = |_: &str| Err(io::Error::new(io::ErrorKind::TimedOut, "slow"));
+        assert!(super::pin_base_station_with(Some(true), &path, busy).is_err());
+        assert_eq!(
+            cv1touch::settings::load(&path).map(|s| s.pin_base_station),
+            Ok(false),
+            "a daemon that does not answer is not bypassed"
+        );
+    }
+
     #[test]
     fn help_lists_the_user_commands_and_how_to_see_the_rest() {
         let (code, text) = super::help(&["--help"]).unwrap();
@@ -7075,7 +7303,8 @@ mod tests {
             let (code, text) = super::help(args).unwrap();
             assert_eq!(code, 0, "{args:?}");
             assert!(
-                text.contains("cv1touch setup [--no-slip-check]") && text.contains("setup --check"),
+                text.contains("cv1touch setup [--events] [--no-slip-check]")
+                    && text.contains("setup --check"),
                 "{text}"
             );
             assert_eq!(text.lines().count(), 2, "{text}");
@@ -8639,7 +8868,10 @@ mod tests {
                 Ok(format!("ok {old}"))
             },
         );
-        assert!(result.err().unwrap().contains("can't confirm recordings"));
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("can't confirm tracking logs"));
         assert_eq!(requests, ["status"]);
         let new = serde_json::json!({"recording_scoped_stop":true,"recording_durable_stop":true,"recording":false});
         assert!(recording_daemon_status(Some(new), false).is_ok());
@@ -9364,7 +9596,7 @@ mod tests {
         let refused = capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100).unwrap_err();
         assert_eq!(
             refused,
-            "SteamVR moved base station LHB-TEST-A, which it tracked LHR-TEST from, by up to 3.0 mm, 0.00 deg during the capture: no station measured, so the registration is unchanged and keeps the stations measured before; record again"
+            "SteamVR moved base station LHB-TEST-A, which it tracked LHR-TEST from, by up to 3.0 mm, 0.00 deg during the capture: no station measured, so the registration is unchanged and keeps the stations measured before; log again"
         );
         // nothing to keep: written as before, measuring none
         for previous in [
@@ -9386,7 +9618,7 @@ mod tests {
         for base in [Some("LHB-TEST-C"), None] {
             assert!(capture_measurements(&tf, base, "LHR-TEST", &x, &earlier, 100)
                 .unwrap_err()
-                .ends_with("no station measured, so the registration is unchanged and keeps the stations measured before; record again"));
+                .ends_with("no station measured, so the registration is unchanged and keeps the stations measured before; log again"));
         }
         // the base left still: measured, beside the earlier one
         let (now, kept) =
@@ -9565,5 +9797,37 @@ mod tests {
             ..ok
         };
         assert!(touch_sample(&asleep, 1_050_000_000).is_none());
+    }
+
+    #[test]
+    fn event_capture_accepts_finish_and_rejects_other_commands() {
+        // Terminal mode keeps Enter-to-stop and EOF behavior.
+        assert!(!capture_line_stops(Line::NotYet));
+        assert!(capture_line_stops(Line::Typed(String::new())));
+        assert!(capture_line_stops(Line::Typed("recheck\n".into())));
+        assert!(capture_line_stops(Line::Closed));
+
+        // Event mode rejects unrelated commands and blank lines, accepts `finish`, and still
+        // routes `quit` through `events::stopped()`.
+        let sink = events::tests::scripted(&["recheck", "", "bogus", "finish", "quit"]);
+        let wait = Duration::from_millis(1);
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(!events::stopped());
+        assert!(capture_line_stops(next_line(wait)));
+        assert!(!events::stopped());
+        assert!(!capture_line_stops(next_line(wait)));
+        assert!(events::stopped());
+        events::end();
+
+        let events = sink.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "rejected");
+        assert_eq!(events[0]["command"], "recheck");
+        assert_eq!(events[1]["event"], "rejected");
+        assert_eq!(events[1]["command"], "");
+        assert_eq!(events[2]["event"], "rejected");
+        assert_eq!(events[2]["command"], "bogus");
     }
 }
