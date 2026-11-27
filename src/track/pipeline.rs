@@ -9,7 +9,7 @@
 //! clock fit, then into each controller's clock through its own fit, plus a constant offset (the
 //! difference of the two links' minimum transport delays and the exposure midpoint).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use nalgebra::{Isometry3, Vector2, Vector3};
 
@@ -17,11 +17,13 @@ use super::clock::{LinearClock, Unwrap32};
 use super::epochs::{Checks, Evidence, State};
 use super::factory::Gyro;
 use super::tracker::{
-    CameraAgreement, EnginePose, ForeignLed, ImuSample, Outcome, Output, Params, Stats, Tracker,
+    AcceptedObs, CameraAgreement, EnginePose, ForeignLed, ImuSample, Outcome, Output, Params,
+    Stats, Tracker,
 };
 use super::vision::{Blob, Body, Camera};
 use crate::calib::camera::CameraModel;
-use crate::calib::capture::{Led, MATCH_GOOD, MATCH_STRONG};
+use crate::calib::capture::{Led, View, WandSample, MATCH_GOOD, MATCH_STRONG, MIN_VIEW_OBS};
+use crate::calib::refit::RefitSample;
 use crate::calib::{iso_from_xyzw, DEVICE_LEFT, DEVICE_RIGHT};
 use crate::engine::{cstr_field, FrameInfo};
 use crate::shm::{HAND_LEFT, HAND_RIGHT};
@@ -43,6 +45,22 @@ pub const PROBE_DELAY_NS: u64 = 80_000_000;
 /// Probed frames waiting for the track to pass their exposure, per hand at most: about a second
 /// of one sensor; a controller asleep drains none.
 pub const PROBING_CAP: usize = 64;
+
+/// Maximum tracker pose standard deviation (metres) for a frame to contribute to a joint refit.
+pub const REFIT_MAX_POS_SD: f64 = 0.004;
+/// Minimum controller motion between consecutively kept joint-refit exposures per hand (metres,
+/// radians), so a resting controller contributes one sample instead of filling the buffer.
+pub const REFIT_THIN_M: f64 = 0.040;
+pub const REFIT_THIN_RAD: f64 = 8.0 * std::f64::consts::PI / 180.0;
+/// Minimum host-time spacing between consecutively kept joint-refit exposures per hand so the
+/// bounded ring buffer spans tens of seconds of varied play instead of one brief wrist burst.
+pub const REFIT_MIN_INTERVAL_NS: u64 = 100_000_000;
+/// Default cap on kept multi-camera joint-refit samples when `Options::collect_refit` is set.
+pub const DEFAULT_REFIT_MAX_SAMPLES: usize = 800;
+/// Keep staged exposures open this long so cameras with differing USB/decode latency join the
+/// same multi-camera sample before it is emitted.
+const REFIT_STAGE_TIMEOUT_NS: u64 = 100_000_000;
+const REFIT_STAGING_CAP: usize = 16;
 
 /// The headset clock (microseconds) of one of its IMU reports.
 pub fn hmd_report_timestamp(d: &[u8]) -> Option<u32> {
@@ -95,6 +113,10 @@ pub struct Options {
     /// Per hand, a verified constant accelerometer bias to start each new tracker from (see
     /// `track::biases::Entry::verified_accel`).
     pub seed_verified_accel: [Option<Vector3<f64>>; 2],
+    /// Collect thinned, synchronised multi-camera tracker observations for joint sensor refit.
+    pub collect_refit: bool,
+    /// Maximum kept joint-refit samples (oldest evicted first); 0 keeps all thinned samples.
+    pub refit_max_samples: usize,
 }
 
 impl Default for Options {
@@ -107,6 +129,8 @@ impl Default for Options {
             delayed_ns: None,
             seed_biases: [None, None],
             seed_verified_accel: [None, None],
+            collect_refit: false,
+            refit_max_samples: DEFAULT_REFIT_MAX_SAMPLES,
         }
     }
 }
@@ -194,6 +218,7 @@ fn count_observed(
 
 struct Pending {
     t_e: u64,
+    exposure_hmd_ns: u64,
     exposure_host_ns: u64,
     frame_start_host_ns: u64,
     camera: usize,
@@ -201,6 +226,183 @@ struct Pending {
     blobs: Vec<Blob>,
     engine: Option<EnginePose>,
     identity_epoch: Option<u64>,
+}
+
+struct OpenExposure {
+    exposure_hmd_ns: u64,
+    device_id: i32,
+    device_time_ns: u64,
+    host_ns: u64,
+    seed: Isometry3<f64>,
+    views: Vec<View>,
+}
+
+/// Collects synchronised multi-camera LED observations from confirmed tracker updates, thinned by
+/// controller motion so resting controllers do not crowd out varied poses.
+struct RefitCollector {
+    staging: [Vec<OpenExposure>; 2],
+    last_kept: [Option<(Isometry3<f64>, u64)>; 2],
+    samples: VecDeque<RefitSample>,
+    max_samples: usize,
+    total_emitted: u64,
+}
+
+impl RefitCollector {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            staging: [Vec::new(), Vec::new()],
+            last_kept: [None, None],
+            samples: VecDeque::new(),
+            max_samples,
+            total_emitted: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        hand: usize,
+        device_id: i32,
+        exposure_hmd_ns: u64,
+        host_ns: u64,
+        obs: AcceptedObs,
+    ) {
+        if obs.obs.len() < MIN_VIEW_OBS || obs.pos_sd > REFIT_MAX_POS_SD {
+            return;
+        }
+        self.drain_ready(hand, host_ns);
+        if let Some(entry) = self.staging[hand].iter_mut().find(|e| {
+            e.exposure_hmd_ns == exposure_hmd_ns
+                && e.host_ns.abs_diff(host_ns) <= REFIT_STAGE_TIMEOUT_NS
+        }) {
+            if !entry.views.iter().any(|v| v.camera == obs.camera) {
+                entry.views.push(View {
+                    camera: obs.camera,
+                    cam_from_obj: None,
+                    strong: false,
+                    obs: obs.obs,
+                });
+                entry.seed = obs.world_from_model;
+            }
+            return;
+        }
+        if self.staging[hand].len() >= REFIT_STAGING_CAP {
+            let oldest = self.staging[hand].remove(0);
+            self.emit(hand, oldest);
+        }
+        self.staging[hand].push(OpenExposure {
+            exposure_hmd_ns,
+            device_id,
+            device_time_ns: obs.t_e,
+            host_ns,
+            seed: obs.world_from_model,
+            views: vec![View {
+                camera: obs.camera,
+                cam_from_obj: None,
+                strong: false,
+                obs: obs.obs,
+            }],
+        });
+    }
+
+    fn drain_ready(&mut self, hand: usize, now_host_ns: u64) {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.staging[hand].len() {
+            let aged = now_host_ns.saturating_sub(self.staging[hand][i].host_ns)
+                > REFIT_STAGE_TIMEOUT_NS
+                || self.staging[hand][i].host_ns.saturating_sub(now_host_ns) > 1_000_000_000;
+            if aged {
+                ready.push(self.staging[hand].remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready.sort_by_key(|e| e.host_ns);
+        for entry in ready {
+            self.emit(hand, entry);
+        }
+    }
+
+    fn expire(&mut self, now_host_ns: u64) {
+        let mut ready: Vec<(usize, OpenExposure)> = Vec::new();
+        for (hand, staged) in self.staging.iter_mut().enumerate() {
+            let mut i = 0;
+            while i < staged.len() {
+                let aged = now_host_ns.saturating_sub(staged[i].host_ns) > REFIT_STAGE_TIMEOUT_NS
+                    || staged[i].host_ns.saturating_sub(now_host_ns) > 1_000_000_000;
+                if aged {
+                    ready.push((hand, staged.remove(i)));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        ready.sort_by_key(|(_, e)| e.host_ns);
+        for (hand, entry) in ready {
+            self.emit(hand, entry);
+        }
+    }
+    fn emit(&mut self, hand: usize, entry: OpenExposure) {
+        if entry.views.len() < 2 {
+            return;
+        }
+        if let Some((last, last_t)) = &self.last_kept[hand] {
+            let dt = entry.host_ns.abs_diff(*last_t);
+            let d = last.inverse() * entry.seed;
+            let moved =
+                d.translation.vector.norm() >= REFIT_THIN_M || d.rotation.angle() >= REFIT_THIN_RAD;
+            if dt < REFIT_MIN_INTERVAL_NS || !moved {
+                return;
+            }
+        }
+        self.last_kept[hand] = Some((entry.seed, entry.host_ns));
+        self.samples.push_back(RefitSample {
+            sample: WandSample {
+                device_id: entry.device_id,
+                device_time_ns: entry.device_time_ns,
+                host_ns: entry.host_ns,
+                views: entry.views,
+            },
+            seed: entry.seed,
+        });
+        self.total_emitted = self.total_emitted.saturating_add(1);
+        if self.max_samples > 0 && self.samples.len() > self.max_samples {
+            self.samples.pop_front();
+        }
+    }
+
+    fn flush(&mut self) {
+        let mut pending: Vec<(usize, OpenExposure)> = Vec::new();
+        for (hand, staged) in self.staging.iter_mut().enumerate() {
+            for entry in staged.drain(..) {
+                pending.push((hand, entry));
+            }
+        }
+        pending.sort_by_key(|(_, e)| e.host_ns);
+        for (hand, entry) in pending {
+            self.emit(hand, entry);
+        }
+    }
+
+    fn remove_camera(&mut self, id: usize) {
+        for staged in &mut self.staging {
+            for entry in staged.iter_mut() {
+                entry.views.retain(|v| v.camera != id);
+            }
+            staged.retain(|e| !e.views.is_empty());
+        }
+        for sample in &mut self.samples {
+            sample.sample.views.retain(|v| v.camera != id);
+        }
+        self.samples.retain(|s| s.sample.views.len() >= 2);
+    }
+
+    fn clear(&mut self) {
+        self.staging[0].clear();
+        self.staging[1].clear();
+        self.last_kept = [None, None];
+        self.samples.clear();
+    }
 }
 
 struct PendingProbe {
@@ -295,10 +497,12 @@ pub struct Pipeline {
     pub lifecycle_overflows: u64,
     pub events: Vec<FrameEvent>,
     pub probes: Vec<Probe>,
+    refit: RefitCollector,
 }
 
 impl Pipeline {
     pub fn new(opts: Options) -> Pipeline {
+        let max_refit = opts.refit_max_samples;
         Pipeline {
             opts,
             hmd_clock: LinearClock::default(),
@@ -323,6 +527,7 @@ impl Pipeline {
             lifecycle_overflows: 0,
             events: Vec::new(),
             probes: Vec::new(),
+            refit: RefitCollector::new(max_refit),
         }
     }
 
@@ -378,6 +583,7 @@ impl Pipeline {
         }
         self.events.retain(|e| e.camera != id);
         self.probes.retain(|p| p.camera != id);
+        self.refit.remove_camera(id);
         for tracker in self.trackers.iter_mut().flatten() {
             tracker.forget_camera(id);
         }
@@ -448,6 +654,13 @@ impl Pipeline {
             .is_some_and(|c| self.probed.contains(&c.id))
     }
 
+    /// Whether the sensor `serial`'s frames are ignored (neither tracked with nor probed).
+    pub fn is_ignored(&self, serial: &str) -> bool {
+        self.cams
+            .get(serial)
+            .is_some_and(|c| self.ignored.contains(&c.id))
+    }
+
     /// The registration id of the sensor `serial`.
     pub fn camera_id(&self, serial: &str) -> Option<usize> {
         self.cams.get(serial).map(|c| c.id)
@@ -464,6 +677,68 @@ impl Pipeline {
     /// The sensor `serial`'s camera model and the pose it is tracked with.
     pub fn camera(&self, serial: &str) -> Option<&Camera> {
         self.cams.get(serial).map(|c| &c.camera)
+    }
+
+    /// Currently registered sensors: `(camera_id, serial, Camera)` in serial order.
+    pub fn registered_sensors(&self) -> Vec<(usize, String, Camera)> {
+        self.cams
+            .iter()
+            .map(|(serial, reg)| (reg.id, serial.clone(), reg.camera))
+            .collect()
+    }
+
+    /// Flushes any open multi-camera exposures into the joint-refit sample buffer.
+    pub fn flush_refit_samples(&mut self) {
+        self.refit.flush();
+    }
+
+    /// Emits staged joint-refit exposures older than the staging window at `now_host_ns` while
+    /// keeping fresh in-flight exposures open so late sibling sensor views merge without splitting.
+    pub fn expire_refit_samples(&mut self, now_host_ns: u64) {
+        self.refit.expire(now_host_ns);
+    }
+
+    /// Number of multi-camera joint-refit samples currently buffered.
+    pub fn refit_sample_count(&self) -> usize {
+        self.refit.samples.len()
+    }
+
+    /// Total multi-camera joint-refit samples emitted into the buffer so far (monotonic even
+    /// when the ring buffer is at capacity or trimmed).
+    pub fn refit_total_samples(&self) -> u64 {
+        self.refit.total_emitted
+    }
+
+    /// Copies the currently buffered multi-camera joint-refit samples in chronological order.
+    pub fn refit_samples(&self) -> Vec<RefitSample> {
+        self.refit.samples.iter().cloned().collect()
+    }
+
+    /// Flushes and takes all buffered multi-camera joint-refit samples.
+    pub fn take_refit_samples(&mut self) -> Vec<RefitSample> {
+        self.refit.flush();
+        self.refit.samples.drain(..).collect()
+    }
+
+    /// Discards buffered and staged joint-refit samples (for instance after sensor poses change).
+    pub fn reset_refit_samples(&mut self) {
+        self.refit.clear();
+    }
+
+    /// Drops the oldest half of the buffered joint-refit samples so recent exposures dominate
+    /// after a mid-session regime shift (for instance a bumped sensor late in a play session).
+    pub fn trim_refit_samples_oldest_half(&mut self) {
+        let drop = self.refit.samples.len() / 2;
+        self.refit.samples.drain(..drop);
+    }
+
+    /// Number of currently buffered joint-refit samples that include a view from `camera_id`.
+    pub fn refit_camera_views(&self, camera_id: usize) -> usize {
+        self.refit
+            .samples
+            .iter()
+            .filter(|s| s.sample.views.iter().any(|v| v.camera == camera_id))
+            .count()
     }
 
     pub fn has_body(&self, hand: usize) -> bool {
@@ -483,6 +758,7 @@ impl Pipeline {
                 self.camera_slots,
             );
             tr.debug = self.opts.trace;
+            tr.collect_obs = self.opts.collect_refit;
             if let Some(g) = self.opts.seed_biases[hand] {
                 seed_gyro_bias(&mut tr, g);
             }
@@ -603,6 +879,7 @@ impl Pipeline {
     /// The headset clock (microseconds) of a report received at `host_ns`.
     pub fn hmd_clock_sample(&mut self, host_ns: u64, us: u32) {
         if self.hmd_clock.observe(self.hmd_stamps.extend(us), host_ns) {
+            self.refit.flush();
             for hand in [HAND_LEFT, HAND_RIGHT] {
                 self.clear_exposure_work(hand);
             }
@@ -880,6 +1157,7 @@ impl Pipeline {
     /// probes still tagged by its epochs. The daemon gives each engine session a new Pipeline;
     /// a replay keeps one across the reopen, for its tracking, and calls this.
     pub fn new_engine_session(&mut self) {
+        self.refit.flush();
         self.inspecting.clear();
         self.identity_evidence.clear();
         self.observed_evidence.clear();
@@ -985,13 +1263,14 @@ impl Pipeline {
                     identified || d.match_flags & crate::engine::MATCH_INSPECTION_MOTION != 0;
             }
         }
-        let exposure = self
-            .hmd_stamps
-            .relative(info.exposure_hmd_ts)
-            .and_then(|e| self.hmd_clock.to_host(e));
-        let (Some(registered), Some(exposure), true) =
-            (registered, exposure, info.exposure_valid != 0)
-        else {
+        let exposure_hmd_ns = self.hmd_stamps.relative(info.exposure_hmd_ts);
+        let exposure = exposure_hmd_ns.and_then(|e| self.hmd_clock.to_host(e));
+        let (Some(registered), Some(exposure_hmd_ns), Some(exposure), true) = (
+            registered,
+            exposure_hmd_ns,
+            exposure,
+            info.exposure_valid != 0,
+        ) else {
             self.frames_skipped += 1;
             return;
         };
@@ -1089,6 +1368,7 @@ impl Pipeline {
                 at,
                 Pending {
                     t_e,
+                    exposure_hmd_ns,
                     exposure_host_ns: exposure,
                     frame_start_host_ns: info.frame_start_host_ns,
                     camera,
@@ -1122,6 +1402,7 @@ impl Pipeline {
             trackers,
             pending,
             inspection_starts,
+            inspecting,
             observed_evidence,
             identity_lifetimes,
             lifecycle_changes,
@@ -1129,6 +1410,7 @@ impl Pipeline {
             clocks,
             events,
             opts,
+            refit,
             ..
         } = self;
         let (left, right) = trackers.split_at_mut(1);
@@ -1194,6 +1476,17 @@ impl Pipeline {
             let outcome = tr.frame(p.t_e, p.camera, &p.cam, &p.blobs, p.engine, &foreign);
             if outcome == Outcome::Early {
                 break;
+            }
+            if let Some(obs) = tr.take_last_obs() {
+                if p.identity_epoch == Some(0) && !inspecting.contains(&p.camera) {
+                    refit.push(
+                        hand,
+                        tr.device_id,
+                        p.exposure_hmd_ns,
+                        p.exposure_host_ns,
+                        obs,
+                    );
+                }
             }
             if let (Some(epoch), Some(evidence)) =
                 (p.identity_epoch, observed_evidence.get_mut(&p.camera))
@@ -1763,6 +2056,7 @@ mod tests {
         for epoch in [valid, invalid] {
             p.pending[HAND_RIGHT].push(Pending {
                 t_e: u64::MAX,
+                exposure_hmd_ns: host,
                 exposure_host_ns: host,
                 frame_start_host_ns: host,
                 camera: 2,
@@ -3382,6 +3676,7 @@ mod tests {
         for hand in [HAND_LEFT, HAND_RIGHT] {
             p.pending[hand].push(Pending {
                 t_e: device + 100_000_000,
+                exposure_hmd_ns: host + 100_000_000,
                 exposure_host_ns: host + 100_000_000,
                 frame_start_host_ns: host + 100_000_000,
                 camera,
@@ -3494,6 +3789,7 @@ mod tests {
             camera: 0,
             cam: removed_camera,
             t_e: 1,
+            exposure_hmd_ns: 1,
             exposure_host_ns: 1,
             frame_start_host_ns: 1,
             blobs: Vec::new(),
@@ -3817,5 +4113,126 @@ mod frame_allocation_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod refit_collector_tests {
+    use super::*;
+    use crate::calib::capture::Observation;
+    use nalgebra::{Translation3, UnitQuaternion};
+
+    fn obs(camera: usize, t_e: u64, x_m: f64) -> AcceptedObs {
+        AcceptedObs {
+            camera,
+            t_e,
+            world_from_model: Isometry3::from_parts(
+                Translation3::new(x_m, 1.0, 0.0),
+                UnitQuaternion::identity(),
+            ),
+            pos_sd: 0.001,
+            obs: (0..MIN_VIEW_OBS)
+                .map(|led| Observation {
+                    led,
+                    xy: Vector2::new(100.0 + led as f64, 200.0),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn groups_by_hmd_exposure_and_preserves_newer_exposures_when_late_frame_arrives() {
+        let mut c = RefitCollector::new(100);
+        // Exposure 1 arrives from camera 0 and camera 1; camera 2 arrives 40 ms later (within the
+        // staging window) after exposure 2 has already started arriving.
+        c.push(0, DEVICE_LEFT, 10_000_000, 100_000_000, obs(0, 1, 0.0));
+        c.push(0, DEVICE_LEFT, 10_000_000, 102_000_000, obs(1, 1, 0.0));
+        c.push(0, DEVICE_LEFT, 110_000_000, 200_000_000, obs(0, 2, 0.05));
+        c.push(0, DEVICE_LEFT, 10_000_000, 101_000_000, obs(2, 1, 0.0));
+        assert_eq!(c.samples.len(), 0);
+        // Exposure 3 arrives >100 ms after exposure 1 (flushes exposure 1 with all 3 cameras, while
+        // keeping exposure 2 open).
+        c.push(0, DEVICE_LEFT, 210_000_000, 300_000_000, obs(0, 3, 0.10));
+        assert_eq!(c.samples.len(), 1);
+        assert_eq!(c.samples[0].sample.views.len(), 3);
+        // A late stray frame must not prematurely flush exposure 2 or 3.
+        c.push(0, DEVICE_LEFT, 5_000_000, 95_000_000, obs(3, 0, -0.05));
+        assert_eq!(c.samples.len(), 1);
+        // Camera 1 completes exposure 2 and exposure 3.
+        c.push(0, DEVICE_LEFT, 110_000_000, 202_000_000, obs(1, 2, 0.05));
+        c.push(0, DEVICE_LEFT, 210_000_000, 302_000_000, obs(1, 3, 0.10));
+        c.flush();
+        assert_eq!(c.samples.len(), 3);
+        assert_eq!(c.samples[1].sample.views.len(), 2);
+        assert_eq!(c.samples[2].sample.views.len(), 2);
+    }
+
+    #[test]
+    fn thins_stationary_poses_caps_storage_and_prunes_removed_cameras() {
+        let mut c = RefitCollector::new(3);
+        // Stationary controller: 10 exposures at the same pose collapse to 1 sample.
+        for k in 0..10u64 {
+            let t = (k + 1) * 150_000_000;
+            c.push(0, DEVICE_LEFT, t, t, obs(0, t, 0.0));
+            c.push(0, DEVICE_LEFT, t, t + 1_000_000, obs(1, t, 0.0));
+        }
+        c.flush();
+        assert_eq!(c.samples.len(), 1);
+        // Moving rapidly within REFIT_MIN_INTERVAL_NS of the kept sample (t=150 ms) is thinned.
+        let burst_t = 200_000_000;
+        c.push(0, DEVICE_LEFT, burst_t, burst_t, obs(0, burst_t, 0.08));
+        c.push(
+            0,
+            DEVICE_LEFT,
+            burst_t,
+            burst_t + 1_000_000,
+            obs(1, burst_t, 0.08),
+        );
+        c.flush();
+        assert_eq!(c.samples.len(), 1);
+        // Moving exposures beyond the cap evict the oldest.
+        for k in 1..=5u64 {
+            let t = (k + 20) * 150_000_000;
+            let x = k as f64 * 0.05;
+            c.push(0, DEVICE_LEFT, t, t, obs(0, t, x));
+            c.push(0, DEVICE_LEFT, t, t + 1_000_000, obs(1, t, x));
+            if k >= 4 {
+                c.push(0, DEVICE_LEFT, t, t + 2_000_000, obs(2, t, x));
+            }
+        }
+        c.flush();
+        assert_eq!(c.samples.len(), 3);
+        // Removing camera 0 leaves only the 2 samples that also had camera 1 + camera 2.
+        c.remove_camera(0);
+        assert_eq!(c.samples.len(), 2);
+        assert!(c
+            .samples
+            .iter()
+            .all(|s| s.sample.views.iter().all(|v| v.camera != 0)));
+
+        // Trimming the oldest half keeps only the newest sample.
+        let newest_t = c.samples.back().unwrap().sample.host_ns;
+        let drop = c.samples.len() / 2;
+        c.samples.drain(..drop);
+        assert_eq!(c.samples.len(), 1);
+        assert_eq!(c.samples[0].sample.host_ns, newest_t);
+    }
+
+    #[test]
+    fn expire_keeps_fresh_staged_exposure_open_until_timeout() {
+        let mut c = RefitCollector::new(100);
+        c.push(0, DEVICE_LEFT, 10_000_000, 100_000_000, obs(0, 1, 0.0));
+        c.push(0, DEVICE_LEFT, 10_000_000, 102_000_000, obs(1, 1, 0.0));
+        // Tick 20 ms later must NOT flush this in-flight exposure prematurely.
+        c.expire(120_000_000);
+        assert_eq!(c.samples.len(), 0);
+        // Sibling sensor arriving 30 ms after exposure merges into the exact same sample.
+        c.push(0, DEVICE_LEFT, 10_000_000, 130_000_000, obs(2, 1, 0.0));
+        assert_eq!(c.samples.len(), 0);
+        // Once past REFIT_STAGE_TIMEOUT_NS (100 ms), expire emits one combined 3-view sample.
+        c.expire(250_000_000);
+        assert_eq!(c.samples.len(), 1);
+        assert_eq!(c.samples[0].sample.views.len(), 3);
+        assert_eq!(c.total_emitted, 1);
     }
 }

@@ -12,9 +12,11 @@ use nalgebra::{Isometry3, Vector3};
 use super::factory::Imu;
 use super::pipeline::{device_hand, FrameEvent, Pipeline, Probe};
 use super::tracker::Stats;
+use super::vision::Camera;
 use crate::calib::camera::CameraModel;
 use crate::calib::capture::Led;
 use crate::calib::file::CalibrationFile;
+use crate::calib::refit::RefitSample;
 use crate::calib::{iso_from_xyzw, vec3};
 use crate::engine::cstr_field;
 use crate::eval::Published;
@@ -44,6 +46,10 @@ pub struct Replay {
     pub probes: Vec<Probe>,
     /// Each sensor's agreement with the others at the end (see `Pipeline::camera_agreement`).
     pub agreement: Vec<(String, super::tracker::CameraAgreement)>,
+    /// With `Options::collect_refit`: thinned synchronised multi-camera tracker observations.
+    pub refit_samples: Vec<RefitSample>,
+    /// Registered sensors at the end of replay: `(camera_id, serial, Camera)` in serial order.
+    pub sensors: Vec<(usize, String, Camera)>,
 }
 
 /// `imu` finds a controller's factory IMU data from its LED model (see `factory`).
@@ -179,5 +185,7 @@ pub fn replay(
     out.agreement = p.camera_agreement();
     out.events = std::mem::take(&mut p.events);
     out.probes.append(&mut p.probes);
+    out.refit_samples = p.take_refit_samples();
+    out.sensors = p.registered_sensors();
     Ok(out)
 }

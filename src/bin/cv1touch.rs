@@ -6118,72 +6118,115 @@ fn calibrate_rig_with(
     run()
 }
 
-/// Re-poses sensors that disagree with the others, against the controller poses the tracker gets
-/// from the others: the worst one first, then again with it fixed, until none improves.
+/// Jointly refits connected sensors from tracker-associated multi-camera exposures in `rec`,
+/// anchored rigidly onto the prior calibration and gated on chronological held-out RMS.
 fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
     let run = || -> Result<i32, String> {
         let mut cal = file::load(path)?;
-        let (models, leds) = track::refine::recording_models(rec)?;
+        let (_models, leds) = track::refine::recording_models(rec)?;
         let dir = track::factory::openhmd_config_dir();
         let imu = |l: &[cv1touch::calib::capture::Led]| track::factory::imu(&dir, l);
-        let mut changed = Vec::new();
-        let mut warned = false;
-        for round in 1..=3 {
-            let mut results = Vec::new();
-            for entry in &cal.sensors {
-                let Some((recorded, model)) = recording_sensor(&models, &entry.serial) else {
-                    continue;
-                };
-                let o = track::replay::Options {
-                    probe_sensors: vec![recorded.clone()],
-                    ..Default::default()
-                };
-                let r = track::replay::replay(rec, &cal, &imu, &o)?;
-                if !warned && r.stopped.is_some() {
-                    replay_warning(&r);
-                    warned = true;
-                }
-                let initial = calib::iso_from_xyzw(entry.orient_xyzw, entry.pos);
-                match track::refine::refine_sensor(
-                    model,
-                    &initial,
-                    [leds[0].as_deref(), leds[1].as_deref()],
-                    &r.probes,
-                    0.002,
-                ) {
-                    Ok(rf) => {
-                        let d = rf.world_from_cam.inverse() * initial;
-                        println!(
-                            "round {round}: {}: {} matches in {} frames; median residual {:.2} -> {:.2} px; moves {:.1} mm, {:.3} deg",
-                            entry.serial,
-                            rf.pairs,
-                            rf.frames,
-                            rf.before_px,
-                            rf.after_px,
-                            d.translation.vector.norm() * 1e3,
-                            d.rotation.angle().to_degrees()
-                        );
-                        results.push((entry.serial.clone(), rf));
-                    }
-                    Err(e) => println!("round {round}: {}: {e}", entry.serial),
-                }
-            }
-            let Some((serial, rf)) = results
-                .into_iter()
-                .filter(|(_, rf)| rf.before_px - rf.after_px > 0.15)
-                .max_by(|a, b| a.1.before_px.total_cmp(&b.1.before_px))
-            else {
-                break;
-            };
-            println!("  -> re-posing {serial}");
-            let entry = cal.sensors.iter_mut().find(|e| e.serial == serial).unwrap();
-            let (orient, pos) = calib::iso_to_xyzw(&rf.world_from_cam);
-            (entry.orient_xyzw, entry.pos, entry.rms_px) = (orient, pos, rf.after_px);
-            changed.push(serial);
+        let o = track::replay::Options {
+            collect_refit: true,
+            refit_max_samples: 0,
+            ..Default::default()
+        };
+        let r = track::replay::replay(rec, &cal, &imu, &o)?;
+        if r.stopped.is_some() {
+            replay_warning(&r);
         }
-        if changed.is_empty() {
-            println!("no sensor improves by re-posing");
+        let mut serials = Vec::new();
+        let mut cameras = Vec::new();
+        let mut prior = Vec::new();
+        let mut id_to_idx = std::collections::HashMap::new();
+        for (cam_id, serial, cam) in &r.sensors {
+            let Some(entry) = cal.sensor(serial) else {
+                continue;
+            };
+            let idx = serials.len();
+            id_to_idx.insert(*cam_id, idx);
+            serials.push(entry.serial.clone());
+            cameras.push(cam.model);
+            prior.push(cam.world_from_cam);
+        }
+        let samples: Vec<calib::refit::RefitSample> = r
+            .refit_samples
+            .into_iter()
+            .filter_map(|mut rs| {
+                rs.sample.views.retain_mut(|v| {
+                    let Some(&idx) = id_to_idx.get(&v.camera) else {
+                        return false;
+                    };
+                    v.camera = idx;
+                    true
+                });
+                (rs.sample.views.len() >= 2).then_some(rs)
+            })
+            .collect();
+        let mut led_map = std::collections::BTreeMap::new();
+        if let Some(l) = &leds[cv1touch::shm::HAND_LEFT] {
+            led_map.insert(calib::DEVICE_LEFT, l.clone());
+        }
+        if let Some(l) = &leds[cv1touch::shm::HAND_RIGHT] {
+            led_map.insert(calib::DEVICE_RIGHT, l.clone());
+        }
+        let res = calib::refit::joint_refit(
+            &serials,
+            &cameras,
+            &prior,
+            &led_map,
+            &samples,
+            &calib::refit::RefitOptions::default(),
+        )?;
+        println!(
+            "joint refit: {} train + {} held-out multi-sensor exposures; held-out RMS {:.3} -> {:.3} px ({} obs)",
+            res.train_samples,
+            res.heldout_samples,
+            res.before.pooled_rms_px,
+            res.after.pooled_rms_px,
+            res.after.total_obs
+        );
+        let bumped = res.bumped_sensor().map(|b| b.serial.as_str());
+        for s in &res.sensors {
+            let note = if bumped == Some(s.serial.as_str()) {
+                " [moved relative to others]"
+            } else {
+                ""
+            };
+            println!(
+                "  {}: held-out RMS {:.3} -> {:.3} px (median {:.3} -> {:.3} px, {} obs); moves {:.1} mm, {:.3} deg{note}",
+                s.serial,
+                s.before_rms_px,
+                s.after_rms_px,
+                s.before_median_px,
+                s.after_median_px,
+                s.heldout_obs,
+                s.delta_m * 1e3,
+                s.delta_rad.to_degrees()
+            );
+        }
+        if !res.skipped_serials.is_empty() {
+            println!(
+                "  left unchanged (insufficient multi-sensor overlap): {}",
+                res.skipped_serials.join(", ")
+            );
+        }
+        if !res.accepted {
+            if let Some(reason) = &res.reject_reason {
+                println!("keeping current calibration ({reason})");
+            }
             return Ok(0);
+        }
+        let mut changed = Vec::new();
+        for s in &res.sensors {
+            if let Some(entry) = cal.sensor_mut(&s.serial) {
+                let (orient, pos) = calib::iso_to_xyzw(&s.world_from_cam);
+                entry.orient_xyzw = orient;
+                entry.pos = pos;
+                entry.rms_px = s.after_rms_px;
+                entry.observations = s.train_obs + s.heldout_obs;
+                changed.push(s.serial.clone());
+            }
         }
         if !write {
             println!(
@@ -6193,7 +6236,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
             return Ok(0);
         }
         cal.source = format!(
-            "{}; re-posed {} against {}",
+            "{}; jointly refitted {} against {}",
             cal.source,
             changed.join(", "),
             rec.display()

@@ -426,6 +426,110 @@ pub fn solve(p: &Problem, s: &mut State, o: &Options) -> Report {
     }
 }
 
+/// Optimises only per-sample controller poses (`ref_from_obj`) with all cameras held fixed.
+/// Each sample is solved independently by 6-DoF Huber Levenberg-Marquardt.
+pub fn solve_poses(p: &Problem, s: &mut State, o: &Options) -> Report {
+    let initial_cost = cost(p, s, o);
+    let delta = o.huber_px / o.sigma_px;
+    let inv_var = 1.0 / (o.sigma_px * o.sigma_px);
+    let mut max_iters = 0usize;
+    for (i, sample) in p.samples.iter().enumerate() {
+        let (Some(mut w), Some(model)) = (s.ref_from_obj[i], p.leds.get(&sample.device_id)) else {
+            continue;
+        };
+        let sample_cost = |pose: &Isometry3<f64>| -> f64 {
+            let mut total = 0.0;
+            for v in &sample.views {
+                let (cam, t_cam) = (&p.cameras[v.camera], &s.ref_from_cam[v.camera]);
+                for ob in &v.obs {
+                    let Some(led) = model.get(ob.led) else {
+                        continue;
+                    };
+                    let px = reprojection(cam, t_cam, pose, &led.pos, &ob.xy)
+                        .map_or(LOST_PX, |e| e.norm());
+                    total += huber_cost(px / o.sigma_px, delta);
+                }
+            }
+            total
+        };
+        let mut current = sample_cost(&w);
+        let mut lambda = 1e-4;
+        let mut iters = 0usize;
+        'sample: while iters < o.max_iterations {
+            iters += 1;
+            let mut hww = Matrix6::<f64>::zeros();
+            let mut bw = Vector6::<f64>::zeros();
+            for v in &sample.views {
+                let (cam, t_cam) = (&p.cameras[v.camera], &s.ref_from_cam[v.camera]);
+                for ob in &v.obs {
+                    let Some(led) = model.get(ob.led) else {
+                        continue;
+                    };
+                    let residual = |pose: &Isometry3<f64>| {
+                        reprojection(cam, t_cam, pose, &led.pos, &ob.xy).map(|e| [e.x, e.y])
+                    };
+                    let Some(r) = residual(&w) else {
+                        continue;
+                    };
+                    let Some(jw) = numeric(|a, h| residual(&retract(&w, &unit::<6>(a, h)))) else {
+                        continue;
+                    };
+                    let norm = (r[0] * r[0] + r[1] * r[1]).sqrt() / o.sigma_px;
+                    let wt = huber_weight(norm, delta) * inv_var;
+                    for a in 0..6 {
+                        bw[a] -= wt * dot(&jw[a], &r);
+                        for b in 0..6 {
+                            hww[(a, b)] += wt * dot(&jw[a], &jw[b]);
+                        }
+                    }
+                }
+            }
+            if hww.diagonal().iter().all(|&d| d == 0.0) {
+                break;
+            }
+            loop {
+                let mut a = hww;
+                for k in 0..6 {
+                    a[(k, k)] += lambda * a[(k, k)].max(1e-9);
+                }
+                let step = match a.cholesky() {
+                    Some(c) => Some(c.solve(&bw)),
+                    None => a.try_inverse().map(|ai| ai * bw),
+                };
+                if let Some(dw) = step {
+                    let candidate = retract(&w, dw.as_slice());
+                    let c = sample_cost(&candidate);
+                    if c < current {
+                        let gain = (current - c) / current.max(f64::MIN_POSITIVE);
+                        w = candidate;
+                        current = c;
+                        lambda = (lambda / 3.0).max(1e-12);
+                        if gain < 1e-9 {
+                            break 'sample;
+                        }
+                        break;
+                    }
+                }
+                lambda *= 4.0;
+                if lambda > 1e12 {
+                    break 'sample;
+                }
+            }
+        }
+        s.ref_from_obj[i] = Some(w);
+        max_iters = max_iters.max(iters);
+    }
+    let final_cost = cost(p, s, o);
+    let (camera_rms_px, camera_obs) = camera_stats(p, s);
+    Report {
+        iterations: max_iters,
+        initial_cost,
+        final_cost,
+        camera_rms_px,
+        camera_obs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +609,43 @@ mod tests {
         assert!(report.final_cost < report.initial_cost);
         assert!(
             report.camera_rms_px.iter().all(|&r| r > 0.2 && r < 0.6),
+            "{:?}",
+            report.camera_rms_px
+        );
+    }
+
+    #[test]
+    fn solve_poses_recovers_perturbed_sample_poses_with_fixed_cameras() {
+        let sc = synth::scene(&SceneParams {
+            pixel_noise: 0.0,
+            pnp_rot_noise_rad: 0.0,
+            pnp_pos_noise_m: 0.0,
+            samples: 40,
+            ..Default::default()
+        });
+        let perturb = Isometry3::from_parts(
+            Translation3::new(0.015, -0.01, 0.012),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.04, -0.03, 0.05)),
+        );
+        let mut state = State {
+            ref_from_cam: sc.world_from_cam.clone(),
+            ref_from_obj: sc
+                .world_from_obj
+                .iter()
+                .map(|p| Some(p * perturb))
+                .collect(),
+        };
+        let p = Problem {
+            cameras: &sc.cameras,
+            leds: &sc.leds,
+            samples: &sc.samples,
+            reference: 0,
+        };
+        let report = solve_poses(&p, &mut state, &Options::default());
+        assert_eq!(state.ref_from_cam, sc.world_from_cam);
+        assert!(report.final_cost < 1e-12, "cost {}", report.final_cost);
+        assert!(
+            report.camera_rms_px.iter().all(|&r| r < 1e-6),
             "{:?}",
             report.camera_rms_px
         );

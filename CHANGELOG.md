@@ -8,6 +8,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - `cv1touch pair` pairs Rift CV1 Touch controllers to the CV1 headset without Oculus software on Linux and Windows. `--check` (with optional `--json`) reads and saves what is paired without changing anything, `--listen` lists controllers asking to be paired without pairing them, and `--normal` returns a headset left in pairing mode back to normal mode. Every run saves snapshots of what was paired before and after, and returns the headset to normal mode on exit or Ctrl+C.
 
+### Changed
+
+- `cv1touch calibrate refine` now refits all connected sensors jointly in a single replay pass using tracker-associated multi-sensor observations (working on ordinary play sessions without requiring cold-search labels), anchors the refit rigidly onto the prior calibration across all sensors (excluding a single moved outlier sensor when three or more sensors participate), and accepts changes only when chronological held-out reprojection RMS improves without regressing individual sensors.
+
 ## [0.7.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) - 2026-11-26
 
 ### Added
