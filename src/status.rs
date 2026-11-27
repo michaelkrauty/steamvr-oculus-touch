@@ -351,20 +351,25 @@ pub fn unmeasured_base_note(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// While SteamVR's headset is another than the one the controllers were lined up with
-/// (`alignment.headset`, `align::Registration::other_headset`), what doctor and the status board
-/// say about it, with the way to line them up with this one.
+/// While SteamVR's headset is another than the one the controllers were lined up with, or the
+/// same non-Lighthouse headset started a new tracking universe (`alignment.headset`,
+/// `align::Registration::headset_match`), what doctor and the status board say about it, with the
+/// way to line them up again.
 pub fn other_headset_note(value: &serde_json::Value) -> Option<String> {
-    (value["alignment"]["headset"] == "other").then(|| {
-        format!(
-            "SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, {}, and follow its steps",
-            if cfg!(windows) {
-                "open cv1touch from the Start menu, choose Align controllers to headset (15 s)"
-            } else {
-                crate::track::repose::redo_headset(false)
-            }
-        )
-    })
+    let align = if cfg!(windows) {
+        "open cv1touch from the Start menu, choose Align controllers to headset (15 s)"
+    } else {
+        crate::track::repose::redo_headset(false)
+    };
+    match value["alignment"]["headset"].as_str() {
+        Some("other") => Some(format!(
+            "SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, {align}, and follow its steps"
+        )),
+        Some("universe_changed") => Some(format!(
+            "SteamVR started a new tracking space for this headset, so the controllers may appear away from your hands. If they do not line up, {align}, and follow its steps"
+        )),
+        _ => None,
+    }
 }
 
 /// While SteamVR waits for the base station its settings name before it tracks the headset
@@ -699,6 +704,13 @@ mod tests {
         let note = other_headset_note(&status("other".into())).unwrap();
         assert!(note.starts_with("SteamVR's headset is not the one the controllers were lined up with, so they appear away from your hands. To line them up with this headset, "));
         assert!(note.ends_with(if cfg!(windows) {
+            "open cv1touch from the Start menu, choose Align controllers to headset (15 s), and follow its steps"
+        } else {
+            "redo Headset alignment in cv1touch setup, and follow its steps"
+        }));
+        let changed = other_headset_note(&status("universe_changed".into())).unwrap();
+        assert!(changed.starts_with("SteamVR started a new tracking space for this headset, so the controllers may appear away from your hands. If they do not line up, "));
+        assert!(changed.ends_with(if cfg!(windows) {
             "open cv1touch from the Start menu, choose Align controllers to headset (15 s), and follow its steps"
         } else {
             "redo Headset alignment in cv1touch setup, and follow its steps"

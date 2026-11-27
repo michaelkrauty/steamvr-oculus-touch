@@ -322,8 +322,10 @@ impl HealthState {
         match result {
             Ok(value) => {
                 self.status = value["engine_ready"].as_bool();
-                self.live_warning = value["alignment"]["headset"] == "other"
-                    || value["alignment"]["unmeasured_base"].as_str().is_some()
+                self.live_warning = matches!(
+                    value["alignment"]["headset"].as_str(),
+                    Some("other" | "universe_changed")
+                ) || value["alignment"]["unmeasured_base"].as_str().is_some()
                     || value["sensors"].as_array().is_some_and(|sensors| {
                         sensors.iter().any(|sensor| {
                             matches!(
@@ -947,6 +949,7 @@ mod tests {
             json!({"engine_ready": true, "sensors": [{"pose":{"state":"moved"}}]}),
             json!({"engine_ready": true, "sensors": [{"pose":{"state":"given_up"}}]}),
             json!({"engine_ready": true, "alignment": {"headset":"other"}}),
+            json!({"engine_ready": true, "alignment": {"headset":"universe_changed"}}),
             json!({"engine_ready": true, "alignment": {"unmeasured_base":"base"}}),
         ] {
             state.status(&Ok(value), now);

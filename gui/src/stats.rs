@@ -55,7 +55,7 @@ fn tip(key: &str) -> &'static str {
         "Reference system" => "The tracking the controllers are aligned with: lighthouse for base station tracking, or the headset's own tracking.",
         "Tracking base" => "The base station SteamVR tracked the headset from when it was aligned.",
         "Measured stations" => "How many of SteamVR's base stations the headset alignment measured, of those it saw.",
-        "Universe" => "SteamVR's ID for the tracked space. If it changes, Room Setup was run again and the headset alignment may need redoing.",
+        "Universe" => "SteamVR's ID for the tracked space. If your headset starts a new tracking space or Room Setup runs again, the headset alignment may need redoing.",
         "Base pin" => "The base station cv1touch has SteamVR track the headset from, so that the alignment stays valid, and who set it.",
         // Controller calibration.
         "Left model offset" | "Right model offset" => "How well the controller's 3D model lines up with its tracked LEDs, as an RMS in millimetres, and how many LEDs the fit used. Lower is better.",

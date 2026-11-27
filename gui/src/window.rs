@@ -196,8 +196,10 @@ pub fn inline_fix(snap: &Snapshot, daemon: Daemon, windows: bool) -> Option<Fix>
             .is_some_and(|d| d.starts_with("todo: "))
     }) {
         Some(Fix::OpenSetup)
-    } else if alignment.is_some_and(|a| a["headset"] == "other" || a["unmeasured_base"].is_string())
-    {
+    } else if alignment.is_some_and(|a| {
+        matches!(a["headset"].as_str(), Some("other" | "universe_changed"))
+            || a["unmeasured_base"].is_string()
+    }) {
         Some(Fix::LineUpHeadset)
     } else if status
         .and_then(|s| s["sensors"].as_array())
@@ -696,6 +698,11 @@ fn alignment_warnings(status: &Value) -> Vec<(&'static str, String)> {
         out.push((
             "Other headset",
             "SteamVR uses another headset than the one cv1touch was aligned with. Run setup to redo the headset stage.".to_owned(),
+        ));
+    } else if alignment["headset"] == "universe_changed" {
+        out.push((
+            "Tracking space changed",
+            "SteamVR started a new tracking space for this headset, so the controllers may appear offset from your hands. Align controllers to headset if they do not line up.".to_owned(),
         ));
     }
     if let Some(base) = alignment["unmeasured_base"].as_str() {
@@ -1413,6 +1420,13 @@ mod tests {
             alignment_warnings(&json!({"alignment":{"headset":"other","unmeasured_base":"LHB-1","base_pin":{"waiting_for":"LHB-2"}}})).len(),
             3
         );
+        assert_eq!(
+            alignment_warnings(&json!({"alignment":{"headset":"universe_changed","base_pin":{}}})),
+            vec![(
+                "Tracking space changed",
+                "SteamVR started a new tracking space for this headset, so the controllers may appear offset from your hands. Align controllers to headset if they do not line up.".to_owned()
+            )]
+        );
     }
 
     #[test]
@@ -1453,6 +1467,9 @@ mod tests {
         assert_eq!(fix(&snap, true), Some(Fix::OpenSetup));
         let mut snap = healthy();
         snap.status.as_mut().unwrap()["alignment"]["headset"] = json!("other");
+        assert_eq!(fix(&snap, false), Some(Fix::LineUpHeadset));
+        let mut snap = healthy();
+        snap.status.as_mut().unwrap()["alignment"]["headset"] = json!("universe_changed");
         assert_eq!(fix(&snap, false), Some(Fix::LineUpHeadset));
         let mut snap = healthy();
         snap.status.as_mut().unwrap()["alignment"]["unmeasured_base"] = json!("LHB-TEST0002");

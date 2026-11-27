@@ -3724,7 +3724,15 @@ fn capture_free_named_with_feedback(
                 std::thread::sleep(Duration::from_millis(2));
             }
             let sampled = sampled.finish(|i| client.device(i));
-            (sampled.tracks, sampled.kinds, sampled.systems)
+            let end_universe = if universe != 0 {
+                universe
+            } else {
+                let latest = client.devices();
+                capture_universe(&latest, |d| {
+                    client.uint64_property(d.index, vr::PROP_CURRENT_UNIVERSE_ID)
+                })
+            };
+            (sampled.tracks, sampled.kinds, sampled.systems, end_universe)
         })
     };
     // the guided flow (with feedback) shows its own short instructions and keeps paths out of view
@@ -3784,7 +3792,12 @@ fn capture_free_named_with_feedback(
     }
     let end = shm::now_ns();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (tracks, kinds, tracking_systems) = sampler.join().unwrap_or_default();
+    let (tracks, kinds, tracking_systems, end_universe) = sampler.join().unwrap_or_default();
+    let universe = if universe != 0 {
+        universe
+    } else {
+        end_universe
+    };
     let tracking_bases = bases.finish();
     // Ctrl+C reaches the whole pipeline, `tee` included: stop the recording and keep the data
     // before printing anything, and print without panicking on a closed pipe
@@ -3883,12 +3896,24 @@ fn capture_free_named_with_feedback(
 type PoseTrack = (String, Vec<[f64; 8]>);
 
 /// The universe a capture is in: the headset's, which SteamVR goes by when several tracking
-/// systems are present and the driver gives the Touches; any device's when the headset has none.
+/// systems are present and the driver gives the Touches; otherwise another non-cv1touch device in
+/// the headset's tracking system (or any non-cv1touch device when no headset is present).
 fn capture_universe(devices: &[vr::Device], universe: impl Fn(&vr::Device) -> Option<u64>) -> u64 {
-    devices
+    if let Some(u) = devices
         .iter()
         .filter(|d| d.class == vr::CLASS_HMD)
-        .chain(devices)
+        .find_map(|d| universe(d).filter(|&u| u != 0))
+    {
+        return u;
+    }
+    let hmd_system = devices
+        .iter()
+        .find(|d| d.class == vr::CLASS_HMD && !d.tracking_system.is_empty())
+        .map(|d| d.tracking_system.as_str());
+    devices
+        .iter()
+        .filter(|d| !d.serial.starts_with("CV1T-"))
+        .filter(|d| hmd_system.is_none_or(|sys| d.tracking_system == sys))
         .find_map(|d| universe(d).filter(|&u| u != 0))
         .unwrap_or(0)
 }
@@ -5148,6 +5173,50 @@ fn registration_seed(
     Ok((had_registration, reg))
 }
 
+/// Median time step between consecutive pairs (ns).
+fn median_step_ns(pairs: &[(u64, nalgebra::Isometry3<f64>, nalgebra::Isometry3<f64>)]) -> u64 {
+    let mut steps: Vec<u64> = pairs
+        .windows(2)
+        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .filter(|&d| d > 0)
+        .collect();
+    if steps.is_empty() {
+        return 0;
+    }
+    steps.sort_unstable();
+    steps[steps.len() / 2]
+}
+
+/// Searches for the relative timestamp shift `lag_ns` (where `reference` at `t + lag_ns` lines up
+/// with Touch at `t`) minimizing held-offset spread under `rough`. Searches `+-100 ms` at 2 ms
+/// resolution (centered on `center_ns` when coarse lag compensation shifted the bootstrap window).
+fn search_lag_ns(
+    span: &[(u64, nalgebra::Isometry3<f64>, nalgebra::Isometry3<f64>)],
+    ref_samples: &[eval::TruthSample],
+    rough: &nalgebra::Isometry3<f64>,
+    center_ns: i64,
+) -> i64 {
+    let rot_w = register::Options::default().rot_weight_m;
+    let spread = |lag_ns: i64| {
+        let shifted: Vec<_> = span
+            .iter()
+            .filter_map(|p| {
+                let t_ref = p.0.checked_add_signed(lag_ns)?;
+                Some((eval::interpolate(ref_samples, t_ref)?, p.2))
+            })
+            .collect();
+        if shifted.len() < 10 {
+            return f64::INFINITY;
+        }
+        let (_, pos, rot) = register::check(&shifted, rough);
+        pos.powi(2) + (rot.to_radians() * rot_w).powi(2)
+    };
+    (-50..=50)
+        .map(|k| center_ns + k as i64 * 2_000_000)
+        .min_by(|a, b| spread(*a).total_cmp(&spread(*b)))
+        .unwrap_or(center_ns)
+}
+
 /// `tracking_base` names the base station SteamVR tracked the reference from throughout the
 /// capture, for a capture whose truth does not record it (made before captures recorded it).
 fn register_from_capture_with(
@@ -5234,22 +5303,53 @@ fn register_from_capture_with(
             let pairs: Vec<_> = if follow {
                 // the IMU's 500 Hz outputs, one in ten, over the stretch the Touch stayed on the
                 // reference: found under the installed registration, then again under a first fit
-                let timed: Vec<(u64, nalgebra::Isometry3<f64>, nalgebra::Isometry3<f64>)> = pubs
-                    .iter()
-                    .step_by(10)
-                    .filter_map(|p| {
-                        Some((p.t_ns, eval::interpolate(&ref_samples, p.t_ns)?, p.pose))
-                    })
-                    .collect();
+                let sample_timed = |lag_ns: i64| -> Vec<(
+                    u64,
+                    nalgebra::Isometry3<f64>,
+                    nalgebra::Isometry3<f64>,
+                )> {
+                    pubs.iter()
+                        .step_by(10)
+                        .filter_map(|p| {
+                            let t_ref = p.t_ns.checked_add_signed(lag_ns)?;
+                            Some((p.t_ns, eval::interpolate(&ref_samples, t_ref)?, p.pose))
+                        })
+                        .collect()
+                };
+                let mut coarse_lag_ns = 0i64;
+                let mut timed = sample_timed(0);
                 let t0 = ref_samples.first().map_or(0, |s| s.t_ns);
-                let span = |x: &nalgebra::Isometry3<f64>, o: &register::Rigid| {
-                    register::rigid_span(&timed, x, o)
-                };
                 let first_span = if had_registration {
-                    span(&x0, &register::Rigid::default()).ok_or(None)
+                    register::rigid_span(&timed, &x0, &register::Rigid::default()).map(Ok)
                 } else {
-                    register::bootstrap_span(&timed)
-                };
+                    None
+                }
+                .unwrap_or_else(|| {
+                    match register::bootstrap_span(&timed) {
+                        Ok(span) => Ok(span),
+                        Err(err) => {
+                            // Wireless links (Quest via Steam Link / Virtual Desktop / ALVR) can
+                            // lag the headset stream by 30-80 ms relative to USB CV1 sensors; try
+                            // frame-independent angular-speed lag alignment before giving up.
+                            let (shift, corr) = register::estimate_timed_lag(&timed, 8);
+                            let step_ns = median_step_ns(&timed);
+                            if corr >= 0.7 && shift != 0 && step_ns > 0 {
+                                let shifted_lag = shift as i64 * step_ns as i64;
+                                let shifted = sample_timed(shifted_lag);
+                                match register::bootstrap_span(&shifted) {
+                                    Ok(span) => {
+                                        coarse_lag_ns = shifted_lag;
+                                        timed = shifted;
+                                        Ok(span)
+                                    }
+                                    Err(_) => Err(err),
+                                }
+                            } else {
+                                Err(err)
+                            }
+                        }
+                    }
+                });
                 let first = match first_span {
                     Ok(first) => first,
                     Err(refusal) => {
@@ -5264,6 +5364,10 @@ fn register_from_capture_with(
                         continue;
                     }
                 };
+                if first.is_empty() {
+                    continue;
+                }
+                let first_t = (timed[first.start].0, timed[first.end - 1].0);
                 let rough = register::solve(
                     &timed[first.clone()]
                         .iter()
@@ -5272,38 +5376,31 @@ fn register_from_capture_with(
                     &options,
                 )?;
                 // the two streams' stamps lined up: the shift that holds the offset steadiest
-                let at = |lag_ns: i64| -> Vec<(u64, nalgebra::Isometry3<f64>, nalgebra::Isometry3<f64>)> {
-                    timed[first.clone()].iter().filter_map(|p| Some((p.0, eval::interpolate(&ref_samples, (p.0 as i64 + lag_ns) as u64)?, p.2))).collect()
-                };
-                let spread = |lag_ns: i64| {
-                    let (_, pos, rot) = register::check(
-                        &at(lag_ns).iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
-                        &rough.lighthouse_from_world,
-                    );
-                    pos.powi(2)
-                        + (rot.to_radians() * register::Options::default().rot_weight_m).powi(2)
-                };
-                let lag_ns = (-15..=15)
-                    .map(|k| k as i64 * 2_000_000)
-                    .min_by(|a, b| spread(*a).total_cmp(&spread(*b)))
-                    .unwrap_or(0);
-                let timed: Vec<_> = timed
-                    .iter()
-                    .filter_map(|p| {
-                        Some((
-                            p.0,
-                            eval::interpolate(&ref_samples, (p.0 as i64 + lag_ns) as u64)?,
-                            p.2,
-                        ))
-                    })
-                    .collect();
+                let lag_ns = search_lag_ns(
+                    &timed[first.clone()],
+                    &ref_samples,
+                    &rough.lighthouse_from_world,
+                    coarse_lag_ns,
+                );
+                let timed = sample_timed(lag_ns);
                 let tight = register::Rigid {
                     tol_m: 0.015,
                     tol_rad: 3f64.to_radians(),
                     ..register::Rigid::default()
                 };
                 let r = register::rigid_span(&timed, &rough.lighthouse_from_world, &tight)
-                    .unwrap_or(first);
+                    .unwrap_or_else(|| {
+                        let start = timed.partition_point(|p| p.0 < first_t.0);
+                        let end = timed.partition_point(|p| p.0 <= first_t.1);
+                        start..end
+                    });
+                if r.is_empty() {
+                    println!(
+                        "Touch {}: no aligned samples after shifting timestamps",
+                        ["left", "right"][h]
+                    );
+                    continue;
+                }
                 let secs = |i: usize| (timed[i].0.saturating_sub(t0)) as f64 * 1e-9;
                 println!("Touch {}: on the reference from {:.1} s to {:.1} s; the reference's stamps {} ours by {:.0} ms", ["left", "right"][h], secs(r.start), secs(r.end - 1), if lag_ns >= 0 { "trail" } else { "lead" }, lag_ns.abs() as f64 * 1e-6);
                 timed[r].iter().map(|p| (p.1, p.2)).collect()
@@ -7885,6 +7982,24 @@ mod tests {
         assert_eq!(universe(Some(0)), 7);
         assert_eq!(universe(None), 7);
         assert_eq!(capture_universe(&devices, |_| None), 0);
+        // a non-Lighthouse headset with universe 0 must not inherit a stale CV1T or Lighthouse
+        // device's universe ID
+        let mut quest = capture_device(0, vr::CLASS_HMD, "QUEST-3");
+        quest.tracking_system = "vrlink".into();
+        let mut cv1t = capture_device(1, vr::CLASS_CONTROLLER, "CV1T-LEFT");
+        cv1t.tracking_system = "oculus".into();
+        let lh_base = capture_device(2, vr::CLASS_TRACKING_REFERENCE, "LHB-TEST-A");
+        let mixed = [quest, cv1t, lh_base];
+        assert_eq!(
+            capture_universe(&mixed, |d| {
+                if d.class == vr::CLASS_HMD {
+                    Some(0)
+                } else {
+                    Some(1772213422)
+                }
+            }),
+            0
+        );
     }
 
     #[test]
@@ -9835,5 +9950,52 @@ mod tests {
         assert_eq!(events[1]["command"], "");
         assert_eq!(events[2]["event"], "rejected");
         assert_eq!(events[2]["command"], "bogus");
+    }
+
+    #[test]
+    fn search_lag_ns_recovers_60_ms_wireless_headset_lag() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+        let x = Isometry3::from_parts(
+            Translation3::new(0.4, -0.2, 0.7),
+            UnitQuaternion::from_euler_angles(0.1, 0.8, -0.05),
+        );
+        let y = Isometry3::from_parts(
+            Translation3::new(0.09, -0.02, 0.04),
+            UnitQuaternion::from_euler_angles(0.2, -0.3, 0.5),
+        );
+        let pose_at = |t_s: f64| {
+            let yaw = 1.1 * (1.2 * t_s).sin();
+            let pitch = 0.5 * (1.7 * t_s).sin();
+            let roll = 0.35 * (0.9 * t_s).cos();
+            Isometry3::from_parts(
+                Translation3::new(0.15 * t_s.cos(), 1.6, 0.15 * t_s.sin()),
+                UnitQuaternion::from_euler_angles(roll, pitch, yaw),
+            )
+        };
+        let lag_s = 0.060f64;
+        // Reference samples at 100 Hz (10 ms), delayed by +60 ms.
+        let ref_samples: Vec<eval::TruthSample> = (0..1200)
+            .map(|k| {
+                let t_s = k as f64 * 0.01;
+                eval::TruthSample {
+                    t_ns: 1_000_000_000 + k * 10_000_000,
+                    pose: x * pose_at(t_s - lag_s) * y.inverse(),
+                }
+            })
+            .collect();
+        // Touch samples at 50 Hz (20 ms), unshifted.
+        let span: Vec<_> = (20..500)
+            .map(|k| {
+                let t_ns = 1_000_000_000 + k * 20_000_000;
+                let t_s = k as f64 * 0.02;
+                let r = eval::interpolate(&ref_samples, t_ns).unwrap();
+                (t_ns, r, pose_at(t_s))
+            })
+            .collect();
+        let lag_ns = search_lag_ns(&span, &ref_samples, &x, 0);
+        assert!(
+            (lag_ns - 60_000_000).abs() <= 2_000_000,
+            "expected ~60 ms lag, got {lag_ns} ns"
+        );
     }
 }

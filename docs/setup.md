@@ -99,6 +99,14 @@ A stage saved before you used the guide shows as "saved earlier, not verified". 
 
 Headset alignment measures the base station SteamVR tracks the headset from. When SteamVR sees more than one station, the driver sets SteamVR's `driver_lighthouse.primarybasestation` to that station from the next SteamVR start, and removes the setting when SteamVR closes. It never changes a value you set. To turn this off, run `cv1touch pin-base-station off` (or add `"pin_base_station": false` to `~/.config/cv1touch/settings.json`); `cv1touch pin-base-station on` turns it back on.
 
+### Headsets without base stations
+
+Any headset that works in SteamVR can be used, including Quest over Steam Link, Virtual Desktop or ALVR, Rift S, PSVR2 and Windows Mixed Reality. Keep the headset's own controllers asleep or out of the way while playing with CV1 Touch, and avoid covering the headset's tracking sensors while holding Touch controllers against it during alignment.
+
+Because there are no fixed base stations, cv1touch follows the headset's live SteamVR universe ID so the controllers stay visible if the headset starts a new tracking space (for example after a boundary reset or a new wireless session). If the tracking space changed, `cv1touch doctor`, `cv1touch status` and `cv1touch-gui` warn you so you can run the 15-second quick alignment if your hands appear offset.
+
+On Quest, use SteamVR's seated or standing recenter rather than the headset's own recenter button when possible; in Virtual Desktop, enabling **Stage Tracking** keeps the play space anchored across sessions.
+
 After setup, check both hands in SteamVR. `cv1touch input-test` checks the buttons, triggers and sticks while a VR app has focus.
 
 ## Bind the right Oculus button
