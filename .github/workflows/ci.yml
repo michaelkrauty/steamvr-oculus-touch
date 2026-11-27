@@ -48,6 +48,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Build and test
         run: scripts/check.sh
+      - name: Check the GUI
+        if: matrix.rust == 'stable'
+        run: |
+          cargo fmt --manifest-path gui/Cargo.toml -- --check
+          cargo clippy --manifest-path gui/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path gui/Cargo.toml --locked
 
   check-hosted:
     # Fork owners can run checks in their own repositories without a private runner.
@@ -74,6 +80,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Build and test
         run: scripts/check.sh
+      - name: Check the GUI
+        if: matrix.rust == 'stable'
+        run: |
+          cargo fmt --manifest-path gui/Cargo.toml -- --check
+          cargo clippy --manifest-path gui/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path gui/Cargo.toml --locked
 
   check-fedora:
     # The Fedora build from the setup guide. Fedora's GCC does not build position-independent

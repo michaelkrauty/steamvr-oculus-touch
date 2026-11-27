@@ -209,7 +209,7 @@ const DAEMON_NOT_RUNNING: &str = "cv1touchd isn't running";
 #[cfg(unix)]
 const START_DAEMON: &str = "Start it with systemctl --user start cv1touchd.";
 #[cfg(windows)]
-const START_DAEMON: &str = "Choose Start cv1touch in the Start menu.";
+const START_DAEMON: &str = "Open cv1touch from the Start menu and choose Start daemon.";
 
 /// Said when a command needs the sensor calibration loaded: the daemon runs without it until
 /// setup has made one, and sets it aside while a calibration capture runs.
@@ -3512,7 +3512,7 @@ fn recording_capability(status: &serde_json::Value, windows: bool) -> Result<(),
         return Ok(());
     }
     let restart = if windows {
-        "choose Stop cv1touch, then Start cv1touch in the Start menu"
+        "open cv1touch from the Start menu and choose Restart daemon"
     } else {
         "systemctl --user restart cv1touchd"
     };
@@ -7966,7 +7966,10 @@ mod tests {
             #[cfg(unix)]
             assert!(note.contains("systemctl --user start cv1touchd"), "{note}");
             #[cfg(windows)]
-            assert!(note.contains("Start cv1touch in the Start menu"), "{note}");
+            assert!(
+                note.contains("Open cv1touch from the Start menu and choose Start daemon."),
+                "{note}"
+            );
             assert!(!note.contains("fixture OS detail"), "{note}");
             let line = cannot_reach(
                 Path::new("/fixture/control.sock"),
@@ -8211,7 +8214,7 @@ mod tests {
             assert!(message.contains("cv1touchd.log"), "{message}");
             assert!(!message.contains("isn't running"), "{message}");
             assert!(!message.contains("start cv1touchd"), "{message}");
-            assert!(!message.contains("Start cv1touch"), "{message}");
+            assert!(!message.contains("Start daemon"), "{message}");
         }
     }
 
@@ -8853,7 +8856,10 @@ mod tests {
         let old = serde_json::json!({"recording_scoped_stop": true, "recording": false});
         for (windows, remedy) in [
             (false, "systemctl --user restart cv1touchd"),
-            (true, "Stop cv1touch, then Start cv1touch in the Start menu"),
+            (
+                true,
+                "open cv1touch from the Start menu and choose Restart daemon",
+            ),
         ] {
             let error = recording_daemon_status(Some(old.clone()), windows).unwrap_err();
             assert!(error.contains("older than this cv1touch"));

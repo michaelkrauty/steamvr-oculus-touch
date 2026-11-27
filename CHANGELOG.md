@@ -16,10 +16,13 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 - The status window has a Settings tab: the controller angle, **Start tray icon when I log in**, on Linux the desktop entry and icons, quick shortcuts to align the controllers to the headset or calibrate buttons and sticks, and on Windows **Finish driver & SteamVR setup**, which runs `cv1touch finish-setup` and lists its steps.
 - The status window's "What to do" card has a button for its first problem where one fixes it: **Start daemon**, **Open setup**, **Align controllers to headset (15 s)**, **Calibrate sensors**, or on Windows **Finish Windows setup**.
 - **Save report** in the status window and **Save diagnostic report…** in the tray menu now save the report without opening a terminal, then show the file, its size and a note to review it before sharing, with **Open folder**.
+- `cv1touch-gui --open` starts the tray icon and opens the status window at once (used by the Start menu and desktop shortcuts). `cv1touch-gui --version` (or `-V`) prints the GUI version, and `cv1touch-gui --quit` closes its windows and tray icon without stopping the daemon.
 
 ### Changed
 
-- `cv1touch doctor`, `cv1touch setup` and `cv1touch calibrate` say a sensor is active instead of streaming.
+- The Windows installer includes the tray app and its executable icon. Open **cv1touch** from the Start menu to see its status window; this one entry replaces the seven old shortcuts, which are removed on upgrade. The tray icon starts at sign-in and after an interactive install. The installer closes the tray app before an upgrade or uninstall.
+- On Windows, the GUI verifies that the sensor preview pipe belongs to the current user before reading it.
+- `cv1touch doctor`, `cv1touch setup` and `cv1touch calibrate` describe sensors that are sending frames as active.
 
 ## [0.6.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.6.0) - 2026-11-24
 

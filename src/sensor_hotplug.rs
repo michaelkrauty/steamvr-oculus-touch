@@ -153,7 +153,7 @@ const ADDING_DETAIL: &str = "The engine is opening this sensor.";
 /// A ready sensor no running engine adds: the next engine start opens it.
 fn engine_start_detail() -> &'static str {
     if cfg!(windows) {
-        "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (choose Stop cv1touch, then Start cv1touch in the Start menu)."
+        "This sensor will be used the next time the tracking engine starts. To use it now, open cv1touch from the Start menu and choose Restart daemon."
     } else {
         "This sensor will be used the next time the tracking engine starts. Restart the daemon to use it now (systemctl --user restart cv1touchd)."
     }
@@ -1175,7 +1175,7 @@ mod tests {
             "{detail}"
         );
         if cfg!(windows) {
-            assert!(detail.contains("Stop cv1touch, then Start cv1touch"));
+            assert!(detail.contains("open cv1touch from the Start menu and choose Restart daemon"));
         } else {
             assert!(detail.contains("systemctl --user restart cv1touchd"));
         }
@@ -1406,7 +1406,7 @@ mod tests {
         );
         assert!(
             detail.contains(if cfg!(windows) {
-                "Start cv1touch"
+                "Restart daemon"
             } else {
                 "systemctl --user restart cv1touchd"
             }),

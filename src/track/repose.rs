@@ -60,14 +60,13 @@ pub const INSPECTION_NS: u64 = 30_000_000_000;
 /// sensor's long search no more than an ordinary cooldown does.
 pub const STARVED_RETRY_NS: u64 = 60_000_000_000;
 
-/// How the daemon's log and `cv1touch doctor` send a person back to the sensor stage: through
-/// setup's list of finished stages, which the Start menu's Set up cv1touch shows as well.
+/// How the daemon's log and `cv1touch doctor` send a person back to the sensor stage.
 pub const REDO_SENSORS: &str = redo_sensors(cfg!(windows));
 
 /// `REDO_SENSORS` on Windows (`windows`) or elsewhere.
 pub const fn redo_sensors(windows: bool) -> &'static str {
     if windows {
-        "redo Sensor positions in Set up cv1touch"
+        "open cv1touch from the Start menu and redo Sensor positions in Set up…"
     } else {
         "redo Sensor positions in cv1touch setup"
     }
@@ -76,7 +75,7 @@ pub const fn redo_sensors(windows: bool) -> &'static str {
 /// The way back to the headset stage, on Windows (`windows`) or elsewhere, as `redo_sensors`.
 pub const fn redo_headset(windows: bool) -> &'static str {
     if windows {
-        "redo Headset alignment in Set up cv1touch"
+        "open cv1touch from the Start menu and redo Headset alignment in Set up…"
     } else {
         "redo Headset alignment in cv1touch setup"
     }
@@ -1238,8 +1237,8 @@ mod tests {
     use super::*;
     use nalgebra::Vector2;
 
-    /// The way back to the sensor stage names what each platform's user opens: the command in a
-    /// terminal, the Start menu's shortcut on Windows. Both reach setup's menu of finished stages.
+    /// The way back to the sensor stage names what each platform's user opens: setup in a
+    /// terminal, or the status window on Windows.
     #[test]
     fn the_advice_to_redo_the_sensors_names_what_the_user_opens() {
         assert_eq!(
@@ -1248,7 +1247,7 @@ mod tests {
         );
         assert_eq!(
             redo_sensors(true),
-            "redo Sensor positions in Set up cv1touch"
+            "open cv1touch from the Start menu and redo Sensor positions in Set up…"
         );
         assert_eq!(REDO_SENSORS, redo_sensors(cfg!(windows)));
         assert_eq!(
@@ -1257,7 +1256,7 @@ mod tests {
         );
         assert_eq!(
             redo_headset(true),
-            "redo Headset alignment in Set up cv1touch"
+            "open cv1touch from the Start menu and redo Headset alignment in Set up…"
         );
         assert!(unsure_advice().ends_with(&format!("for several minutes, {REDO_SENSORS}")));
         let (timed_out, _) = LetGo::TimedOut.advice(None);

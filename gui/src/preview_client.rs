@@ -498,13 +498,19 @@ mod pipe {
     use std::{io, os::windows::ffi::OsStrExt, path::PathBuf, ptr};
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, ERROR_BROKEN_PIPE, GENERIC_READ, GENERIC_WRITE, HANDLE,
+            CloseHandle, LocalFree, ERROR_BROKEN_PIPE, GENERIC_READ, GENERIC_WRITE, HANDLE,
             INVALID_HANDLE_VALUE,
+        },
+        Security::{
+            Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT},
+            EqualSid, GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, TOKEN_QUERY,
+            TOKEN_USER,
         },
         Storage::FileSystem::{
             CreateFileW, ReadFile, WriteFile, OPEN_EXISTING, SECURITY_IDENTIFICATION,
             SECURITY_SQOS_PRESENT,
         },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
     /// A synchronous connection to the daemon's control pipe.
@@ -548,7 +554,58 @@ mod pipe {
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self(handle))
+            let pipe = Self(handle);
+            if !pipe.ours()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the pipe belongs to another account",
+                ));
+            }
+            Ok(pipe)
+        }
+
+        /// Whether this user owns the pipe. Pipe names are global, so another account could
+        /// create ours before the daemon does; the daemon makes its user the owner.
+        fn ours(&self) -> io::Result<bool> {
+            // SAFETY: valid handles and out-pointers; TOKEN_USER and the largest SID fit in
+            // `user`, and `owner` points into `descriptor`, freed after the comparison.
+            unsafe {
+                let mut token = ptr::null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut user = [0u64; 16];
+                let mut len = 0;
+                let read = GetTokenInformation(
+                    token,
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    size_of_val(&user) as u32,
+                    &mut len,
+                );
+                let error = io::Error::last_os_error();
+                CloseHandle(token);
+                if read == 0 {
+                    return Err(error);
+                }
+                let (mut owner, mut descriptor) = (ptr::null_mut(), ptr::null_mut());
+                let error = GetSecurityInfo(
+                    self.0,
+                    SE_KERNEL_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut descriptor,
+                );
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error as i32));
+                }
+                let ours = EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0;
+                LocalFree(descriptor);
+                Ok(ours)
+            }
         }
     }
 

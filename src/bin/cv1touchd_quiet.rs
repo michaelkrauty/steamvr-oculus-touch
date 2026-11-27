@@ -65,8 +65,7 @@ fn main() -> ExitCode {
             command.get_program().to_string_lossy()
         )),
         Ok(Some(code)) if code != 0 => fail(format!(
-            "the supervisor ended at once (exit {code}); Check cv1touch in the Start menu says what \
-             is missing"
+            "the supervisor ended at once (exit {code}); open cv1touch from the Start menu to see what needs attention"
         )),
         _ => ExitCode::SUCCESS,
     }

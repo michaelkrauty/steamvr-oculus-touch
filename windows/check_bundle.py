@@ -18,8 +18,9 @@ import subprocess
 # Inbox on supported Windows 11 x64, not optional redistributables. Keep this explicit:
 # a newly imported DLL needs either a reviewed system dependency or a bundled copy.
 SYSTEM_DLLS = frozenset(name.lower() + ".dll" for name in (
-    "advapi32", "bcrypt", "bcryptprimitives", "cfgmgr32", "hid", "kernel32",
-    "newdev", "ntdll", "ole32", "setupapi", "shell32", "user32", "winmm",
+    "advapi32", "bcrypt", "bcryptprimitives", "cfgmgr32", "combase", "dwmapi",
+    "gdi32", "hid", "imm32", "kernel32", "newdev", "ntdll", "ole32", "oleaut32",
+    "opengl32", "setupapi", "shell32", "uiautomationcore", "user32", "uxtheme", "winmm",
 ))
 
 OPENCV_NOTICES = (
@@ -45,6 +46,7 @@ def system_dll(name):
 
 
 def check(bundle, readobj):
+    # Audit all payloads, including the GUI, native engine and SteamVR driver.
     binaries = sorted(p for p in bundle.rglob("*") if p.is_file() and p.suffix.lower() in (".dll", ".exe"))
     if not binaries:
         raise ValueError("bundle has no executables or DLLs")
@@ -72,6 +74,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         check_notices(args.bundle, Path(__file__).resolve().parents[1])
+        if not (args.bundle / "bin/cv1touch-gui.exe").is_file():
+            raise ValueError("missing: bin/cv1touch-gui.exe")
         check(args.bundle, args.readobj)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Windows bundle: {error}\n")

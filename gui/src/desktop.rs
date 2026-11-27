@@ -65,7 +65,7 @@ fn install(data: &Path, exe: &Path) -> io::Result<Vec<PathBuf>> {
     std::fs::write(
         entry,
         format!(
-            "[Desktop Entry]\nType=Application\nName=cv1touch\nComment=Status tray and window for cv1touch\nExec={}\nIcon={APP_ID}\nStartupWMClass={APP_ID}\nTerminal=false\nCategories=Utility;\n",
+            "[Desktop Entry]\nType=Application\nName=cv1touch\nComment=Status tray and window for cv1touch\nExec={} --open\nIcon={APP_ID}\nStartupWMClass={APP_ID}\nTerminal=false\nCategories=Utility;\n",
             exec_arg(exe)
         ),
     )?;
@@ -182,7 +182,7 @@ mod tests {
         let entry = std::fs::read_to_string(written.last().unwrap()).unwrap();
         for line in [
             "[Desktop Entry]",
-            "Exec=/opt/cv1touch/cv1touch-gui",
+            "Exec=/opt/cv1touch/cv1touch-gui --open",
             "Icon=cv1touch-gui",
             "StartupWMClass=cv1touch-gui",
         ] {

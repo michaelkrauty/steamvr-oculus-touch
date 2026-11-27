@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 michaelkrauty
-//! One repeatable Windows first-run/repair action, shared by the installer and Start menu.
+//! One repeatable Windows first-run/repair action, shared by the installer and status window.
 //! It never calibrates or resets settings. Stop acquisition before changing USB drivers and
 //! restart it afterward, including when only some prerequisites could be installed.
 
@@ -188,9 +188,9 @@ pub(super) fn run(json: bool) -> i32 {
             }
         }
         println!("\n{}", match code {
-            0 => "Driver setup finished. Choose Set up cv1touch in the Start menu to calibrate.",
-            3 => "Then choose Set up cv1touch in the Start menu.",
-            _ => "Then run Finish setting up cv1touch again. For help, choose Send a cv1touch report in the Start menu.",
+            0 => "Driver setup finished. Open cv1touch from the Start menu and choose Set up… to calibrate.",
+            3 => "Then open cv1touch from the Start menu and choose Set up…",
+            _ => "Then open cv1touch from the Start menu and choose Finish driver & SteamVR setup in Settings. For help, choose Save report.",
         });
         Ok(code)
     };

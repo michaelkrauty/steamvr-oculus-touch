@@ -41,13 +41,16 @@ cargo test --lib --bins
 
 ## Installer
 
+Build the GUI separately with Rust 1.95 or newer. Then bundle it with the driver and command-line tools.
+
 ```powershell
 cargo build --locked --release --bins
+cargo build --manifest-path gui/Cargo.toml --locked --release
 powershell -ExecutionPolicy Bypass -File windows\bundle.ps1
 & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=0.6.0 "/DBundle=$PWD\target\bundle" windows\installer\cv1touch.iss
 ```
 
-`windows\bundle.ps1` collects the install into `target\bundle`, and Inno Setup 6 writes the installer to `target\installer`. `python windows/check_bundle.py target/bundle` rejects DLL dependencies the bundle does not ship.
+`windows\bundle.ps1` collects the install into `target\bundle`, including `cv1touch-gui.exe`. Its `-GuiTarget` option defaults to `gui\target`; set it if the GUI build uses another target directory. Inno Setup 6 writes the installer to `target\installer`. `python windows/check_bundle.py target/bundle` rejects DLL dependencies the bundle does not ship.
 
 CI (`.github\workflows\windows.yml`) builds the installer on every push and pull request, tests install, repair, upgrade and uninstall as a standard user on a clean hosted runner (`windows\test_standard_user.ps1`, which runs `windows\test_install.py`), and attaches the installer to the release of a `v*` tag. Do not run those tests on a configured PC.
 

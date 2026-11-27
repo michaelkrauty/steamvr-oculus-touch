@@ -62,6 +62,12 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --no-default-features --lib
+      - name: Lint the GUI
+        if: matrix.rust == 'stable'
+        run: cargo clippy --manifest-path gui/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Test the GUI
+        if: matrix.rust == 'stable'
+        run: cargo test --manifest-path gui/Cargo.toml --locked
       # Hosted, disposable runner only: a generated ROOT node, never a USB device. This
       # validates SetupAPI's real inbox-driver binding path, not USB transfers or UAC UI.
       - name: Inbox WinUSB driver binding without hardware
@@ -160,6 +166,9 @@ jobs:
       - name: Release build
         if: matrix.rust == 'stable'
         run: cargo build --locked --release --bins
+      - name: Build the GUI
+        if: matrix.rust == 'stable'
+        run: cargo build --manifest-path gui/Cargo.toml --locked --release
       - name: Bundle
         if: matrix.rust == 'stable'
         run: powershell -NoProfile -ExecutionPolicy Bypass -File windows\bundle.ps1 -Target target -Out target\bundle
@@ -198,6 +207,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cv1touchd exit $LASTEXITCODE" }
           & target\bundle\bin\cv1touch.exe --version
           if ($LASTEXITCODE -ne 0) { throw "cv1touch exit $LASTEXITCODE" }
+          python -c "from pathlib import Path; import subprocess; out = subprocess.check_output([Path('target/bundle/bin/cv1touch-gui.exe'), '--version'], text=True); assert 'cv1touch-gui ' in out, repr(out); print(out.strip())"
+          if ($LASTEXITCODE -ne 0) { throw "cv1touch-gui --version exit $LASTEXITCODE" }
       - name: Pack
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
