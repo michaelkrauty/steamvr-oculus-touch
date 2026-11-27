@@ -885,6 +885,73 @@ impl HidDevice {
     }
 }
 
+/// One hidraw node opened read-write for synchronous HID feature reports.
+pub struct HidFeatureDevice {
+    file: File,
+}
+
+/// HIDIOCSFEATURE(len) / HIDIOCGFEATURE(len): _IOC(_IOC_WRITE | _IOC_READ, 'H', nr, len).
+fn feature_ioctl(nr: u64, len: usize) -> libc::Ioctl {
+    ((3u64 << 30) | ((len as u64) << 16) | ((b'H' as u64) << 8) | nr) as libc::Ioctl
+}
+
+impl HidFeatureDevice {
+    pub fn open(path: &Path) -> io::Result<HidFeatureDevice> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(HidFeatureDevice { file })
+    }
+
+    pub fn set_feature(&mut self, report: &[u8]) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if report.is_empty() || report.len() > 0x3fff {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid HID feature report length",
+            ));
+        }
+        let mut buf = report.to_vec();
+        // SAFETY: `buf` is valid for the exact byte length encoded in the ioctl request.
+        let ret = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                feature_ioctl(0x06, buf.len()),
+                buf.as_mut_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if buf.is_empty() || buf.len() > 0x3fff {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid HID feature report length",
+            ));
+        }
+        // SAFETY: `buf` is valid for the exact byte length encoded in the ioctl request;
+        // `buf[0]` names the report ID.
+        let ret = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                feature_ioctl(0x07, buf.len()),
+                buf.as_mut_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ret as usize)
+    }
+}
+
 pub fn headset_interface(interface: u8) -> Option<std::path::PathBuf> {
     headset_hidraw(Path::new("/sys/class/hidraw"), interface)
 }
@@ -2196,5 +2263,13 @@ mod container_control_tests {
         assert!(unlink_private_socket(&path).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"keep this target");
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hidraw_feature_ioctls_match_the_kernels() {
+        // linux/hidraw.h: HIDIOCSFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
+        assert_eq!(feature_ioctl(0x06, 31), 0xc01f_4806 as libc::Ioctl);
+        assert_eq!(feature_ioctl(0x07, 6), 0xc006_4807 as libc::Ioctl);
+        assert_eq!(feature_ioctl(0x06, 4), 0xc004_4806 as libc::Ioctl);
     }
 }

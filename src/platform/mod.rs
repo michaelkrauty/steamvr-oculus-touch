@@ -396,6 +396,26 @@ pub mod hid {
         }
     }
 
+    /// A headset HID interface opened for synchronous feature reports (interface 0).
+    pub struct FeatureDevice(pub(super) os::HidFeatureDevice);
+
+    impl FeatureDevice {
+        /// Opens an interface for synchronous HID feature get/set requests.
+        pub fn open(path: &Path) -> io::Result<FeatureDevice> {
+            os::HidFeatureDevice::open(path).map(FeatureDevice)
+        }
+
+        /// Sends one feature report; `report[0]` is the report ID.
+        pub fn set_feature(&mut self, report: &[u8]) -> io::Result<()> {
+            self.0.set_feature(report)
+        }
+
+        /// Reads one feature report; `buf[0]` names the report ID. Returns the bytes filled.
+        pub fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.get_feature(buf)
+        }
+    }
+
     /// What the radio thread reads the controllers' reports from: the headset's radio
     /// interface, or another radio in its place.
     pub trait RadioPort {
