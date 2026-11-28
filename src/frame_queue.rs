@@ -27,6 +27,8 @@ pub struct FrameQueue<F> {
     next: usize,
     clocks: VecDeque<(u64, u32)>,
     stats: QueueStats,
+    /// Monotonic pose generation shared between frame admission and live pose boundaries.
+    pose_epoch: u64,
 }
 
 impl<F> Default for FrameQueue<F> {
@@ -37,6 +39,7 @@ impl<F> Default for FrameQueue<F> {
             next: 0,
             clocks: VecDeque::new(),
             stats: QueueStats::default(),
+            pose_epoch: 0,
         }
     }
 }
@@ -198,6 +201,36 @@ impl<F> FrameQueue<F> {
         None
     }
 
+    pub fn pose_epoch(&self) -> u64 {
+        self.pose_epoch
+    }
+
+    /// Advances and returns the pose generation for frames admitted after a pose boundary.
+    pub fn advance_pose_epoch(&mut self) -> u64 {
+        self.pose_epoch = self.pose_epoch.wrapping_add(1);
+        self.pose_epoch
+    }
+
+    pub fn has_frame_matching(&self, mut pred: impl FnMut(&F) -> bool) -> bool {
+        self.frames
+            .values()
+            .any(|(_, queue)| queue.iter().any(|(_, frame)| pred(frame)))
+    }
+
+    /// Pops the next queued frame matching `pred` in round-robin sensor order, preserving
+    /// exposure order within each sensor.
+    pub fn pop_frame_matching(&mut self, mut pred: impl FnMut(&F) -> bool) -> Option<F> {
+        for _ in 0..self.roster.len() {
+            let serial = &self.roster[self.next];
+            self.next = (self.next + 1) % self.roster.len();
+            let queue = &mut self.frames.get_mut(serial).unwrap().1;
+            if let Some(index) = queue.iter().position(|(_, frame)| pred(frame)) {
+                return Some(queue.remove(index).unwrap().1);
+            }
+        }
+        None
+    }
+
     pub fn is_empty(&self) -> bool {
         self.clocks.is_empty() && !self.has_frames()
     }
@@ -265,6 +298,34 @@ mod tests {
         q.push_frame("SENSORBETA", 2, 6, 6);
         assert_eq!(q.pop_frame(), Some(6));
         assert_eq!(q.stats().unknown_frames, 2);
+    }
+
+    #[test]
+    fn pose_epoch_filtering_drains_older_frames_before_newer_ones() {
+        let mut q = FrameQueue::default();
+        q.register([("a".into(), 1), ("b".into(), 1)]);
+        assert_eq!(q.pose_epoch(), 0);
+        q.push_frame("a", 1, 10, ("a0", 0u64));
+        q.push_frame("b", 1, 11, ("b0", 0u64));
+        let next_epoch = q.advance_pose_epoch();
+        assert_eq!(next_epoch, 1);
+        q.push_frame("a", 1, 20, ("a1", next_epoch));
+        q.push_frame("b", 1, 21, ("b1", next_epoch));
+        assert!(q.has_frame_matching(|&(_, epoch)| epoch < next_epoch));
+        assert_eq!(
+            q.pop_frame_matching(|&(_, epoch)| epoch < next_epoch),
+            Some(("a0", 0))
+        );
+        assert!(q.has_frame_matching(|&(_, epoch)| epoch < next_epoch));
+        assert_eq!(
+            q.pop_frame_matching(|&(_, epoch)| epoch < next_epoch),
+            Some(("b0", 0))
+        );
+        assert!(!q.has_frame_matching(|&(_, epoch)| epoch < next_epoch));
+        assert_eq!(q.pop_frame_matching(|&(_, epoch)| epoch < next_epoch), None);
+        assert_eq!(q.pop_frame(), Some(("a1", 1)));
+        assert_eq!(q.pop_frame(), Some(("b1", 1)));
+        assert_eq!(q.pop_frame(), None);
     }
 
     #[test]
