@@ -314,6 +314,18 @@ static void dump_controller_calibration(rift_touch_controller_t *touch)
 	}
 }
 
+static inline void touch_calib_lock(rift_touch_controller_t *touch)
+{
+	while (__atomic_exchange_n(&touch->cv1touch_calibration_spinlock, 1u, __ATOMIC_ACQUIRE)) {
+		/* spin: only contended during a rare live controller swap */
+	}
+}
+
+static inline void touch_calib_unlock(rift_touch_controller_t *touch)
+{
+	__atomic_store_n(&touch->cv1touch_calibration_spinlock, 0u, __ATOMIC_RELEASE);
+}
+
 /* Called only by the engine thread, from reports and from the no-report update path. */
 static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *touch)
 {
@@ -330,8 +342,11 @@ static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *t
 
 	/* Poll first: the engine thread can stall (a blocked USB call, a suspend), and a command that
 	 * finished meanwhile is read, not abandoned for having waited. */
-	ret = rift_touch_get_calibration(hmd->ctx, radio, touch->device_num,
-			&touch->calibration, state);
+	const bool is_recheck = touch->have_calibration;
+	rift_touch_calibration *target = is_recheck ? &touch->cv1touch_staging_calibration : &touch->calibration;
+	const uint8_t *current_hash = is_recheck ? touch->cv1touch_calibration_hash : NULL;
+	ret = rift_touch_get_calibration_if_changed(hmd->ctx, radio, touch->device_num,
+			current_hash, target, state);
 	if (ret == -EINPROGRESS && radio->calibration_deadline && now >= radio->calibration_deadline &&
 	    progress == radio->calibration_progress) {
 		/* Abandon this read, including its result. The next operation must send
@@ -355,6 +370,14 @@ static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *t
 	if (ret == -EBUSY)
 		return false;
 	radio->calibration_deadline = 0;
+	if (ret == RIFT_TOUCH_CALIBRATION_UNCHANGED) {
+		state->retry_time = 0;
+		state->retry_delay = 0;
+		state->error = 0;
+		touch->cv1touch_recheck_pending = false;
+		rift_leds_clear(&touch->cv1touch_staging_calibration.leds);
+		return true;
+	}
 	if (ret < 0) {
 		state->retry_delay = state->retry_delay ? OHMD_MIN(state->retry_delay * 2, 60) : 1;
 		state->retry_time = completed + second * state->retry_delay;
@@ -380,7 +403,7 @@ static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *t
 
 	quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
 	posef imu_pose;
-	oposef_init(&imu_pose, &touch->calibration.imu_position, &imu_orient);
+	oposef_init(&imu_pose, &target->imu_position, &imu_orient);
 
 	quatf model_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
 	vec3f model_pos = {{ 0.0, 0.0, 0.0 }};
@@ -388,17 +411,36 @@ static bool update_touch_calibration(rift_hmd_t *hmd, rift_touch_controller_t *t
 	oposef_init(&model_pose, &model_pos, &model_orient);
 
 	/* Copy into imu_calibration array */
-	imu_calibration.accel_offset = touch->calibration.accel_offset;
-	imu_calibration.gyro_offset = touch->calibration.gyro_offset;
+	imu_calibration.accel_offset = target->accel_offset;
+	imu_calibration.gyro_offset = target->gyro_offset;
 	for (i = 0; i < 9; i++) {
-		imu_calibration.accel_matrix[i] = touch->calibration.accel_matrix[i/3][i%3];
-		imu_calibration.gyro_matrix[i] = touch->calibration.gyro_matrix[i/3][i%3];
+		imu_calibration.accel_matrix[i] = target->accel_matrix[i/3][i%3];
+		imu_calibration.gyro_matrix[i] = target->gyro_matrix[i/3][i%3];
 	}
 
-	touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
-	memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
-	/* release: the radio thread's decoder copies the calibration once it sees the flag */
-	__atomic_store_n(&touch->have_calibration, true, __ATOMIC_RELEASE);
+	touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &target->leds, &imu_calibration);
+	if (is_recheck) {
+		rift_leds old_leds = touch->calibration.leds;
+		touch_calib_lock(touch);
+		touch->calibration = touch->cv1touch_staging_calibration;
+		memset(&touch->cv1touch_staging_calibration, 0, sizeof touch->cv1touch_staging_calibration);
+		memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
+		__atomic_fetch_add(&touch->cv1touch_calibration_gen, 1, __ATOMIC_RELEASE);
+		touch_calib_unlock(touch);
+		touch->time_valid = false;
+		touch->last_timestamp = 0;
+		touch->cv1touch_clock_ns = 0;
+		touch->cv1touch_clock_ts = 0;
+		rift_leds_clear(&old_leds);
+	} else {
+		touch_calib_lock(touch);
+		memcpy(touch->cv1touch_calibration_hash, hmd->radio.calibration_hash, 16);
+		/* release: the radio thread's decoder copies the calibration once it sees the flag/gen */
+		__atomic_store_n(&touch->have_calibration, true, __ATOMIC_RELEASE);
+		__atomic_fetch_add(&touch->cv1touch_calibration_gen, 1, __ATOMIC_RELEASE);
+		touch_calib_unlock(touch);
+	}
+	touch->cv1touch_recheck_pending = false;
 	dump_controller_calibration(touch);
 	return true;
 }
@@ -414,7 +456,8 @@ static void update_pending_calibration(rift_hmd_t *hmd)
 		return;
 	for (int hand = 0; hand < 2; hand++) {
 		rift_touch_controller_t *touch = &hmd->touch_dev[hand];
-		if (!touch->have_calibration && touch->device_num == radio->device_in_progress) {
+		if ((!touch->have_calibration || touch->cv1touch_recheck_pending) &&
+		    touch->device_num == radio->device_in_progress) {
 			update_touch_calibration(hmd, touch);
 			return;
 		}
@@ -434,11 +477,26 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	}
 	touch->buttons = buttons;
 
-	if (touch_empty_activity(hmd->ctx, 0, touch, msg, cv1touch_received_ns))
+	if (touch_empty_activity(hmd->ctx, 0, touch, msg, cv1touch_received_ns)) {
+		touch->cv1touch_was_asleep = true;
 		return;
+	}
+
+	const uint64_t second = ohmd_monotonic_per_sec(hmd->ctx);
+	if (touch->have_calibration) {
+		if (touch->cv1touch_was_asleep ||
+		    (touch->cv1touch_last_active_ns != 0 && cv1touch_received_ns >= touch->cv1touch_last_active_ns &&
+		     cv1touch_received_ns - touch->cv1touch_last_active_ns >= second)) {
+			touch->cv1touch_recheck_pending = true;
+		}
+	}
+	touch->cv1touch_was_asleep = false;
+	touch->cv1touch_last_active_ns = cv1touch_received_ns;
 
 	if (!touch->have_calibration && !update_touch_calibration(hmd, touch))
 		return;
+	if (touch->have_calibration && touch->cv1touch_recheck_pending)
+		update_touch_calibration(hmd, touch);
 
 	// time in microseconds
 	vec3f gyro, accel;
@@ -1412,6 +1470,8 @@ static void close_hmd(rift_hmd_t *hmd)
 
 	rift_touch_clear_calibration (&hmd->touch_dev[0].calibration);
 	rift_touch_clear_calibration (&hmd->touch_dev[1].calibration);
+	rift_leds_clear (&hmd->touch_dev[0].cv1touch_staging_calibration.leds);
+	rift_leds_clear (&hmd->touch_dev[1].cv1touch_staging_calibration.leds);
 	rift_leds_clear (&hmd->leds);
 	free(hmd);
 }
@@ -1709,12 +1769,25 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_cv1touch_radio_decode(ohmd_cv1touch_radi
 		rift_touch_controller_t *touch = &dec->touch[t];
 		if (touch_empty_activity(dec->hmd->ctx, 1, touch, msg, received_ns))
 			continue;
-		if (!touch->have_calibration) {
-			rift_touch_controller_t *engine = &dec->hmd->touch_dev[t];
-			if (!__atomic_load_n(&engine->have_calibration, __ATOMIC_ACQUIRE))
-				continue;
+		rift_touch_controller_t *engine = &dec->hmd->touch_dev[t];
+		if (!__atomic_load_n(&engine->have_calibration, __ATOMIC_ACQUIRE))
+			continue;
+		uint32_t gen = __atomic_load_n(&engine->cv1touch_calibration_gen, __ATOMIC_ACQUIRE);
+		if (!touch->have_calibration || gen != touch->cv1touch_calibration_gen) {
+			touch_calib_lock(engine);
 			touch->calibration = engine->calibration;
+			touch->calibration.leds.points = NULL;
+			touch->calibration.leds.num_points = 0;
+			gen = __atomic_load_n(&engine->cv1touch_calibration_gen, __ATOMIC_ACQUIRE);
+			touch_calib_unlock(engine);
+			if (touch->have_calibration) {
+				touch->time_valid = false;
+				touch->last_timestamp = 0;
+				touch->cv1touch_clock_ns = 0;
+				touch->cv1touch_clock_ts = 0;
+			}
 			touch->have_calibration = true;
+			touch->cv1touch_calibration_gen = gen;
 		}
 		if (touch_decode_sample(dec->hmd->ctx, touch, msg, received_ns, &out[n]))
 			n++;

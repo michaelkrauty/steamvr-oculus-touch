@@ -99,6 +99,7 @@ uint32_t test_search_skip(rift_tracker_ctx *t) { (void)t; return 0; }
 void test_video_frame_release(ohmd_video_frame *f) { (void)f; video_releases++; }
 void test_thread_name(const char *name) { (void)name; }
 void ohmd_cond_signal(ohmd_cond *c) { (void)c; }
+void ohmd_cond_broadcast(ohmd_cond *c) { (void)c; }
 void ohmd_cond_wait(ohmd_cond *c, ohmd_mutex *m) { (void)c; (void)m; abort(); }
 static void count_frame(void *user, uint64_t lifetime, const ohmd_cv1touch_frame_info *info, int n,
     const ohmd_cv1touch_blob *blobs) {

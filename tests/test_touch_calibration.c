@@ -1735,6 +1735,96 @@ static void repeated_timeouts_warn_after_the_second_failure_in_plain_words(void)
 	CHECK(warning_logs == 1 && !hmd.touch_dev[1].have_calibration);
 	clear_retry_fixture(&hmd);
 }
+static void wake_recheck_same_hash_skips_download_and_preserves_tracking(void)
+{
+	ohmd_context ctx = {0};
+	rift_hmd_t hmd;
+	retry_fixture(&hmd, &ctx);
+	flash_hash[0] = 0x51;
+	cached_json = valid_json;
+	report_frame(&hmd, 0, 1000000000);
+	CHECK(hmd.touch_dev[0].have_calibration);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+	CHECK(hash_reads == 1 && cache_reads == 1 && flash_headers == 0 && tracker_creations == 1);
+
+	/* Empty report (sleep), then wake with same hash: re-checks hash only, no download or reset. */
+	pkt_rift_radio_message empty = {0};
+	empty.valid = true;
+	empty.device_type = RIFT_TOUCH_CONTROLLER_RIGHT;
+	handle_touch_controller_message(&hmd, 1002000000, &hmd.touch_dev[0], &empty);
+	CHECK(hmd.touch_dev[0].cv1touch_was_asleep);
+	report_frame(&hmd, 0, 1004000000);
+	CHECK(hmd.touch_dev[0].have_calibration);
+	CHECK(!hmd.touch_dev[0].cv1touch_recheck_pending);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+	CHECK(hash_reads == 2 && cache_reads == 1 && flash_headers == 0 && tracker_creations == 1);
+
+	/* Inactivity gap >= 1 s with same hash: re-checks hash only. */
+	report_frame(&hmd, 0, 2100000000);
+	CHECK(hmd.touch_dev[0].have_calibration);
+	CHECK(!hmd.touch_dev[0].cv1touch_recheck_pending);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+	CHECK(hash_reads == 3 && cache_reads == 1 && flash_headers == 0 && tracker_creations == 1);
+	clear_retry_fixture(&hmd);
+}
+static void wake_recheck_different_hash_swaps_calibration_and_resets_time(void)
+{
+	ohmd_context ctx = {0};
+	rift_hmd_t hmd;
+	retry_fixture(&hmd, &ctx);
+	flash_hash[0] = 0x61;
+	cached_json = valid_json;
+	report_frame(&hmd, 0, 1000000000);
+	CHECK(hmd.touch_dev[0].have_calibration && hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_hash[0] == 0x61);
+
+	/* Repeated swaps across cached and flash-downloaded calibrations. */
+	for (int swap = 1; swap <= 4; swap++) {
+		flash_hash[0] = (uint8_t)(0x61 + swap);
+		if (swap % 2 == 1) {
+			cached_json = valid_json;
+		} else {
+			cached_json = "{\"bad\":true}";
+			radio_json = valid_json;
+		}
+		report_frame(&hmd, 0, 1000000000ull + (uint64_t)swap * 2000000000ull);
+		CHECK(hmd.touch_dev[0].have_calibration);
+		CHECK(!hmd.touch_dev[0].cv1touch_recheck_pending);
+		CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == (uint32_t)(1 + swap));
+		CHECK(hmd.touch_dev[0].cv1touch_calibration_hash[0] == (uint8_t)(0x61 + swap));
+		CHECK(tracker_creations == 1 + swap);
+	}
+	clear_retry_fixture(&hmd);
+}
+static void wake_recheck_failure_preserves_active_calibration_and_backs_off(void)
+{
+	ohmd_context ctx = {0};
+	rift_hmd_t hmd;
+	retry_fixture(&hmd, &ctx);
+	flash_hash[0] = 0x71;
+	cached_json = valid_json;
+	report_frame(&hmd, 0, 1000000000);
+	CHECK(hmd.touch_dev[0].have_calibration && hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+
+	/* Wake with radio failure: active calibration and hash stay intact. */
+	hash_timeouts = 1;
+	report_frame(&hmd, 0, 3000000000);
+	CHECK(hmd.touch_dev[0].have_calibration);
+	CHECK(hmd.touch_dev[0].cv1touch_recheck_pending);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == 1);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_hash[0] == 0x71);
+	CHECK(hmd.radio.cur_read_cmd == RIFT_RADIO_CMD_NONE);
+
+	/* Recover after backoff with new hash. */
+	hash_timeouts = 0;
+	flash_hash[0] = 0x72;
+	report_frame(&hmd, 0, 5000000000);
+	CHECK(hmd.touch_dev[0].have_calibration);
+	CHECK(!hmd.touch_dev[0].cv1touch_recheck_pending);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_gen == 2);
+	CHECK(hmd.touch_dev[0].cv1touch_calibration_hash[0] == 0x72);
+	clear_retry_fixture(&hmd);
+}
 int main(int argc, char **argv)
 {
 	CHECK(argc <= 2);
@@ -1743,6 +1833,11 @@ int main(int argc, char **argv)
 	if (argc == 1 || strcmp(argv[1], "drain_notice") == 0) a_long_drain_warns_once_and_a_later_drain_can_warn_again();
 	if (argc == 1 || strcmp(argv[1], "wake") == 0) one_wake_up_timeout_recovers_without_a_warning();
 	if (argc == 1 || strcmp(argv[1], "wake_reason") == 0) repeated_timeouts_warn_after_the_second_failure_in_plain_words();
+	if (argc == 1 || strcmp(argv[1], "hotswap") == 0) {
+		wake_recheck_same_hash_skips_download_and_preserves_tracking();
+		wake_recheck_different_hash_swaps_calibration_and_resets_time();
+		wake_recheck_failure_preserves_active_calibration_and_backs_off();
+	}
 	if (argc == 1 || strcmp(argv[1], "parser") == 0)
 		parser_failures_release_the_copy();
 	if (argc == 1 || strcmp(argv[1], "cache") == 0) {
@@ -1816,6 +1911,7 @@ int main(int argc, char **argv)
 	      strcmp(argv[1], "diagnostics") == 0 ||
 	      strcmp(argv[1], "drain") == 0 || strcmp(argv[1], "drain_slow") == 0 || strcmp(argv[1], "drain_notice") == 0 ||
 	      strcmp(argv[1], "wake") == 0 || strcmp(argv[1], "wake_reason") == 0 ||
+	      strcmp(argv[1], "hotswap") == 0 ||
 	      strcmp(argv[1], "ops") == 0);
 	if (argc == 1 || strcmp(argv[1], "haptics") == 0) haptics_confirm_only_the_wanted_state();
 	if (argc == 1 || strcmp(argv[1], "ops") == 0) another_radio_carries_calibration_and_haptics();

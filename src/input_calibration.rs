@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const FORMAT: &str = "cv1touch-input-calibration";
 pub const VERSION: u32 = 1;
 pub const DEFAULT_DEADZONE: f32 = 0.05;
-pub const MAX_FILE_BYTES: usize = 16 * 1024;
+pub const MAX_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_ENTRIES_PER_HAND: usize = 32;
 const MIN_TRAVEL: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -37,6 +38,10 @@ pub struct HandCalibration {
     pub grip: Endpoint,
     pub stick: [StickAxis; 2],
 }
+fn extra_is_empty(extra: &[Vec<HandCalibration>; 2]) -> bool {
+    extra[0].is_empty() && extra[1].is_empty()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CalibrationFile {
@@ -45,6 +50,8 @@ pub struct CalibrationFile {
     pub analog_deadzone: f32,
     pub stick_deadzone: f32,
     pub hands: [HandCalibration; 2],
+    #[serde(default, skip_serializing_if = "extra_is_empty")]
+    pub extra: [Vec<HandCalibration>; 2],
 }
 
 fn valid_coordinate(x: f32) -> bool {
@@ -128,9 +135,46 @@ impl CalibrationFile {
             analog_deadzone: DEFAULT_DEADZONE,
             stick_deadzone: DEFAULT_DEADZONE,
             hands,
+            extra: [Vec::new(), Vec::new()],
         };
         value.validate()?;
         Ok(value)
+    }
+    pub fn find(&self, hand: usize, identity: &str) -> Option<&HandCalibration> {
+        let primary = self.hands.get(hand)?;
+        if primary.identity == identity {
+            return Some(primary);
+        }
+        self.extra[hand].iter().find(|h| h.identity == identity)
+    }
+    pub fn has_identity(&self, hand: usize, identity: &str) -> bool {
+        !identity.is_empty() && self.find(hand, identity).is_some()
+    }
+    pub fn upsert(&mut self, hand: usize, entry: HandCalibration) -> Result<(), String> {
+        if hand >= 2 {
+            return Err(format!("invalid hand index {hand}"));
+        }
+        entry.validate()?;
+        let other = 1 - hand;
+        if self.has_identity(other, &entry.identity) {
+            return Err("controller identities must be distinct".into());
+        }
+        if self.hands[hand].identity == entry.identity {
+            self.hands[hand] = entry;
+        } else if let Some(slot) = self.extra[hand]
+            .iter_mut()
+            .find(|h| h.identity == entry.identity)
+        {
+            *slot = entry;
+        } else {
+            if 1 + self.extra[hand].len() >= MAX_ENTRIES_PER_HAND {
+                return Err(format!(
+                    "at most {MAX_ENTRIES_PER_HAND} calibrated controllers are supported per hand"
+                ));
+            }
+            self.extra[hand].push(entry);
+        }
+        self.validate()
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.format != FORMAT || self.version != VERSION {
@@ -139,11 +183,27 @@ impl CalibrationFile {
         if !valid_deadzone(self.analog_deadzone) || !valid_deadzone(self.stick_deadzone) {
             return Err("input deadzones must be finite between 0 and 0.2".into());
         }
+        let mut seen = std::collections::HashSet::new();
         for (i, hand) in self.hands.iter().enumerate() {
             hand.validate().map_err(|e| format!("hand {i}: {e}"))?;
+            if !seen.insert(hand.identity.as_str()) {
+                return Err("controller identities must be distinct".into());
+            }
         }
-        if self.hands[0].identity == self.hands[1].identity {
-            return Err("controller identities must be distinct".into());
+        for (i, list) in self.extra.iter().enumerate() {
+            if 1 + list.len() > MAX_ENTRIES_PER_HAND {
+                return Err(format!(
+                    "hand {i}: at most {MAX_ENTRIES_PER_HAND} calibrated controllers are supported"
+                ));
+            }
+            for (j, entry) in list.iter().enumerate() {
+                entry
+                    .validate()
+                    .map_err(|e| format!("hand {i} extra {j}: {e}"))?;
+                if !seen.insert(entry.identity.as_str()) {
+                    return Err("controller identities must be distinct".into());
+                }
+            }
         }
         Ok(())
     }
@@ -158,12 +218,12 @@ impl CalibrationFile {
         grip: f32,
         stick: [f32; 2],
     ) -> (f32, f32, [f32; 2]) {
-        let Some(h) = self.hands.get(hand) else {
-            return factory_values(trigger, grip, stick);
-        };
-        if h.identity != identity || self.validate().is_err() {
+        if self.validate().is_err() {
             return factory_values(trigger, grip, stick);
         }
+        let Some(h) = self.find(hand, identity) else {
+            return factory_values(trigger, grip, stick);
+        };
         let mut out = [0.; 2];
         if stick.into_iter().all(f32::is_finite) {
             let x = h.stick[0].apply(stick[0]);
@@ -209,14 +269,14 @@ pub fn load(path: &Path) -> Result<Option<CalibrationFile>, String> {
     };
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES as u64 {
-        return Err("input calibration must be a regular file of at most 16 KiB".into());
+        return Err("input calibration must be a regular file of at most 64 KiB".into());
     }
     let mut bytes = Vec::new();
     file.take((MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() > MAX_FILE_BYTES {
-        return Err("input calibration exceeds 16 KiB".into());
+        return Err("input calibration exceeds 64 KiB".into());
     }
     let value: CalibrationFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     value.validate()?;
@@ -419,5 +479,40 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         std::os::unix::fs::symlink("/dev/zero", &p).unwrap();
         assert!(load(&p).is_err());
+    }
+    #[test]
+    fn multi_controller_upsert_lookup_and_v1_compat() {
+        let mut c = example();
+        let v1_json = serde_json::to_string(&c).unwrap();
+        assert!(!v1_json.contains("\"extra\""));
+        let loaded: CalibrationFile = serde_json::from_str(&v1_json).unwrap();
+        assert_eq!(loaded, c);
+
+        let id_extra = "c".repeat(32);
+        let extra_left = HandCalibration {
+            identity: id_extra.clone(),
+            trigger: Endpoint {
+                released: 0.0,
+                pressed: 0.8,
+            },
+            grip: Endpoint {
+                released: 0.0,
+                pressed: 0.8,
+            },
+            stick: [StickAxis {
+                min: -0.8,
+                center: 0.0,
+                max: 0.8,
+            }; 2],
+        };
+        c.upsert(0, extra_left.clone()).unwrap();
+        assert!(c.has_identity(0, &id_extra));
+        assert!(!c.has_identity(1, &id_extra));
+        assert_eq!(c.apply(0, &id_extra, 0.8, 0.8, [0.0; 2]), (1., 1., [0.; 2]));
+        assert!(c.upsert(1, extra_left).is_err());
+        assert_eq!(
+            c.apply(0, &"f".repeat(32), 0.4, 0.6, [0.5, -0.5]),
+            factory_values(0.4, 0.6, [0.5, -0.5])
+        );
     }
 }

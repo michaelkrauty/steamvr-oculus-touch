@@ -24,6 +24,12 @@ int rift_touch_get_calibration(ohmd_context *ctx, rift_hmd_radio_state *radio, i
 	(void)ctx; (void)radio; (void)device_num; (void)calibration; (void)state;
 	return -1; /* no answer from the controller: nothing decoded but the beacon */
 }
+int rift_touch_get_calibration_if_changed(ohmd_context *ctx, rift_hmd_radio_state *radio, int device_num,
+    const uint8_t *current_hash, rift_touch_calibration *calibration, rift_touch_calibration_state *state)
+{
+	(void)current_hash;
+	return rift_touch_get_calibration(ctx, radio, device_num, calibration, state);
+}
 static int imu_updates;
 void rift_tracked_device_imu_update(rift_tracked_device *dev, uint64_t local_ts, uint32_t device_ts,
     float dt, const vec3f *ang_vel, const vec3f *accel, const vec3f *mag_field)

@@ -31,6 +31,8 @@ void blobwatch_update_labels(blobwatch *bw, blobservation *ob, int device_id)
     native_blobwatch_update_labels(bw, ob, device_id);
 }
 void ohmd_cond_signal(ohmd_cond *cond) { (void)cond; }
+void ohmd_cond_broadcast(ohmd_cond *cond) { (void)cond; }
+void ohmd_cond_wait(ohmd_cond *cond, ohmd_mutex *mutex) { (void)cond; (void)mutex; }
 
 static int awake_device;
 static int matching_first_blob = 1;

@@ -154,7 +154,7 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
             return Err("wake both controllers to verify input identities".into());
         }
         let ids = identities.as_ref().unwrap();
-        if (0..2).all(|h| value.hands[h].identity == ids[h]) {
+        if (0..2).all(|h| value.has_identity(h, &ids[h])) {
             Ok(())
         } else {
             Err("input calibration belongs to a different controller pair".into())
@@ -165,8 +165,18 @@ fn inspect(checkpoint: &Checkpoint) -> Inspection {
         if !known_identities {
             return Err("wake both controllers to verify render geometry".into());
         }
-        for identity in identities.as_ref().unwrap() {
-            source_hash.update(identity.as_bytes());
+        let ids = identities.as_ref().unwrap();
+        let render_file = align::load_render(&align::render_path()).ok();
+        let both_covered = render_file.as_ref().is_some_and(|r| {
+            ["left", "right"]
+                .iter()
+                .enumerate()
+                .all(|(h, name)| r.has_identity(name, &ids[h]))
+        });
+        if !both_covered {
+            for identity in ids {
+                source_hash.update(identity.as_bytes());
+            }
         }
         for left in [true, false] {
             let mesh = rendermodel::steamvr_body_obj(left);

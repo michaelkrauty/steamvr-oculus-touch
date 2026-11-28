@@ -1625,6 +1625,7 @@ fn fit_render(rec: Option<&Path>) -> i32 {
         }
         hands.push(align::RenderOffset {
             hand: hand.into(),
+            identity: None,
             model_from_render: align::PoseEntry::from_iso(&f.render_from_model.inverse()),
             rms_mm: f.rms_m * 1e3,
             leds: f.used,
@@ -1641,13 +1642,26 @@ fn fit_render(rec: Option<&Path>) -> i32 {
     if hands.is_empty() {
         return 1;
     }
-    let file = align::RenderOffsets {
-        format: align::RENDER_FORMAT.into(),
-        version: align::VERSION,
-        created_unix_s: unix_now(),
-        source: absolute(&rec).display().to_string(),
-        hands,
-    };
+    let factory_dir = track::factory::openhmd_config_dir();
+    let rec_ids: [Option<String>; 2] = [
+        ll.and_then(|leds| track::factory::identity(&factory_dir, leds)),
+        lr.and_then(|leds| track::factory::identity(&factory_dir, leds)),
+    ];
+    let mut file =
+        align::load_render(&align::render_path()).unwrap_or_else(|_| align::RenderOffsets {
+            format: align::RENDER_FORMAT.into(),
+            version: align::VERSION,
+            created_unix_s: unix_now(),
+            source: absolute(&rec).display().to_string(),
+            hands: Vec::new(),
+        });
+    file.created_unix_s = unix_now();
+    file.source = absolute(&rec).display().to_string();
+    for mut entry in hands {
+        let idx = if entry.hand == "left" { 0 } else { 1 };
+        entry.identity = rec_ids[idx].clone();
+        file.upsert(entry);
+    }
     match commit_fit(interrupted(), || {
         align::save(&align::render_path(), &file).map(|_| ())
     }) {
@@ -2909,14 +2923,65 @@ fn reload_inputs() -> Result<(), String> {
     }
 }
 
-fn calibrate_inputs(out: Option<&Path>, reset: bool) -> i32 {
-    calibrate_inputs_with(out, reset, false)
+fn collect_inputs_single(
+    step: CalStep,
+    hand: usize,
+    identities: &[String; 2],
+    last_ns: &mut [u64; 2],
+    quiet: bool,
+) -> Result<Vec<RawInput>, String> {
+    let name = ["left", "right"][hand];
+    let (seconds, minimum) = step.length();
+    if !quiet {
+        println!("Sampling {name} hand for {seconds} seconds...");
+    }
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(seconds);
+    let mut phase = InputPhase {
+        last_ns: last_ns[hand],
+        samples: Vec::new(),
+    };
+    let mut ticker = events::Ticker::new(EVENT_PERIOD);
+    while Instant::now() < deadline {
+        if interrupted() {
+            return Err("input calibration cancelled; no calibration saved".into());
+        }
+        let tick = Instant::now();
+        let raw = raw_inputs()?;
+        phase.observe(&raw, identities, hand, shm::now_ns())?;
+        if events::on() && ticker.due() {
+            let elapsed = start.elapsed().as_secs_f64();
+            let total = Some(seconds as f64);
+            events::progress(
+                "inputs",
+                Some(elapsed),
+                total,
+                step.id(),
+                input_metrics(&raw),
+            );
+        }
+        thread::sleep(Duration::from_millis(50).saturating_sub(tick.elapsed()));
+    }
+    last_ns[hand] = phase.last_ns;
+    if phase.samples.len() < minimum {
+        return Err(format!(
+            "{name} controller produced only {} fresh samples (need at least {minimum}); wake it and retry",
+            phase.samples.len()
+        ));
+    }
+    if !quiet {
+        println!("Done: {name} {} fresh samples.", phase.samples.len());
+    }
+    Ok(phase.samples)
 }
 
-/// `guided`: the setup guide's version: each step records as soon as both hands are in position,
-/// with buzzes and beeps instead of Enter, and nothing printed but the steps.
-fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
-    match calibrate_inputs_result(out, reset, guided) {
+fn calibrate_inputs_for_hand(
+    out: Option<&Path>,
+    reset: bool,
+    hand: Option<usize>,
+    guided: bool,
+) -> i32 {
+    match calibrate_inputs_result_for_hand(out, reset, hand, guided) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("cv1touch: {error}");
@@ -2931,6 +2996,15 @@ fn calibrate_inputs_with(out: Option<&Path>, reset: bool, guided: bool) -> i32 {
 
 /// `calibrate_inputs_with`, the error as the guide shows it.
 fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Result<(), String> {
+    calibrate_inputs_result_for_hand(out, reset, None, guided)
+}
+
+fn calibrate_inputs_result_for_hand(
+    out: Option<&Path>,
+    reset: bool,
+    single_hand: Option<usize>,
+    guided: bool,
+) -> Result<(), String> {
     catch_interrupts();
     let path = out
         .map(Path::to_path_buf)
@@ -2941,14 +3015,25 @@ fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Res
             println!("Input calibration reset; factory input mapping reloaded.");
             return Ok(());
         }
+        let existing = cv1touch::input_calibration::load(&path).ok().flatten();
+        if single_hand.is_some() && existing.is_none() {
+            return Err("calibrating a single hand requires an existing input calibration; run 'cv1touch calibrate inputs' with both hands first".into());
+        }
         if guided {
             human_action(INPUTS_GUIDE);
+        } else if let Some(h) = single_hand {
+            let name = ["left", "right"][h];
+            input_enter(&format!("Input calibration uses raw factory inputs. Wake the {name} controller.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running."))?;
         } else {
             input_enter("Input calibration uses raw factory inputs. Wake both controllers.\nIt changes triggers, grips and sticks only; tracking and SteamVR can keep running.")?;
         }
         let first = raw_inputs()?;
         let identities = std::array::from_fn(|hand| first.hands[hand].identity.clone());
-        for hand in 0..2 {
+        let hands_to_cal: Vec<usize> = match single_hand {
+            Some(h) => vec![h],
+            None => vec![0, 1],
+        };
+        for &hand in &hands_to_cal {
             InputPhase::default().observe(&first, &identities, hand, shm::now_ns())?;
         }
         let mut last_ns = std::array::from_fn(|hand| first.hands[hand].received_host_ns);
@@ -2962,34 +3047,54 @@ fn calibrate_inputs_result(out: Option<&Path>, reset: bool, guided: bool) -> Res
             } else {
                 input_enter(step.prompt())?;
             }
-            let samples = collect_inputs(step, &identities, &mut last_ns, guided)?;
+            if let Some(h) = single_hand {
+                phases[h][phase] =
+                    collect_inputs_single(step, h, &identities, &mut last_ns, guided)?;
+            } else {
+                let samples = collect_inputs(step, &identities, &mut last_ns, guided)?;
+                for (hand, samples) in samples.into_iter().enumerate() {
+                    phases[hand][phase] = samples;
+                }
+            }
             if guided {
                 cue(2);
             }
-            for (hand, samples) in samples.into_iter().enumerate() {
-                phases[hand][phase] = samples;
-            }
         }
-        let mut measured = Vec::new();
-        for (hand, identity) in identities.iter().enumerate() {
+        let mut measured: Vec<(usize, cv1touch::input_calibration::HandCalibration)> = Vec::new();
+        for &hand in &hands_to_cal {
+            let identity = &identities[hand];
             let name = ["left", "right"][hand];
             let calibration = measured_inputs(identity, &phases[hand])?;
             calibration.validate().map_err(|e| format!("{name} input measurements rejected: {e}; retry with released controls and full travel"))?;
             if !guided {
                 println!("{name}: trigger {:.3}..{:.3}, grip {:.3}..{:.3}; stick X {:.3}/{:.3}/{:.3}, Y {:.3}/{:.3}/{:.3}", calibration.trigger.released, calibration.trigger.pressed, calibration.grip.released, calibration.grip.pressed, calibration.stick[0].min, calibration.stick[0].center, calibration.stick[0].max, calibration.stick[1].min, calibration.stick[1].center, calibration.stick[1].max);
             }
-            measured.push(calibration);
+            measured.push((hand, calibration));
         }
-        let candidate = cv1touch::input_calibration::CalibrationFile::new(
-            measured
+        let candidate = if let Some(mut file) = existing {
+            for (hand, cal) in measured {
+                file.upsert(hand, cal)?;
+            }
+            file
+        } else {
+            let pair: [cv1touch::input_calibration::HandCalibration; 2] = measured
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect::<Vec<_>>()
                 .try_into()
-                .map_err(|_| "both hands must be calibrated")?,
-        )?;
+                .map_err(|_| "both hands must be calibrated")?;
+            cv1touch::input_calibration::CalibrationFile::new(pair)?
+        };
         if !guided {
-            input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+            if let Some(h) = single_hand {
+                let name = ["left", "right"][h];
+                input_enter(&format!("Measurements accepted. Wake the {name} controller again if needed; press Enter to verify its identity and save."))?;
+            } else {
+                input_enter("Measurements accepted. Wake both controllers again if needed; press Enter to verify their identities and save.")?;
+            }
         }
         let final_inputs = raw_inputs()?;
-        for hand in 0..2 {
+        for &hand in &hands_to_cal {
             InputPhase::default().observe(&final_inputs, &identities, hand, shm::now_ns())?;
         }
         if interrupted() {
@@ -7148,9 +7253,31 @@ fn main() {
             }
             rec_summary(Path::new(path), &windows)
         }
-        ["calibrate", "inputs"] => calibrate_inputs(None, false),
-        ["calibrate", "inputs", "--out", out] => calibrate_inputs(Some(Path::new(out)), false),
-        ["calibrate", "inputs", "--reset"] => calibrate_inputs(None, true),
+        ["calibrate", "inputs", rest @ ..] => {
+            let mut out: Option<PathBuf> = None;
+            let mut reset = false;
+            let mut hand: Option<usize> = None;
+            let mut it = rest.iter();
+            while let Some(&arg) = it.next() {
+                match arg {
+                    "--out" => match it.next() {
+                        Some(p) => out = Some(PathBuf::from(p)),
+                        None => usage(),
+                    },
+                    "--reset" => reset = true,
+                    "--hand" => match it.next().copied() {
+                        Some("left") => hand = Some(0),
+                        Some("right") => hand = Some(1),
+                        _ => usage(),
+                    },
+                    _ => usage(),
+                }
+            }
+            if reset && hand.is_some() {
+                usage();
+            }
+            calibrate_inputs_for_hand(out.as_deref(), reset, hand, false)
+        }
         ["calibrate"] => calibrate(&file::default_path()),
         ["calibrate", "--out", out] => calibrate(Path::new(out)),
         ["calibrate", "solve", rec, rest @ ..] => {

@@ -47,10 +47,16 @@ static char sysfs_root[PATH_MAX];
 #define rift_sensor_accept_frames_from fake_sensor_accept
 #define rift_sensor_get_usb_device fake_sensor_usb_device
 #define rift_sensor_add_device fake_sensor_add_device
+#define rift_sensor_pause_for_model_swap fake_sensor_pause_for_model_swap
+#define rift_sensor_update_device_model_parked fake_sensor_update_device_model_parked
+#define rift_sensor_resume_after_model_swap fake_sensor_resume_after_model_swap
 #define rift_kalman_6dof_init fake_kalman_init
 #include "omath.c"
 #include "rift-tracker.c"
 #include "test_util.h"
+void fake_sensor_pause_for_model_swap(rift_sensor_ctx *s, int id) { (void)s; (void)id; }
+void fake_sensor_update_device_model_parked(rift_sensor_ctx *s, rift_tracked_device *d) { (void)s; (void)d; }
+void fake_sensor_resume_after_model_swap(rift_sensor_ctx *s) { (void)s; }
 
 /* ohmd platform locks and threads on pthreads, with each lock's owner kept for the checks */
 struct ohmd_mutex {

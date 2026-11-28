@@ -911,6 +911,8 @@ pub fn universe_shift(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderOffset {
     pub hand: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     /// LED model frame <- SteamVR render model frame.
     pub model_from_render: PoseEntry,
     pub rms_mm: f64,
@@ -925,6 +927,51 @@ pub struct RenderOffsets {
     pub created_unix_s: u64,
     pub source: String,
     pub hands: Vec<RenderOffset>,
+}
+
+impl RenderOffsets {
+    /// Look up the render offset for `hand` ("left" or "right"), preferring an exact
+    /// identity match and falling back to a legacy identity-less entry (or the first
+    /// entry for that hand when `identity` is `None`).
+    pub fn lookup(&self, hand: &str, identity: Option<&str>) -> Option<&RenderOffset> {
+        if let Some(id) = identity.filter(|s| !s.is_empty()) {
+            if let Some(exact) = self
+                .hands
+                .iter()
+                .find(|h| h.hand == hand && h.identity.as_deref() == Some(id))
+            {
+                return Some(exact);
+            }
+            return self
+                .hands
+                .iter()
+                .find(|h| h.hand == hand && h.identity.is_none());
+        }
+        self.hands
+            .iter()
+            .find(|h| h.hand == hand && h.identity.is_none())
+            .or_else(|| self.hands.iter().find(|h| h.hand == hand))
+    }
+
+    pub fn has_identity(&self, hand: &str, identity: &str) -> bool {
+        !identity.is_empty()
+            && self
+                .hands
+                .iter()
+                .any(|h| h.hand == hand && h.identity.as_deref() == Some(identity))
+    }
+
+    pub fn upsert(&mut self, entry: RenderOffset) {
+        if let Some(slot) = self
+            .hands
+            .iter_mut()
+            .find(|h| h.hand == entry.hand && h.identity == entry.identity)
+        {
+            *slot = entry;
+        } else {
+            self.hands.push(entry);
+        }
+    }
 }
 
 fn config_dir() -> PathBuf {
@@ -991,6 +1038,18 @@ pub fn load_render(path: &Path) -> Result<RenderOffsets, String> {
                 h.hand
             ));
         }
+        if let Some(id) = &h.identity {
+            if id.len() != 32
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(format!(
+                    "{}: controller identity must be 32 lowercase hex characters",
+                    path.display()
+                ));
+            }
+        }
         h.model_from_render.validate(&path.display().to_string())?;
     }
     Ok(r)
@@ -1022,6 +1081,14 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<Option<PathBuf>, Str
 }
 
 pub fn alignment(reg: Option<&Registration>, render: Option<&RenderOffsets>) -> Alignment {
+    alignment_for(reg, render, [None, None])
+}
+
+pub fn alignment_for(
+    reg: Option<&Registration>,
+    render: Option<&RenderOffsets>,
+    identities: [Option<&str>; 2],
+) -> Alignment {
     let mut a = Alignment::default();
     if let Some(r) = reg {
         a.valid |= ffi::CV1T_ALIGN_LIGHTHOUSE;
@@ -1029,15 +1096,17 @@ pub fn alignment(reg: Option<&Registration>, render: Option<&RenderOffsets>) -> 
         a.lighthouse_orient = r.lighthouse_from_world.orient_xyzw;
         a.lighthouse_pos = r.lighthouse_from_world.pos;
     }
-    for h in render.map_or(&[][..], |r| &r.hands[..]) {
-        let (hand, bit) = if h.hand == "left" {
-            (HAND_LEFT, ffi::CV1T_ALIGN_RENDER_LEFT)
-        } else {
-            (HAND_RIGHT, ffi::CV1T_ALIGN_RENDER_RIGHT)
-        };
-        a.valid |= bit;
-        a.render_orient[hand] = h.model_from_render.orient_xyzw;
-        a.render_pos[hand] = h.model_from_render.pos;
+    if let Some(r) = render {
+        for (hand, name, bit) in [
+            (HAND_LEFT, "left", ffi::CV1T_ALIGN_RENDER_LEFT),
+            (HAND_RIGHT, "right", ffi::CV1T_ALIGN_RENDER_RIGHT),
+        ] {
+            if let Some(h) = r.lookup(name, identities[hand]) {
+                a.valid |= bit;
+                a.render_orient[hand] = h.model_from_render.orient_xyzw;
+                a.render_pos[hand] = h.model_from_render.pos;
+            }
+        }
     }
     a
 }
@@ -1063,6 +1132,13 @@ pub fn load_default() -> (Alignment, Vec<String>) {
 /// As `load_default`, with the registration carried by `shift` (the Lighthouse universe's move
 /// since it was fitted, see `universe_shift`).
 pub fn load_with(shift: Option<&Isometry3<f64>>) -> (Alignment, Vec<String>) {
+    load_with_identities(shift, [None, None])
+}
+
+pub fn load_with_identities(
+    shift: Option<&Isometry3<f64>>,
+    identities: [Option<&str>; 2],
+) -> (Alignment, Vec<String>) {
     let mut notes = Vec::new();
     let mut reg = optional(registration_path(), load_registration, &mut notes);
     if let (Some(r), Some(s)) = (reg.as_mut(), shift) {
@@ -1083,7 +1159,10 @@ pub fn load_with(shift: Option<&Isometry3<f64>>) -> (Alignment, Vec<String>) {
             .collect::<Vec<_>>()
             .join("+"))
     ));
-    (alignment(reg.as_ref(), render.as_ref()), notes)
+    (
+        alignment_for(reg.as_ref(), render.as_ref(), identities),
+        notes,
+    )
 }
 
 #[cfg(test)]
@@ -1532,6 +1611,7 @@ mod tests {
             source: "/tmp/x.rec".into(),
             hands: vec![RenderOffset {
                 hand: "right".into(),
+                identity: None,
                 model_from_render: PoseEntry::from_iso(&pose(-0.1)),
                 rms_mm: 1.2,
                 leds: 22,
@@ -1899,5 +1979,81 @@ mod tests {
             .collect();
         assert_eq!(lines, [first, second]);
         assert!(text.lines().next().unwrap().contains("\"moved_mm\":null"));
+    }
+
+    #[test]
+    fn render_offsets_lookup_prefers_identity_then_legacy_fallback_and_upserts() {
+        let id_a = "a".repeat(32);
+        let id_b = "b".repeat(32);
+        let entry = |hand: &str, identity: Option<String>, x: f32| RenderOffset {
+            hand: hand.into(),
+            identity,
+            model_from_render: PoseEntry {
+                orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                pos: [x, 0.0, 0.0],
+            },
+            rms_mm: 0.5,
+            leds: 20,
+        };
+        let mut offsets = RenderOffsets {
+            format: RENDER_FORMAT.into(),
+            version: VERSION,
+            created_unix_s: 1,
+            source: "test".into(),
+            hands: vec![entry("left", None, 1.0)],
+        };
+        assert_eq!(
+            offsets
+                .lookup("left", Some(&id_a))
+                .unwrap()
+                .model_from_render
+                .pos[0],
+            1.0
+        );
+        offsets.upsert(entry("left", Some(id_a.clone()), 2.0));
+        offsets.upsert(entry("left", Some(id_b.clone()), 3.0));
+        assert_eq!(
+            offsets
+                .lookup("left", Some(&id_a))
+                .unwrap()
+                .model_from_render
+                .pos[0],
+            2.0
+        );
+        assert_eq!(
+            offsets
+                .lookup("left", Some(&id_b))
+                .unwrap()
+                .model_from_render
+                .pos[0],
+            3.0
+        );
+        assert_eq!(
+            offsets
+                .lookup("left", Some(&"c".repeat(32)))
+                .unwrap()
+                .model_from_render
+                .pos[0],
+            1.0
+        );
+        offsets.upsert(entry("left", Some(id_a.clone()), 4.0));
+        assert_eq!(offsets.hands.len(), 3);
+        assert_eq!(
+            offsets
+                .lookup("left", Some(&id_a))
+                .unwrap()
+                .model_from_render
+                .pos[0],
+            4.0
+        );
+
+        let mut reg = registration();
+        let shift = pose(0.5);
+        reg.lighthouse_from_world = PoseEntry::from_iso(&(shift * reg.lighthouse_from_world.iso()));
+        let aligned = alignment_for(Some(&reg), Some(&offsets), [Some(&id_b), None]);
+        assert_ne!(aligned.valid & ffi::CV1T_ALIGN_LIGHTHOUSE, 0);
+        assert_ne!(aligned.valid & ffi::CV1T_ALIGN_RENDER_LEFT, 0);
+        assert_eq!(aligned.render_pos[HAND_LEFT][0], 3.0);
+        assert!((aligned.lighthouse_pos[0] - reg.lighthouse_from_world.pos[0]).abs() < 1e-6);
     }
 }

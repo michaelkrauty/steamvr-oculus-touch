@@ -282,6 +282,14 @@ struct rift_touch_controller_s {
 	/* Snapshot of the factory calibration identity, owned by this controller. */
 	uint8_t cv1touch_calibration_hash[16];
 	rift_touch_calibration calibration;
+	/* Staged calibration for wake-time re-check swaps; never mutates active calibration in place. */
+	rift_touch_calibration cv1touch_staging_calibration;
+	/* Atomic generation incremented on every calibration install/swap; 0 while uncalibrated. */
+	uint32_t cv1touch_calibration_gen;
+	uint32_t cv1touch_calibration_spinlock;
+	bool cv1touch_was_asleep;
+	bool cv1touch_recheck_pending;
+	uint64_t cv1touch_last_active_ns;
 
 	bool time_valid;
 	uint32_t last_timestamp;

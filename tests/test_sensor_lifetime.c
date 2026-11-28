@@ -288,7 +288,7 @@ int main(void) {
   /* Buffers and outer analyser are freed directly, so subtract their successful
    * allocations after destruction; all lock/cond/thread/search allocations use
    * counted destructors. */
-  for (int fail = 1; fail <= 11; fail++) {
+  for (int fail = 1; fail <= 12; fail++) {
     calls = owned = closed = 0;
     fail_at = fail;
     rift_sensor_device *d = calloc(1, sizeof *d);
@@ -299,7 +299,7 @@ int main(void) {
     if (s)
       rift_sensor_free(s);
     CHECK(closed == 1);
-    int direct = (fail > 1 ? 1 : 0) + (fail > 5 ? 1 : 0);
+    int direct = (fail > 1 ? 1 : 0) + (fail > 6 ? 1 : 0);
     CHECK(owned == direct);
   }
   puts("test_sensor_lifetime: ok");

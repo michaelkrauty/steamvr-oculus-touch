@@ -286,6 +286,7 @@ test('touch_calibration_drain_slow', test_touch_calibration, args: ['drain_slow'
 test('touch_calibration_drain_notice', test_touch_calibration, args: ['drain_notice'])
 test('touch_calibration_wake', test_touch_calibration, args: ['wake'])
 test('touch_calibration_wake_reason', test_touch_calibration, args: ['wake_reason'])
+test('touch_calibration_hotswap', test_touch_calibration, args: ['hotswap'])
 test('touch_calibration_ops', test_touch_calibration, args: ['ops'])
 
 # Cache I/O failures reach the caller without making valid controller calibration unusable.
