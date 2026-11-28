@@ -141,6 +141,16 @@ void ohmd_cond_signal(ohmd_cond *cond)
     (void)cond;
     wakeups++;
 }
+void ohmd_cond_broadcast(ohmd_cond *cond)
+{
+    (void)cond;
+    wakeups++;
+}
+void ohmd_cond_wait(ohmd_cond *cond, ohmd_mutex *mutex)
+{
+    (void)cond;
+    (void)mutex;
+}
 static rift_sensor_ctx sensor;
 static correspondence_search_t search;
 

@@ -193,8 +193,56 @@ static void decoded_report_gap_keeps_elapsed_time_and_sample_lag(void)
 	}
 }
 
+static void decoder_generation_swap_resets_timestamp_and_clears_leds(void)
+{
+	rift_touch_controller_t engine, dec;
+	calibrated(&engine);
+	memset(&dec, 0, sizeof dec);
+	dec.base.id = engine.base.id;
+	engine.cv1touch_calibration_gen = 1;
+	rift_led dummy_led = {0};
+	engine.calibration.leds.points = &dummy_led;
+	engine.calibration.leds.num_points = 1;
+
+	/* First controller sample at timestamp 1000000 */
+	uint32_t gen = __atomic_load_n(&engine.cv1touch_calibration_gen, __ATOMIC_ACQUIRE);
+	CHECK(gen == 1 && gen != dec.cv1touch_calibration_gen);
+	dec.calibration = engine.calibration;
+	dec.calibration.leds.points = NULL;
+	dec.calibration.leds.num_points = 0;
+	dec.have_calibration = true;
+	dec.cv1touch_calibration_gen = gen;
+	CHECK(dec.calibration.leds.points == NULL && dec.calibration.leds.num_points == 0);
+
+	ohmd_cv1touch_controller out;
+	pkt_rift_radio_message a = touch_msg(1000000, 0, 0, 0);
+	CHECK(touch_decode_sample(NULL, &dec, &a, 100, &out));
+	CHECK(dec.time_valid && out.device_time_ns == rift_device_time_next(0, 0, 998000));
+
+	/* Swap controller on engine: new accel offset and bumped generation */
+	engine.calibration.accel_offset.x = 1.5f;
+	__atomic_fetch_add(&engine.cv1touch_calibration_gen, 1, __ATOMIC_RELEASE);
+	gen = __atomic_load_n(&engine.cv1touch_calibration_gen, __ATOMIC_ACQUIRE);
+	CHECK(gen == 2 && gen != dec.cv1touch_calibration_gen);
+	dec.calibration = engine.calibration;
+	dec.calibration.leds.points = NULL;
+	dec.calibration.leds.num_points = 0;
+	dec.time_valid = false;
+	dec.last_timestamp = 0;
+	dec.cv1touch_clock_ns = 0;
+	dec.cv1touch_clock_ts = 0;
+	dec.cv1touch_calibration_gen = gen;
+
+	/* New controller has an unrelated timestamp; reset avoids a bogus dt jump */
+	pkt_rift_radio_message b = touch_msg(50000, 0, 0, 0);
+	CHECK(touch_decode_sample(NULL, &dec, &b, 200, &out));
+	CHECK(out.device_time_ns == rift_device_time_next(0, 0, 48000));
+	CHECK_NEAR(out.imu_accel[0], -1.5f, 1e-4);
+}
+
 int main(void)
 {
+	decoder_generation_swap_resets_timestamp_and_clears_leds();
 	decoded_report_gap_keeps_elapsed_time_and_sample_lag();
 	activity_follows_decoding_on_each_reader();
 	times_samples_like_the_engine();

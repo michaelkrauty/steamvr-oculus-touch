@@ -85,6 +85,7 @@ struct rift_sensor_ctx_s
 
 	/* Protected by sensor_lock */
 	rift_tracked_device *devices[RIFT_MAX_TRACKED_DEVICES];
+	led_search_model_t *device_led_search[RIFT_MAX_TRACKED_DEVICES];
 	uint8_t n_devices;
 
 	/* Queue of frames being returned to the capture thread */
@@ -134,6 +135,9 @@ struct rift_sensor_ctx_s
 	blobservation label_updates[RIFT_MAX_TRACKED_DEVICES];
 	posef label_world_pose[RIFT_MAX_TRACKED_DEVICES];
 	posef label_cam_pose[RIFT_MAX_TRACKED_DEVICES];
+	ohmd_cond *model_swap_cond;
+	bool model_swap_hold;
+	bool model_swap_parked;
 
 	/* End protected by sensor_lock */
 
@@ -187,6 +191,20 @@ static rift_sensor_analysis_frame *REWIND_QUEUE(rift_sensor_frame_queue *q) {
 	return f;
 }
 
+static void clear_device_sensor_state_locked(rift_sensor_ctx *sensor, int device_id)
+{
+	uint32_t bit = 1u << device_id;
+	if (sensor->bw)
+		blobwatch_clear_labels(sensor->bw, device_id);
+	sensor->pf.inspection_pose_mask &= ~bit;
+	memset(&sensor->pf.inspection_candidate[device_id], 0, sizeof sensor->pf.inspection_candidate[device_id]);
+	memset(&sensor->pf.inspection_identity[device_id], 0, sizeof sensor->pf.inspection_identity[device_id]);
+	sensor->pending_candidate &= ~bit;
+	sensor->pending_label_updates &= ~bit;
+	sensor->pending_label_pose &= ~bit;
+	sensor->pending_label_revoke &= ~bit;
+}
+
 bool
 rift_sensor_add_device(rift_sensor_ctx *sensor, rift_tracked_device *device)
 {
@@ -206,12 +224,62 @@ rift_sensor_add_device(rift_sensor_ctx *sensor, rift_tracked_device *device)
 
 	if (ret) {
 		sensor->devices[sensor->n_devices] = device;
+		sensor->device_led_search[sensor->n_devices] = device->led_search;
 		sensor->n_devices++;
 	}
 
 	ohmd_unlock_mutex(sensor->sensor_lock);
 
 	return ret;
+}
+
+void
+rift_sensor_pause_for_model_swap(rift_sensor_ctx *sensor, int device_id)
+{
+	(void)device_id;
+	ohmd_lock_mutex(sensor->sensor_lock);
+	if (sensor->fast_analysis_thread == NULL && sensor->long_analysis_thread == NULL) {
+		ohmd_unlock_mutex(sensor->sensor_lock);
+		return;
+	}
+	__atomic_store_n(&sensor->search_cancelled, true, __ATOMIC_RELAXED);
+	sensor->model_swap_hold = true;
+	if (sensor->fast_analysis_q_cond)
+		ohmd_cond_signal(sensor->fast_analysis_q_cond);
+	while (!sensor->model_swap_parked && !sensor->shutdown) {
+		ohmd_cond_wait(sensor->model_swap_cond, sensor->sensor_lock);
+	}
+	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
+void
+rift_sensor_update_device_model_parked(rift_sensor_ctx *sensor, rift_tracked_device *device)
+{
+	ohmd_lock_mutex(sensor->sensor_lock);
+	for (int d = 0; d < sensor->n_devices; d++) {
+		if (sensor->devices[d] == device) {
+			if (device->id >= 0 && device->id < RIFT_MAX_TRACKED_DEVICES) {
+				correspondence_search_set_model(sensor->pf.cs, device->id, device->led_search);
+				clear_device_sensor_state_locked(sensor, device->id);
+				sensor->device_led_search[d] = device->led_search;
+			}
+			break;
+		}
+	}
+	ohmd_unlock_mutex(sensor->sensor_lock);
+}
+
+void
+rift_sensor_resume_after_model_swap(rift_sensor_ctx *sensor)
+{
+	ohmd_lock_mutex(sensor->sensor_lock);
+	sensor->model_swap_hold = false;
+	sensor->model_swap_parked = false;
+	if (!sensor->have_pending_pose && !sensor->pending_clear)
+		__atomic_store_n(&sensor->search_cancelled, sensor->retired, __ATOMIC_RELAXED);
+	if (sensor->model_swap_cond)
+		ohmd_cond_broadcast(sensor->model_swap_cond);
+	ohmd_unlock_mutex(sensor->sensor_lock);
 }
 
 /* Called with sensor_lock held. */
@@ -558,7 +626,23 @@ static void apply_pending_labels(rift_sensor_ctx *sensor)
 /* Only the fast worker changes the pose finder, between its own frames and long searches. */
 static void apply_pending_pose(rift_sensor_ctx *sensor)
 {
-	if (sensor->shutdown || __atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED))
+	if (sensor->shutdown)
+		return;
+	if (sensor->model_swap_hold && !sensor->long_analysis_busy) {
+		rift_sensor_analysis_frame *queued;
+		while ((queued = POP_QUEUE(&sensor->long_analysis_q)) != NULL)
+			release_capture_frame(sensor, queued);
+		sensor->model_swap_parked = true;
+		if (sensor->model_swap_cond)
+			ohmd_cond_broadcast(sensor->model_swap_cond);
+		while (sensor->model_swap_hold && !sensor->shutdown) {
+			ohmd_cond_wait(sensor->model_swap_cond, sensor->sensor_lock);
+		}
+		sensor->model_swap_parked = false;
+		if (sensor->shutdown)
+			return;
+	}
+	if (__atomic_load_n(&sensor->search_stopping, __ATOMIC_RELAXED))
 		return;
 	apply_pending_labels(sensor);
 	if (sensor->long_analysis_busy || (!sensor->have_pending_pose && !sensor->pending_clear))
@@ -603,7 +687,8 @@ static rift_sensor_analysis_frame *next_fast_frame(rift_sensor_ctx *sensor)
 static bool pending_image_work(const rift_sensor_ctx *sensor)
 {
 	return sensor->have_pending_pose || sensor->pending_clear || sensor->pending_candidate ||
-		sensor->pending_label_updates || sensor->pending_label_revoke;
+		sensor->pending_label_updates || sensor->pending_label_revoke ||
+		sensor->model_swap_hold;
 }
 
 static bool sensor_images_wanted(void *data)
@@ -679,7 +764,8 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	/* Conds we use to wake queue waiters */
 	sensor_ctx->fast_analysis_q_cond = ohmd_create_cond(ohmd_ctx);
 	sensor_ctx->long_analysis_q_cond = ohmd_create_cond(ohmd_ctx);
-	if (!sensor_ctx->fast_analysis_q_cond || !sensor_ctx->long_analysis_q_cond) goto fail;
+	sensor_ctx->model_swap_cond = ohmd_create_cond(ohmd_ctx);
+	if (!sensor_ctx->fast_analysis_q_cond || !sensor_ctx->long_analysis_q_cond || !sensor_ctx->model_swap_cond) goto fail;
 
 	/* Allocate capture frame buffers */
 	sensor_ctx->frames = ohmd_alloc(ohmd_ctx, NUM_CAPTURE_BUFFERS * sizeof (rift_sensor_analysis_frame));
@@ -788,6 +874,7 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
         sensor_ctx->shutdown = true;
         if (sensor_ctx->fast_analysis_q_cond) ohmd_cond_broadcast(sensor_ctx->fast_analysis_q_cond);
         if (sensor_ctx->long_analysis_q_cond) ohmd_cond_broadcast(sensor_ctx->long_analysis_q_cond);
+        if (sensor_ctx->model_swap_cond) ohmd_cond_broadcast(sensor_ctx->model_swap_cond);
         ohmd_unlock_mutex(sensor_ctx->sensor_lock);
     }
 
@@ -817,6 +904,8 @@ rift_sensor_free (rift_sensor_ctx *sensor_ctx)
 		ohmd_destroy_cond(sensor_ctx->fast_analysis_q_cond);
 	if (sensor_ctx->long_analysis_q_cond)
 		ohmd_destroy_cond(sensor_ctx->long_analysis_q_cond);
+	if (sensor_ctx->model_swap_cond)
+		ohmd_destroy_cond(sensor_ctx->model_swap_cond);
 
 #if HAVE_LIBJPEG
 	if (sensor_ctx->jpeg_decoder)

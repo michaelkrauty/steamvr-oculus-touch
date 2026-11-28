@@ -105,6 +105,9 @@ void ohmd_unlock_mutex(ohmd_mutex *m) { CHECK(locks_held == 1); locks_held--; CH
 uint64_t ohmd_monotonic_get(ohmd_context *ctx) { (void)ctx; return 10000000000ull; }
 led_search_model_t *led_search_model_new(rift_leds *leds) { (void)leds; return NULL; }
 bool rift_sensor_add_device(rift_sensor_ctx *ctx, rift_tracked_device *dev) { (void)ctx; (void)dev; return true; }
+void rift_sensor_pause_for_model_swap(rift_sensor_ctx *ctx, int device_id) { (void)ctx; (void)device_id; }
+void rift_sensor_update_device_model_parked(rift_sensor_ctx *ctx, rift_tracked_device *dev) { (void)ctx; (void)dev; }
+void rift_sensor_resume_after_model_swap(rift_sensor_ctx *ctx) { (void)ctx; }
 
 static const vec3f accel = {{0, 9.80665f, 0}}, mag = {{0}};
 static const posef identity = {.orient = {.w = 1}};
@@ -282,7 +285,7 @@ static void reset_matches_fresh(struct fixture *f)
 	CHECK(memcmp(&sensors, &f->ohmd.cv1touch_sensors, sizeof sensors) == 0);
 	CHECK(memcmp(&calibration, &f->calibration, sizeof calibration) == 0);
 	CHECK(memcmp(&touch_calibration, &f->touch.calibration, sizeof touch_calibration) == 0);
-	CHECK(d->base.leds == &f->leds);
+		CHECK(d->base.leds != NULL && d->base.leds->num_points == f->leds.num_points);
 	CHECK(memcmp(&allocation_identity, &u->ukf, sizeof allocation_identity) == 0);
 	CHECK(memcmp(&imu_allocation, &u->m1, sizeof imu_allocation) == 0);
 	CHECK(memcmp(&pose_allocation, &u->m2, sizeof pose_allocation) == 0);

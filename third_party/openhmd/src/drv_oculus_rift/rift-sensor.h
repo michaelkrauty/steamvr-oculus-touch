@@ -132,6 +132,9 @@ bool rift_sensor_set_cv1touch_pose(rift_sensor_ctx *sensor, const ohmd_cv1touch_
 bool rift_sensor_clear_cv1touch_pose(rift_sensor_ctx *sensor, const char *serial, uint64_t timeout_ns, uint32_t inspection_mask);
 int rift_sensor_cv1touch_pose_applied(rift_sensor_ctx *sensor, const char *serial);
 bool rift_sensor_add_device (rift_sensor_ctx *ctx, rift_tracked_device *device);
+void rift_sensor_pause_for_model_swap (rift_sensor_ctx *ctx, int device_id);
+void rift_sensor_update_device_model_parked (rift_sensor_ctx *ctx, rift_tracked_device *device);
+void rift_sensor_resume_after_model_swap (rift_sensor_ctx *ctx);
 bool rift_sensor_start(rift_sensor_ctx *sensor);
 
 #endif

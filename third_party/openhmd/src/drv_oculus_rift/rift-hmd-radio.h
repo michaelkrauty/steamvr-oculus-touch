@@ -64,9 +64,15 @@ struct rift_hmd_radio_state {
 
 void rift_hmd_radio_init(rift_hmd_radio_state *radio, hid_device *handle, hid_device *hmd_handle);
 void rift_hmd_radio_clear(rift_hmd_radio_state *radio);
+#define RIFT_TOUCH_CALIBRATION_UNCHANGED 1
 int rift_touch_get_calibration(ohmd_context* ctx,
 		rift_hmd_radio_state *radio,
 		int device_id,
+		rift_touch_calibration *calibration, rift_touch_calibration_state *state);
+int rift_touch_get_calibration_if_changed(ohmd_context* ctx,
+		rift_hmd_radio_state *radio,
+		int device_id,
+		const uint8_t *current_hash,
 		rift_touch_calibration *calibration, rift_touch_calibration_state *state);
 void rift_touch_clear_calibration(rift_touch_calibration *calibration);
 int rift_touch_send_haptics(ohmd_context *ctx, rift_hmd_radio_state *radio, int device_id, bool low_freq, uint8_t amplitude);

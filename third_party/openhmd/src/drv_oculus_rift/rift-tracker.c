@@ -99,6 +99,7 @@ struct rift_tracker_pose_delay_slot {
 /* Internal full tracked device struct */
 struct rift_tracked_device_priv {
 	rift_tracked_device base;
+	rift_leds *owned_leds;
 
 	int index; /* Index of this entry in the devices array for the tracker and exposures */
 
@@ -234,6 +235,33 @@ static void rift_tracked_device_on_new_exposure (rift_tracked_device_priv *dev, 
 static int rift_tracked_device_exposure_claim(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
 static void rift_tracked_device_exposure_release_locked(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
 
+static rift_leds *
+rift_leds_dup(const rift_leds *src)
+{
+	rift_leds *dst = calloc(1, sizeof *dst);
+	if (!dst)
+		return NULL;
+	if (src && src->num_points > 0 && src->points != NULL) {
+		dst->points = calloc(src->num_points, sizeof *dst->points);
+		if (dst->points != NULL) {
+			dst->num_points = src->num_points;
+			memcpy(dst->points, src->points, src->num_points * sizeof *dst->points);
+		}
+	}
+	return dst;
+}
+
+static void
+rift_leds_free_owned(rift_leds *leds)
+{
+	if (!leds)
+		return;
+	free(leds->points);
+	leds->points = NULL;
+	leds->num_points = 0;
+	free(leds);
+}
+
 rift_tracked_device *
 rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, posef *model_pose, rift_leds *leds,
       rift_tracked_device_imu_calibration *imu_calib)
@@ -243,29 +271,59 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	char device_name[64];
 	/* Rotate our initial pose 180 deg to point along the -Z axis */
 	posef init_pose = { .pos = {{ 0.0, 0.0, 0.0 }}, .orient = {{ 0.0, 1.0, 0.0, 0.0 }}};
+	bool existing = false;
+	rift_leds *new_owned_leds = rift_leds_dup(leds);
+	rift_leds *old_owned_leds = NULL;
+	led_search_model_t *new_led_search = led_search_model_new(new_owned_leds ? new_owned_leds : leds);
+	led_search_model_t *old_led_search = NULL;
 
 	snprintf(device_name,64,"openhmd-rift-device-%d", device_id);
 	device_name[63] = 0;
 
-	OHMD_ASSERT(ctx->n_devices < RIFT_MAX_TRACKED_DEVICES);
-
 	ohmd_lock_mutex (ctx->tracker_lock);
-	next_dev = ctx->devices + ctx->n_devices;
+	next_dev = NULL;
+	for (i = 0; i < ctx->n_devices; i++) {
+		if (ctx->devices[i].base.id == device_id) {
+			next_dev = &ctx->devices[i];
+			existing = true;
+			break;
+		}
+	}
+	if (existing) {
+		ohmd_unlock_mutex (ctx->tracker_lock);
+		/* Phase 1: park every sensor before mutating dev->base.leds or led_search. */
+		for (i = 0; i < ctx->n_sensors; i++)
+			rift_sensor_pause_for_model_swap(ctx->sensors[i], device_id);
+		ohmd_lock_mutex (ctx->tracker_lock);
+	}
+	if (!existing) {
+		OHMD_ASSERT(ctx->n_devices < RIFT_MAX_TRACKED_DEVICES);
+		next_dev = ctx->devices + ctx->n_devices;
+	}
+	if (existing && next_dev->device_lock)
+		ohmd_lock_mutex (next_dev->device_lock);
 
 	next_dev->base.id = device_id;
 	/* cv1touch: always, so a sensor plugged in after this device came online can feed its fusion */
 	next_dev->n_delay_slots = NUM_POSE_DELAY_SLOTS;
+	if (existing)
+		rift_kalman_6dof_clear(&next_dev->ukf_fusion);
 	rift_kalman_6dof_init(&next_dev->ukf_fusion, &init_pose, next_dev->n_delay_slots);
 	next_dev->last_acquired_pose_lock_ts = next_dev->last_reported_pose = next_dev->last_observed_orient_ts = next_dev->last_observed_pose_ts = next_dev->device_time_ns = 0;
 
 	exp_filter_pose_init(&next_dev->pose_output_filter);
 
 	/* Init delay slot bookkeeping */
+	next_dev->delay_slot_index = 0;
+	next_dev->last_no_free_delay_slot = 0;
 	for (s = 0; s < next_dev->n_delay_slots; s++) {
 		rift_tracker_pose_delay_slot *slot = next_dev->delay_slots + s;
 
 		slot->slot_id = s;
 		slot->valid = false;
+		slot->use_count = 0;
+		slot->device_time_ns = 0;
+		slot->had_used_report = false;
 	}
 
 	/* Compute the device->IMU conversion from the imu->device pose passed */
@@ -278,7 +336,8 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	next_dev->model_from_fusion = next_dev->fusion_from_model;
 	oposef_inverse(&next_dev->model_from_fusion);
 
-	next_dev->debug_metadata = ohmd_pw_debug_stream_new (device_name, "Rift Device");
+	if (!existing)
+		next_dev->debug_metadata = ohmd_pw_debug_stream_new (device_name, "Rift Device");
 
 	uint64_t now = ohmd_monotonic_get(ctx->ohmd_ctx);
 	rift_tracked_device_send_debug_printf (next_dev, now, "{ \"type\": \"device\", "
@@ -296,16 +355,35 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 		imu_calib->gyro_matrix[3], imu_calib->gyro_matrix[4], imu_calib->gyro_matrix[5],
 		imu_calib->gyro_matrix[6], imu_calib->gyro_matrix[7], imu_calib->gyro_matrix[8]);
 
-	next_dev->base.leds = leds;
-	next_dev->base.led_search = led_search_model_new (leds);
-	ctx->n_devices++;
+	old_owned_leds = next_dev->owned_leds;
+	old_led_search = next_dev->base.led_search;
+	next_dev->owned_leds = new_owned_leds;
+	next_dev->base.leds = new_owned_leds ? new_owned_leds : leds;
+	next_dev->base.led_search = new_led_search;
+	if (!existing)
+		ctx->n_devices++;
+	if (existing && next_dev->device_lock)
+		ohmd_unlock_mutex (next_dev->device_lock);
 	ohmd_unlock_mutex (ctx->tracker_lock);
 
-	/* Tell the sensors about the new device */
-	for (i = 0; i < ctx->n_sensors; i++) {
-		rift_sensor_ctx *sensor_ctx = ctx->sensors[i];
-		if (!rift_sensor_add_device (sensor_ctx, (rift_tracked_device *) next_dev)) {
-			LOGE("Failed to configure object tracking for device %d\n", device_id);
+	if (existing) {
+		/* Phase 2: all sensors are parked; update models and free old allocations safely. */
+		for (i = 0; i < ctx->n_sensors; i++)
+			rift_sensor_update_device_model_parked(ctx->sensors[i], (rift_tracked_device *) next_dev);
+		if (old_led_search != NULL)
+			led_search_model_free (old_led_search);
+		if (old_owned_leds != NULL)
+			rift_leds_free_owned (old_owned_leds);
+		/* Phase 3: resume all sensors. */
+		for (i = 0; i < ctx->n_sensors; i++)
+			rift_sensor_resume_after_model_swap(ctx->sensors[i]);
+	} else {
+		/* Tell the sensors about the new device */
+		for (i = 0; i < ctx->n_sensors; i++) {
+			rift_sensor_ctx *sensor_ctx = ctx->sensors[i];
+			if (!rift_sensor_add_device (sensor_ctx, (rift_tracked_device *) next_dev)) {
+				LOGE("Failed to configure object tracking for device %d\n", device_id);
+			}
 		}
 	}
 
@@ -1298,6 +1376,8 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 		rift_tracked_device_priv *dev = tracker_ctx->devices + i;
 		if (dev->base.led_search)
 			led_search_model_free (dev->base.led_search);
+		if (dev->owned_leds)
+			rift_leds_free_owned (dev->owned_leds);
 		if (dev->debug_metadata != NULL)
 			ohmd_pw_debug_stream_free (dev->debug_metadata);
 

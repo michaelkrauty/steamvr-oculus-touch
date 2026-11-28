@@ -175,11 +175,19 @@ correspondence_search_set_blobs (correspondence_search_t *cs, struct blob *blobs
 bool
 correspondence_search_set_model (correspondence_search_t *cs, int id, led_search_model_t *model)
 {
+    for (int i = 0; i < cs->num_models; i++) {
+        if (cs->models[i].id == id) {
+            cs->models[i].model = model;
+            cs->models[i].match_flags = 0;
+            return true;
+        }
+    }
     if (cs->num_models == CS_MAX_MODELS)
         return false;
 
     cs->models[cs->num_models].id = id;
     cs->models[cs->num_models].model = model;
+    cs->models[cs->num_models].match_flags = 0;
     cs->num_models++;
 
     return true;

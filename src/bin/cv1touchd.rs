@@ -138,10 +138,9 @@ impl InputRuntime {
     }
 
     fn calibration_applies(&self, hand: usize) -> bool {
-        self.calibration.as_ref().is_some_and(|c| {
-            !self.latest[hand].identity.is_empty()
-                && c.hands[hand].identity == self.latest[hand].identity
-        })
+        self.calibration
+            .as_ref()
+            .is_some_and(|c| c.has_identity(hand, &self.latest[hand].identity))
     }
 
     fn apply(&mut self, hand: usize, state: &mut ControllerState) {
@@ -241,6 +240,9 @@ struct Daemon {
     /// How the Lighthouse universe moved since the registration (see `universe_watch`), with
     /// the registration it was measured against (its `created_unix_s`).
     universe_shift: Mutex<Option<(u64, nalgebra::Isometry3<f64>)>>,
+    active_identities: Mutex<[Option<String>; 2]>,
+    auto_render_offsets: Mutex<Vec<align::RenderOffset>>,
+    pending_render_fits: Mutex<Vec<(usize, String, Vec<calib::capture::Led>)>>,
     /// Asks `universe_watch` to measure now rather than at its next check.
     universe_recheck: AtomicBool,
     /// The base stations' raw poses as the SteamVR driver last reported them (`stations`), with
@@ -1375,6 +1377,125 @@ fn tilt_text(deg: f64) -> String {
 }
 
 /// Publishes `alignment` with the daemon's tilt. One at a time, the tilt read while publishing: a
+fn current_active_identities(d: &Daemon) -> [Option<String>; 2] {
+    let mut ids = d.active_identities.lock().unwrap().clone();
+    let inputs = d.inputs.lock().unwrap();
+    for (h, slot) in ids.iter_mut().enumerate() {
+        if slot.is_none() && !inputs.latest[h].identity.is_empty() {
+            *slot = Some(inputs.latest[h].identity.clone());
+        }
+    }
+    ids
+}
+
+fn publish_current_alignment(d: &Daemon) -> Vec<String> {
+    let created = align::load_registration(&align::registration_path())
+        .map(|r| r.created_unix_s)
+        .ok();
+    let shift = d
+        .universe_shift
+        .lock()
+        .unwrap()
+        .filter(|p| Some(p.0) == created)
+        .map(|p| p.1);
+    let ids = current_active_identities(d);
+    let id_refs = [ids[0].as_deref(), ids[1].as_deref()];
+    let (mut alignment, notes) = align::load_with_identities(shift.as_ref(), id_refs);
+    let extra = d.auto_render_offsets.lock().unwrap().clone();
+    if !extra.is_empty() {
+        let mut render =
+            align::load_render(&align::render_path()).unwrap_or_else(|_| align::RenderOffsets {
+                format: align::RENDER_FORMAT.into(),
+                version: align::VERSION,
+                created_unix_s: 0,
+                source: "auto-fit".into(),
+                hands: Vec::new(),
+            });
+        for entry in extra {
+            if entry
+                .identity
+                .as_deref()
+                .is_some_and(|id| !render.has_identity(&entry.hand, id))
+            {
+                render.upsert(entry);
+            }
+        }
+        for (hand, name, bit) in [
+            (HAND_LEFT, "left", ffi::CV1T_ALIGN_RENDER_LEFT),
+            (HAND_RIGHT, "right", ffi::CV1T_ALIGN_RENDER_RIGHT),
+        ] {
+            if let Some(h) = render.lookup(name, id_refs[hand]) {
+                alignment.valid |= bit;
+                alignment.render_orient[hand] = h.model_from_render.orient_xyzw;
+                alignment.render_pos[hand] = h.model_from_render.pos;
+            }
+        }
+    }
+    publish_alignment(d, alignment);
+    notes
+}
+
+fn process_pending_render_fits(d: &Daemon) {
+    let jobs = mem::take(&mut *d.pending_render_fits.lock().unwrap());
+    for (hand, identity, leds) in jobs {
+        let hand_name = ["left", "right"][hand];
+        let obj_path = cv1touch::rendermodel::steamvr_body_obj(hand == HAND_LEFT);
+        let Ok(text) = std::fs::read_to_string(&obj_path) else {
+            continue;
+        };
+        let Ok(mesh) = cv1touch::rendermodel::parse_obj(&text) else {
+            continue;
+        };
+        let fit = cv1touch::rendermodel::fit(&leds, &mesh);
+        if fit.used < 6 {
+            continue;
+        }
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let entry = align::RenderOffset {
+            hand: hand_name.into(),
+            identity: Some(identity.clone()),
+            model_from_render: align::PoseEntry::from_iso(&fit.render_from_model.inverse()),
+            rms_mm: fit.rms_m * 1e3,
+            leds: fit.used,
+        };
+        {
+            let mut mem_offsets = d.auto_render_offsets.lock().unwrap();
+            if let Some(slot) = mem_offsets
+                .iter_mut()
+                .find(|h| h.hand == entry.hand && h.identity == entry.identity)
+            {
+                *slot = entry.clone();
+            } else {
+                mem_offsets.push(entry.clone());
+            }
+        }
+        let path = align::render_path();
+        let mut render = align::load_render(&path).unwrap_or_else(|_| align::RenderOffsets {
+            format: align::RENDER_FORMAT.into(),
+            version: align::VERSION,
+            created_unix_s: now_s,
+            source: "auto-fit".into(),
+            hands: Vec::new(),
+        });
+        if !render.has_identity(hand_name, &identity) {
+            render.created_unix_s = now_s;
+            render.upsert(entry);
+            if let Err(err) = align::save(&path, &render) {
+                log!("{hand_name}: could not save auto-fitted render offset: {err}");
+            } else {
+                log!(
+                    "{hand_name}: auto-fitted render offset ({} LEDs, rms {:.2} mm)",
+                    fit.used,
+                    fit.rms_m * 1e3
+                );
+            }
+        }
+        publish_current_alignment(d);
+    }
+}
+
 /// reload or the universe watch cannot put back a tilt a `tilt` request has just changed.
 fn publish_alignment(d: &Daemon, mut alignment: shm::Alignment) {
     let _one = d.alignment_publish.lock().unwrap();
@@ -1737,8 +1858,10 @@ fn universe_watch(d: Arc<Daemon>) {
     while !d.quit.load(Ordering::Acquire) {
         sleep_until(&d, if first { 5_000 } else { UNIVERSE_TICK_MS }, || {
             d.universe_recheck.swap(false, Ordering::AcqRel)
+                || !d.pending_render_fits.lock().unwrap().is_empty()
         });
         first = false;
+        process_pending_render_fits(&d);
         if !d.universe_watch_on.load(Ordering::Acquire) {
             say(String::new());
             unmeasured(None);
@@ -1910,8 +2033,7 @@ fn universe_watch(d: Arc<Daemon>) {
         say(how.to_string());
         if moved {
             *d.universe_shift.lock().unwrap() = Some((reg.created_unix_s, s));
-            let (alignment, _) = align::load_with(Some(&s));
-            publish_alignment(&d, alignment);
+            publish_current_alignment(&d);
         }
         if (moved
             && (s != nalgebra::Isometry3::identity()
@@ -3777,6 +3899,7 @@ fn thin_own_backups(own: &mut Vec<PathBuf>, backup: PathBuf) {
 struct NewBody {
     hand: usize,
     device_id: i32,
+    identity: Option<String>,
     /// The engine's LED model, for the recording.
     model: Vec<engine::LedEntry>,
     leds: Vec<calib::capture::Led>,
@@ -3892,6 +4015,42 @@ fn deliver_engine_queues(
 /// model first (`record_led_model`). The engine thread pushes the next body on that lock. A `for`
 /// keeps its iterator temporaries until the loop ends, in every edition, so a `for` over the
 /// locked queue would keep it through tracker setup and the log line.
+fn schedule_render_offset_for_body(d: &Daemon, body: &NewBody, swapped: bool) {
+    let Some(identity) = body.identity.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    d.active_identities.lock().unwrap()[body.hand] = Some(identity.to_string());
+    if body.leds.is_empty() {
+        return;
+    }
+    let hand_name = ["left", "right"][body.hand];
+    let render = align::load_render(&align::render_path()).ok();
+    if let Some(r) = &render {
+        if r.has_identity(hand_name, identity) {
+            publish_current_alignment(d);
+            return;
+        }
+        let has_legacy = r
+            .hands
+            .iter()
+            .any(|h| h.hand == hand_name && h.identity.is_none());
+        let has_other_ids = r
+            .hands
+            .iter()
+            .any(|h| h.hand == hand_name && h.identity.is_some());
+        if !swapped && has_legacy && !has_other_ids {
+            publish_current_alignment(d);
+            return;
+        }
+    }
+    d.pending_render_fits.lock().unwrap().push((
+        body.hand,
+        identity.to_string(),
+        body.leds.clone(),
+    ));
+    d.wake_sleepers();
+}
+
 fn deliver_new_bodies(d: &Daemon, queued: &Mutex<Vec<NewBody>>, mut install: impl FnMut(NewBody)) {
     let queued = mem::take(&mut *queued.lock().unwrap());
     for body in queued {
@@ -4062,9 +4221,20 @@ fn engine_updated(d: &Daemon, updated: bool, opening: &mut bool) {
 
 /// Finds each controller's tracker body (its LED model and factory IMU position) once the engine
 /// has the model, for the radio thread to add.
+fn led_model_hash(leds: &[calib::capture::Led]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for l in leds {
+        for v in [l.pos.x, l.pos.y, l.pos.z, l.dir.x, l.dir.y, l.dir.z] {
+            h ^= v.to_bits();
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
 #[derive(Default)]
 struct BodyFinder {
-    sent: [bool; 2],
+    last_sent: [Option<(Option<String>, u64)>; 2],
     warned: [bool; 2],
     next_try: [u64; 2],
 }
@@ -4077,7 +4247,7 @@ impl BodyFinder {
         for h in [HAND_LEFT, HAND_RIGHT] {
             // a controller with no cached configuration is looked up again every few seconds, not
             // on every pass of the engine loop
-            if self.sent[h] || now < self.next_try[h] {
+            if now < self.next_try[h] {
                 continue;
             }
             let Some(c) = e.controller(h) else { continue };
@@ -4092,16 +4262,23 @@ impl BodyFinder {
                     dir: calib::vec3(l.dir),
                 })
                 .collect();
+            let identity = e.controller_identity(h).map(|id| id.as_str().to_string());
+            let key = (identity.clone(), led_model_hash(&leds));
+            if self.last_sent[h].as_ref() == Some(&key) {
+                continue;
+            }
             match track::factory::imu(&track::factory::openhmd_config_dir(), &leds) {
                 Some(imu) => {
                     link.bodies.lock().unwrap().push(NewBody {
                         hand: h,
                         device_id: c.device_id,
+                        identity,
                         model,
                         leds,
                         imu,
                     });
-                    self.sent[h] = true;
+                    self.last_sent[h] = Some(key);
+                    self.warned[h] = false;
                     found = true;
                 }
                 None => {
@@ -4547,16 +4724,29 @@ fn radio_main(
                     holds.note(arrived, shm::now_ns());
                 }
                 deliver_new_bodies(d, &link.bodies, |b| {
+                    let swapped = pipe.has_body(b.hand);
                     pipe.body(b.device_id, b.leds.clone(), b.imu.position);
                     pipe.gyro_range(b.device_id, b.imu.gyro);
-                    log!(
-                        "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
-                        ["left", "right"][b.hand],
-                        b.leds.len(),
-                        b.imu.position.x * 1e3,
-                        b.imu.position.y * 1e3,
-                        b.imu.position.z * 1e3
-                    );
+                    schedule_render_offset_for_body(d, &b, swapped);
+                    if swapped {
+                        log!(
+                            "{}: controller swapped, tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
+                            ["left", "right"][b.hand],
+                            b.leds.len(),
+                            b.imu.position.x * 1e3,
+                            b.imu.position.y * 1e3,
+                            b.imu.position.z * 1e3
+                        );
+                    } else {
+                        log!(
+                            "{}: tracking with {} LEDs, IMU at ({:.1}, {:.1}, {:.1}) mm",
+                            ["left", "right"][b.hand],
+                            b.leds.len(),
+                            b.imu.position.x * 1e3,
+                            b.imu.position.y * 1e3,
+                            b.imu.position.z * 1e3
+                        );
+                    }
                     biases.seed(pipe, b.hand, &b.leds);
                     link.hands.request(b.hand);
                 });
@@ -6310,21 +6500,9 @@ fn handle(d: &Daemon, line: &str) -> String {
             format!("ok {}{unsaved}", if on { "on" } else { "off" })
         }
         Ok(Command::AlignmentReload) => {
-            // a shift measured against another registration does not apply to this one: until
-            // the watch measures afresh (now), none
-            let created = align::load_registration(&align::registration_path())
-                .map(|r| r.created_unix_s)
-                .ok();
-            let shift = d
-                .universe_shift
-                .lock()
-                .unwrap()
-                .filter(|p| Some(p.0) == created)
-                .map(|p| p.1);
             d.universe_recheck.store(true, Ordering::Release);
             d.wake_sleepers();
-            let (alignment, notes) = align::load_with(shift.as_ref());
-            publish_alignment(d, alignment);
+            let notes = publish_current_alignment(d);
             format!("ok {}", notes.join("; "))
         }
     }
@@ -7231,6 +7409,9 @@ fn main() {
         calibration: Mutex::new(calibration_path.map(LoadedCalibration::at)),
         own_backups: Mutex::new(Vec::new()),
         universe_shift: Mutex::new(None),
+        active_identities: Mutex::new([None, None]),
+        auto_render_offsets: Mutex::new(Vec::new()),
+        pending_render_fits: Mutex::new(Vec::new()),
         universe_recheck: AtomicBool::new(false),
         driver_stations: Mutex::new(None),
         universe_connection: Mutex::new(UniverseConnection::default()),
@@ -9362,6 +9543,9 @@ mod tests {
             calibration: Mutex::new(None),
             own_backups: Mutex::new(Vec::new()),
             universe_shift: Mutex::new(None),
+            active_identities: Mutex::new([None, None]),
+            auto_render_offsets: Mutex::new(Vec::new()),
+            pending_render_fits: Mutex::new(Vec::new()),
             universe_recheck: AtomicBool::new(false),
             driver_stations: Mutex::new(None),
             universe_connection: Mutex::new(UniverseConnection::default()),
@@ -10508,6 +10692,7 @@ mod tests {
         link.bodies.lock().unwrap().push(NewBody {
             hand: HAND_LEFT,
             device_id: 1,
+            identity: None,
             model: Vec::new(),
             leds: Vec::new(),
             imu: nalgebra::Vector3::zeros().into(),
@@ -10692,6 +10877,7 @@ mod tests {
         let body = |hand, device_id| NewBody {
             hand,
             device_id,
+            identity: None,
             model: model.clone(),
             leds: Vec::new(),
             imu: nalgebra::Vector3::zeros().into(),

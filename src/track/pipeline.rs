@@ -470,27 +470,25 @@ impl Pipeline {
         self.trackers[hand].is_some()
     }
 
-    /// A controller's LED model and factory IMU position; the first one per hand is kept.
+    /// A controller's LED model and factory IMU position; replaces any existing tracker for that hand.
     pub fn body(&mut self, device_id: i32, leds: Vec<Led>, imu_pos: Vector3<f64>) {
         let Some(hand) = device_hand(device_id) else {
             return;
         };
-        if self.trackers[hand].is_none() {
-            let mut tr = Tracker::new(
-                device_id,
-                Body { leds, imu_pos },
-                self.opts.params,
-                self.camera_slots,
-            );
-            tr.debug = self.opts.trace;
-            if let Some(g) = self.opts.seed_biases[hand] {
-                seed_gyro_bias(&mut tr, g);
-            }
-            if let Some(a) = self.opts.seed_verified_accel[hand] {
-                tr.seed_verified_accel(a, super::biases::SEED_SD_ACCEL);
-            }
-            self.trackers[hand] = Some(tr);
+        let mut tr = Tracker::new(
+            device_id,
+            Body { leds, imu_pos },
+            self.opts.params,
+            self.camera_slots,
+        );
+        tr.debug = self.opts.trace;
+        if let Some(g) = self.opts.seed_biases[hand] {
+            seed_gyro_bias(&mut tr, g);
         }
+        if let Some(a) = self.opts.seed_verified_accel[hand] {
+            tr.seed_verified_accel(a, super::biases::SEED_SD_ACCEL);
+        }
+        self.trackers[hand] = Some(tr);
     }
 
     /// Starts a hand's gyro bias from an earlier run's (see `track::biases`).

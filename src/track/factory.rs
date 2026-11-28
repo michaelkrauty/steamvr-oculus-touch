@@ -148,6 +148,43 @@ pub fn imu(dir: &Path, leds: &[Led]) -> Option<Imu> {
     None
 }
 
+/// The 32 lowercase hex identity from the cached configuration in `dir` whose LED positions
+/// match `leds` to within half a millimetre.
+pub fn identity(dir: &Path, leds: &[Led]) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name
+            .strip_prefix("rift-touch-config-")
+            .and_then(|s| s.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        if id.len() != 32
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Some((points, _)) = parse(&String::from_utf8_lossy(&bytes)) else {
+            continue;
+        };
+        if points.len() == leds.len()
+            && points
+                .iter()
+                .zip(leds)
+                .all(|(p, l)| (p - l.pos).norm() < 5e-4)
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

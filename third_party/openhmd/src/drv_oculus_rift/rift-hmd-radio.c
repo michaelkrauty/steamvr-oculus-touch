@@ -548,8 +548,9 @@ make_calibration_hash_key(rift_hmd_radio_state *radio, char *config_block_key)
 	config_block_key[255] = '0';
 }
 
-int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
-	int device_id, rift_touch_calibration *calibration, rift_touch_calibration_state *state)
+int rift_touch_get_calibration_if_changed(ohmd_context* ctx, rift_hmd_radio_state *radio,
+	int device_id, const uint8_t *current_hash,
+	rift_touch_calibration *calibration, rift_touch_calibration_state *state)
 {
 	unsigned long length;
 	char *json = NULL, *cached_json = NULL;
@@ -589,6 +590,11 @@ int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
 		memcpy(state->hash, radio->calibration_hash, 16);
 		state->have_hash = true;
 		radio->cur_read_cmd = RIFT_RADIO_CMD_NONE;
+		if (current_hash != NULL && memcmp(current_hash, radio->calibration_hash, 16) == 0) {
+			radio->device_in_progress = -1;
+			ret = RIFT_TOUCH_CALIBRATION_UNCHANGED;
+			goto out;
+		}
 	}
 
 	/* Only malformed data quarantines this hash's cache entry. A temporary
@@ -667,6 +673,12 @@ out:
 	}
 	free(cached_json);
 	return ret;
+}
+
+int rift_touch_get_calibration(ohmd_context* ctx, rift_hmd_radio_state *radio,
+	int device_id, rift_touch_calibration *calibration, rift_touch_calibration_state *state)
+{
+	return rift_touch_get_calibration_if_changed(ctx, radio, device_id, NULL, calibration, state);
 }
 
 void
