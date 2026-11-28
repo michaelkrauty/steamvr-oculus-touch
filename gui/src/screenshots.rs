@@ -435,6 +435,11 @@ fn screenshots_show_each_state_and_the_overview_fits_without_scrolling_or_waste(
                         "{name}: missing {text:?} in {labels:?}"
                     );
                 }
+                assert!(
+                    labels.iter().any(|l| l.contains(window::VERSION)),
+                    "{name}: missing version {} in {labels:?}",
+                    window::VERSION
+                );
                 assert!(!labels.iter().any(|l| l.contains("Headset: not reported")));
                 let running = !name.contains("daemon-down");
                 assert_eq!(
@@ -538,6 +543,47 @@ fn no_text_overlaps_in_any_state() {
                 );
             }
         }
+    }
+    // Minimum window width must keep the versioned header subtitle clear of the tabs.
+    let scene = scenario("overview-playing");
+    let mut icons = None;
+    let mut draw_tab = Tab::Overview;
+    let min_size = [480.0, 620.0];
+    let (_, _, _, boxes) = render_boxes(
+        egui::Theme::Dark,
+        min_size,
+        1.0,
+        &mut |ui: &mut egui::Ui, ctx: &egui::Context| {
+            let icons = icons.get_or_insert_with(|| Icons::load(ctx));
+            window::draw(ui, &view(&scene, icons, None), &mut draw_tab)
+        },
+    );
+    let header_boxes: Boxes = boxes
+        .into_iter()
+        .filter(|(label, _)| {
+            label.contains(window::VERSION)
+                || matches!(
+                    label.as_str(),
+                    "Ready to play" | "Overview" | "Stats" | "Settings"
+                )
+        })
+        .collect();
+    assert!(
+        header_boxes
+            .iter()
+            .any(|(l, _)| l.contains(window::VERSION)),
+        "min width: missing version in header"
+    );
+    let header_overlaps = overlaps(&header_boxes);
+    assert!(
+        header_overlaps.is_empty(),
+        "min width header overlaps: {header_overlaps:?}"
+    );
+    for (label, r) in header_boxes.iter().filter_map(|(l, r)| Some((l, (*r)?))) {
+        assert!(
+            r.x0 >= 0.0 && r.x1 <= min_size[0] as f64,
+            "min width header: {label:?} is cut off at {r:?}"
+        );
     }
 }
 

@@ -13,7 +13,7 @@ On Windows, open **cv1touch** from the Start menu to see the status window. The 
 
 Run `cv1touch-gui` to start the tray icon; running it again, or `cv1touch-gui --open`, opens the status window (starting the tray too if it is not running). Click the icon to show or hide the window. The tray menu starts, restarts or stops the daemon, opens setup and saves a diagnostic report. A report can contain private information; review it before sharing it.
 
-`cv1touch-gui --version` (or `-V`) prints the GUI version. `cv1touch-gui --quit` closes the GUI windows and removes the tray icon, leaving `cv1touchd` running.
+`cv1touch-gui --version` (or `-V`) prints the GUI version; the status window header and tray tooltip also show it. `cv1touch-gui --quit` closes the GUI windows and removes the tray icon, leaving `cv1touchd` running.
 
 The window's Overview tab shows the controllers, sensors and calibration at a glance, with advice when something needs attention and a button that fixes it where one can. The Stats tab lists the daemon's tracking counters, each sensor's video and agreement figures, the saved calibration's fit quality and every diagnostic check; hover over any of them for what it means. The Settings tab sets the controller angle and whether the tray icon starts when you log in, and offers shortcuts to align the controllers to the headset or calibrate buttons and sticks. **Save report** saves the diagnostic report and shows where it went.
 
