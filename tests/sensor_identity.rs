@@ -16,25 +16,40 @@ fn mixed_case_refine_and_place_commands_find_the_recorded_camera() {
     std::fs::write(&calibration, serde_json::to_vec(&serde_json::json!({
         "format": file::FORMAT, "version": 1, "created_unix_s": 1,
         "world": "test", "source": "synthetic recording",
-        "sensors": [{"serial": "camera1", "orient_xyzw": [0,0,0,1], "pos": [0,0,0], "rms_px": 0, "observations": 100}],
+        "sensors": [
+            {"serial": "camera1", "orient_xyzw": [0,0,0,1], "pos": [0,0,0], "rms_px": 0, "observations": 100},
+            {"serial": "camera2", "orient_xyzw": [0,0,0,1], "pos": [1,0,0], "rms_px": 0, "observations": 100}
+        ],
         "stats": {"reference": "camera1", "gravity_mps2": 9.81, "gravity_spread_deg": 0,
             "motion_segments": 10, "samples": 1000, "rejected_views": 0}
     })).unwrap()).unwrap();
-    let mut sensor = recorder::SensorInfo {
-        width: 1280,
-        height: 960,
-        fx: 715.0,
-        fy: 715.0,
-        cx: 640.0,
-        cy: 480.0,
-        ..Default::default()
+    let make_sensor = |name: &[u8]| {
+        let mut sensor = recorder::SensorInfo {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            ..Default::default()
+        };
+        for (out, byte) in sensor.serial.iter_mut().zip(name) {
+            *out = *byte as _;
+        }
+        sensor
     };
-    for (out, byte) in sensor.serial.iter_mut().zip(b"CAMERA1") {
-        *out = *byte as _;
-    }
     let recording = recorder::Recorder::new(1 << 20);
     recording.start(&rec, 1).unwrap();
-    recording.write(recorder::SENSOR_INFO, 1, &[recorder::as_bytes(&sensor)]);
+    recording.write(
+        recorder::SENSOR_INFO,
+        1,
+        &[recorder::as_bytes(&make_sensor(b"CAMERA1"))],
+    );
+    recording.write(
+        recorder::SENSOR_INFO,
+        1,
+        &[recorder::as_bytes(&make_sensor(b"CAMERA2"))],
+    );
     let stats = recording.stop();
     assert_eq!((stats.dropped, stats.write_errors), (0, 0));
     let run = |args: &[&str]| {
@@ -51,17 +66,13 @@ fn mixed_case_refine_and_place_commands_find_the_recorded_camera() {
             .unwrap()
     };
     let refined = run(&["calibrate", "refine"]);
+    assert_eq!(refined.status.code(), Some(1));
+    let refine_err = String::from_utf8_lossy(&refined.stderr);
+    // The empty capture cannot improve poses, but must match both mixed-case sensors against
+    // calibration.json and fail on exposure count rather than "needs at least two calibrated sensors".
     assert!(
-        refined.status.success(),
-        "{}",
-        String::from_utf8_lossy(&refined.stderr)
-    );
-    let text = String::from_utf8_lossy(&refined.stdout);
-    // The empty capture cannot improve a pose, but must attempt refinement. An exact
-    // metadata lookup silently skips it and prints only "no sensor improves".
-    assert!(
-        text.contains("round 1: camera1: only 0 LED matches"),
-        "{text}"
+        refine_err.contains("not enough multi-sensor exposures"),
+        "{refine_err}"
     );
     let placed = run(&["calibrate", "place", "cAmErA1"]);
     assert_eq!(placed.status.code(), Some(1));

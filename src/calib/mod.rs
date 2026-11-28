@@ -14,6 +14,7 @@ pub mod gravity;
 pub mod gyro;
 pub mod init;
 pub mod motion;
+pub mod refit;
 pub mod rig;
 pub mod solve;
 pub mod stations;

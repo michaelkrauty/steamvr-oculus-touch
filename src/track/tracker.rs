@@ -14,6 +14,7 @@ use super::eskf::{Cov, Filter, Noise, Nominal, BA, BG, POS, ROT, VEL};
 use super::factory::{Gyro, GYRO_PER_COUNT};
 use super::search::{self, SearchParams};
 use super::vision::{self, Blob, Body, Camera, FitParams};
+use crate::calib::capture::Observation;
 
 /// A first lock not yet told from its ring turns (see `Tracker::undecided`).
 #[derive(Debug, Clone, PartialEq)]
@@ -469,6 +470,17 @@ pub struct ForeignLed {
     pub seen: bool,
 }
 
+/// LED-to-blob correspondences accepted by a confirmed tracker update, for joint sensor refit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptedObs {
+    pub camera: usize,
+    pub t_e: u64,
+    pub world_from_model: Isometry3<f64>,
+    /// Position standard deviation of the updated pose (metres, largest axis).
+    pub pos_sd: f64,
+    pub obs: Vec<Observation>,
+}
+
 /// A blob at `xy` under the prediction `uv` with covariance `cov`: its Mahalanobis^2, and its
 /// negative log-likelihood (less a constant).
 fn prediction_fit(uv: Vector2<f64>, cov: &Matrix2<f64>, xy: Vector2<f64>) -> (f64, f64) {
@@ -626,6 +638,10 @@ pub struct Tracker {
     pub misses: Vec<(usize, usize, usize, usize)>,
     /// When `debug`: (matched, unexplained) of every accepted update.
     pub fits: Vec<(usize, usize)>,
+    /// Record accepted confirmed-track LED-to-blob correspondences in `last_obs`.
+    pub collect_obs: bool,
+    /// Correspondences from the most recent `frame()` call, when `collect_obs` is enabled.
+    last_obs: Option<AcceptedObs>,
 }
 
 /// Only native searches retain an exposure beyond the ordinary filter history. The native
@@ -797,6 +813,8 @@ impl Tracker {
             debug: false,
             misses: Vec::new(),
             fits: Vec::new(),
+            collect_obs: false,
+            last_obs: None,
         }
     }
 
@@ -849,6 +867,11 @@ impl Tracker {
     /// awaited (see `provisional`).
     pub fn tracking(&self) -> bool {
         self.has_track() && self.provisional.is_none() && !self.undecided_now()
+    }
+
+    /// Takes the confirmed LED-to-blob observations from the last `frame()` call, if any.
+    pub fn take_last_obs(&mut self) -> Option<AcceptedObs> {
+        self.last_obs.take()
     }
 
     /// An undecided track (see `undecided`) is published at the latest `max_refusing_ns` after
@@ -1655,6 +1678,7 @@ impl Tracker {
         engine: Option<EnginePose>,
         foreign: &[ForeignLed],
     ) -> Outcome {
+        self.last_obs = None;
         if camera >= self.camera_updates.len() {
             return Outcome::UnknownCamera;
         }
@@ -1825,6 +1849,20 @@ impl Tracker {
                         self.stats.out_of_order += 1;
                     }
                     let n = fit.pairs.len();
+                    let will_confirm = !relock
+                        && (self.track_confirmed
+                            || self.track_camera.is_some_and(|first| first != camera));
+                    let captured = (self.collect_obs && will_confirm).then(|| {
+                        let obs: Vec<Observation> = fit
+                            .pairs
+                            .iter()
+                            .map(|&(led, blob)| Observation {
+                                led,
+                                xy: blobs[blob].xy,
+                            })
+                            .collect();
+                        (obs, fit.updated.filter)
+                    });
                     self.rebuild(
                         k,
                         Applied {
@@ -1853,6 +1891,21 @@ impl Tracker {
                     self.refusing_since = 0;
                     self.decide(t_e, cam, blobs);
                     self.bias_pending = Some(self.bias_pending.map_or(t_e, |t| t.max(t_e)));
+                    if let Some((obs, f)) = captured {
+                        if self.tracking() && self.track_confirmed {
+                            let pos_sd = (0..3)
+                                .map(|i| f.cov[(3 + i, 3 + i)])
+                                .fold(0.0, f64::max)
+                                .sqrt();
+                            self.last_obs = Some(AcceptedObs {
+                                camera,
+                                t_e,
+                                world_from_model: self.body.world_from_model(&f.x),
+                                pos_sd,
+                                obs,
+                            });
+                        }
+                    }
                     if self.tracking() && self.track_confirmed {
                         if let Some(&(t_now, f_now)) = self.history.back() {
                             if let Some(verified) = self.bias_verifier.observe(

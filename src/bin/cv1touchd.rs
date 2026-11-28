@@ -84,7 +84,7 @@ enum TrackerKind {
     OpenHmd,
 }
 
-type QueuedFrame = (Box<engine::FrameInfo>, Vec<Blob>);
+type QueuedFrame = (Box<engine::FrameInfo>, Vec<Blob>, u64);
 
 #[derive(Clone, Copy)]
 struct Haptic {
@@ -229,6 +229,12 @@ struct Daemon {
     landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
     /// Per sensor serial: where it stands with the pose watch (`repose`), for `status`.
     sensor_poses: Mutex<std::collections::BTreeMap<String, PoseNote>>,
+    /// Active live camera extrinsics (`sensor_identity` -> `(serial, world_from_cam)`), seeded
+    /// from the calibrated pipeline at engine session start and updated on live sensor add/remove,
+    /// session refit, and single-sensor re-placement. Held across initial recording activation and
+    /// live `SENSOR_POSES` writes so every recording starts with every active camera's pose before
+    /// any tracking record is admitted, even if a later bump overwrites `calibration.json`.
+    session_poses: Mutex<std::collections::BTreeMap<String, (String, nalgebra::Isometry3<f64>)>>,
     /// Per sensor serial: its agreement with the others, as of the last tick (`status`).
     sensor_agreement: Mutex<std::collections::BTreeMap<String, track::tracker::CameraAgreement>>,
     /// Fewer than two sensors agree with each other (see `repose::Change::Unsure`).
@@ -806,22 +812,38 @@ impl EngineSink for Daemon {
     }
 
     fn frame(&self, info: &engine::FrameInfo, lifetime: u64, blobs: &[Blob]) {
-        if self.rec.active() {
+        if self.tracker == TrackerKind::Rust {
+            let serial = engine::cstr_field(&info.serial);
+            let frame_info = Box::new(*info);
+            let frame_blobs = blobs.to_vec();
+            {
+                // Lock order everywhere is `d.session_poses` -> `d.track_in` -> `d.rec` ring:
+                // recording `FRAME_OBS` and tagging the queued frame with `pose_epoch` under
+                // `d.track_in` guarantees live consumption and offline replay process each frame
+                // under the same camera extrinsics across pose updates.
+                let mut ingress = self.track_in.lock().unwrap();
+                let epoch = ingress.pose_epoch();
+                if self.rec.active() {
+                    self.rec.write(
+                        recorder::FRAME_OBS,
+                        info.frame_start_host_ns,
+                        &[recorder::as_bytes(info), recorder::slice_bytes(blobs)],
+                    );
+                }
+                ingress.push_frame(
+                    &serial,
+                    lifetime,
+                    info.frame_start_host_ns,
+                    (frame_info, frame_blobs, epoch),
+                );
+            }
+            self.wake_radio();
+        } else if self.rec.active() {
             self.rec.write(
                 recorder::FRAME_OBS,
                 info.frame_start_host_ns,
                 &[recorder::as_bytes(info), recorder::slice_bytes(blobs)],
             );
-        }
-        if self.tracker == TrackerKind::Rust {
-            enqueue_frame(
-                &self.track_in,
-                engine::cstr_field(&info.serial),
-                lifetime,
-                info.frame_start_host_ns,
-                (Box::new(*info), blobs.to_vec()),
-            );
-            self.wake_radio();
         }
         if self.preview.leased() {
             self.preview.on_frame(info, blobs, shm::now_ns());
@@ -1197,7 +1219,10 @@ fn new_pipeline(d: &Daemon, opts: &EngineOptions, e: &Engine) -> Option<Pipeline
 /// spelling their frames carry (the calibration may spell the serial in another letter case, as
 /// the native engine allows).
 fn calibrated_pipeline(opts: &EngineOptions, sensors: &[engine::Sensor]) -> Pipeline {
-    let mut p = Pipeline::new(pipeline::Options::default());
+    let mut p = Pipeline::new(pipeline::Options {
+        collect_refit: true,
+        ..Default::default()
+    });
     for s in sensors {
         let serial = engine::sensor_serial(s);
         if let Some(pose) = modes::calibrated_pose(opts, &serial) {
@@ -2550,28 +2575,44 @@ fn engine_session(
     log!("engine running with {} sensor(s)", e.sensors().len());
     make_usb_thread_realtime();
     let open: Vec<String> = e.sensors().iter().map(engine::sensor_serial).collect();
-    {
+    let admitted: Vec<(String, u64)> = {
         let watch = d.sensor_watch.lock().unwrap();
         // each as its open native object, whose callbacks alone are admitted
-        let admitted: Vec<(String, u64)> = open
-            .iter()
+        open.iter()
             .filter(|s| watch.admitted(s))
             .filter_map(|s| Some((s.clone(), e.sensor_lifetime(s)?)))
-            .collect();
-        d.track_in
-            .lock()
-            .unwrap()
-            .register(admitted.iter().cloned());
-        d.track_searches
-            .lock()
-            .unwrap()
-            .register(admitted.iter().cloned());
-        d.track_identities.lock().unwrap().register(admitted);
-        // the new radio thread's pipeline starts from this engine's admitted sensors, and counts
-        // their removals from here
-        clear_sensor_events(d);
-        d.sensor_removals.lock().unwrap().clear();
-    }
+            .collect()
+    };
+    let initial_poses: Vec<(String, nalgebra::Isometry3<f64>)> =
+        if d.tracker == TrackerKind::Rust && !opts.fixed_poses.is_empty() {
+            admitted
+                .iter()
+                .filter_map(|(serial, _)| {
+                    let pose = modes::calibrated_pose(opts, serial)?;
+                    Some((serial.clone(), calib::iso_from_xyzw(pose.orient, pose.pos)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let initial_pose_refs: Vec<(&str, nalgebra::Isometry3<f64>)> = initial_poses
+        .iter()
+        .map(|(serial, iso)| (serial.as_str(), *iso))
+        .collect();
+    Reposing::replace_session_poses(d, shm::now_ns(), &initial_pose_refs);
+    d.track_in
+        .lock()
+        .unwrap()
+        .register(admitted.iter().cloned());
+    d.track_searches
+        .lock()
+        .unwrap()
+        .register(admitted.iter().cloned());
+    d.track_identities.lock().unwrap().register(admitted);
+    // the new radio thread's pipeline starts from this engine's admitted sensors, and counts
+    // their removals from here
+    clear_sensor_events(d);
+    d.sensor_removals.lock().unwrap().clear();
     for serial in modes::unposed_sensors(opts, &open) {
         log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
     }
@@ -2614,7 +2655,7 @@ fn engine_session(
                 }
             })
         });
-        engine_loop(d, e, &link, radio.is_some());
+        engine_loop(d, e, &link, radio.is_some(), revision);
         drop(stop);
         finish_engine_run(d, reopening_since, || {
             if let Some(Err(_)) = radio.map(|r| r.join()) {
@@ -2918,6 +2959,8 @@ struct RadioLink {
     reposed: Mutex<Vec<(PoseChange, u64)>>,
     /// Native acknowledgements that a restored pose has stopped its previous search.
     restored: Mutex<Vec<String>>,
+    /// Persisted bump writes confirmed by the engine thread after `write_reposed` succeeds.
+    refit_saved: Mutex<Vec<SavedRefitBump>>,
 }
 
 /// The calibration file the daemon's sensor poses came from.
@@ -2925,6 +2968,7 @@ struct RadioLink {
 struct LoadedCalibration {
     path: PathBuf,
     sha256: String,
+    revision: u64,
 }
 
 impl LoadedCalibration {
@@ -2932,7 +2976,11 @@ impl LoadedCalibration {
     /// so that it is never written over.
     fn at(path: PathBuf) -> LoadedCalibration {
         let sha256 = setup::fingerprint(&path).unwrap_or_default();
-        LoadedCalibration { path, sha256 }
+        LoadedCalibration {
+            path,
+            sha256,
+            revision: 1,
+        }
     }
 }
 
@@ -2955,6 +3003,7 @@ fn prune_placements(placements: &mut std::collections::BTreeMap<String, Vec<u64>
 const RELEASE_RUN_NS: u64 = 3_600_000_000_000;
 
 /// What the radio thread decided about a sensor's pose in the engine.
+#[derive(Debug)]
 enum PoseChange {
     /// A non-demoting label inspection, with a native deadline.
     Inspect(String, [bool; 2]),
@@ -2964,6 +3013,11 @@ enum PoseChange {
     /// The sensor's pose, placed again from the others (or given back, as calibrated, when it
     /// could not be placed: the engine stops its search then).
     Set(Reposed),
+    /// One rig-wide background session joint refit (`(pose, removals)` per participating sensor).
+    /// `write: false` updates the engine in memory; `write: true` persists only a single confirmed
+    /// bumped sensor if every sensor in the batch is still current and the calibration revision
+    /// has not changed. Does not participate in inspection restoration acknowledgement.
+    Refit(Vec<(Reposed, u64)>),
 }
 
 impl PoseChange {
@@ -2971,12 +3025,14 @@ impl PoseChange {
         match self {
             PoseChange::Inspect(serial, _) | PoseChange::Placing(serial) => serial,
             PoseChange::Set(r) => &r.serial,
+            PoseChange::Refit(batch) => batch.first().map_or("", |(r, _)| r.serial.as_str()),
         }
     }
 }
 
 /// A sensor placed again from the others (`repose`): its new pose, and how far it is from the
 /// calibrated one; `write` is false for a pose given back as it was.
+#[derive(Debug)]
 struct Reposed {
     serial: String,
     orient_xyzw: [f32; 4],
@@ -2988,6 +3044,32 @@ struct Reposed {
     write: bool,
 }
 
+/// Confirmation from the engine thread that a bumped sensor's new pose from a joint refit was
+/// actually written to `calibration.json` on disk.
+#[derive(Debug)]
+struct SavedRefitBump {
+    serial: String,
+    removals: u64,
+    session_revision: u64,
+    world_from_cam: nalgebra::Isometry3<f64>,
+    at_ns: u64,
+    moved_mm: f64,
+    turned_deg: f64,
+    median_px: f64,
+    matches: usize,
+}
+
+fn reposed_iso(r: &Reposed) -> nalgebra::Isometry3<f64> {
+    nalgebra::Isometry3::from_parts(
+        nalgebra::Translation3::new(r.pos[0] as f64, r.pos[1] as f64, r.pos[2] as f64),
+        nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+            r.orient_xyzw[3] as f64,
+            r.orient_xyzw[0] as f64,
+            r.orient_xyzw[1] as f64,
+            r.orient_xyzw[2] as f64,
+        )),
+    )
+}
 /// Gives the engine its calibrated pose back without writing the calibration. `removals`: the
 /// sensor's, as the radio thread counts them (`Reposing::removals`).
 fn restore_engine_pose(link: &RadioLink, pipe: &mut Pipeline, serial: &str, removals: u64) {
@@ -3101,12 +3183,83 @@ enum PoseNote {
 const REPOSE_TICK_NS: u64 = 1_000_000_000;
 /// "Unsure" is logged at most this often.
 const UNSURE_LOG_NS: u64 = 60_000_000_000;
+/// Minimum buffered multi-sensor exposures before attempting a background session refit.
+const REFIT_MIN_SAMPLES: usize = 200;
+/// Minimum chronological span across buffered exposures before a live background session refit
+/// is accepted, preventing a brief single-corner wrist burst from overfitting.
+const REFIT_MIN_SPAN_NS: u64 = 15_000_000_000;
+/// Minimum extra exposures before retrying a refit that failed for insufficient motion or overlap.
+const REFIT_RETRY_SAMPLE_STEP: usize = 50;
+/// Cooldowns between background session refit attempts.
+const REFIT_ACCEPT_COOLDOWN_NS: u64 = 600_000_000_000;
+const REFIT_REJECT_COOLDOWN_NS: u64 = 300_000_000_000;
+const REFIT_ERROR_COOLDOWN_NS: u64 = 60_000_000_000;
+const REFIT_ELEVATED_COOLDOWN_NS: u64 = 60_000_000_000;
+/// Live agreement levels that shorten the wait before the next background session refit.
+const REFIT_ELEVATED_BIAS_PX: f64 = 0.35;
+const REFIT_ELEVATED_MEDIAN_PX: f64 = 0.40;
+const REFIT_ELEVATED_MIN_SAMPLES: u64 = 40;
+/// Held-out error levels on a rejected refit that indicate a mid-session regime shift (recent
+/// tail disagrees with older training samples), prompting trimming of the older buffer half.
+const REFIT_REGIME_SHIFT_RMS_PX: f64 = 0.25;
+const REFIT_REGIME_SHIFT_CAM_RMS_PX: f64 = 0.35;
+
+fn daemon_refit_options() -> calib::refit::RefitOptions {
+    calib::refit::RefitOptions {
+        max_train_samples: 400,
+        max_heldout_samples: 200,
+        min_span_ns: REFIT_MIN_SPAN_NS,
+        ..Default::default()
+    }
+}
 
 /// A batch for the solver thread: the probes, the sensor's camera model and the controllers' LEDs.
 struct SolveJob {
     job: repose::Job,
     model: calib::camera::CameraModel,
     bodies: [Option<Vec<calib::capture::Led>>; 2],
+}
+
+/// One background session-fresh joint sensor refit request.
+struct RefitJob {
+    version: u64,
+    serials: Vec<String>,
+    removals: std::collections::BTreeMap<String, u64>,
+    cameras: Vec<calib::camera::CameraModel>,
+    anchors: Vec<nalgebra::Isometry3<f64>>,
+    currents: Vec<nalgebra::Isometry3<f64>>,
+    leds: std::collections::BTreeMap<i32, Vec<calib::capture::Led>>,
+    samples: Vec<calib::refit::RefitSample>,
+    opts: calib::refit::RefitOptions,
+}
+
+struct RefitOutcome {
+    version: u64,
+    removals: std::collections::BTreeMap<String, u64>,
+    result: Result<calib::refit::RefitResult, String>,
+}
+
+struct PendingRefitSensor {
+    serial: String,
+    removals: u64,
+    world_from_cam: nalgebra::Isometry3<f64>,
+    reposed: Reposed,
+}
+
+enum PendingPoseUpdate {
+    Placed {
+        serial: String,
+        removals: u64,
+        world_from_cam: nalgebra::Isometry3<f64>,
+        at_ns: u64,
+        moved_mm: f64,
+        turned_deg: f64,
+        median_px: f64,
+        pairs: usize,
+    },
+    Refit {
+        sensors: Vec<PendingRefitSensor>,
+    },
 }
 
 /// The radio thread's side of placing moved sensors again: judges the agreement every
@@ -3117,6 +3270,8 @@ struct Reposing {
     reposer: repose::Reposer,
     to_solver: std::sync::mpsc::Sender<SolveJob>,
     from_solver: std::sync::mpsc::Receiver<(repose::Job, Result<repose::Solved, String>)>,
+    to_refit: std::sync::mpsc::Sender<RefitJob>,
+    from_refit: std::sync::mpsc::Receiver<RefitOutcome>,
     next_tick: u64,
     unsure_until: u64,
     unsure_logged: u64,
@@ -3137,6 +3292,28 @@ struct Reposing {
     /// Per sensor (`status::sensor_identity`): the native object last added. An add of an older
     /// one comes too late, and changes nothing.
     lifetimes: std::collections::BTreeMap<String, u64>,
+    /// Saved calibration poses per sensor (`status::sensor_identity`), used as the immutable
+    /// SE(3) gauge anchor across session refits (updated only on hotplug or persisted placement).
+    anchors: std::collections::BTreeMap<String, nalgebra::Isometry3<f64>>,
+    /// Incremented on sensor hotplug, inspection, placing, or pose update so stale background
+    /// refit results are discarded.
+    refit_version: u64,
+    refit_in_flight: bool,
+    refit_worker_dead: bool,
+    refit_last_at: Option<u64>,
+    refit_cooldown_ns: u64,
+    refit_last_samples: u64,
+    /// Sensors (`status::sensor_identity`) left unchanged on the last accepted refit due to
+    /// insufficient overlap; once one accumulates enough fresh views, the cooldown shortens.
+    refit_skipped: std::collections::BTreeSet<String>,
+    /// Consecutive rejected refits that trimmed the oldest buffer half on a suspected regime shift.
+    refit_regime_trims: u32,
+    /// Whether the last refit finished with a rejection (prevents a static elevated residual floor
+    /// from shortening the post-rejection backoff indefinitely).
+    refit_last_rejected: bool,
+    /// Pose updates already committed to `d.session_poses` and recorded as `SENSOR_POSES`, waiting
+    /// for older queued frames (`epoch < target_epoch`) to be consumed under the previous poses.
+    pending_poses: std::collections::VecDeque<(u64, PendingPoseUpdate)>,
 }
 
 impl Reposing {
@@ -3159,11 +3336,45 @@ impl Reposing {
         if let Err(e) = spawned {
             log!("no solver thread for moved sensors ({e})");
         }
+        let (to_refit, refit_jobs) = std::sync::mpsc::channel::<RefitJob>();
+        let (refit_results, from_refit) = std::sync::mpsc::channel();
+        let spawned_refit =
+            std::thread::Builder::new()
+                .name("cv1t-refit".into())
+                .spawn(move || {
+                    for w in refit_jobs {
+                        let result = calib::refit::joint_refit_against(
+                            &w.serials,
+                            &w.cameras,
+                            &w.anchors,
+                            &w.currents,
+                            &w.leds,
+                            &w.samples,
+                            &w.opts,
+                        );
+                        if refit_results
+                            .send(RefitOutcome {
+                                version: w.version,
+                                removals: w.removals,
+                                result,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+        let refit_worker_dead = spawned_refit.is_err();
+        if let Err(e) = spawned_refit {
+            log!("no worker thread for session sensor refit ({e})");
+        }
         Reposing {
             monitor: repose::Monitor::new(repose::WINDOW_NS),
             reposer: repose::Reposer::default(),
             to_solver,
             from_solver,
+            to_refit,
+            from_refit,
             next_tick: 0,
             unsure_until: 0,
             unsure_logged: 0,
@@ -3173,6 +3384,17 @@ impl Reposing {
             removals: Default::default(),
             stale_landmarks: Default::default(),
             lifetimes: Default::default(),
+            anchors: Default::default(),
+            refit_version: 0,
+            refit_in_flight: false,
+            refit_worker_dead,
+            refit_last_at: None,
+            refit_cooldown_ns: 0,
+            refit_last_samples: 0,
+            refit_skipped: Default::default(),
+            refit_regime_trims: 0,
+            refit_last_rejected: false,
+            pending_poses: Default::default(),
         }
     }
 
@@ -3191,10 +3413,13 @@ impl Reposing {
 
     /// The sensor was removed: whatever it left goes, and its count of removals advances.
     fn forget(&mut self, serial: &str, pipe: &mut Pipeline) {
-        *self
-            .removals
-            .entry(cv1touch::status::sensor_identity(serial))
-            .or_default() += 1;
+        let id = cv1touch::status::sensor_identity(serial);
+        *self.removals.entry(id.clone()).or_default() += 1;
+        self.anchors.remove(&id);
+        self.refit_skipped.remove(&id);
+        self.refit_regime_trims = 0;
+        self.refit_last_rejected = false;
+        self.refit_version = self.refit_version.wrapping_add(1);
         if let Some(camera) = pipe.remove_sensor(serial) {
             self.reposer.forget(camera);
         }
@@ -3205,6 +3430,212 @@ impl Reposing {
             .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
         self.releases
             .retain(|s, _| !cv1touch::status::same_sensor(s, serial));
+    }
+
+    fn sync_anchors(&mut self, pipe: &Pipeline) {
+        for (_, serial, cam) in pipe.registered_sensors() {
+            self.anchors
+                .entry(cv1touch::status::sensor_identity(&serial))
+                .or_insert(cam.world_from_cam);
+        }
+    }
+
+    fn write_sensor_poses_record(d: &Daemon, now: u64, poses: &[(&str, nalgebra::Isometry3<f64>)]) {
+        if poses.is_empty() || !d.rec.active() {
+            return;
+        }
+        let encoded: Vec<(&str, [f64; 4], [f64; 3])> = poses
+            .iter()
+            .map(|&(serial, iso)| {
+                let q = iso.rotation.quaternion();
+                let t = iso.translation.vector;
+                (serial, [q.i, q.j, q.k, q.w], [t.x, t.y, t.z])
+            })
+            .collect();
+        let payload = recorder::encode_sensor_poses(&encoded);
+        d.rec
+            .write_boundary(recorder::SENSOR_POSES, now, &[&payload]);
+    }
+
+    fn replace_session_poses(d: &Daemon, now: u64, poses: &[(&str, nalgebra::Isometry3<f64>)]) {
+        let mut active = d.session_poses.lock().unwrap();
+        let mut ingress = d.track_in.lock().unwrap();
+        active.clear();
+        for &(serial, iso) in poses {
+            active.insert(
+                cv1touch::status::sensor_identity(serial),
+                (serial.to_string(), iso),
+            );
+        }
+        let _ = ingress.advance_pose_epoch();
+        Self::write_sensor_poses_record(d, now, poses);
+    }
+
+    fn record_sensor_poses(d: &Daemon, now: u64, poses: &[(&str, nalgebra::Isometry3<f64>)]) {
+        let _ = Self::record_sensor_poses_fenced(d, now, poses);
+    }
+
+    /// Updates `d.session_poses`, advances `d.track_in`'s pose epoch, and writes `SENSOR_POSES`
+    /// atomically with respect to frame admission (`d.session_poses` -> `d.track_in` -> `d.rec`).
+    /// Returns `(target_epoch, has_older_frames)` where `has_older_frames` is true when frames
+    /// admitted before this boundary are still queued in `d.track_in`.
+    fn record_sensor_poses_fenced(
+        d: &Daemon,
+        now: u64,
+        poses: &[(&str, nalgebra::Isometry3<f64>)],
+    ) -> (u64, bool) {
+        if poses.is_empty() {
+            return (0, false);
+        }
+        let mut active = d.session_poses.lock().unwrap();
+        let mut ingress = d.track_in.lock().unwrap();
+        for &(serial, iso) in poses {
+            active.insert(
+                cv1touch::status::sensor_identity(serial),
+                (serial.to_string(), iso),
+            );
+        }
+        let target_epoch = ingress.advance_pose_epoch();
+        Self::write_sensor_poses_record(d, now, poses);
+        let has_older = ingress.has_frame_matching(|&(_, _, epoch)| epoch < target_epoch);
+        (target_epoch, has_older)
+    }
+
+    fn next_pending_pose_epoch(&self) -> Option<u64> {
+        self.pending_poses.front().map(|&(epoch, _)| epoch)
+    }
+
+    fn apply_pending_pose(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        watch: &mut Option<LandmarkWatch>,
+        update: PendingPoseUpdate,
+    ) -> bool {
+        match update {
+            PendingPoseUpdate::Placed {
+                serial,
+                removals,
+                world_from_cam,
+                at_ns,
+                moved_mm,
+                turned_deg,
+                median_px,
+                pairs,
+            } => {
+                let Some(cam) = pipe.camera(&serial).copied() else {
+                    return false;
+                };
+                if self.removals(&serial) != removals {
+                    return false;
+                }
+                pipe.cancel_inspection(&serial);
+                pipe.sensor(&serial, cam.model, world_from_cam);
+                pipe.probe(&serial, false);
+                pipe.reset_agreement(&serial);
+                pipe.reset_refit_samples();
+                if let Some(w) = watch.as_mut() {
+                    w.forget(d, &serial);
+                }
+                let (orient_xyzw, pos) = calib::iso_to_xyzw(&world_from_cam);
+                let change = PoseChange::Set(Reposed {
+                    serial: serial.clone(),
+                    orient_xyzw,
+                    pos,
+                    median_px,
+                    matches: pairs,
+                    moved_mm,
+                    turned_deg,
+                    write: true,
+                });
+                link.reposed.lock().unwrap().push((change, removals));
+                d.sensor_poses.lock().unwrap().insert(
+                    serial,
+                    PoseNote::Placed {
+                        at_ns,
+                        moved_mm,
+                        turned_deg,
+                        median_px,
+                        matches: pairs,
+                    },
+                );
+                false
+            }
+            PendingPoseUpdate::Refit { sensors } => {
+                let mut batch = Vec::with_capacity(sensors.len());
+                for s in sensors {
+                    let Some(cam) = pipe.camera(&s.serial).copied() else {
+                        continue;
+                    };
+                    if pipe.is_probed(&s.serial)
+                        || pipe.is_ignored(&s.serial)
+                        || self.removals(&s.serial) != s.removals
+                    {
+                        continue;
+                    }
+                    pipe.sensor(&s.serial, cam.model, s.world_from_cam);
+                    pipe.reset_agreement(&s.serial);
+                    self.monitor.reset_agreement(&s.serial);
+                    batch.push((s.reposed, s.removals));
+                }
+                if !batch.is_empty() {
+                    pipe.reset_refit_samples();
+                    link.reposed
+                        .lock()
+                        .unwrap()
+                        .push((PoseChange::Refit(batch), 0));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Applies any queued pose updates whose pre-boundary frames have all drained from
+    /// `d.track_in`. Returns true if a refit batch was applied to `pipe`.
+    fn apply_ready_poses(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        watch: &mut Option<LandmarkWatch>,
+    ) -> bool {
+        let mut refit_applied = false;
+        while let Some(target_epoch) = self.next_pending_pose_epoch() {
+            let has_older = d
+                .track_in
+                .lock()
+                .unwrap()
+                .has_frame_matching(|&(_, _, epoch)| epoch < target_epoch);
+            if has_older {
+                break;
+            }
+            let (_, update) = self.pending_poses.pop_front().unwrap();
+            if self.apply_pending_pose(d, link, pipe, watch, update) {
+                refit_applied = true;
+            }
+        }
+        if refit_applied {
+            *d.sensor_agreement.lock().unwrap() = pipe.camera_agreement().into_iter().collect();
+        }
+        refit_applied
+    }
+
+    fn note_sensor_added(&mut self, serial: &str, world_from_cam: nalgebra::Isometry3<f64>) {
+        let id = cv1touch::status::sensor_identity(serial);
+        self.anchors.insert(id.clone(), world_from_cam);
+        self.refit_skipped.insert(id);
+        self.refit_regime_trims = 0;
+        self.refit_last_rejected = false;
+        self.refit_version = self.refit_version.wrapping_add(1);
+    }
+
+    fn repose_busy(&self) -> bool {
+        self.monitor.inspecting().is_some()
+            || !self.probed_since.is_empty()
+            || !self.monitor.restoring().is_empty()
     }
 
     /// Lets a probed sensor go, tracked with again as calibrated: the engine gets its pose back,
@@ -3290,6 +3721,7 @@ impl Reposing {
         pipe.probe(&serial, true);
         self.reposer.watch(camera);
         self.probed_since.insert(serial.clone(), now);
+        self.refit_version = self.refit_version.wrapping_add(1);
         let change = PoseChange::Placing(serial.clone());
         link.reposed
             .lock()
@@ -3335,6 +3767,7 @@ impl Reposing {
             match change {
                 repose::Change::Inspect(serial) => {
                     pipe.begin_inspection(&serial);
+                    self.refit_version = self.refit_version.wrapping_add(1);
                     // Missing sightings request labels for these hands without demoting the
                     // sensor or disturbing the other hand's native fast tracking.
                     let change = PoseChange::Inspect(
@@ -3402,6 +3835,7 @@ impl Reposing {
             return Vec::new();
         }
         self.next_tick = now + REPOSE_TICK_NS;
+        self.sync_anchors(pipe);
         prune_placements(&mut self.placements, now);
         // An acknowledgement may still be arriving: the radio thread never waits for it.
         let restored = link
@@ -3420,10 +3854,10 @@ impl Reposing {
                     .track_in
                     .lock()
                     .unwrap()
-                    .take_sensor_frames(serial, |(info, _)| pipe.retracts(info));
+                    .take_sensor_frames(serial, |(info, _, _)| pipe.retracts(info));
                 // the landmark watch reads unlabelled blobs, which no identity retracts
                 if let Some(w) = watch.as_mut() {
-                    for (info, blobs) in &retracted {
+                    for (info, blobs, _) in &retracted {
                         w.frame(info, blobs);
                     }
                 }
@@ -3433,7 +3867,48 @@ impl Reposing {
                     .write(recorder::IDENTITIES_RETIRED, now, &[serial.as_bytes()]);
             }
         }
-        while let Ok((job, result)) = self.from_solver.try_recv() {
+        self.apply_ready_poses(d, link, pipe, watch);
+        let saved_bumps = link
+            .refit_saved
+            .try_lock()
+            .map(|mut saved| mem::take(&mut *saved))
+            .unwrap_or_default();
+        for bump in saved_bumps {
+            if pipe.camera(&bump.serial).is_none()
+                || self.removals(&bump.serial) != bump.removals
+                || d.reopen.load(Ordering::Acquire)
+                || d.engine_requested.load(Ordering::Acquire) != bump.session_revision
+            {
+                continue;
+            }
+            self.anchors.insert(
+                cv1touch::status::sensor_identity(&bump.serial),
+                bump.world_from_cam,
+            );
+            self.placements
+                .entry(bump.serial.clone())
+                .or_default()
+                .push(bump.at_ns);
+            self.releases.remove(&bump.serial);
+            if let Some(w) = watch.as_mut() {
+                w.forget(d, &bump.serial);
+            }
+            self.stale_landmarks.insert(bump.serial.clone());
+            d.sensor_poses.lock().unwrap().insert(
+                bump.serial,
+                PoseNote::Placed {
+                    at_ns: bump.at_ns,
+                    moved_mm: bump.moved_mm,
+                    turned_deg: bump.turned_deg,
+                    median_px: bump.median_px,
+                    matches: bump.matches,
+                },
+            );
+        }
+        while self.pending_poses.is_empty() {
+            let Ok((job, result)) = self.from_solver.try_recv() else {
+                break;
+            };
             let camera = job.camera;
             let Some(serial) = pipe.serial_of(camera).map(str::to_string) else {
                 continue;
@@ -3461,48 +3936,41 @@ impl Reposing {
                     let delta = cam.world_from_cam.inverse() * fit.world_from_cam;
                     let moved_mm = delta.translation.vector.norm() * 1e3;
                     let turned_deg = delta.rotation.angle().to_degrees();
+                    let removals = self.removals(&serial);
+                    let (target_epoch, has_older) =
+                        Self::record_sensor_poses_fenced(d, now, &[(&serial, fit.world_from_cam)]);
                     self.placements.entry(serial.clone()).or_default().push(now);
                     self.releases.remove(&serial);
-                    pipe.cancel_inspection(&serial);
-                    pipe.sensor(&serial, cam.model, fit.world_from_cam);
-                    pipe.probe(&serial, false);
-                    pipe.reset_agreement(&serial);
                     self.reposer.forget(camera);
                     self.probed_since.remove(&serial);
                     self.monitor.released(&serial);
-                    if let Some(w) = watch.as_mut() {
-                        w.forget(d, &serial);
-                    }
-                    self.stale_landmarks.insert(serial.clone());
-                    let (orient_xyzw, pos) = calib::iso_to_xyzw(&fit.world_from_cam);
-                    let change = PoseChange::Set(Reposed {
-                        serial: serial.clone(),
-                        orient_xyzw,
-                        pos,
-                        median_px: fit.median_px,
-                        matches: fit.pairs,
-                        moved_mm,
-                        turned_deg,
-                        write: true,
-                    });
-                    link.reposed
-                        .lock()
-                        .unwrap()
-                        .push((change, self.removals(&serial)));
-                    d.sensor_poses.lock().unwrap().insert(
-                        serial.clone(),
-                        PoseNote::Placed {
-                            at_ns: now,
-                            moved_mm,
-                            turned_deg,
-                            median_px: fit.median_px,
-                            matches: fit.pairs,
-                        },
+                    self.anchors.insert(
+                        cv1touch::status::sensor_identity(&serial),
+                        fit.world_from_cam,
                     );
+                    self.refit_regime_trims = 0;
+                    self.refit_last_rejected = false;
+                    self.refit_version = self.refit_version.wrapping_add(1);
+                    self.stale_landmarks.insert(serial.clone());
                     log!(
                         "sensor {serial}: placed again from the other sensors, {moved_mm:.0} mm and {turned_deg:.1} degrees from its calibrated pose ({:.2} px median over {} LED matches in {} frames); tracking with it again",
                         fit.median_px, fit.pairs, fit.frames
                     );
+                    let update = PendingPoseUpdate::Placed {
+                        serial: serial.clone(),
+                        removals,
+                        world_from_cam: fit.world_from_cam,
+                        at_ns: now,
+                        moved_mm,
+                        turned_deg,
+                        median_px: fit.median_px,
+                        pairs: fit.pairs,
+                    };
+                    if has_older {
+                        self.pending_poses.push_back((target_epoch, update));
+                    } else {
+                        self.apply_pending_pose(d, link, pipe, watch, update);
+                    }
                 }
                 repose::Outcome::GaveUp {
                     attempts, reason, ..
@@ -3528,6 +3996,12 @@ impl Reposing {
                 }
             }
         }
+        // Wait until any fenced pose boundary drains its pre-boundary queued frames before running
+        // monitor state transitions (which could probe/ignore a sensor already recorded in
+        // `SENSOR_POSES`) or starting another refit. `radio_main` keeps `idle_ms = 0` meanwhile.
+        if !self.pending_poses.is_empty() {
+            return Vec::new();
+        }
         let changes = cv1touch::track::epochs::commit(&d.track_identities, pipe, |pipe| {
             // Late invalidation and overflow still retract window state after a timeout,
             // while native restoration is draining frames and inspection counters are gone.
@@ -3548,7 +4022,6 @@ impl Reposing {
         let said = self.apply_changes(d, link, pipe, changes, now);
         d.sensors_unsure
             .store(now < self.unsure_until, Ordering::Relaxed);
-        *d.sensor_agreement.lock().unwrap() = agreement.into_iter().collect();
         // a probed sensor that gathers no labelled sighting in `PROBATION_NS`, or whose probes
         // bring no pose in `PATIENCE_NS`, is let go, so that the engine's search on it ends
         let waited_out: Vec<(String, repose::LetGo)> = self
@@ -3598,31 +4071,377 @@ impl Reposing {
                 log!("the solver thread for moved sensors is gone");
             }
         }
+        let refit_applied = if self.pending_poses.is_empty() {
+            self.tick_session_refit(d, link, pipe, watch, &agreement, now)
+        } else {
+            false
+        };
+        let published_agreement = if refit_applied {
+            pipe.camera_agreement()
+        } else {
+            agreement
+        };
+        *d.sensor_agreement.lock().unwrap() = published_agreement.into_iter().collect();
         said
+    }
+
+    /// Polls any completed background session refit and dispatches a fresh job when eligible.
+    /// Returns true if an accepted refit was applied to `pipe`.
+    fn tick_session_refit(
+        &mut self,
+        d: &Daemon,
+        link: &RadioLink,
+        pipe: &mut Pipeline,
+        watch: &mut Option<LandmarkWatch>,
+        agreement: &[(String, track::tracker::CameraAgreement)],
+        now: u64,
+    ) -> bool {
+        let mut applied = false;
+        while self.pending_poses.is_empty() {
+            let outcome = match self.from_refit.try_recv() {
+                Ok(outcome) => {
+                    self.refit_in_flight = false;
+                    outcome
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.refit_in_flight = false;
+                    if !self.refit_worker_dead {
+                        self.refit_worker_dead = true;
+                        log!("the worker thread for session sensor refit is gone");
+                    }
+                    break;
+                }
+            };
+            if outcome.version != self.refit_version || self.repose_busy() {
+                continue;
+            }
+            match outcome.result {
+                Ok(res) if res.accepted => {
+                    let still_valid = res.sensors.iter().all(|s| {
+                        pipe.camera(&s.serial).is_some()
+                            && !pipe.is_probed(&s.serial)
+                            && !pipe.is_ignored(&s.serial)
+                            && outcome.removals.get(&s.serial).copied()
+                                == Some(self.removals(&s.serial))
+                    });
+                    if !still_valid {
+                        self.refit_last_at = Some(now);
+                        self.refit_cooldown_ns = REFIT_ERROR_COOLDOWN_NS;
+                        self.refit_last_samples = pipe.refit_total_samples();
+                        continue;
+                    }
+                    let bumped = res.bumped_sensor().map(|b| b.serial.clone());
+                    let persist_bump = bumped.as_ref().is_some_and(|serial| {
+                        self.placements.get(serial).map_or(0, Vec::len) < MAX_PLACEMENTS
+                    });
+                    let mut max_mm = 0.0_f64;
+                    let mut max_deg = 0.0_f64;
+                    let mut bumped_summary: Option<(String, f64, f64, f64, f64)> = None;
+                    let mut pending_sensors = Vec::with_capacity(res.sensors.len());
+                    let mut rec_poses = Vec::with_capacity(res.sensors.len());
+                    for s in &res.sensors {
+                        if pipe.camera(&s.serial).is_none() {
+                            continue;
+                        }
+                        let moved_mm = s.delta_m * 1e3;
+                        let turned_deg = s.delta_rad.to_degrees();
+                        max_mm = max_mm.max(moved_mm);
+                        max_deg = max_deg.max(turned_deg);
+                        let write = persist_bump && bumped.as_deref() == Some(s.serial.as_str());
+                        rec_poses.push((s.serial.as_str(), s.world_from_cam));
+                        let (orient_xyzw, pos) = calib::iso_to_xyzw(&s.world_from_cam);
+                        let matches = s.train_obs + s.heldout_obs;
+                        pending_sensors.push(PendingRefitSensor {
+                            serial: s.serial.clone(),
+                            removals: self.removals(&s.serial),
+                            world_from_cam: s.world_from_cam,
+                            reposed: Reposed {
+                                serial: s.serial.clone(),
+                                orient_xyzw,
+                                pos,
+                                median_px: s.after_median_px,
+                                matches,
+                                moved_mm,
+                                turned_deg,
+                                write,
+                            },
+                        });
+                        if write {
+                            bumped_summary = Some((
+                                s.serial.clone(),
+                                moved_mm,
+                                turned_deg,
+                                s.before_rms_px,
+                                s.after_rms_px,
+                            ));
+                        }
+                    }
+                    let (target_epoch, has_older) =
+                        Self::record_sensor_poses_fenced(d, now, &rec_poses);
+                    self.refit_version = self.refit_version.wrapping_add(1);
+                    self.refit_last_at = Some(now);
+                    self.refit_cooldown_ns = REFIT_ACCEPT_COOLDOWN_NS;
+                    self.refit_last_samples = pipe.refit_total_samples();
+                    self.refit_regime_trims = 0;
+                    self.refit_last_rejected = false;
+                    self.refit_skipped = res
+                        .skipped_serials
+                        .iter()
+                        .map(|s| cv1touch::status::sensor_identity(s))
+                        .collect();
+                    if let Some((serial, moved_mm, turned_deg, before_px, after_px)) =
+                        bumped_summary
+                    {
+                        log!(
+                            "sensor {serial}: moved relative to the other sensors ({moved_mm:.0} mm and {turned_deg:.1} degrees; held-out RMS {before_px:.2} -> {after_px:.2} px); requesting calibration save for its new pose and adjusting {} sensor(s) for this session",
+                            res.sensors.len()
+                        );
+                    } else {
+                        log!(
+                            "session sensor refit: adjusted {} sensor(s) in memory (held-out RMS {:.2} -> {:.2} px over {} samples, max shift {:.1} mm / {:.2} deg)",
+                            res.sensors.len(),
+                            res.before.pooled_rms_px,
+                            res.after.pooled_rms_px,
+                            res.train_samples + res.heldout_samples,
+                            max_mm,
+                            max_deg
+                        );
+                    }
+                    let update = PendingPoseUpdate::Refit {
+                        sensors: pending_sensors,
+                    };
+                    if has_older {
+                        self.pending_poses.push_back((target_epoch, update));
+                    } else if self.apply_pending_pose(d, link, pipe, watch, update) {
+                        applied = true;
+                    }
+                }
+                Ok(rej) => {
+                    for s in &rej.sensors {
+                        self.refit_skipped
+                            .remove(&cv1touch::status::sensor_identity(&s.serial));
+                    }
+                    let regime_shift = rej.before.pooled_rms_px >= REFIT_REGIME_SHIFT_RMS_PX
+                        || rej
+                            .sensors
+                            .iter()
+                            .any(|s| s.before_rms_px >= REFIT_REGIME_SHIFT_CAM_RMS_PX);
+                    if regime_shift && self.refit_regime_trims < 2 {
+                        pipe.trim_refit_samples_oldest_half();
+                        self.refit_regime_trims += 1;
+                        self.refit_cooldown_ns = REFIT_ELEVATED_COOLDOWN_NS;
+                    } else {
+                        if !regime_shift {
+                            self.refit_regime_trims = 0;
+                        }
+                        self.refit_cooldown_ns = REFIT_REJECT_COOLDOWN_NS;
+                    }
+                    self.refit_last_at = Some(now);
+                    self.refit_last_samples = pipe.refit_total_samples();
+                    self.refit_last_rejected = true;
+                }
+                Err(_) => {
+                    self.refit_last_at = Some(now);
+                    self.refit_cooldown_ns = REFIT_ERROR_COOLDOWN_NS;
+                    self.refit_last_samples = pipe.refit_total_samples();
+                    self.refit_last_rejected = false;
+                }
+            }
+        }
+        if applied || self.refit_in_flight || self.refit_worker_dead || self.repose_busy() {
+            return applied;
+        }
+        pipe.expire_refit_samples(now);
+        let sample_count = pipe.refit_sample_count();
+        if sample_count < REFIT_MIN_SAMPLES {
+            return false;
+        }
+        let opts = daemon_refit_options();
+        if opts.min_span_ns > 0 && pipe.refit_sample_span_ns() < opts.min_span_ns {
+            return false;
+        }
+        let total_samples = pipe.refit_total_samples();
+        let elevated = agreement.iter().any(|(serial, a)| {
+            !pipe.is_probed(serial)
+                && !pipe.is_ignored(serial)
+                && a.samples >= REFIT_ELEVATED_MIN_SAMPLES
+                && (a.bias_px.norm() >= REFIT_ELEVATED_BIAS_PX
+                    || a.median_px >= REFIT_ELEVATED_MEDIAN_PX)
+        });
+        let skipped_ready = !self.refit_skipped.is_empty()
+            && pipe.registered_sensors().iter().any(|(cam_id, serial, _)| {
+                !pipe.is_probed(serial)
+                    && !pipe.is_ignored(serial)
+                    && self
+                        .refit_skipped
+                        .contains(&cv1touch::status::sensor_identity(serial))
+                    && pipe.refit_camera_views(*cam_id)
+                        >= opts.min_camera_views + opts.min_heldout_camera_views
+            });
+        if let Some(last) = self.refit_last_at {
+            let elapsed = now.saturating_sub(last);
+            let wait = if (skipped_ready || elevated) && !self.refit_last_rejected {
+                self.refit_cooldown_ns.min(REFIT_ELEVATED_COOLDOWN_NS)
+            } else {
+                self.refit_cooldown_ns
+            };
+            if elapsed < wait {
+                return false;
+            }
+            if total_samples
+                < self
+                    .refit_last_samples
+                    .saturating_add(REFIT_RETRY_SAMPLE_STEP as u64)
+            {
+                return false;
+            }
+        }
+        let mut leds = std::collections::BTreeMap::new();
+        if let Some(tr) = pipe.tracker(HAND_LEFT) {
+            leds.insert(calib::DEVICE_LEFT, tr.body.leds.clone());
+        }
+        if let Some(tr) = pipe.tracker(HAND_RIGHT) {
+            leds.insert(calib::DEVICE_RIGHT, tr.body.leds.clone());
+        }
+        if leds.is_empty() {
+            return false;
+        }
+        let mut serials = Vec::new();
+        let mut removals = std::collections::BTreeMap::new();
+        let mut cameras = Vec::new();
+        let mut anchors = Vec::new();
+        let mut currents = Vec::new();
+        let mut id_to_idx = std::collections::HashMap::new();
+        for (cam_id, serial, cam) in pipe.registered_sensors() {
+            if pipe.is_probed(&serial) || pipe.is_ignored(&serial) {
+                continue;
+            }
+            let idx = serials.len();
+            id_to_idx.insert(cam_id, idx);
+            let anchor = self
+                .anchors
+                .get(&cv1touch::status::sensor_identity(&serial))
+                .copied()
+                .unwrap_or(cam.world_from_cam);
+            removals.insert(serial.clone(), self.removals(&serial));
+            serials.push(serial);
+            cameras.push(cam.model);
+            anchors.push(anchor);
+            currents.push(cam.world_from_cam);
+        }
+        if serials.len() < 2 {
+            return false;
+        }
+        let samples: Vec<calib::refit::RefitSample> = pipe
+            .refit_samples()
+            .into_iter()
+            .filter_map(|mut rs| {
+                rs.sample.views.retain_mut(|v| {
+                    let Some(&idx) = id_to_idx.get(&v.camera) else {
+                        return false;
+                    };
+                    v.camera = idx;
+                    true
+                });
+                (rs.sample.views.len() >= 2).then_some(rs)
+            })
+            .collect();
+        if samples.len() < opts.min_train_samples + opts.min_heldout_samples {
+            return false;
+        }
+        if opts.min_span_ns > 0 {
+            let (lo, hi) = samples.iter().fold((u64::MAX, 0u64), |(lo, hi), rs| {
+                (lo.min(rs.sample.host_ns), hi.max(rs.sample.host_ns))
+            });
+            if hi.saturating_sub(lo) < opts.min_span_ns {
+                return false;
+            }
+        }
+        let job = RefitJob {
+            version: self.refit_version,
+            serials,
+            removals,
+            cameras,
+            anchors,
+            currents,
+            leds,
+            samples,
+            opts,
+        };
+        if self.to_refit.send(job).is_ok() {
+            self.refit_in_flight = true;
+        } else {
+            self.refit_worker_dead = true;
+            log!("the worker thread for session sensor refit is gone");
+        }
+        false
     }
 }
 
 /// The engine thread's side: the engine tracks with the new pose, the options keep it for a
 /// reopen, the calibration file records it (with a backup of the old), and the sensor's
 /// landmarks, learned where it stood, are dropped.
-fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
-    if let Err(err) = e.set_sensor_pose(
-        &r.serial,
-        r.orient_xyzw.map(f64::from),
-        r.pos.map(f64::from),
-    ) {
+fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed, session_revision: u64) -> bool {
+    let landmarks = track::landmarks::default_path();
+    apply_reposed_with(
+        d,
+        r,
+        session_revision,
+        &platform::dirs::get().state,
+        &landmarks,
+        |r| {
+            e.set_sensor_pose(
+                &r.serial,
+                r.orient_xyzw.map(f64::from),
+                r.pos.map(f64::from),
+            )
+        },
+    )
+}
+
+fn apply_reposed_with(
+    d: &Daemon,
+    r: &Reposed,
+    session_revision: u64,
+    state_dir: &std::path::Path,
+    landmarks_path: &std::path::Path,
+    set_pose: impl FnOnce(&Reposed) -> Result<(), String>,
+) -> bool {
+    if let Err(err) = set_pose(r) {
         log!(
             "sensor {}: the engine did not take the pose ({err}); it has what it had",
             r.serial
         );
+        return false;
     }
     if !r.write {
-        return;
+        return false;
     }
-    adopt_reposed_pose(&mut d.opts.lock().unwrap(), r);
+    if d.reopen.load(Ordering::Acquire) {
+        log!(
+            "sensor {}: new pose not written: engine is reopening",
+            r.serial
+        );
+        return false;
+    }
+    if d.engine_requested.load(Ordering::Acquire) != session_revision {
+        log!(
+            "sensor {}: new pose not written: calibration changed since this engine opened",
+            r.serial
+        );
+        return false;
+    }
     let loaded = d.calibration.lock().unwrap().clone();
     let written = match loaded {
-        Some(loaded) => match write_reposed(&loaded, r, &platform::dirs::get().state) {
+        Some(loaded) if loaded.revision != session_revision => {
+            log!(
+                "sensor {}: new pose not written: calibration changed since this engine opened",
+                r.serial
+            );
+            false
+        }
+        Some(loaded) => match write_reposed(&loaded, r, state_dir) {
             Ok((backup, sha256)) => {
                 log!(
                     "sensor {}: wrote its new pose to {}{}",
@@ -3633,7 +4452,9 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
                         .map_or(String::new(), |b| format!(" (previous: {})", b.display()))
                 );
                 if let Some(c) = d.calibration.lock().unwrap().as_mut() {
-                    c.sha256 = sha256;
+                    if c.revision == session_revision {
+                        c.sha256 = sha256;
+                    }
                 }
                 if let Some(backup) = backup {
                     thin_own_backups(&mut d.own_backups.lock().unwrap(), backup);
@@ -3655,17 +4476,82 @@ fn apply_reposed(d: &Daemon, e: &Engine, r: &Reposed) {
     };
     if !written {
         // the old pose comes back at the next start: its landmarks stay with it
-        return;
+        return false;
     }
-    let landmarks = track::landmarks::default_path();
-    match track::landmarks::forget_in_file(&landmarks, &r.serial) {
+    {
+        let mut opts = d.opts.lock().unwrap();
+        if d.engine_requested.load(Ordering::Acquire) == session_revision {
+            adopt_reposed_pose(&mut opts, r);
+        }
+    }
+    match track::landmarks::forget_in_file(landmarks_path, &r.serial) {
         Ok(0) => {}
         Ok(n) => log!(
             "sensor {}: dropped its {n} landmark(s) from {}, learned where it stood; cv1touch setup learns new ones",
             r.serial,
-            landmarks.display()
+            landmarks_path.display()
         ),
         Err(err) => log!("sensor {}: {err}", r.serial),
+    }
+    true
+}
+
+struct ReposePaths<'a> {
+    state_dir: &'a std::path::Path,
+    landmarks: &'a std::path::Path,
+}
+
+/// Applies one rig-wide joint refit batch on the engine thread. Still-current sensors receive
+/// their updated in-memory poses; a confirmed bumped sensor is persisted to `calibration.json`
+/// only when every sensor in the batch is still current and `write_reposed` succeeds, in which
+/// case a `SavedRefitBump` confirmation is sent back to the radio thread.
+fn apply_refit_batch_with(
+    d: &Daemon,
+    link: &RadioLink,
+    batch: Vec<(Reposed, u64)>,
+    session_revision: u64,
+    paths: ReposePaths<'_>,
+    now_ns: u64,
+    mut set_pose: impl FnMut(&Reposed) -> Result<(), String>,
+) {
+    if d.reopen.load(Ordering::Acquire) {
+        return;
+    }
+    let all_current = batch
+        .iter()
+        .all(|(r, removals)| sensor_removals_match(d, &r.serial, *removals));
+    for (mut r, removals) in batch {
+        if !sensor_removals_match(d, &r.serial, removals) {
+            continue;
+        }
+        if r.write && !all_current {
+            log!(
+                "sensor {}: new pose not written: another sensor changed while refit was pending",
+                r.serial
+            );
+            r.write = false;
+        }
+        if apply_reposed_with(
+            d,
+            &r,
+            session_revision,
+            paths.state_dir,
+            paths.landmarks,
+            &mut set_pose,
+        ) && r.write
+        {
+            link.refit_saved.lock().unwrap().push(SavedRefitBump {
+                world_from_cam: reposed_iso(&r),
+                serial: r.serial,
+                removals,
+                session_revision,
+                at_ns: now_ns,
+                moved_mm: r.moved_mm,
+                turned_deg: r.turned_deg,
+                median_px: r.median_px,
+                matches: r.matches,
+            });
+        }
     }
 }
 
@@ -3904,7 +4790,7 @@ fn deliver_new_bodies(d: &Daemon, queued: &Mutex<Vec<NewBody>>, mut install: imp
 /// the tracker relies on, the headset, haptics), each controller's engine view for the radio
 /// thread, and the hands the radio thread does not publish (no tracker body, or no radio thread),
 /// from OpenHMD. Returns when the engine is to close.
-fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
+fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool, session_revision: u64) {
     let mut live_sensors = LiveSensorState::default();
     let mut holds = HoldStats::default();
     let mut bodies = BodyFinder::default();
@@ -3968,30 +4854,49 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
         }
         d.shm.heartbeat(now);
         holds.note(arrived, shm::now_ns());
-        deliver_engine_queues(link, save_biases, |change, removals| {
-            if !made_for_its_camera(d, &change, removals) {
-                return;
+        deliver_engine_queues(link, save_biases, |change, removals| match change {
+            PoseChange::Refit(batch) => {
+                let landmarks = track::landmarks::default_path();
+                apply_refit_batch_with(
+                    d,
+                    link,
+                    batch,
+                    session_revision,
+                    ReposePaths {
+                        state_dir: &platform::dirs::get().state,
+                        landmarks: &landmarks,
+                    },
+                    now,
+                    |r| {
+                        e.set_sensor_pose(
+                            &r.serial,
+                            r.orient_xyzw.map(f64::from),
+                            r.pos.map(f64::from),
+                        )
+                    },
+                );
             }
-            match change {
-                PoseChange::Inspect(serial, hands) => {
-                    match e.inspect_sensor(&serial, hands, repose::INSPECTION_NS) {
-                        Ok(()) => {
-                            log!("sensor {serial}: the engine is looking for its controller LEDs")
-                        }
-                        Err(err) => log!("sensor {serial}: {err}"),
+            _ if !made_for_its_camera(d, &change, removals) => {}
+            PoseChange::Inspect(serial, hands) => {
+                match e.inspect_sensor(&serial, hands, repose::INSPECTION_NS) {
+                    Ok(()) => {
+                        log!("sensor {serial}: the engine is looking for its controller LEDs")
                     }
+                    Err(err) => log!("sensor {serial}: {err}"),
                 }
-                PoseChange::Placing(serial) => {
-                    match e.inspect_sensor(&serial, [true; 2], repose::PATIENCE_NS) {
-                        Ok(()) => {
-                            log!("sensor {serial}: the engine is looking for its controller LEDs")
-                        }
-                        Err(err) => log!("sensor {serial}: {err}"),
+            }
+            PoseChange::Placing(serial) => {
+                match e.inspect_sensor(&serial, [true; 2], repose::PATIENCE_NS) {
+                    Ok(()) => {
+                        log!("sensor {serial}: the engine is looking for its controller LEDs")
                     }
+                    Err(err) => log!("sensor {serial}: {err}"),
                 }
-                PoseChange::Set(r) => {
-                    set_engine_pose(&mut restoring, r, |r| apply_reposed(d, e, r));
-                }
+            }
+            PoseChange::Set(r) => {
+                set_engine_pose(&mut restoring, r, |r| {
+                    apply_reposed(d, e, r, session_revision);
+                });
             }
         });
         acknowledge_restored(&mut restoring, &link.restored, |serial| {
@@ -4037,11 +4942,15 @@ fn engine_loop(d: &Daemon, e: &mut Engine, link: &RadioLink, radio: bool) {
 /// camera of the sensor removed since (unplugged, and maybe back as a new camera) counts fewer
 /// removals, and its pose and inspection are not the new camera's.
 fn made_for_its_camera(d: &Daemon, change: &PoseChange, removals: u64) -> bool {
+    sensor_removals_match(d, change.serial(), removals)
+}
+
+fn sensor_removals_match(d: &Daemon, serial: &str, removals: u64) -> bool {
     let since = d
         .sensor_removals
         .lock()
         .unwrap()
-        .get(&cv1touch::status::sensor_identity(change.serial()))
+        .get(&cv1touch::status::sensor_identity(serial))
         .copied()
         .unwrap_or(0);
     removals == since
@@ -4327,24 +5236,45 @@ fn publish_radio_state(
 /// consumer's queue. The frame is taken after the sensor events are applied, so a frame of an
 /// object replaced meanwhile went with its queue and never reaches its successor's camera. The
 /// ingress lock is released before any tracking work.
-fn consume_camera_frame(d: &Daemon, sensors: &mut RadioSensors<'_>, pipe: &mut Pipeline) -> bool {
+fn consume_camera_frame(
+    d: &Daemon,
+    link: &RadioLink,
+    sensors: &mut RadioSensors<'_>,
+    pipe: &mut Pipeline,
+) -> bool {
     with_radio_sensors(
         d,
         &mut sensors.revision,
         pipe,
         &mut sensors.reposing,
         sensors.watch,
-        |pipe, watch| {
-            let Some((info, blobs)) = d.track_in.lock().unwrap().pop_frame() else {
-                return false;
-            };
-            if let Some(w) = watch.as_mut() {
-                w.frame(&info, &blobs);
-            }
-            pipe.frame(&info, &blobs);
-            true
-        },
-    )
+        |_, _| (),
+    );
+    sensors
+        .reposing
+        .apply_ready_poses(d, link, pipe, sensors.watch);
+    let frame = {
+        let mut ingress = d.track_in.lock().unwrap();
+        if let Some(target_epoch) = sensors.reposing.next_pending_pose_epoch() {
+            ingress.pop_frame_matching(|&(_, _, epoch)| epoch < target_epoch)
+        } else {
+            ingress.pop_frame()
+        }
+    };
+    let Some((info, blobs, _epoch)) = frame else {
+        sensors
+            .reposing
+            .apply_ready_poses(d, link, pipe, sensors.watch);
+        return false;
+    };
+    if let Some(w) = sensors.watch.as_mut() {
+        w.frame(&info, &blobs);
+    }
+    pipe.frame(&info, &blobs);
+    sensors
+        .reposing
+        .apply_ready_poses(d, link, pipe, sensors.watch);
+    true
 }
 
 /// Apply sensor removals and additions, in order, before this IMU sample or frame is consumed.
@@ -4406,6 +5336,12 @@ fn with_radio_sensors<T>(
                     retire_radio_sensor(d, pipe, reposing, watch, &serial);
                     if let Some((model, world_from_cam)) = camera {
                         pipe.sensor(&serial, model, world_from_cam);
+                        reposing.note_sensor_added(&serial, world_from_cam);
+                        Reposing::record_sensor_poses(
+                            d,
+                            shm::now_ns(),
+                            &[(&serial, world_from_cam)],
+                        );
                     }
                     // its frames, searches and identity notices are taken from now on: none of
                     // an earlier object of the serial
@@ -4437,6 +5373,10 @@ fn retire_radio_sensor(
     serial: &str,
 ) {
     reposing.forget(serial, pipe);
+    d.session_poses
+        .lock()
+        .unwrap()
+        .remove(&cv1touch::status::sensor_identity(serial));
     d.sensor_poses
         .lock()
         .unwrap()
@@ -4489,7 +5429,9 @@ fn radio_main(
     let started = shm::now_ns();
     while !link.stop.load(Ordering::Acquire) && !radio_failed {
         // Queued frames need immediate service; clock samples wake us in batches.
-        let idle_ms = if !d.track_in.lock().unwrap().has_frames() {
+        let idle_ms = if !d.track_in.lock().unwrap().has_frames()
+            && sensors.reposing.pending_poses.is_empty()
+        {
             let now = shm::now_ns();
             let timers = [next_stats, sensors.reposing.next_tick, biases.next_save];
             radio_deadline(&link.hands, &own, &d.preview, now, timers)
@@ -4580,7 +5522,7 @@ fn radio_main(
                 if let Some((info, remaining_ns)) = search {
                     pipe.hold_inspection(&info, remaining_ns);
                 }
-                consume_camera_frame(d, sensors, pipe);
+                consume_camera_frame(d, link, sensors, pipe);
                 // A handoff can happen after the radio's last report. Persistent publication still
                 // refreshes and expires that hand even before this worker has a sample of its own.
                 let now = shm::now_ns();
@@ -6113,6 +7055,33 @@ fn recording_started(d: &Daemon, started: Result<(), String>) -> String {
     }
 }
 
+fn start_recording(
+    d: &Daemon,
+    reserved: recorder::ReservedRecording<'_>,
+    start_host_ns: u64,
+) -> Result<(), String> {
+    reserved.start_with(start_host_ns, |activate| {
+        let poses = d.session_poses.lock().unwrap();
+        // Lock order everywhere is `d.session_poses` -> `d.track_in` -> `d.rec` ring: serialize
+        // opening snapshot + admission against both `Daemon::frame` and fenced pose boundaries.
+        let _ingress = d.track_in.lock().unwrap();
+        if poses.is_empty() {
+            activate(None);
+        } else {
+            let encoded: Vec<(&str, [f64; 4], [f64; 3])> = poses
+                .values()
+                .map(|(serial, iso)| {
+                    let q = iso.rotation.quaternion();
+                    let t = iso.translation.vector;
+                    (serial.as_str(), [q.i, q.j, q.k, q.w], [t.x, t.y, t.z])
+                })
+                .collect();
+            let payload = recorder::encode_sensor_poses(&encoded);
+            activate(Some((recorder::SENSOR_POSES, &payload)));
+        }
+    })
+}
+
 fn handle(d: &Daemon, line: &str) -> String {
     match control::parse(line) {
         Err(e) => format!("err {e}"),
@@ -6140,7 +7109,11 @@ fn handle(d: &Daemon, line: &str) -> String {
         // Control requests start recordings in `handle_control_recording`, which reserves the
         // session under the dispatch turn; this is the same start in one step.
         Ok(Command::RecordStart(path, frames)) => {
-            recording_started(d, d.rec.start_with_frames(&path, shm::now_ns(), frames))
+            let started = d
+                .rec
+                .reserve_with_frames(&path, frames)
+                .and_then(|reserved| start_recording(d, reserved, shm::now_ns()));
+            recording_started(d, started)
         }
         Ok(Command::RecordStop) => match d.rec.stop_timeout(None, RECORD_STOP_WAIT) {
             Some(status) => record_stop_reply(&status, false),
@@ -6171,17 +7144,17 @@ fn handle(d: &Daemon, line: &str) -> String {
             }
         }
         Ok(Command::CalibrationCapture) => {
-            *d.calibration.lock().unwrap() = None;
-            switch_mode(d, modes::capture(&current_opts(d)), "capture")
+            switch_mode_with_calibration(d, None, modes::capture(&current_opts(d)), "capture")
         }
-        Ok(Command::CalibrationProvisional) => {
-            *d.calibration.lock().unwrap() = None;
-            switch_mode(d, modes::provisional(&current_opts(d)), "provisional")
-        }
+        Ok(Command::CalibrationProvisional) => switch_mode_with_calibration(
+            d,
+            None,
+            modes::provisional(&current_opts(d)),
+            "provisional",
+        ),
         Ok(Command::CalibrationLoad(path)) => match modes::calibrated(&current_opts(d), &path) {
             Ok((opts, n)) => {
-                *d.calibration.lock().unwrap() = Some(LoadedCalibration::at(path.clone()));
-                switch_mode(d, opts, "calibrated");
+                switch_mode_with_calibration(d, Some(path.clone()), opts, "calibrated");
                 format!("ok calibrated: {n} sensor poses from {}", path.display())
             }
             Err(e) => format!("err {e}"),
@@ -6346,11 +7319,35 @@ fn engine_is_ready(d: &Daemon, _opts: &EngineOptions) -> bool {
 }
 
 /// Installs new engine options; the engine thread reopens the engine with them.
+#[cfg(test)]
 fn switch_mode(d: &Daemon, opts: EngineOptions, mode: &str) -> String {
     {
         let mut current = d.opts.lock().unwrap();
         *current = opts;
         d.engine_requested.fetch_add(1, Ordering::AcqRel);
+    }
+    *d.mode.lock().unwrap() = mode.to_string();
+    d.reopen.store(true, Ordering::Release);
+    format!("ok {mode}")
+}
+
+/// Installs new engine options and updates `d.calibration` atomically with the new engine
+/// revision so queued pose writes from the previous engine session cannot overwrite it.
+fn switch_mode_with_calibration(
+    d: &Daemon,
+    cal: Option<PathBuf>,
+    opts: EngineOptions,
+    mode: &str,
+) -> String {
+    let loaded = cal.map(LoadedCalibration::at);
+    {
+        let mut current = d.opts.lock().unwrap();
+        *current = opts;
+        let rev = d.engine_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        *d.calibration.lock().unwrap() = loaded.map(|mut c| {
+            c.revision = rev;
+            c
+        });
     }
     *d.mode.lock().unwrap() = mode.to_string();
     d.reopen.store(true, Ordering::Release);
@@ -6681,7 +7678,7 @@ fn handle_control(d: &Daemon, line: &str, one_at_a_time: &Mutex<()>) -> String {
         line,
         one_at_a_time,
         Recorder::reserve_with_frames,
-        |reserved| reserved.start(shm::now_ns()),
+        |reserved| start_recording(d, reserved, shm::now_ns()),
     )
 }
 
@@ -7226,6 +8223,7 @@ fn main() {
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
         sensor_poses: Mutex::new(Default::default()),
+        session_poses: Mutex::new(Default::default()),
         sensor_agreement: Mutex::new(Default::default()),
         sensors_unsure: AtomicBool::new(false),
         calibration: Mutex::new(calibration_path.map(LoadedCalibration::at)),
@@ -9357,6 +10355,7 @@ mod tests {
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
             sensor_poses: Mutex::new(Default::default()),
+            session_poses: Mutex::new(Default::default()),
             sensor_agreement: Mutex::new(Default::default()),
             sensors_unsure: AtomicBool::new(false),
             calibration: Mutex::new(None),
@@ -9558,8 +10557,8 @@ mod tests {
                                 },
                                 observed_misses: 0,
                                 samples: 100,
-                                median_px: if c { 0.9 } else { 0.1 },
-                                bias_px: nalgebra::Vector2::new(if c { 0.9 } else { 0.1 }, 0.0),
+                                median_px: if c { 1.4 } else { 0.1 },
+                                bias_px: nalgebra::Vector2::new(if c { 1.4 } else { 0.1 }, 0.0),
                             };
                             let mut hands = [CameraAgreement::default(); 2];
                             hands[hand] = a;
@@ -9640,7 +10639,7 @@ mod tests {
                                     checks: 100,
                                     misses: 0,
                                 },
-                                residual_px: Some((0.9, 0.9)),
+                                residual_px: Some((1.4, 1.4)),
                             });
                             vec![repose::Change::Moved {
                                 serial: "C".into(),
@@ -9654,7 +10653,9 @@ mod tests {
                 }
                 assert!(link.reposed.lock().unwrap().iter().all(|(p, _)| !matches!(
                     p,
-                    PoseChange::Placing(_) | PoseChange::Set(Reposed { write: true, .. })
+                    PoseChange::Placing(_)
+                        | PoseChange::Set(Reposed { write: true, .. })
+                        | PoseChange::Refit(_)
                 )));
                 assert_eq!(states[hand].epochs[&1].state, State::Started);
             }
@@ -9882,7 +10883,7 @@ mod tests {
                 reposing.tick(&d, &link, &mut pipe, &mut None, now);
                 assert_eq!(pipe.frames_skipped, search - 1, "no frame work at the ack");
                 let left = d.track_in.lock().unwrap().pop_frame();
-                let (info, blobs) = left.expect("the valid frame stays queued");
+                let (info, blobs, _) = left.expect("the valid frame stays queued");
                 assert_eq!(info.devices[0].identity_epoch_lo, (search + 10_000) as u32);
                 assert!(!pipe.retracts(&info));
                 pipe.frame(&info, &blobs);
@@ -10493,6 +11494,7 @@ mod tests {
                     }
                     PoseChange::Placing(serial) => format!("placing {serial} {removals}"),
                     PoseChange::Set(r) => format!("set {} {} {removals}", r.serial, r.write),
+                    PoseChange::Refit(batch) => format!("refit {}", batch.len()),
                 });
             },
         );
@@ -11488,7 +12490,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(serial, 1, 1, (Box::default(), Vec::new()));
+            .push_frame(serial, 1, 1, (Box::default(), Vec::new(), 0));
         d.sensor_poses.lock().unwrap().insert(
             serial.into(),
             PoseNote::Moved {
@@ -11546,7 +12548,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new(), 0));
         d.sensor_agreement
             .lock()
             .unwrap()
@@ -12171,7 +13173,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new()));
+            .push_frame(&a.serial, 1, 1, (Box::default(), Vec::new(), 0));
         let mut native = engine::Sensor::default();
         for (slot, byte) in native.serial.iter_mut().zip(a.serial.bytes()) {
             *slot = byte as _;
@@ -12341,7 +13343,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame("SensorAlpha", 2, 1, (Box::default(), Vec::new()));
+            .push_frame("SensorAlpha", 2, 1, (Box::default(), Vec::new(), 0));
         assert!(
             d.track_in.lock().unwrap().pop_frame().is_none(),
             "its frames were admitted before its camera was registered"
@@ -12360,7 +13362,7 @@ mod tests {
         d.track_in
             .lock()
             .unwrap()
-            .push_frame("SensorAlpha", 2, 2, (Box::default(), Vec::new()));
+            .push_frame("SensorAlpha", 2, 2, (Box::default(), Vec::new(), 0));
         assert!(
             d.track_in.lock().unwrap().pop_frame().is_some(),
             "its frames are queued"
@@ -12750,7 +13752,7 @@ mod tests {
             a.serial.clone(),
             2,
             1,
-            (Box::default(), Vec::new()),
+            (Box::default(), Vec::new(), 0),
         );
         *d.sensor_events.lock().unwrap() = removed;
         d.sensor_revision.fetch_add(1, Ordering::Release);
@@ -12943,10 +13945,11 @@ mod tests {
         d.frame(&lifetime_frame("SENSORALPHA", 10), 1, &[]);
         queue_lifetime_event(&d, SensorEvent::Removed("SENSORALPHA".into()));
         queue_lifetime_event(&d, added("SENSORALPHA", 2));
-        let consumed_stale = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        let link = RadioLink::default();
+        let consumed_stale = consume_camera_frame(&d, &link, &mut sensors, &mut pipe);
         let new = pipe.camera_id("SENSORALPHA");
         d.frame(&lifetime_frame("SENSORALPHA", 20), 2, &[]);
-        let consumed_current = consume_camera_frame(&d, &mut sensors, &mut pipe);
+        let consumed_current = consume_camera_frame(&d, &link, &mut sensors, &mut pipe);
         assert!(old.is_some() && new.is_some() && old != new);
         assert_eq!(
             (consumed_stale, consumed_current),
@@ -13383,7 +14386,7 @@ mod tests {
                         &a2.serial,
                         1,
                         1,
-                        (Box::default(), Vec::new()),
+                        (Box::default(), Vec::new(), 0),
                     );
                     let revision = d.sensor_revision.load(Ordering::Acquire);
                     // Read before the starts, or the replacement itself: either way not a
@@ -21638,5 +22641,1082 @@ mod tests {
         // Subsequent ticks while asleep must not re-queue unchanged verified bias.
         mem.record(&pipe);
         assert!(mem.take_changed().is_none());
+    }
+
+    /// Real CV1 Touch LED ring geometry (asymmetric, matching factory calibration).
+    fn synthetic_touch_leds() -> Vec<calib::capture::Led> {
+        use nalgebra::Vector3;
+        const LEDS: [([f64; 3], [f64; 3]); 24] = [
+            ([0.02983, -0.00837, -0.01136], [0.8841, 0.3883, -0.2601]),
+            ([0.03556, -0.03320, -0.01055], [0.9672, -0.0248, -0.2530]),
+            ([0.02961, -0.05587, -0.01147], [0.8449, -0.4430, -0.2997]),
+            ([0.01123, -0.07539, -0.01455], [0.4922, -0.8024, -0.3376]),
+            ([-0.01049, -0.08232, -0.01856], [0.1151, -0.9043, -0.4110]),
+            ([-0.03680, -0.07705, -0.02313], [-0.3608, -0.8039, -0.4728]),
+            ([-0.05492, -0.06126, -0.02616], [-0.6802, -0.5182, -0.5184]),
+            ([-0.06364, -0.03840, -0.02787], [-0.8033, -0.1040, -0.5865]),
+            ([-0.06115, -0.01498, -0.02745], [-0.7496, 0.3302, -0.5736]),
+            ([-0.04838, 0.00485, -0.02515], [-0.5021, 0.6476, -0.5732]),
+            ([0.03066, -0.00955, 0.00556], [0.9098, 0.3467, 0.2280]),
+            ([0.03551, -0.03344, 0.00638], [0.9657, -0.0479, 0.2551]),
+            ([0.02983, -0.05618, 0.00538], [0.8520, -0.4575, 0.2543]),
+            ([0.01583, -0.07364, 0.00292], [0.5794, -0.7906, 0.1980]),
+            ([-0.00404, -0.08371, -0.00048], [0.2103, -0.9706, 0.1174]),
+            ([-0.02612, -0.08458, -0.00441], [-0.2157, -0.9737, 0.0738]),
+            ([-0.04767, -0.07545, -0.00803], [-0.6127, -0.7900, 0.0218]),
+            ([-0.06220, -0.05948, -0.01079], [-0.8735, -0.4862, -0.0244]),
+            ([-0.06953, -0.03688, -0.01212], [-0.9957, -0.0612, -0.0697]),
+            ([-0.06643, -0.01323, -0.01162], [-0.9261, 0.3709, -0.0696]),
+            ([-0.05531, 0.00496, -0.00972], [-0.6969, 0.6983, -0.1633]),
+            ([-0.03976, 0.01188, -0.01375], [0.2846, 0.9449, 0.1617]),
+            ([-0.00511, 0.00148, -0.02931], [0.0084, 0.7970, -0.6039]),
+            ([0.01760, -0.00147, -0.02364], [0.5632, 0.6698, -0.4839]),
+        ];
+        LEDS.iter()
+            .map(|&(p, d)| calib::capture::Led {
+                pos: Vector3::new(p[0], p[1], p[2]),
+                dir: Vector3::new(d[0], d[1], d[2]).normalize(),
+            })
+            .collect()
+    }
+
+    /// Drives a 4-sensor synthetic moving-controller session through `Pipeline` (`collect_refit:
+    /// true`) using unlabelled blobs after initial lock, returning the populated pipeline and
+    /// final host timestamp.
+    fn run_synthetic_refit_session(
+        registered_cams: &[nalgebra::Isometry3<f64>; 4],
+        true_cams: &[nalgebra::Isometry3<f64>; 4],
+        duration_s: u64,
+    ) -> (Pipeline, u64) {
+        use cv1touch::engine::Blob;
+        use nalgebra::{Isometry3, Point3, UnitQuaternion, Vector3};
+        const H0: u64 = 10_000_000_000;
+        const C0: u64 = 9_000_000_000;
+        const HMD_DELAY: u64 = 4_000_000;
+        const IMU_DELAY: u64 = 3_000_000;
+        let hmd_us = |host: u64| ((host - H0) / 1000 + 77_000) as u32;
+        let mut pipe = Pipeline::new(pipeline::Options {
+            exposure_offset_ns: IMU_DELAY as i64 - HMD_DELAY as i64,
+            collect_refit: true,
+            ..Default::default()
+        });
+        let leds = synthetic_touch_leds();
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        let sensors = ["A", "B", "C", "D"];
+        for (serial, w) in sensors.iter().zip(registered_cams) {
+            pipe.sensor(serial, model, *w);
+        }
+        pipe.body(calib::DEVICE_RIGHT, leds.clone(), Vector3::zeros());
+
+        let omega = Vector3::new(0.30, 0.50, 0.20);
+        // Orient the ring upward toward the ceiling sensors, matching normal hand-held use.
+        let base_rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        // Start smoothly at rest (v(0) = 0) so initial lock velocity matches the EKF.
+        let pose_at = |t_s: f64| -> Isometry3<f64> {
+            let pos = Vector3::new(
+                0.28 * (1.0 - (1.5 * t_s).cos()),
+                1.05 + 0.18 * (1.0 - (1.2 * t_s).cos()),
+                0.22 * (1.0 - (1.0 * t_s).cos()),
+            );
+            let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+            Isometry3::from_parts(pos.into(), rot)
+        };
+        let accel_world_at = |t_s: f64| -> Vector3<f64> {
+            Vector3::new(
+                0.28 * 1.5 * 1.5 * (1.5 * t_s).cos(),
+                0.18 * 1.2 * 1.2 * (1.2 * t_s).cos(),
+                0.22 * 1.0 * 1.0 * (1.0 * t_s).cos(),
+            )
+        };
+
+        enum Ev {
+            Hmd(u64),
+            Imu(u64),
+            Frame(usize, u64, u32),
+        }
+        let end = H0 + duration_s * 1_000_000_000;
+        let mut evs: Vec<(u64, Ev)> = (H0..end)
+            .step_by(2_000_000)
+            .map(|h| (h + HMD_DELAY, Ev::Hmd(h)))
+            .chain(
+                (H0 + 2_000_000..end)
+                    .step_by(2_000_000)
+                    .map(|h| (h + IMU_DELAY, Ev::Imu(h))),
+            )
+            .collect();
+        let (mut e, mut k) = (H0 + 10_000_000, 0u32);
+        while e < end {
+            for c in 0..true_cams.len() {
+                evs.push((e + 25_000_000 + c as u64 * 1_000_000, Ev::Frame(c, e, k)));
+            }
+            k += 1;
+            e += 1_000_000_000 / 52;
+        }
+        evs.sort_by_key(|ev| ev.0);
+
+        let jitter = |n: u64| (n.wrapping_mul(2_654_435_761) % 1000) as f64 / 5000.0 - 0.1;
+        for (at, ev) in evs {
+            match ev {
+                Ev::Hmd(h) => pipe.hmd_clock_sample(at, hmd_us(h)),
+                Ev::Imu(h) => {
+                    let t_s = (h - H0) as f64 * 1e-9;
+                    let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+                    let specific =
+                        rot.inverse() * (accel_world_at(t_s) + Vector3::new(0.0, 9.80665, 0.0));
+                    pipe.imu(HAND_RIGHT, h - C0, at, omega, specific);
+                }
+                Ev::Frame(c, e, k) => {
+                    let t_s = (e - H0) as f64 * 1e-9;
+                    let pose = pose_at(t_s);
+                    let cam_from_obj = true_cams[c].inverse() * pose;
+                    // Provide an initial engine lock on exposure 0 from an unmoved sensor; every
+                    // subsequent frame is purely unlabelled (ordinary play).
+                    let lock_seed = k == 0 && (c == 2 || c == 3);
+                    let blobs: Vec<Blob> = leds
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, l)| {
+                            let pc = cam_from_obj * Point3::from(l.pos);
+                            if (cam_from_obj.rotation * l.dir).dot(&(-pc.coords)) / pc.coords.norm()
+                                < 0.3
+                            {
+                                return None;
+                            }
+                            let uv = model.project(&pc.coords)?;
+                            let n = u64::from(k) * 256 + c as u64 * 64 + i as u64 * 2;
+                            Some(Blob {
+                                x: (uv.x + jitter(n)) as f32,
+                                y: (uv.y + jitter(n + 1)) as f32,
+                                width: 3,
+                                height: 3,
+                                area: 9,
+                                led_id: if lock_seed {
+                                    (calib::DEVICE_RIGHT << 8) | i as i32
+                                } else {
+                                    -1
+                                },
+                            })
+                        })
+                        .collect();
+                    let mut info = engine::FrameInfo {
+                        serial: serial_field(sensors[c]),
+                        frame_start_host_ns: e,
+                        exposure_valid: 1,
+                        exposure_count: k,
+                        exposure_hmd_ts: hmd_us(e),
+                        n_devices: if lock_seed { 1 } else { 0 },
+                        ..Default::default()
+                    };
+                    if lock_seed {
+                        let (o, q) = calib::iso_to_xyzw(&cam_from_obj);
+                        let device = &mut info.devices[0];
+                        device.device_id = calib::DEVICE_RIGHT;
+                        device.match_flags =
+                            calib::capture::MATCH_GOOD | calib::capture::MATCH_STRONG;
+                        device.pose_valid = 1;
+                        device.cam_orient = o;
+                        device.cam_pos = q;
+                    }
+                    pipe.frame(&info, &blobs);
+                }
+            }
+        }
+        (pipe, end + 1_000_000_000)
+    }
+
+    fn four_synthetic_cameras() -> [nalgebra::Isometry3<f64>; 4] {
+        use nalgebra::{Isometry3, Matrix3, Rotation3, UnitQuaternion, Vector3};
+        let target = Vector3::new(0.28, 1.23, 0.22);
+        let look_at = |pos: Vector3<f64>| {
+            let z = (target - pos).normalize();
+            let y = (-Vector3::y() + z * z.y).normalize();
+            let r = Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[y.cross(&z), y, z]));
+            Isometry3::from_parts(pos.into(), UnitQuaternion::from_rotation_matrix(&r))
+        };
+        [
+            look_at(Vector3::new(-1.1, 2.0, 1.3)),
+            look_at(Vector3::new(1.5, 2.0, 1.3)),
+            look_at(Vector3::new(-1.0, 2.1, -1.2)),
+            look_at(Vector3::new(1.5, 2.1, -1.2)),
+        ]
+    }
+
+    fn iso_perturbation(t: [f64; 3], rot_deg: [f64; 3]) -> nalgebra::Isometry3<f64> {
+        nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(t[0], t[1], t[2]),
+            nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(
+                rot_deg[0].to_radians(),
+                rot_deg[1].to_radians(),
+                rot_deg[2].to_radians(),
+            )),
+        )
+    }
+
+    #[test]
+    fn session_refit_adjusts_drifted_sensors_in_memory_without_persisting() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        // Two sensors drifted slightly (typical inter-session thermal/mount shift).
+        registered[0] *= iso_perturbation([0.002, -0.001, 0.002], [0.07, -0.05, 0.04]);
+        registered[1] *= iso_perturbation([-0.002, 0.001, -0.002], [-0.06, 0.04, -0.04]);
+        let (mut pipe, mut now) = run_synthetic_refit_session(&registered, &true_cams, 32);
+        pipe.flush_refit_samples();
+        assert!(
+            pipe.refit_sample_count() >= REFIT_MIN_SAMPLES,
+            "collected only {} samples",
+            pipe.refit_sample_count()
+        );
+
+        let mut reposing = Reposing::start();
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(reposing.refit_in_flight, "session refit should dispatch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session refit worker timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            now += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        }
+
+        let queued = mem::take(&mut *link.reposed.lock().unwrap());
+        assert_eq!(queued.len(), 1, "one rig-wide refit batch queued");
+        let PoseChange::Refit(batch) = &queued[0].0 else {
+            panic!("expected PoseChange::Refit batch, got {:?}", queued[0].0);
+        };
+        assert_eq!(batch.len(), 4, "all 4 sensors updated in memory");
+        for (r, removals) in batch {
+            assert_eq!(*removals, 0);
+            assert!(
+                !r.write,
+                "thermal drift must stay in-memory only, got {r:?}"
+            );
+        }
+        assert!(
+            d.sensor_poses.lock().unwrap().is_empty(),
+            "in-memory session refit must not write PoseNote::Placed"
+        );
+        assert!(reposing.stale_landmarks.is_empty());
+        assert_eq!(pipe.refit_sample_count(), 0);
+        // Anchors stay fixed to the original loaded poses (no gauge walk across refits).
+        for (serial, orig) in ["A", "B", "C", "D"].iter().zip(&registered) {
+            let anchor = reposing.anchors[&cv1touch::status::sensor_identity(serial)];
+            let diff = orig.inverse() * anchor;
+            assert!(diff.translation.vector.norm() < 1e-12 && diff.rotation.angle() < 1e-12);
+        }
+        // Relative geometry between sensor A and sensor C must recover to truth.
+        let rel_true = true_cams[2].inverse() * true_cams[0];
+        let rel_fit = pipe.camera("C").unwrap().world_from_cam.inverse()
+            * pipe.camera("A").unwrap().world_from_cam;
+        let rel_err = rel_true.inverse() * rel_fit;
+        assert!(
+            rel_err.translation.vector.norm() < 0.002
+                && rel_err.rotation.angle().to_degrees() < 0.05,
+            "relative pose error too large: {:.2} mm, {:.3} deg",
+            rel_err.translation.vector.norm() * 1e3,
+            rel_err.rotation.angle().to_degrees()
+        );
+    }
+
+    #[test]
+    fn session_refit_persists_single_bumped_sensor_and_keeps_peers_in_memory() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        // Sensor A physically bumped relative to B, C, D (within tracker association range).
+        registered[0] *= iso_perturbation([0.002, -0.001, 0.012], [0.09, -0.04, 0.26]);
+        let (mut pipe, mut now) = run_synthetic_refit_session(&registered, &true_cams, 32);
+        let mut reposing = Reposing::start();
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(reposing.refit_in_flight);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session refit worker timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            now += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        }
+        let queued = mem::take(&mut *link.reposed.lock().unwrap());
+        assert_eq!(queued.len(), 1);
+        let PoseChange::Refit(batch) = queued.into_iter().next().unwrap().0 else {
+            panic!("expected PoseChange::Refit batch");
+        };
+        let persisted: Vec<String> = batch
+            .iter()
+            .filter(|(r, _)| r.write)
+            .map(|(r, _)| r.serial.clone())
+            .collect();
+        let in_memory: Vec<String> = batch
+            .iter()
+            .filter(|(r, _)| !r.write)
+            .map(|(r, _)| r.serial.clone())
+            .collect();
+        assert_eq!(persisted, vec!["A".to_string()]);
+        assert_eq!(in_memory, vec!["B", "C", "D"]);
+        // Before engine confirmation, anchor and PoseNote::Placed are NOT prematurely marked saved.
+        assert!(d.sensor_poses.lock().unwrap().is_empty());
+        assert!(reposing.stale_landmarks.is_empty());
+        let orig_anchor_diff = registered[0].inverse() * reposing.anchors["A"];
+        assert!(orig_anchor_diff.translation.vector.norm() < 1e-12);
+
+        // Engine applies the batch against a disposable calibration file and confirms the save.
+        let tmp = tempfile::tempdir().unwrap();
+        let cal_path = tmp.path().join("calibration.json");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cal = calib::file::CalibrationFile {
+            format: calib::file::FORMAT.into(),
+            version: calib::file::VERSION,
+            created_unix_s: 1,
+            world: "test".into(),
+            source: "test".into(),
+            sensors: ["A", "B", "C", "D"]
+                .iter()
+                .zip(&registered)
+                .map(|(serial, iso)| {
+                    let (orient_xyzw, pos) = calib::iso_to_xyzw(iso);
+                    calib::file::SensorEntry {
+                        serial: (*serial).into(),
+                        orient_xyzw,
+                        pos,
+                        rms_px: 0.2,
+                        observations: 100,
+                    }
+                })
+                .collect(),
+            stats: calib::file::Stats {
+                reference: "A".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 100,
+                rejected_views: 0,
+            },
+        };
+        calib::file::save(&cal_path, &cal).unwrap();
+        *d.calibration.lock().unwrap() = Some(LoadedCalibration::at(cal_path.clone()));
+        let mut engine_applied = Vec::new();
+        let landmarks_path = tmp.path().join("landmarks.json");
+        apply_refit_batch_with(
+            &d,
+            &link,
+            batch,
+            1,
+            ReposePaths {
+                state_dir: &state_dir,
+                landmarks: &landmarks_path,
+            },
+            now,
+            |r| {
+                engine_applied.push(r.serial.clone());
+                Ok(())
+            },
+        );
+        assert_eq!(engine_applied, vec!["A", "B", "C", "D"]);
+        now += REPOSE_TICK_NS;
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(matches!(
+            d.sensor_poses.lock().unwrap().get("A"),
+            Some(PoseNote::Placed { .. })
+        ));
+        assert_eq!(d.sensor_poses.lock().unwrap().len(), 1);
+        assert!(reposing.stale_landmarks.contains("A"));
+        assert_eq!(reposing.stale_landmarks.len(), 1);
+        // Bumped sensor's anchor updated to its recovered true pose; peers keep their exact anchors.
+        let err_a = true_cams[0].inverse() * pipe.camera("A").unwrap().world_from_cam;
+        assert!(
+            err_a.translation.vector.norm() < 0.002 && err_a.rotation.angle().to_degrees() < 0.05,
+            "bumped sensor A error: {:.2} mm, {:.3} deg",
+            err_a.translation.vector.norm() * 1e3,
+            err_a.rotation.angle().to_degrees()
+        );
+        let anchor_a_err = true_cams[0].inverse() * reposing.anchors["A"];
+        assert!(anchor_a_err.translation.vector.norm() < 0.002);
+        // On disk, only A changed; B stayed at its saved calibration.
+        let saved_cal = calib::file::load(&cal_path).unwrap();
+        let saved_a = saved_cal.sensor("A").unwrap();
+        let saved_b = saved_cal.sensor("B").unwrap();
+        let (_, orig_b_pos) = calib::iso_to_xyzw(&registered[1]);
+        assert_eq!(saved_b.pos, orig_b_pos);
+        assert!((saved_a.pos[2] as f64 - true_cams[0].translation.z).abs() < 0.002);
+    }
+
+    #[test]
+    fn session_refit_guards_disk_write_against_calibration_reload_and_hotplug() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let cal_path = tmp.path().join("calibration.json");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cal = calib::file::CalibrationFile {
+            format: calib::file::FORMAT.into(),
+            version: calib::file::VERSION,
+            created_unix_s: 1,
+            world: "test".into(),
+            source: "fresh-cal".into(),
+            sensors: ["A", "B"]
+                .iter()
+                .map(|serial| calib::file::SensorEntry {
+                    serial: (*serial).into(),
+                    orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    pos: [0.0, 1.0, 0.0],
+                    rms_px: 0.2,
+                    observations: 100,
+                })
+                .collect(),
+            stats: calib::file::Stats {
+                reference: "A".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 100,
+                rejected_views: 0,
+            },
+        };
+        calib::file::save(&cal_path, &cal).unwrap();
+        let orig_bytes = std::fs::read(&cal_path).unwrap();
+
+        // Case 1: another calibration was loaded (revision bumped to 2) before batch from rev 1 lands.
+        switch_mode_with_calibration(
+            &d,
+            Some(cal_path.clone()),
+            EngineOptions::default(),
+            "calibrated",
+        );
+        d.reopen.store(false, Ordering::Release);
+        let mk_batch = || {
+            vec![
+                (
+                    Reposed {
+                        serial: "A".into(),
+                        orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        pos: [0.2, 1.0, 0.0],
+                        median_px: 0.2,
+                        matches: 200,
+                        moved_mm: 20.0,
+                        turned_deg: 0.5,
+                        write: true,
+                    },
+                    0,
+                ),
+                (
+                    Reposed {
+                        serial: "B".into(),
+                        orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        pos: [0.0, 1.0, 0.0],
+                        median_px: 0.2,
+                        matches: 200,
+                        moved_mm: 1.0,
+                        turned_deg: 0.01,
+                        write: false,
+                    },
+                    0,
+                ),
+            ]
+        };
+        let landmarks_path = tmp.path().join("landmarks.json");
+        apply_refit_batch_with(
+            &d,
+            &link,
+            mk_batch(),
+            1,
+            ReposePaths {
+                state_dir: &state_dir,
+                landmarks: &landmarks_path,
+            },
+            100,
+            |_| Ok(()),
+        );
+        assert!(link.refit_saved.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&cal_path).unwrap(), orig_bytes);
+
+        // Case 2: sensor B was hotplugged (removal count advanced) before batch from rev 2 lands.
+        d.sensor_removals.lock().unwrap().insert("B".into(), 1);
+        let mut applied = Vec::new();
+        apply_refit_batch_with(
+            &d,
+            &link,
+            mk_batch(),
+            2,
+            ReposePaths {
+                state_dir: &state_dir,
+                landmarks: &landmarks_path,
+            },
+            200,
+            |r| {
+                applied.push(r.serial.clone());
+                Ok(())
+            },
+        );
+        assert_eq!(applied, vec!["A"]);
+        assert!(link.refit_saved.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&cal_path).unwrap(), orig_bytes);
+
+        // Case 3: a SavedRefitBump from an older session_revision is ignored on the radio tick.
+        let mut pipe = Pipeline::new(pipeline::Options::default());
+        let orig_a = nalgebra::Isometry3::identity();
+        pipe.sensor(
+            "A",
+            calib::camera::CameraModel {
+                width: 1280,
+                height: 960,
+                fx: 715.0,
+                fy: 715.0,
+                cx: 640.0,
+                cy: 480.0,
+                k: [0.0; 4],
+            },
+            orig_a,
+        );
+        let mut reposing = Reposing::start();
+        reposing.sync_anchors(&pipe);
+        link.refit_saved.lock().unwrap().push(SavedRefitBump {
+            serial: "A".into(),
+            removals: 0,
+            session_revision: 1,
+            world_from_cam: iso_perturbation([0.05, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            at_ns: 300,
+            moved_mm: 50.0,
+            turned_deg: 1.0,
+            median_px: 0.2,
+            matches: 200,
+        });
+        reposing.tick(&d, &link, &mut pipe, &mut None, 300);
+        assert!(d.sensor_poses.lock().unwrap().is_empty());
+        assert!(reposing.stale_landmarks.is_empty());
+        let diff = orig_a.inverse() * reposing.anchors["A"];
+        assert!(diff.translation.vector.norm() < 1e-12 && diff.rotation.angle() < 1e-12);
+    }
+
+    #[test]
+    fn session_refit_discards_stale_result_after_hotplug() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        registered[0] *= iso_perturbation([0.004, -0.002, 0.002], [0.14, -0.08, 0.04]);
+        let (mut pipe, mut now) = run_synthetic_refit_session(&registered, &true_cams, 32);
+        let mut reposing = Reposing::start();
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(reposing.refit_in_flight);
+        // Hotplug removal while refit is in flight invalidates the result.
+        reposing.forget("D", &mut pipe);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session refit worker timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            now += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        }
+        assert!(
+            link.reposed.lock().unwrap().is_empty(),
+            "stale refit result must not queue PoseChange::Refit"
+        );
+        // Sensor A must keep its original pre-refit pose.
+        let diff = registered[0].inverse() * pipe.camera("A").unwrap().world_from_cam;
+        assert!(diff.translation.vector.norm() < 1e-12 && diff.rotation.angle() < 1e-12);
+    }
+
+    #[test]
+    fn session_refit_trims_old_half_on_regime_shift_and_shortens_cooldown_for_skipped_sensor() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let (mut pipe, now) = run_synthetic_refit_session(&true_cams, &true_cams, 32);
+        pipe.flush_refit_samples();
+        let before_count = pipe.refit_sample_count();
+        assert!(before_count >= REFIT_MIN_SAMPLES);
+        let cam_d = pipe.camera_id("D").unwrap();
+        assert!(pipe.refit_camera_views(cam_d) >= 30);
+
+        let mut reposing = Reposing::start();
+        // Simulate an accepted partial refit that skipped D, putting us in the 10-minute cooldown.
+        reposing.refit_last_at = Some(now);
+        reposing.refit_cooldown_ns = REFIT_ACCEPT_COOLDOWN_NS;
+        reposing
+            .refit_skipped
+            .insert(cv1touch::status::sensor_identity("D"));
+        // Before REFIT_ELEVATED_COOLDOWN_NS (60 s), it still waits.
+        reposing.tick(&d, &link, &mut pipe, &mut None, now + 30_000_000_000);
+        assert!(!reposing.refit_in_flight);
+        // Once 60 s pass and skipped sensor D has enough buffered views, it dispatches early
+        // instead of waiting 10 minutes.
+        reposing.tick(
+            &d,
+            &link,
+            &mut pipe,
+            &mut None,
+            now + REFIT_ELEVATED_COOLDOWN_NS,
+        );
+        assert!(reposing.refit_in_flight);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut t = now + REFIT_ELEVATED_COOLDOWN_NS;
+        while reposing.refit_in_flight {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+            t += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, t);
+        }
+        // Exact room was rejected without trimming (clean before-RMS keeps full buffer).
+        assert_eq!(pipe.refit_sample_count(), before_count);
+        assert_eq!(reposing.refit_cooldown_ns, REFIT_REJECT_COOLDOWN_NS);
+        assert!(
+            reposing.refit_skipped.is_empty(),
+            "participating skipped sensor must be cleared after evaluation"
+        );
+        // Must wait out the full rejection cooldown rather than spinning every 60 s.
+        reposing.tick(
+            &d,
+            &link,
+            &mut pipe,
+            &mut None,
+            t + REFIT_ELEVATED_COOLDOWN_NS,
+        );
+        assert!(!reposing.refit_in_flight);
+        // Even after the full rejection cooldown, an unchanged idle buffer must not re-run BA.
+        reposing.tick(
+            &d,
+            &link,
+            &mut pipe,
+            &mut None,
+            t + REFIT_REJECT_COOLDOWN_NS,
+        );
+        assert!(!reposing.refit_in_flight);
+
+        // Trimming drops the oldest half while keeping chronological order.
+        pipe.trim_refit_samples_oldest_half();
+        assert_eq!(pipe.refit_sample_count(), before_count - before_count / 2);
+    }
+
+    #[test]
+    fn session_refit_waits_for_min_span_without_error_cooldown() {
+        use cv1touch::engine::Blob;
+        use nalgebra::{Isometry3, Point3, UnitQuaternion, Vector3};
+        const H0: u64 = 10_000_000_000;
+        const C0: u64 = 9_000_000_000;
+        const HMD_DELAY: u64 = 4_000_000;
+        const IMU_DELAY: u64 = 3_000_000;
+        let hmd_us = |host: u64| ((host - H0) / 1000 + 77_000) as u32;
+
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        registered[0] *= iso_perturbation([0.002, -0.001, 0.002], [0.07, -0.05, 0.04]);
+
+        let mut pipe = Pipeline::new(pipeline::Options {
+            exposure_offset_ns: IMU_DELAY as i64 - HMD_DELAY as i64,
+            collect_refit: true,
+            ..Default::default()
+        });
+        let leds = synthetic_touch_leds();
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        let sensors = ["A", "B", "C", "D"];
+        for (serial, w) in sensors.iter().zip(&registered) {
+            pipe.sensor(serial, model, *w);
+        }
+        pipe.body(calib::DEVICE_LEFT, leds.clone(), Vector3::zeros());
+        pipe.body(calib::DEVICE_RIGHT, leds.clone(), Vector3::zeros());
+
+        let omega = Vector3::new(0.30, 0.50, 0.20);
+        let base_rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        let hand_pose = |hand: usize, t_s: f64| -> Isometry3<f64> {
+            let x_off = if hand == HAND_LEFT { -0.35 } else { 0.35 };
+            let pos = Vector3::new(
+                x_off + 0.20 * (1.0 - (2.2 * t_s).cos()),
+                1.05 + 0.16 * (1.0 - (1.7 * t_s).cos()),
+                0.20 * (1.0 - (1.4 * t_s).cos()),
+            );
+            let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+            Isometry3::from_parts(pos.into(), rot)
+        };
+        let hand_accel = |t_s: f64| -> Vector3<f64> {
+            Vector3::new(
+                0.20 * 2.2 * 2.2 * (2.2 * t_s).cos(),
+                0.16 * 1.7 * 1.7 * (1.7 * t_s).cos(),
+                0.20 * 1.4 * 1.4 * (1.4 * t_s).cos(),
+            )
+        };
+
+        enum Ev {
+            Hmd(u64),
+            Imu(u64),
+            Frame(usize, u64, u32),
+        }
+        let feed_window = |pipe: &mut Pipeline, start_s: u64, end_s: u64, k_start: u32| -> u32 {
+            let start = H0 + start_s * 1_000_000_000;
+            let end = H0 + end_s * 1_000_000_000;
+            let mut evs: Vec<(u64, Ev)> = (start..end)
+                .step_by(2_000_000)
+                .map(|h| (h + HMD_DELAY, Ev::Hmd(h)))
+                .chain(
+                    (start + 2_000_000..end)
+                        .step_by(2_000_000)
+                        .map(|h| (h + IMU_DELAY, Ev::Imu(h))),
+                )
+                .collect();
+            let (mut e, mut k) = (start + 10_000_000, k_start);
+            while e < end {
+                for c in 0..true_cams.len() {
+                    evs.push((e + 25_000_000 + c as u64 * 1_000_000, Ev::Frame(c, e, k)));
+                }
+                k += 1;
+                e += 1_000_000_000 / 52;
+            }
+            evs.sort_by_key(|ev| ev.0);
+            for (at, ev) in evs {
+                match ev {
+                    Ev::Hmd(h) => pipe.hmd_clock_sample(at, hmd_us(h)),
+                    Ev::Imu(h) => {
+                        let t_s = (h - H0) as f64 * 1e-9;
+                        let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+                        let specific =
+                            rot.inverse() * (hand_accel(t_s) + Vector3::new(0.0, 9.80665, 0.0));
+                        pipe.imu(HAND_LEFT, h - C0, at, omega, specific);
+                        pipe.imu(HAND_RIGHT, h - C0, at, omega, specific);
+                    }
+                    Ev::Frame(c, e, k) => {
+                        let t_s = (e - H0) as f64 * 1e-9;
+                        let lock_seed = k == 0 && (c == 2 || c == 3);
+                        let mut blobs = Vec::new();
+                        let mut info = engine::FrameInfo {
+                            serial: serial_field(sensors[c]),
+                            frame_start_host_ns: e,
+                            exposure_valid: 1,
+                            exposure_count: k,
+                            exposure_hmd_ts: hmd_us(e),
+                            n_devices: if lock_seed { 2 } else { 0 },
+                            ..Default::default()
+                        };
+                        for (slot, (hand, dev_id)) in [
+                            (HAND_LEFT, calib::DEVICE_LEFT),
+                            (HAND_RIGHT, calib::DEVICE_RIGHT),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cam_from_obj = true_cams[c].inverse() * hand_pose(hand, t_s);
+                            if lock_seed {
+                                let (o, q) = calib::iso_to_xyzw(&cam_from_obj);
+                                let device = &mut info.devices[slot];
+                                device.device_id = dev_id;
+                                device.match_flags =
+                                    calib::capture::MATCH_GOOD | calib::capture::MATCH_STRONG;
+                                device.pose_valid = 1;
+                                device.cam_orient = o;
+                                device.cam_pos = q;
+                            }
+                            for (i, l) in leds.iter().enumerate() {
+                                let pc = cam_from_obj * Point3::from(l.pos);
+                                if (cam_from_obj.rotation * l.dir).dot(&(-pc.coords))
+                                    / pc.coords.norm()
+                                    < 0.3
+                                {
+                                    continue;
+                                }
+                                let Some(uv) = model.project(&pc.coords) else {
+                                    continue;
+                                };
+                                blobs.push(Blob {
+                                    x: uv.x as f32,
+                                    y: uv.y as f32,
+                                    width: 3,
+                                    height: 3,
+                                    area: 9,
+                                    led_id: if lock_seed {
+                                        (dev_id << 8) | i as i32
+                                    } else {
+                                        -1
+                                    },
+                                });
+                            }
+                        }
+                        pipe.frame(&info, &blobs);
+                    }
+                }
+            }
+            k
+        };
+
+        // 14 s of two-hand motion exceeds REFIT_MIN_SAMPLES (200) before reaching the 15 s span.
+        let k_mid = feed_window(&mut pipe, 0, 14, 0);
+        pipe.flush_refit_samples();
+        assert!(
+            pipe.refit_sample_count() >= REFIT_MIN_SAMPLES,
+            "expected >= {REFIT_MIN_SAMPLES} samples in 14 s, got {}",
+            pipe.refit_sample_count()
+        );
+        assert!(pipe.refit_sample_span_ns() < REFIT_MIN_SPAN_NS);
+
+        let mut reposing = Reposing::start();
+        let t_mid = H0 + 14_500_000_000;
+        reposing.tick(&d, &link, &mut pipe, &mut None, t_mid);
+        assert!(
+            !reposing.refit_in_flight,
+            "must wait for min_span_ns instead of dispatching a doomed solve"
+        );
+        assert!(
+            reposing.refit_last_at.is_none() && reposing.refit_cooldown_ns == 0,
+            "span preflight must not trigger the 60 s error cooldown"
+        );
+
+        // Continuing to 18 s crosses REFIT_MIN_SPAN_NS and dispatches immediately.
+        feed_window(&mut pipe, 14, 18, k_mid);
+        pipe.flush_refit_samples();
+        assert!(pipe.refit_sample_span_ns() >= REFIT_MIN_SPAN_NS);
+        let mut t_end = H0 + 19_000_000_000;
+        reposing.tick(&d, &link, &mut pipe, &mut None, t_end);
+        assert!(
+            reposing.refit_in_flight,
+            "should dispatch immediately once span reaches min_span_ns"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+            t_end += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, t_end);
+        }
+    }
+
+    #[test]
+    fn session_refit_records_pose_batch_for_active_and_subsequent_recordings() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        registered[0] *= iso_perturbation([0.003, -0.002, 0.002], [0.10, -0.06, 0.04]);
+        let (mut pipe, mut now) = run_synthetic_refit_session(&registered, &true_cams, 32);
+        pipe.flush_refit_samples();
+
+        // Seed the starting calibrated poses as `engine_session` does before any refit runs, so a
+        // recording started before any adjustment captures the pre-adjustment geometry (even if a
+        // later bump persists new poses to calibration.json).
+        let initial_poses: Vec<(String, nalgebra::Isometry3<f64>)> = pipe
+            .registered_sensors()
+            .into_iter()
+            .map(|(_, serial, cam)| (serial, cam.world_from_cam))
+            .collect();
+        let initial_refs: Vec<(&str, nalgebra::Isometry3<f64>)> = initial_poses
+            .iter()
+            .map(|(serial, iso)| (serial.as_str(), *iso))
+            .collect();
+        Reposing::replace_session_poses(&d, now, &initial_refs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let rec1 = dir.path().join("during.rec");
+        let reserved1 = d.rec.reserve_with_frames(&rec1, false).unwrap();
+        start_recording(&d, reserved1, now).unwrap();
+        d.rec.write(recorder::FRAME_OBS, now + 1, &[b"pre-refit"]);
+
+        let mut reposing = Reposing::start();
+        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        assert!(reposing.refit_in_flight);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+            now += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        }
+        d.rec.stop();
+
+        let r1: Vec<_> = recorder::Reader::open(&rec1).unwrap().collect();
+        assert_eq!(
+            r1.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [
+                recorder::SENSOR_POSES,
+                recorder::FRAME_OBS,
+                recorder::SENSOR_POSES,
+            ],
+            "recording started before refit must snapshot initial poses, then emit the refit batch"
+        );
+        let p1_start = recorder::decode_sensor_poses(&r1[0].payload).unwrap();
+        assert_eq!(p1_start.len(), 4);
+        let start_a = p1_start.iter().find(|p| p.serial == "A").unwrap();
+        assert!(
+            (nalgebra::Vector3::from(start_a.pos) - registered[0].translation.vector).norm()
+                < 1e-12,
+            "opening snapshot must preserve pre-refit pose for earlier frames"
+        );
+        let p1_updated = recorder::decode_sensor_poses(&r1[2].payload).unwrap();
+        assert_eq!(p1_updated.len(), 4);
+        let updated_a = p1_updated.iter().find(|p| p.serial == "A").unwrap();
+        let pipe_a = pipe.camera("A").unwrap().world_from_cam;
+        assert!(
+            (nalgebra::Vector3::from(updated_a.pos) - pipe_a.translation.vector).norm() < 1e-12,
+            "post-refit batch must match updated pipeline pose"
+        );
+
+        // A recording started after the session refit must emit the active session poses during
+        // recording initialization, before any tracking record is admitted and even if stopped
+        // before the next periodic repose tick.
+        let rec2 = dir.path().join("after.rec");
+        now += REPOSE_TICK_NS;
+        let reserved = d.rec.reserve_with_frames(&rec2, false).unwrap();
+        start_recording(&d, reserved, now).unwrap();
+        d.rec.write(recorder::FRAME_OBS, now + 1, &[b"synthetic"]);
+        d.rec.stop();
+
+        let r2: Vec<_> = recorder::Reader::open(&rec2).unwrap().collect();
+        assert_eq!(
+            r2.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [recorder::SENSOR_POSES, recorder::FRAME_OBS],
+            "initial session poses must precede any admitted tracking record"
+        );
+        let p2 = recorder::decode_sensor_poses(&r2[0].payload).unwrap();
+        assert_eq!(p2.len(), 4);
+
+        // Clearing active poses (e.g. capture mode) emits no SENSOR_POSES on recording start.
+        Reposing::replace_session_poses(&d, now + 2, &[]);
+        let rec3 = dir.path().join("capture.rec");
+        let reserved3 = d.rec.reserve_with_frames(&rec3, false).unwrap();
+        start_recording(&d, reserved3, now + 3).unwrap();
+        d.rec.write(recorder::FRAME_OBS, now + 4, &[b"capture"]);
+        d.rec.stop();
+        let r3: Vec<_> = recorder::Reader::open(&rec3).unwrap().collect();
+        assert_eq!(
+            r3.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [recorder::FRAME_OBS],
+            "capture mode with no active calibrated poses must not emit SENSOR_POSES"
+        );
+    }
+
+    #[test]
+    fn session_refit_defers_live_pose_update_until_pre_refit_queued_frames_drain() {
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        registered[0] *= iso_perturbation([0.003, -0.002, 0.002], [0.10, -0.06, 0.04]);
+        let (mut pipe, mut now) = run_synthetic_refit_session(&registered, &true_cams, 32);
+        pipe.flush_refit_samples();
+
+        let roster: Vec<(String, u64)> = pipe
+            .registered_sensors()
+            .into_iter()
+            .map(|(_, serial, _)| (serial, 1))
+            .collect();
+        d.track_in.lock().unwrap().register(roster);
+        let initial_poses: Vec<(String, nalgebra::Isometry3<f64>)> = pipe
+            .registered_sensors()
+            .into_iter()
+            .map(|(_, serial, cam)| (serial, cam.world_from_cam))
+            .collect();
+        let initial_refs: Vec<(&str, nalgebra::Isometry3<f64>)> = initial_poses
+            .iter()
+            .map(|(serial, iso)| (serial.as_str(), *iso))
+            .collect();
+        Reposing::replace_session_poses(&d, now, &initial_refs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued_refit.rec");
+        let reserved = d.rec.reserve_with_frames(&path, false).unwrap();
+        start_recording(&d, reserved, now).unwrap();
+
+        // Two camera frames arrive and are written to the recording BEFORE the refit commits.
+        let make_frame = |serial: &str, ts: u64| engine::FrameInfo {
+            serial: serial_field(serial),
+            frame_start_host_ns: ts,
+            ..Default::default()
+        };
+        d.frame(&make_frame("A", now + 100), 1, &[]);
+        d.frame(&make_frame("B", now + 200), 1, &[]);
+
+        let mut watch = None;
+        let mut sensors = RadioSensors {
+            revision: 0,
+            reposing: Reposing::start(),
+            watch: &mut watch,
+        };
+        sensors
+            .reposing
+            .tick(&d, &link, &mut pipe, sensors.watch, now);
+        assert!(sensors.reposing.refit_in_flight);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while sensors.reposing.refit_in_flight {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+            now += REPOSE_TICK_NS;
+            sensors
+                .reposing
+                .tick(&d, &link, &mut pipe, sensors.watch, now);
+        }
+        // Pre-refit frames are still queued, so live poses stay on the pre-refit extrinsics.
+        assert!(
+            !sensors.reposing.pending_poses.is_empty(),
+            "refit must defer live pose installation until pre-refit queued frames drain"
+        );
+        let old_a = registered[0].translation.vector;
+        assert!(
+            (pipe.camera("A").unwrap().world_from_cam.translation.vector - old_a).norm() < 1e-12
+        );
+
+        // A post-refit frame arrives AFTER SENSOR_POSES is recorded.
+        d.frame(&make_frame("A", now + 300), 1, &[]);
+        d.rec.stop();
+
+        // First queued frame (pre-refit) is consumed with the OLD pose.
+        assert!(consume_camera_frame(&d, &link, &mut sensors, &mut pipe));
+        assert!(
+            (pipe.camera("A").unwrap().world_from_cam.translation.vector - old_a).norm() < 1e-12,
+            "pose must still be pre-refit while a second pre-refit frame remains queued"
+        );
+        // Second queued frame (last pre-refit frame) is consumed with the OLD pose, then the
+        // deferred refit pose batch installs immediately before the post-refit frame.
+        assert!(consume_camera_frame(&d, &link, &mut sensors, &mut pipe));
+        assert!(sensors.reposing.pending_poses.is_empty());
+        let new_a = pipe.camera("A").unwrap().world_from_cam.translation.vector;
+        assert!(
+            (new_a - old_a).norm() > 1e-4,
+            "deferred refit pose must install as soon as pre-refit frames finish"
+        );
+        // Third queued frame (post-refit) is consumed under the NEW pose.
+        assert!(consume_camera_frame(&d, &link, &mut sensors, &mut pipe));
+        assert!(!consume_camera_frame(&d, &link, &mut sensors, &mut pipe));
+
+        let records: Vec<_> = recorder::Reader::open(&path).unwrap().collect();
+        assert_eq!(
+            records.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [
+                recorder::SENSOR_POSES,
+                recorder::FRAME_OBS,
+                recorder::FRAME_OBS,
+                recorder::SENSOR_POSES,
+                recorder::FRAME_OBS,
+            ],
+            "recorded SENSOR_POSES boundary must sit strictly between pre-refit and post-refit FRAME_OBS"
+        );
+        let recorded_new = recorder::decode_sensor_poses(&records[3].payload).unwrap();
+        let recorded_a = recorded_new.iter().find(|p| p.serial == "A").unwrap();
+        assert!((nalgebra::Vector3::from(recorded_a.pos) - new_a).norm() < 1e-12);
     }
 }
