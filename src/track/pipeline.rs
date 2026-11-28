@@ -117,6 +117,9 @@ pub struct Options {
     pub collect_refit: bool,
     /// Maximum kept joint-refit samples (oldest evicted first); 0 keeps all thinned samples.
     pub refit_max_samples: usize,
+    /// Replay only: apply recorded `SENSOR_POSES` updates at their application point to reproduce
+    /// live session refits; set false when evaluating a fixed calibration across the recording.
+    pub apply_recorded_poses: bool,
 }
 
 impl Default for Options {
@@ -131,6 +134,7 @@ impl Default for Options {
             seed_verified_accel: [None, None],
             collect_refit: false,
             refit_max_samples: DEFAULT_REFIT_MAX_SAMPLES,
+            apply_recorded_poses: true,
         }
     }
 }

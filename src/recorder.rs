@@ -58,6 +58,9 @@ pub const ENGINE_SESSION: u16 = 10;
 pub const IDENTITIES_RETIRED: u16 = 11;
 /// A live sensor addition was accepted; later frames may belong to a new object. Additive to v2.
 pub const SENSOR_ADDED: u16 = 12;
+/// Updated camera extrinsics batch applied to the live pipeline (`count`, then per sensor:
+/// `serial_len`, UTF-8 `serial`, `orient_xyzw: [f64; 4]`, `pos: [f64; 3]`). Additive to v2.
+pub const SENSOR_POSES: u16 = 13;
 
 pub fn decode_inspection_identity(payload: &[u8]) -> Option<crate::engine::InspectionIdentity> {
     (payload.len() == size_of::<crate::engine::InspectionIdentity>())
@@ -898,6 +901,10 @@ impl Recorder {
     pub fn active(&self) -> bool {
         self.shared.active.load(Ordering::Acquire) != 0
     }
+    /// Non-zero session token while a recording is active, 0 otherwise. Lock-free.
+    pub fn session_token(&self) -> u64 {
+        self.shared.active.load(Ordering::Acquire)
+    }
     /// Status snapshot only; `write_frame` captures permission together with session identity.
     pub fn frames_enabled(&self) -> bool {
         self.admit(RAW_FRAME).is_some()
@@ -981,8 +988,14 @@ impl Recorder {
         } else if ring.buf.len() - ring.used < len {
             ring.stats.dropped += 1;
             if boundary {
-                ring.reason =
-                    Some("the recording could not keep up when a sensor was plugged in".into());
+                ring.reason = Some(
+                    if rtype == SENSOR_ADDED {
+                        "the recording could not keep up when a sensor was plugged in"
+                    } else {
+                        "the recording could not keep up when sensor poses changed"
+                    }
+                    .into(),
+                );
                 ring.stop = true;
                 self.shared.active.store(0, Ordering::Release);
                 drop(ring);
@@ -1286,9 +1299,105 @@ pub fn decode_led_model(payload: &[u8]) -> Option<(i32, Vec<LedEntry>)> {
     Some((device, read_array(&payload[8..], n)?))
 }
 
+/// One sensor's extrinsics inside a `SENSOR_POSES` recording batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedSensorPose {
+    pub serial: String,
+    pub orient_xyzw: [f64; 4],
+    pub pos: [f64; 3],
+}
+
+/// Encodes a batch of live camera extrinsics (`(serial, orient_xyzw, pos)`) for `SENSOR_POSES`.
+pub fn encode_sensor_poses(poses: &[(&str, [f64; 4], [f64; 3])]) -> Vec<u8> {
+    let count = u16::try_from(poses.len()).expect("too many sensor poses for one record");
+    let mut out = Vec::with_capacity(2 + poses.len() * 72);
+    out.extend_from_slice(&count.to_le_bytes());
+    for &(serial, orient_xyzw, pos) in poses {
+        let slen = u16::try_from(serial.len()).expect("sensor serial too long");
+        out.extend_from_slice(&slen.to_le_bytes());
+        out.extend_from_slice(serial.as_bytes());
+        for v in orient_xyzw {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in pos {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Decodes a `SENSOR_POSES` payload into `(serial, orient_xyzw, pos)` entries.
+pub fn decode_sensor_poses(payload: &[u8]) -> Option<Vec<RecordedSensorPose>> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let mut p = &payload[2..];
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if p.len() < 2 {
+            return None;
+        }
+        let slen = u16::from_le_bytes([p[0], p[1]]) as usize;
+        p = &p[2..];
+        if slen == 0 || p.len() < slen + 56 {
+            return None;
+        }
+        let serial = std::str::from_utf8(&p[..slen]).ok()?.to_string();
+        p = &p[slen..];
+        let mut orient = [0.0_f64; 4];
+        for slot in &mut orient {
+            *slot = f64::from_le_bytes(p[..8].try_into().ok()?);
+            p = &p[8..];
+        }
+        let mut pos = [0.0_f64; 3];
+        for slot in &mut pos {
+            *slot = f64::from_le_bytes(p[..8].try_into().ok()?);
+            p = &p[8..];
+        }
+        let q_norm2 = orient.iter().map(|v| v * v).sum::<f64>();
+        if !orient.iter().all(|v| v.is_finite())
+            || !pos.iter().all(|v| v.is_finite())
+            || q_norm2 < 1e-12
+        {
+            return None;
+        }
+        out.push(RecordedSensorPose {
+            serial,
+            orient_xyzw: orient,
+            pos,
+        });
+    }
+    p.is_empty().then_some(out)
+}
+
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+
+    #[test]
+    fn sensor_poses_roundtrip_and_validation() {
+        let input = [
+            ("SENSOR_A", [0.1, -0.2, 0.3, 0.92736185], [1.2, 0.5, -2.1]),
+            ("SENSOR_B", [0.0, 0.0, 0.0, 1.0], [-0.4, 1.1, 1.7]),
+        ];
+        let bytes = encode_sensor_poses(&input);
+        let decoded = decode_sensor_poses(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].serial, "SENSOR_A");
+        assert_eq!(decoded[0].orient_xyzw, input[0].1);
+        assert_eq!(decoded[0].pos, input[0].2);
+        assert_eq!(decoded[1].serial, "SENSOR_B");
+        // Truncated, trailing bytes, zero quaternion, and empty serial all fail decoding.
+        assert!(decode_sensor_poses(&bytes[..bytes.len() - 1]).is_none());
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(decode_sensor_poses(&extra).is_none());
+        let bad_q = encode_sensor_poses(&[("A", [0.0; 4], [0.0; 3])]);
+        assert!(decode_sensor_poses(&bad_q).is_none());
+        let bad_s = encode_sensor_poses(&[("", [0.0, 0.0, 0.0, 1.0], [0.0; 3])]);
+        assert!(decode_sensor_poses(&bad_s).is_none());
+    }
 
     #[test]
     fn sensor_info_boolean_validity_through_reader_and_calibration() {

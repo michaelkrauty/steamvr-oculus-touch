@@ -4603,7 +4603,10 @@ fn replayed_with_calibration(
         &base.with_extension("rec"),
         cal,
         &|l| track::factory::imu(&dir, l),
-        &track::replay::Options::default(),
+        &track::replay::Options {
+            apply_recorded_poses: false,
+            ..Default::default()
+        },
     )?;
     replay_warning(&r);
     Ok(r.hands)
@@ -6129,6 +6132,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
         let o = track::replay::Options {
             collect_refit: true,
             refit_max_samples: 0,
+            apply_recorded_poses: false,
             ..Default::default()
         };
         let r = track::replay::replay(rec, &cal, &imu, &o)?;
@@ -6147,7 +6151,7 @@ fn calibrate_refine(rec: &Path, path: &Path, write: bool) -> i32 {
             id_to_idx.insert(*cam_id, idx);
             serials.push(entry.serial.clone());
             cameras.push(cam.model);
-            prior.push(cam.world_from_cam);
+            prior.push(calib::iso_from_xyzw(entry.orient_xyzw, entry.pos));
         }
         let samples: Vec<calib::refit::RefitSample> = r
             .refit_samples
@@ -6628,7 +6632,10 @@ fn calibrate_gravity_with(
         let mut measure = |cal: &file::CalibrationFile,
                            round: usize|
          -> Result<Vector3<f64>, String> {
-            let mut o = track::replay::Options::default();
+            let mut o = track::replay::Options {
+                apply_recorded_poses: false,
+                ..Default::default()
+            };
             (
                 o.params.noise.accel,
                 o.params.noise.accel_bias,
@@ -6771,11 +6778,13 @@ fn calibrate_gravity_with(
 fn track_cmd(base: &Path, args: &[&str]) -> i32 {
     let run = || -> Result<track::replay::Replay, String> {
         let (mut cal_path, mut rest) = (file::default_path(), Vec::new());
+        let mut custom_cal = false;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match *a {
                 "--calibration" => {
-                    cal_path = PathBuf::from(*it.next().ok_or("--calibration needs a path")?)
+                    cal_path = PathBuf::from(*it.next().ok_or("--calibration needs a path")?);
+                    custom_cal = true;
                 }
                 "--registration" => {
                     it.next().ok_or("--registration needs a path")?;
@@ -6784,7 +6793,10 @@ fn track_cmd(base: &Path, args: &[&str]) -> i32 {
                 _ => rest.push(*a),
             }
         }
-        let o = track_options(&rest)?;
+        let mut o = track_options(&rest)?;
+        if custom_cal {
+            o.apply_recorded_poses = false;
+        }
         let cal = file::load(&cal_path)?;
         let dir = track::factory::openhmd_config_dir();
         track::replay::replay(

@@ -455,12 +455,15 @@ fn heldout_stats_from_state(p: &Problem, s: &State) -> HeldoutStats {
 
 /// Scores `s_prior` and `s_cand` on the exact same intersection of validly projected observations,
 /// and counts every observation that `s_prior` projected but `s_cand` failed to project (so a
-/// candidate can never improve its RMS by dropping failed projections).
+/// candidate can never improve its RMS by dropping failed projections). Also returns the 3D
+/// motion spread (`2 * RMS radius`, metres) across the surviving exposures that contributed
+/// observations.
 fn heldout_stats_pair(
     p: &Problem,
     s_prior: &State,
     s_cand: &State,
-) -> (HeldoutStats, HeldoutStats, usize) {
+    samples: &[RefitSample],
+) -> (HeldoutStats, HeldoutStats, usize, f64) {
     let n = p.cameras.len();
     let mut p_sum_sq = vec![0.0_f64; n];
     let mut c_sum_sq = vec![0.0_f64; n];
@@ -471,6 +474,7 @@ fn heldout_stats_pair(
     let mut total_obs = 0usize;
     let mut active_samples = 0usize;
     let mut cand_lost_obs = 0usize;
+    let mut active_pts = Vec::with_capacity(samples.len());
 
     for (i, sample) in p.samples.iter().enumerate() {
         let Some(model) = p.leds.get(&sample.device_id) else {
@@ -540,12 +544,15 @@ fn heldout_stats_pair(
         }
         if sample_obs > 0 {
             active_samples += 1;
+            active_pts.push(samples[i].seed.translation.vector);
         }
     }
+    let surviving_spread_m = spread_m_points(&active_pts);
     (
         finish_heldout_stats(n, p_sum_sq, p_errs, p_total_sq, total_obs, active_samples),
         finish_heldout_stats(n, c_sum_sq, c_errs, c_total_sq, total_obs, active_samples),
         cand_lost_obs,
+        surviving_spread_m,
     )
 }
 
@@ -584,7 +591,7 @@ fn compare_heldout(
     candidate: &[Isometry3<f64>],
     samples: &[RefitSample],
     ba_opts: &ba::Options,
-) -> (HeldoutStats, HeldoutStats, usize, usize) {
+) -> (HeldoutStats, HeldoutStats, usize, usize, f64) {
     let wand: Vec<WandSample> = samples.iter().map(|s| s.sample.clone()).collect();
     let p = Problem {
         cameras,
@@ -631,8 +638,9 @@ fn compare_heldout(
         }
     }
     if dropped == 0 {
-        let (before, after, cand_lost_obs) = heldout_stats_pair(&p, &s_prior, &s_cand);
-        return (before, after, 0, cand_lost_obs);
+        let (before, after, cand_lost_obs, surviving_spread_m) =
+            heldout_stats_pair(&p, &s_prior, &s_cand, samples);
+        return (before, after, 0, cand_lost_obs, surviving_spread_m);
     }
     let clean_wand: Vec<WandSample> = cleaned.iter().map(|s| s.sample.clone()).collect();
     let p_clean = Problem {
@@ -651,23 +659,20 @@ fn compare_heldout(
     };
     ba::solve_poses(&p_clean, &mut sp_clean, ba_opts);
     ba::solve_poses(&p_clean, &mut sc_clean, ba_opts);
-    let (before, after, cand_lost_obs) = heldout_stats_pair(&p_clean, &sp_clean, &sc_clean);
-    (before, after, dropped, cand_lost_obs)
+    let (before, after, cand_lost_obs, surviving_spread_m) =
+        heldout_stats_pair(&p_clean, &sp_clean, &sc_clean, &cleaned);
+    (before, after, dropped, cand_lost_obs, surviving_spread_m)
 }
 
-fn pca_stds_3d(samples: &[RefitSample]) -> [f64; 3] {
-    if samples.len() < 3 {
+fn pca_stds_3d_points(pts: &[Vector3<f64>]) -> [f64; 3] {
+    if pts.len() < 3 {
         return [0.0; 3];
     }
-    let n = samples.len() as f64;
-    let mean: Vector3<f64> = samples
-        .iter()
-        .map(|s| s.seed.translation.vector)
-        .sum::<Vector3<f64>>()
-        / n;
+    let n = pts.len() as f64;
+    let mean: Vector3<f64> = pts.iter().copied().sum::<Vector3<f64>>() / n;
     let mut cov = Matrix3::<f64>::zeros();
-    for s in samples {
-        let d = s.seed.translation.vector - mean;
+    for p in pts {
+        let d = p - mean;
         cov += d * d.transpose();
     }
     cov /= n;
@@ -679,6 +684,16 @@ fn pca_stds_3d(samples: &[RefitSample]) -> [f64; 3] {
     ];
     stds.sort_by(|a, b| b.total_cmp(a));
     stds
+}
+
+fn pca_stds_3d(samples: &[RefitSample]) -> [f64; 3] {
+    let pts: Vec<Vector3<f64>> = samples.iter().map(|s| s.seed.translation.vector).collect();
+    pca_stds_3d_points(&pts)
+}
+
+fn spread_m_points(pts: &[Vector3<f64>]) -> f64 {
+    let pca = pca_stds_3d_points(pts);
+    2.0 * (pca[0] * pca[0] + pca[1] * pca[1] + pca[2] * pca[2]).sqrt()
 }
 
 fn camera_img_pca_stds(samples: &[RefitSample], n_cams: usize) -> Vec<[f64; 2]> {
@@ -1255,7 +1270,7 @@ pub fn joint_refit_against(
 
     let aligned = align_to_prior(&fitted_raw, &sub_anchor)
         .ok_or_else(|| "rigid SE(3) alignment of fitted sensors failed".to_string())?;
-    let (before, after, heldout_dropped_views, cand_lost_obs) = compare_heldout(
+    let (before, after, heldout_dropped_views, cand_lost_obs, heldout_spread_m) = compare_heldout(
         &sub_cams,
         leds,
         &sub_current,
@@ -1284,6 +1299,11 @@ pub fn joint_refit_against(
         || after.samples < opts.min_heldout_samples / 2
     {
         reject_reason = Some("held-out validation had too few usable observations".into());
+    } else if opts.min_heldout_spread_m > 0.0 && heldout_spread_m < opts.min_heldout_spread_m {
+        reject_reason = Some(format!(
+            "surviving held-out motion spread too narrow ({heldout_spread_m:.2} m < {:.2} m)",
+            opts.min_heldout_spread_m
+        ));
     } else if after.pooled_rms_px > opts.max_after_rms_px {
         reject_reason = Some(format!(
             "held-out RMS remained too high ({:.3} px > {:.3} px)",
@@ -1892,7 +1912,7 @@ mod tests {
         // Flipping camera 0 180 deg causes its observations to fail projection under candidate.
         let mut bad = sc.world_from_cam.clone();
         bad[0] *= iso([0.0, 0.0, 0.0], [180.0, 0.0, 0.0]);
-        let (before, after, _dropped, lost) = compare_heldout(
+        let (before, after, _dropped, lost, _spread_m) = compare_heldout(
             &sc.cameras,
             &sc.leds,
             &sc.world_from_cam,
@@ -1989,5 +2009,64 @@ mod tests {
         assert!(res.accepted, "{:?}", res.reject_reason);
         assert_eq!(res.skipped_serials, vec![sc.serials[2].clone()]);
         assert_eq!(res.sensors.len(), 2);
+    }
+
+    #[test]
+    fn rejects_when_corrupt_heldout_views_collapse_surviving_motion_spread() {
+        let sc = synth::scene(&SceneParams {
+            pixel_noise: 0.10,
+            pnp_rot_noise_rad: 0.0,
+            pnp_pos_noise_m: 0.0,
+            samples: 240,
+            ..Default::default()
+        });
+        let mut samples: Vec<RefitSample> = sc
+            .samples
+            .iter()
+            .zip(&sc.world_from_obj)
+            .map(|(sample, &seed)| RefitSample {
+                sample: sample.clone(),
+                seed,
+            })
+            .collect();
+        let split = (samples.len() as f64 * 0.70).round() as usize;
+        // Keep the clean held-out exposures clustered at one stationary point, while the only
+        // spatially wide held-out exposures carry corrupt views that compare_heldout drops.
+        let stationary = samples[split].clone();
+        for (idx, rs) in samples[split..split + 50].iter_mut().enumerate() {
+            let host_ns = rs.sample.host_ns;
+            *rs = stationary.clone();
+            rs.sample.host_ns = host_ns;
+            rs.seed.translation.vector.x += (idx as f64 % 5.0) * 0.001;
+        }
+        for rs in &mut samples[split + 50..] {
+            for v in &mut rs.sample.views {
+                for ob in &mut v.obs {
+                    ob.xy += Vector2::new(150.0, 150.0);
+                }
+            }
+        }
+        let mut drifted = sc.world_from_cam.clone();
+        drifted[0] *= iso([0.005, -0.003, 0.002], [0.15, -0.10, 0.05]);
+        let res = joint_refit(
+            &sc.serials,
+            &sc.cameras,
+            &drifted,
+            &sc.leds,
+            &samples,
+            &RefitOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !res.accepted,
+            "stationary surviving held-out set must not accept"
+        );
+        assert!(
+            res.reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("surviving held-out motion spread too narrow")),
+            "unexpected reject_reason: {:?}",
+            res.reject_reason
+        );
     }
 }

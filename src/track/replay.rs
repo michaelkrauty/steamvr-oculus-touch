@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use nalgebra::{Isometry3, Vector3};
+use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
 
 use super::factory::Imu;
 use super::pipeline::{device_hand, FrameEvent, Pipeline, Probe};
@@ -61,6 +61,7 @@ pub fn replay(
 ) -> Result<Replay, String> {
     let mut p = Pipeline::new(o.clone());
     let mut out = Replay::default();
+    let mut pending_poses: std::collections::BTreeMap<String, Isometry3<f64>> = Default::default();
     let o_delayed = o.delayed_ns;
     let reader = Reader::open(path)?;
     let start_host_ns = reader.start_host_ns;
@@ -77,9 +78,16 @@ pub fn replay(
                     continue;
                 };
                 let serial = cstr_field(&s.serial);
+                let id = crate::status::sensor_identity(&serial);
                 // as live: the calibration's serial may be spelled in another letter case
                 if let Some(entry) = cal.sensor(&serial) {
-                    let w = iso_from_xyzw(entry.orient_xyzw, entry.pos);
+                    let w = if o.apply_recorded_poses {
+                        pending_poses
+                            .remove(&id)
+                            .unwrap_or_else(|| iso_from_xyzw(entry.orient_xyzw, entry.pos))
+                    } else {
+                        iso_from_xyzw(entry.orient_xyzw, entry.pos)
+                    };
                     p.sensor(&serial, CameraModel::from_sensor(&s), w);
                 } else if o
                     .probe_sensors
@@ -88,6 +96,35 @@ pub fn replay(
                 {
                     // a sensor being placed has no pose yet; probing needs only its frames
                     p.sensor(&serial, CameraModel::from_sensor(&s), Isometry3::identity());
+                }
+            }
+            recorder::SENSOR_POSES if o.apply_recorded_poses => {
+                let Some(poses) = recorder::decode_sensor_poses(&rec.payload) else {
+                    continue;
+                };
+                let registered = p.registered_sensors();
+                let mut applied_live = false;
+                for entry in poses {
+                    let (serial, orient, pos) = (entry.serial, entry.orient_xyzw, entry.pos);
+                    let w = Isometry3::from_parts(
+                        Translation3::new(pos[0], pos[1], pos[2]),
+                        UnitQuaternion::new_normalize(Quaternion::new(
+                            orient[3], orient[0], orient[1], orient[2],
+                        )),
+                    );
+                    if let Some((_, existing, cam)) = registered
+                        .iter()
+                        .find(|(_, s, _)| crate::status::same_sensor(s, &serial))
+                    {
+                        p.sensor(existing, cam.model, w);
+                        p.reset_agreement(existing);
+                        applied_live = true;
+                    } else {
+                        pending_poses.insert(crate::status::sensor_identity(&serial), w);
+                    }
+                }
+                if applied_live {
+                    p.reset_refit_samples();
                 }
             }
             recorder::LED_MODEL => {
@@ -188,4 +225,116 @@ pub fn replay(
     out.refit_samples = p.take_refit_samples();
     out.sensors = p.registered_sensors();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calib::file::{CalibrationFile, SensorEntry, Stats as CalStats, FORMAT, VERSION};
+    use crate::engine::Sensor as SensorInfo;
+    use crate::recorder::Recorder;
+
+    fn sensor_info(serial: &str) -> SensorInfo {
+        let mut s = SensorInfo::default();
+        for (dst, b) in s.serial.iter_mut().zip(serial.bytes()) {
+            *dst = b as _;
+        }
+        s.width = 1280;
+        s.height = 960;
+        s.fx = 715.0;
+        s.fy = 715.0;
+        s.cx = 640.0;
+        s.cy = 480.0;
+        s
+    }
+
+    #[test]
+    fn replay_applies_recorded_sensor_poses_and_respects_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poses.rec");
+        let rec = Recorder::new(1 << 20);
+        rec.start(&path, 1_000).unwrap();
+        // Pose recorded before SENSOR_INFO (e.g. recording started after an earlier session refit).
+        let pre = recorder::encode_sensor_poses(&[("A", [0.0, 0.0, 0.0, 1.0], [1.5, 2.5, 3.5])]);
+        rec.write_boundary(recorder::SENSOR_POSES, 1_100, &[&pre]);
+        let sa = sensor_info("A");
+        let sb = sensor_info("B");
+        rec.write(recorder::SENSOR_INFO, 1_200, &[recorder::as_bytes(&sa)]);
+        rec.write(recorder::SENSOR_INFO, 1_200, &[recorder::as_bytes(&sb)]);
+        // Mid-recording session refit updating both sensors (including case-insensitive serial).
+        let mid = recorder::encode_sensor_poses(&[
+            ("a", [0.0, 0.0, 0.0, 1.0], [1.6, 2.6, 3.6]),
+            ("B", [0.0, 0.0, 0.0, 1.0], [-0.5, 1.0, 2.0]),
+        ]);
+        rec.write_boundary(recorder::SENSOR_POSES, 2_000, &[&mid]);
+        rec.stop();
+
+        let cal = CalibrationFile {
+            format: FORMAT.into(),
+            version: VERSION,
+            created_unix_s: 0,
+            world: "test".into(),
+            source: "test".into(),
+            sensors: vec![
+                SensorEntry {
+                    serial: "A".into(),
+                    orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    pos: [0.0, 0.0, 0.0],
+                    rms_px: 0.1,
+                    observations: 100,
+                },
+                SensorEntry {
+                    serial: "B".into(),
+                    orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    pos: [0.0, 0.0, 0.0],
+                    rms_px: 0.1,
+                    observations: 100,
+                },
+            ],
+            stats: CalStats {
+                reference: "A".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 10,
+                rejected_views: 0,
+            },
+        };
+
+        let applied = replay(&path, &cal, &|_| None, &Options::default()).unwrap();
+        let pos_a = applied
+            .sensors
+            .iter()
+            .find(|(_, s, _)| s == "A")
+            .unwrap()
+            .2
+            .world_from_cam
+            .translation
+            .vector;
+        let pos_b = applied
+            .sensors
+            .iter()
+            .find(|(_, s, _)| s == "B")
+            .unwrap()
+            .2
+            .world_from_cam
+            .translation
+            .vector;
+        assert!((pos_a - Vector3::new(1.6, 2.6, 3.6)).norm() < 1e-9);
+        assert!((pos_b - Vector3::new(-0.5, 1.0, 2.0)).norm() < 1e-9);
+
+        let fixed = replay(
+            &path,
+            &cal,
+            &|_| None,
+            &Options {
+                apply_recorded_poses: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (_, _, cam) in &fixed.sensors {
+            assert!(cam.world_from_cam.translation.vector.norm() < 1e-9);
+        }
+    }
 }
