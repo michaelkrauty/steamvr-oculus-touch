@@ -84,6 +84,14 @@ pub fn replay(
                     let w = if o.apply_recorded_poses {
                         pending_poses
                             .remove(&id)
+                            .or_else(|| {
+                                p.registered_sensors()
+                                    .into_iter()
+                                    .find(|(_, existing, _)| {
+                                        crate::status::same_sensor(existing, &serial)
+                                    })
+                                    .map(|(_, _, cam)| cam.world_from_cam)
+                            })
                             .unwrap_or_else(|| iso_from_xyzw(entry.orient_xyzw, entry.pos))
                     } else {
                         iso_from_xyzw(entry.orient_xyzw, entry.pos)
@@ -336,5 +344,114 @@ mod tests {
         for (_, _, cam) in &fixed.sensors {
             assert!(cam.world_from_cam.translation.vector.norm() < 1e-9);
         }
+    }
+
+    #[test]
+    fn replay_preserves_recorded_poses_across_repeated_sensor_info_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen_poses.rec");
+        let rec = Recorder::new(1 << 20);
+        rec.start(&path, 1_000).unwrap();
+        // Session 1 starts with pre-bump poses in SENSOR_POSES, then emits SENSOR_INFO.
+        let pre = recorder::encode_sensor_poses(&[
+            ("A", [0.0, 0.0, 0.0, 1.0], [1.5, 2.5, 3.5]),
+            ("B", [0.0, 0.0, 0.0, 1.0], [-1.0, 0.5, 2.0]),
+        ]);
+        rec.write_boundary(recorder::SENSOR_POSES, 1_100, &[&pre]);
+        let sa = sensor_info("A");
+        let sb = sensor_info("B");
+        rec.write(recorder::SENSOR_INFO, 1_200, &[recorder::as_bytes(&sa)]);
+        rec.write(recorder::SENSOR_INFO, 1_200, &[recorder::as_bytes(&sb)]);
+        // Engine reopen: ENGINE_SESSION, then session-2 SENSOR_POSES snapshot (with updated pose
+        // for A, and same pre-bump pose for B), followed by repeated SENSOR_INFO.
+        rec.write_boundary(recorder::ENGINE_SESSION, 2_000, &[]);
+        let reopen = recorder::encode_sensor_poses(&[
+            ("A", [0.0, 0.0, 0.0, 1.0], [1.7, 2.7, 3.7]),
+            ("B", [0.0, 0.0, 0.0, 1.0], [-1.0, 0.5, 2.0]),
+        ]);
+        rec.write_boundary(recorder::SENSOR_POSES, 2_100, &[&reopen]);
+        rec.write(recorder::SENSOR_INFO, 2_200, &[recorder::as_bytes(&sa)]);
+        rec.write(recorder::SENSOR_INFO, 2_200, &[recorder::as_bytes(&sb)]);
+        // Another reopen with repeated SENSOR_INFO and no new SENSOR_POSES still keeps poses.
+        rec.write_boundary(recorder::ENGINE_SESSION, 3_000, &[]);
+        rec.write(recorder::SENSOR_INFO, 3_100, &[recorder::as_bytes(&sa)]);
+        rec.write(recorder::SENSOR_INFO, 3_100, &[recorder::as_bytes(&sb)]);
+        rec.stop();
+
+        // Calibration file on disk reflects a later post-bump pose (e.g. [9.0, 9.0, 9.0]).
+        let cal = CalibrationFile {
+            format: FORMAT.into(),
+            version: VERSION,
+            created_unix_s: 0,
+            world: "test".into(),
+            source: "test".into(),
+            sensors: vec![
+                SensorEntry {
+                    serial: "A".into(),
+                    orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    pos: [9.0, 9.0, 9.0],
+                    rms_px: 0.1,
+                    observations: 100,
+                },
+                SensorEntry {
+                    serial: "B".into(),
+                    orient_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    pos: [8.0, 8.0, 8.0],
+                    rms_px: 0.1,
+                    observations: 100,
+                },
+            ],
+            stats: CalStats {
+                reference: "A".into(),
+                gravity_mps2: 9.81,
+                gravity_spread_deg: None,
+                motion_segments: 1,
+                samples: 10,
+                rejected_views: 0,
+            },
+        };
+
+        let applied = replay(&path, &cal, &|_| None, &Options::default()).unwrap();
+        let pos_a = applied
+            .sensors
+            .iter()
+            .find(|(_, s, _)| s == "A")
+            .unwrap()
+            .2
+            .world_from_cam
+            .translation
+            .vector;
+        let pos_b = applied
+            .sensors
+            .iter()
+            .find(|(_, s, _)| s == "B")
+            .unwrap()
+            .2
+            .world_from_cam
+            .translation
+            .vector;
+        assert!((pos_a - Vector3::new(1.7, 2.7, 3.7)).norm() < 1e-9);
+        assert!((pos_b - Vector3::new(-1.0, 0.5, 2.0)).norm() < 1e-9);
+
+        let fixed = replay(
+            &path,
+            &cal,
+            &|_| None,
+            &Options {
+                apply_recorded_poses: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fixed_a = fixed
+            .sensors
+            .iter()
+            .find(|(_, s, _)| s == "A")
+            .unwrap()
+            .2
+            .world_from_cam
+            .translation
+            .vector;
+        assert!((fixed_a - Vector3::new(9.0, 9.0, 9.0)).norm() < 1e-9);
     }
 }
