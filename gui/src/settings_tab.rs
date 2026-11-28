@@ -142,6 +142,7 @@ pub(super) fn tab(ui: &mut Ui, view: &View, action: &mut Option<Action>) {
         title(ui, "Maintenance");
         ui.horizontal_wrapped(|ui| {
             let mut shortcuts = vec![
+                ("Pair controllers", Action::Pair, "Pair Touch controllers to your headset."),
                 (
                     "Align controllers to headset (15 s)…",
                     Action::Setup(Request::QUICK_HEADSET),

@@ -66,6 +66,7 @@ fn events(kind: Kind) -> [&'static str; 2] {
             "Local\\cv1touch-gui-sensors",
             "Local\\cv1touch-gui-sensors-close",
         ],
+        Kind::Pair => ["Local\\cv1touch-gui-pair", "Local\\cv1touch-gui-pair-close"],
         Kind::Setup => [
             "Local\\cv1touch-gui-setup",
             "Local\\cv1touch-gui-setup-close",
@@ -213,7 +214,7 @@ fn toggle_window(kind: Kind) {
     with_tray(|tray| match kind {
         Kind::Status => tray.window.toggle(),
         Kind::Sensors => tray.sensors.toggle(),
-        Kind::Setup => {}
+        Kind::Setup | Kind::Pair => {}
     });
 }
 
@@ -300,7 +301,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
             };
             // Each entry's command is its position, from 1.
-            let entries: [(u32, Option<&str>); 12] = [
+            let entries: [(u32, Option<&str>); 13] = [
                 (MF_STRING, Some(toggle)),
                 (MF_STRING, Some(sensors)),
                 (MF_STRING | MF_GRAYED, Some(summary.as_str())),
@@ -319,6 +320,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 ),
                 (MF_SEPARATOR, None),
                 (MF_STRING, Some("Set up…")),
+                (MF_STRING, Some(Kind::Pair.labels()[0])),
                 (MF_STRING, Some("Save diagnostic report…")),
                 (MF_SEPARATOR, None),
                 (MF_STRING, Some("Quit (cv1touchd keeps running)")),
@@ -363,6 +365,13 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     }
                 }
                 10 => {
+                    if let Err(error) = super::show(Kind::Pair) {
+                        with_tray(|tray| {
+                            tray.action_error = Some(format!("Could not open pairing: {error}"));
+                        });
+                    }
+                }
+                11 => {
                     with_tray(|tray| {
                         tray.action_error = Some("Saving diagnostic report…".into());
                         let send = tray.action_send.clone();
@@ -371,7 +380,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                         });
                     });
                 }
-                12 => {
+                13 => {
                     close_windows();
                     DestroyWindow(hwnd);
                 }
@@ -497,14 +506,17 @@ pub(super) fn quit() -> Result<(), Box<dyn Error>> {
         if !tray.is_null() {
             PostMessageW(tray, QUIT, 0, 0);
         }
-        for _ in 0..60 {
+        for i in 0..4000 {
             let running = !FindWindowW(CLASS.as_ptr(), ptr::null()).is_null()
                 || exists(OpenMutexW, MUTEX)
-                || [Kind::Status, Kind::Sensors, Kind::Setup]
+                || [Kind::Status, Kind::Sensors, Kind::Setup, Kind::Pair]
                     .into_iter()
                     .any(|kind| exists(OpenEventW, events(kind)[0]));
             if !running {
                 return Ok(());
+            }
+            if i >= 60 && !exists(OpenEventW, events(Kind::Pair)[0]) {
+                break;
             }
             thread::sleep(Duration::from_millis(50));
         }

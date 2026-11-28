@@ -102,6 +102,7 @@ pub enum Action {
     Service(ServiceAction),
     /// Open the setup window, at a stage if one is named.
     Setup(Request),
+    Pair,
     Report,
     OpenFolder,
     DismissReport,
@@ -438,7 +439,7 @@ impl App {
     fn act(&mut self, action: Action, ctx: &egui::Context) {
         if matches!(
             action,
-            Action::Service(_) | Action::Setup(_) | Action::Sensors
+            Action::Service(_) | Action::Setup(_) | Action::Sensors | Action::Pair
         ) {
             self.notice = None;
         }
@@ -459,6 +460,7 @@ impl App {
                 result
             }
             Action::Setup(request) => crate::tray::show_setup(request),
+            Action::Pair => crate::tray::show(crate::tray::Kind::Pair),
             Action::Sensors => crate::tray::show(crate::tray::Kind::Sensors),
             Action::Report => {
                 if self.report != Some(ReportState::Saving) {

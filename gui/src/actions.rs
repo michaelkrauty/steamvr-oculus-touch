@@ -142,7 +142,7 @@ fn checked(command: &mut Command, description: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn service(action: ServiceAction) -> io::Result<()> {
+pub(crate) fn service(action: ServiceAction) -> io::Result<()> {
     let verb = match action {
         ServiceAction::Start => "start",
         ServiceAction::Restart => "restart",
@@ -166,7 +166,7 @@ fn hidden(command: &mut Command) -> &mut Command {
 }
 
 #[cfg(windows)]
-fn service(action: ServiceAction) -> io::Result<()> {
+pub(crate) fn service(action: ServiceAction) -> io::Result<()> {
     if matches!(action, ServiceAction::Stop | ServiceAction::Restart) {
         let status = bounded_status(hidden(Command::new(installed("cv1touch.exe")?).arg("stop")))?;
         // Exit 1 includes an already stopped daemon; 2 means it is still running.
