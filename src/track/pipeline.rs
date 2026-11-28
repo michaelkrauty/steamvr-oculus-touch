@@ -703,6 +703,17 @@ impl Pipeline {
         self.refit.samples.len()
     }
 
+    /// Chronological duration spanned by the currently buffered joint-refit samples (nanoseconds).
+    pub fn refit_sample_span_ns(&self) -> u64 {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for s in &self.refit.samples {
+            lo = lo.min(s.sample.host_ns);
+            hi = hi.max(s.sample.host_ns);
+        }
+        hi.saturating_sub(lo)
+    }
+
     /// Total multi-camera joint-refit samples emitted into the buffer so far (monotonic even
     /// when the ring buffer is at capacity or trimmed).
     pub fn refit_total_samples(&self) -> u64 {

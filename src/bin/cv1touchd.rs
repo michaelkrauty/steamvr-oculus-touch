@@ -4005,8 +4005,11 @@ impl Reposing {
         if sample_count < REFIT_MIN_SAMPLES {
             return false;
         }
-        let total_samples = pipe.refit_total_samples();
         let opts = daemon_refit_options();
+        if opts.min_span_ns > 0 && pipe.refit_sample_span_ns() < opts.min_span_ns {
+            return false;
+        }
+        let total_samples = pipe.refit_total_samples();
         let elevated = agreement.iter().any(|(serial, a)| {
             !pipe.is_probed(serial)
                 && !pipe.is_ignored(serial)
@@ -4094,6 +4097,14 @@ impl Reposing {
             .collect();
         if samples.len() < opts.min_train_samples + opts.min_heldout_samples {
             return false;
+        }
+        if opts.min_span_ns > 0 {
+            let (lo, hi) = samples.iter().fold((u64::MAX, 0u64), |(lo, hi), rs| {
+                (lo.min(rs.sample.host_ns), hi.max(rs.sample.host_ns))
+            });
+            if hi.saturating_sub(lo) < opts.min_span_ns {
+                return false;
+            }
         }
         let job = RefitJob {
             version: self.refit_version,
@@ -22977,5 +22988,204 @@ mod tests {
         // Trimming drops the oldest half while keeping chronological order.
         pipe.trim_refit_samples_oldest_half();
         assert_eq!(pipe.refit_sample_count(), before_count - before_count / 2);
+    }
+
+    #[test]
+    fn session_refit_waits_for_min_span_without_error_cooldown() {
+        use cv1touch::engine::Blob;
+        use nalgebra::{Isometry3, Point3, UnitQuaternion, Vector3};
+        const H0: u64 = 10_000_000_000;
+        const C0: u64 = 9_000_000_000;
+        const HMD_DELAY: u64 = 4_000_000;
+        const IMU_DELAY: u64 = 3_000_000;
+        let hmd_us = |host: u64| ((host - H0) / 1000 + 77_000) as u32;
+
+        let d = status_daemon();
+        let link = RadioLink::default();
+        let true_cams = four_synthetic_cameras();
+        let mut registered = true_cams;
+        registered[0] *= iso_perturbation([0.002, -0.001, 0.002], [0.07, -0.05, 0.04]);
+
+        let mut pipe = Pipeline::new(pipeline::Options {
+            exposure_offset_ns: IMU_DELAY as i64 - HMD_DELAY as i64,
+            collect_refit: true,
+            ..Default::default()
+        });
+        let leds = synthetic_touch_leds();
+        let model = calib::camera::CameraModel {
+            width: 1280,
+            height: 960,
+            fx: 715.0,
+            fy: 715.0,
+            cx: 640.0,
+            cy: 480.0,
+            k: [0.0; 4],
+        };
+        let sensors = ["A", "B", "C", "D"];
+        for (serial, w) in sensors.iter().zip(&registered) {
+            pipe.sensor(serial, model, *w);
+        }
+        pipe.body(calib::DEVICE_LEFT, leds.clone(), Vector3::zeros());
+        pipe.body(calib::DEVICE_RIGHT, leds.clone(), Vector3::zeros());
+
+        let omega = Vector3::new(0.30, 0.50, 0.20);
+        let base_rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        let hand_pose = |hand: usize, t_s: f64| -> Isometry3<f64> {
+            let x_off = if hand == HAND_LEFT { -0.35 } else { 0.35 };
+            let pos = Vector3::new(
+                x_off + 0.20 * (1.0 - (2.2 * t_s).cos()),
+                1.05 + 0.16 * (1.0 - (1.7 * t_s).cos()),
+                0.20 * (1.0 - (1.4 * t_s).cos()),
+            );
+            let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+            Isometry3::from_parts(pos.into(), rot)
+        };
+        let hand_accel = |t_s: f64| -> Vector3<f64> {
+            Vector3::new(
+                0.20 * 2.2 * 2.2 * (2.2 * t_s).cos(),
+                0.16 * 1.7 * 1.7 * (1.7 * t_s).cos(),
+                0.20 * 1.4 * 1.4 * (1.4 * t_s).cos(),
+            )
+        };
+
+        enum Ev {
+            Hmd(u64),
+            Imu(u64),
+            Frame(usize, u64, u32),
+        }
+        let feed_window = |pipe: &mut Pipeline, start_s: u64, end_s: u64, k_start: u32| -> u32 {
+            let start = H0 + start_s * 1_000_000_000;
+            let end = H0 + end_s * 1_000_000_000;
+            let mut evs: Vec<(u64, Ev)> = (start..end)
+                .step_by(2_000_000)
+                .map(|h| (h + HMD_DELAY, Ev::Hmd(h)))
+                .chain(
+                    (start + 2_000_000..end)
+                        .step_by(2_000_000)
+                        .map(|h| (h + IMU_DELAY, Ev::Imu(h))),
+                )
+                .collect();
+            let (mut e, mut k) = (start + 10_000_000, k_start);
+            while e < end {
+                for c in 0..true_cams.len() {
+                    evs.push((e + 25_000_000 + c as u64 * 1_000_000, Ev::Frame(c, e, k)));
+                }
+                k += 1;
+                e += 1_000_000_000 / 52;
+            }
+            evs.sort_by_key(|ev| ev.0);
+            for (at, ev) in evs {
+                match ev {
+                    Ev::Hmd(h) => pipe.hmd_clock_sample(at, hmd_us(h)),
+                    Ev::Imu(h) => {
+                        let t_s = (h - H0) as f64 * 1e-9;
+                        let rot = base_rot * UnitQuaternion::from_scaled_axis(omega * t_s);
+                        let specific =
+                            rot.inverse() * (hand_accel(t_s) + Vector3::new(0.0, 9.80665, 0.0));
+                        pipe.imu(HAND_LEFT, h - C0, at, omega, specific);
+                        pipe.imu(HAND_RIGHT, h - C0, at, omega, specific);
+                    }
+                    Ev::Frame(c, e, k) => {
+                        let t_s = (e - H0) as f64 * 1e-9;
+                        let lock_seed = k == 0 && (c == 2 || c == 3);
+                        let mut blobs = Vec::new();
+                        let mut info = engine::FrameInfo {
+                            serial: serial_field(sensors[c]),
+                            frame_start_host_ns: e,
+                            exposure_valid: 1,
+                            exposure_count: k,
+                            exposure_hmd_ts: hmd_us(e),
+                            n_devices: if lock_seed { 2 } else { 0 },
+                            ..Default::default()
+                        };
+                        for (slot, (hand, dev_id)) in [
+                            (HAND_LEFT, calib::DEVICE_LEFT),
+                            (HAND_RIGHT, calib::DEVICE_RIGHT),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let cam_from_obj = true_cams[c].inverse() * hand_pose(hand, t_s);
+                            if lock_seed {
+                                let (o, q) = calib::iso_to_xyzw(&cam_from_obj);
+                                let device = &mut info.devices[slot];
+                                device.device_id = dev_id;
+                                device.match_flags =
+                                    calib::capture::MATCH_GOOD | calib::capture::MATCH_STRONG;
+                                device.pose_valid = 1;
+                                device.cam_orient = o;
+                                device.cam_pos = q;
+                            }
+                            for (i, l) in leds.iter().enumerate() {
+                                let pc = cam_from_obj * Point3::from(l.pos);
+                                if (cam_from_obj.rotation * l.dir).dot(&(-pc.coords))
+                                    / pc.coords.norm()
+                                    < 0.3
+                                {
+                                    continue;
+                                }
+                                let Some(uv) = model.project(&pc.coords) else {
+                                    continue;
+                                };
+                                blobs.push(Blob {
+                                    x: uv.x as f32,
+                                    y: uv.y as f32,
+                                    width: 3,
+                                    height: 3,
+                                    area: 9,
+                                    led_id: if lock_seed {
+                                        (dev_id << 8) | i as i32
+                                    } else {
+                                        -1
+                                    },
+                                });
+                            }
+                        }
+                        pipe.frame(&info, &blobs);
+                    }
+                }
+            }
+            k
+        };
+
+        // 14 s of two-hand motion exceeds REFIT_MIN_SAMPLES (200) before reaching the 15 s span.
+        let k_mid = feed_window(&mut pipe, 0, 14, 0);
+        pipe.flush_refit_samples();
+        assert!(
+            pipe.refit_sample_count() >= REFIT_MIN_SAMPLES,
+            "expected >= {REFIT_MIN_SAMPLES} samples in 14 s, got {}",
+            pipe.refit_sample_count()
+        );
+        assert!(pipe.refit_sample_span_ns() < REFIT_MIN_SPAN_NS);
+
+        let mut reposing = Reposing::start();
+        let t_mid = H0 + 14_500_000_000;
+        reposing.tick(&d, &link, &mut pipe, &mut None, t_mid);
+        assert!(
+            !reposing.refit_in_flight,
+            "must wait for min_span_ns instead of dispatching a doomed solve"
+        );
+        assert!(
+            reposing.refit_last_at.is_none() && reposing.refit_cooldown_ns == 0,
+            "span preflight must not trigger the 60 s error cooldown"
+        );
+
+        // Continuing to 18 s crosses REFIT_MIN_SPAN_NS and dispatches immediately.
+        feed_window(&mut pipe, 14, 18, k_mid);
+        pipe.flush_refit_samples();
+        assert!(pipe.refit_sample_span_ns() >= REFIT_MIN_SPAN_NS);
+        let mut t_end = H0 + 19_000_000_000;
+        reposing.tick(&d, &link, &mut pipe, &mut None, t_end);
+        assert!(
+            reposing.refit_in_flight,
+            "should dispatch immediately once span reaches min_span_ns"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while reposing.refit_in_flight {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+            t_end += REPOSE_TICK_NS;
+            reposing.tick(&d, &link, &mut pipe, &mut None, t_end);
+        }
     }
 }
