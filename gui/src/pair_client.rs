@@ -260,6 +260,7 @@ fn run(recovery: bool, commands: &Receiver<Request>, emit: &impl Fn(Event)) -> R
             Duration::from_secs(180) + cleanup
         };
     let mut stopping = recovery;
+    let mut warned_slow_cleanup = false;
     loop {
         match output.recv_timeout(Duration::from_millis(50)) {
             Ok(event) => forward(event),
@@ -306,14 +307,14 @@ fn run(recovery: bool, commands: &Receiver<Request>, emit: &impl Fn(Event)) -> R
                     deadline = Instant::now() + cleanup;
                 }
             }
-        } else if Instant::now() >= deadline {
-            // Never kill the CLI while it may still be returning the headset to normal mode.
-            thread::spawn(move || child.wait());
-            emit(Event::Error(
-                "The headset did not confirm normal mode in time.".into(),
-                true,
+        } else if !warned_slow_cleanup && Instant::now() >= deadline {
+            // Never kill or detach the CLI while it may still be returning the headset to normal
+            // mode, and keep the daemon stopped until it exits so nothing touches the headset
+            // concurrently.
+            warned_slow_cleanup = true;
+            emit(Event::Status(
+                "Still waiting for the headset to return to normal mode…".into(),
             ));
-            return Ok(());
         }
     }
 }
