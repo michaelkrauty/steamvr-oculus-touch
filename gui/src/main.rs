@@ -8,6 +8,8 @@ mod config_stats;
 mod desktop;
 mod icon;
 mod model;
+mod pair_client;
+mod pair_window;
 #[cfg(any(target_os = "linux", test))]
 mod png;
 mod preview_client;
@@ -29,6 +31,7 @@ Options:
   --open               Start the tray icon and open the status window
   --window             Open the status window only
   --sensors            Open the live sensor views only
+  --pair               Pair Touch controllers
   --setup [--stage STAGE [--quick]]
                        Open the guided setup, or one stage of it: sensors, floor,
                        model, buttons or headset (--quick: the short headset
@@ -60,6 +63,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
         Some("--window") => Command::Window(tray::Kind::Status),
         // --cameras is the older name.
         Some("--sensors" | "--cameras") => Command::Window(tray::Kind::Sensors),
+        Some("--pair") if args.len() == 1 => Command::Window(tray::Kind::Pair),
         Some("--setup") => Command::Setup(setup_client::Request::parse(&args[1..])?),
         #[cfg(target_os = "linux")]
         Some(flag @ ("--install-desktop" | "--uninstall-desktop")) => {
@@ -122,6 +126,8 @@ mod tests {
             parse(&["--sensors"]),
             Ok(Command::Window(tray::Kind::Sensors))
         );
+        assert_eq!(parse(&["--pair"]), Ok(Command::Window(tray::Kind::Pair)));
+        assert!(parse(&["--pair", "--quit"]).is_err());
         assert!(parse(&["--stop"]).is_err());
     }
 }

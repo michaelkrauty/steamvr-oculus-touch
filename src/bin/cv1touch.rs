@@ -83,7 +83,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pin-base-station", "pin-base-station [on|off]   (SteamVR starts tracking the headset from a base station headset alignment measured; on by default)"),
     ("report", "report [--out PATH] [--json] [--no-open]   (one file with the logs and settings, for someone helping you)"),
     ("stop", "stop   (stops the daemon, and its supervisor, and waits until they have ended)"),
-    ("pair", "pair [--check [--json] | --listen | --normal]   (pair Touch controllers to the CV1 headset)"),
+    ("pair", "pair [--check [--json] | --listen | --normal | --events]   (pair Touch controllers to the CV1 headset)"),
     ("sensors", "sensors | sensors install | sensors remove   (Windows: the sensors' USB driver)"),
     ("finish-setup", "finish-setup [--json]   (Windows: the sensors' driver and the SteamVR registration, as the installer does them)"),
     ("calibration", "calibration capture|provisional|load PATH"),

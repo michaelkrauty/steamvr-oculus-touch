@@ -18,6 +18,8 @@ pub(super) enum Mode {
     Pair,
     /// Return a headset left in pairing mode back to normal mode.
     Normal,
+    /// Pair Touch controllers using commands and JSON events.
+    Events,
 }
 
 /// Parses `cv1touch pair`'s flags, or None when they do not match.
@@ -28,6 +30,7 @@ pub(super) fn flags(args: &[&str]) -> Option<Mode> {
         ["--check", "--json"] | ["--json", "--check"] => Some(Mode::Check { json: true }),
         ["--listen"] => Some(Mode::Listen),
         ["--normal"] => Some(Mode::Normal),
+        ["--events"] => Some(Mode::Events),
         _ => None,
     }
 }
@@ -277,6 +280,9 @@ fn pair_question(device: pairing::Device, also_paired: Option<u32>) -> String {
 }
 
 pub(super) fn run(mode: Mode) -> i32 {
+    if mode == Mode::Events {
+        return event_mode();
+    }
     match work(mode) {
         Ok(()) => 0,
         Err(e) => {
@@ -433,6 +439,10 @@ fn work(mode: Mode) -> Result<(), String> {
     println!("{}", start_daemon_hint());
     Ok(())
 }
+
+#[path = "pair_events.rs"]
+mod protocol;
+use protocol::event_mode;
 
 #[cfg(test)]
 mod tests {

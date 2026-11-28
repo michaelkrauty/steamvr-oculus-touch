@@ -32,6 +32,7 @@ pub enum Kind {
     Status,
     Sensors,
     Setup,
+    Pair,
 }
 
 impl Kind {
@@ -40,6 +41,7 @@ impl Kind {
             Self::Status => "--window",
             Self::Sensors => "--sensors",
             Self::Setup => "--setup",
+            Self::Pair => "--pair",
         }
     }
 
@@ -48,6 +50,7 @@ impl Kind {
         match self {
             Self::Status => ["Show status window", "Hide status window"],
             Self::Sensors => ["Show sensor views", "Hide sensor views"],
+            Self::Pair => ["Pair controllers…", "Pair controllers…"],
             Self::Setup => ["Set up…", "Set up…"],
         }
     }
@@ -57,6 +60,7 @@ impl Kind {
             Self::Status => crate::window::run(),
             Self::Sensors => crate::cameras::run(),
             Self::Setup => crate::setup_window::run(),
+            Self::Pair => crate::pair_window::run(),
         }
     }
 
@@ -171,7 +175,7 @@ pub fn quit() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub(super) fn close_windows() {
-    for kind in [Kind::Status, Kind::Sensors, Kind::Setup] {
+    for kind in [Kind::Status, Kind::Sensors, Kind::Setup, Kind::Pair] {
         platform::signal_window(kind, Message::Close);
     }
 }
@@ -547,6 +551,11 @@ mod linux {
                         t.action_message = Some(format!("Could not open setup: {error}"));
                     }
                 }),
+                item(Kind::Pair.labels()[0], true, |t| {
+                    if let Err(error) = show(Kind::Pair) {
+                        t.action_message = Some(format!("Could not open pairing: {error}"));
+                    }
+                }),
                 item("Save diagnostic report…", true, |t| {
                     t.action_message = Some("Saving diagnostic report…".into());
                     let updates = t.action_updates.clone();
@@ -607,6 +616,7 @@ mod linux {
             Kind::Status => "cv1touch-window",
             Kind::Sensors => "cv1touch-sensors",
             Kind::Setup => "cv1touch-setup",
+            Kind::Pair => "cv1touch-pair",
         }
     }
 
@@ -637,13 +647,16 @@ mod linux {
     /// Asks the tray and any open windows in `dir` to quit, and waits for them to exit.
     fn stop(dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
         let _ = send(&dir.join("cv1touch-gui.sock"), b"quit");
-        let names = [Kind::Status, Kind::Sensors, Kind::Setup].map(name);
+        let names = [Kind::Status, Kind::Sensors, Kind::Setup, Kind::Pair].map(name);
         for name in names {
             let _ = send(&dir.join(format!("{name}.sock")), b"close");
         }
-        for _ in 0..60 {
+        for i in 0..4000 {
             if !names.iter().chain(&["cv1touch-gui"]).any(|n| held(dir, n)) {
                 return Ok(());
+            }
+            if i >= 60 && !held(dir, name(Kind::Pair)) {
+                break;
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -746,7 +759,7 @@ mod linux {
     fn closing_all_windows_signals_every_window_kind() {
         let dir = std::env::temp_dir().join(format!("tray-close-all-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sockets: Vec<_> = [Kind::Status, Kind::Sensors, Kind::Setup]
+        let sockets: Vec<_> = [Kind::Status, Kind::Sensors, Kind::Setup, Kind::Pair]
             .into_iter()
             .map(|kind| {
                 let path = dir.join(format!("{}.sock", name(kind)));
@@ -1035,4 +1048,10 @@ mod tests {
             assert!(window.child.is_none());
         }
     }
+}
+
+#[test]
+fn pairing_window_has_its_own_flag_and_label() {
+    assert_eq!(Kind::Pair.flag(), "--pair");
+    assert_eq!(Kind::Pair.labels()[0], "Pair controllers…");
 }
