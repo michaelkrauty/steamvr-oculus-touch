@@ -440,17 +440,32 @@ pub struct ReservedRecording<'a> {
 }
 
 impl ReservedRecording<'_> {
-    pub fn start(mut self, start_host_ns: u64) -> Result<(), String> {
+    pub fn start(self, start_host_ns: u64) -> Result<(), String> {
+        self.start_with(start_host_ns, |activate| activate(None))
+    }
+
+    /// Starts the reserved session, running `before_activate` after the file header is written and
+    /// immediately before recording admission turns on. Call `activate(Some((rtype, payload)))`
+    /// while holding any lock that also guards live boundary updates so the initial record lands
+    /// before any tracking record can be admitted.
+    pub fn start_with(
+        mut self,
+        start_host_ns: u64,
+        before_activate: impl FnOnce(&mut dyn FnMut(Option<(u16, &[u8])>)),
+    ) -> Result<(), String> {
         let path = &self.path;
-        let result = self
-            .recorder
-            .start_reserved_session(path, start_host_ns, || {
+        let result = self.recorder.start_reserved_session(
+            path,
+            start_host_ns,
+            || {
                 let file = OpenOptions::new().write(true).create_new(true).open(path)?;
                 Ok(Box::new(FileSink {
                     file,
                     path: path.to_path_buf(),
                 }))
-            });
+            },
+            before_activate,
+        );
         self.started = true;
         result
     }
@@ -469,6 +484,7 @@ fn write_header(
     file: &mut dyn RecordingSink,
     path: &Path,
     start_host_ns: u64,
+    before_activate: impl FnOnce(&mut dyn FnMut(Option<(u16, &[u8])>)),
 ) -> Result<(), String> {
     let space = file
         .disk_space()
@@ -489,13 +505,49 @@ fn write_header(
     header[16..24].copy_from_slice(&start_host_ns.to_le_bytes());
     file.write_all(&header)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    let mut ring = shared.ring.lock().unwrap();
-    ring.stats.bytes = FILE_HEADER_LEN as u64;
-    ring.opening = false;
-    shared.active.store(
-        if ring.stop { 0 } else { ring.admission },
-        Ordering::Release,
-    );
+    let mut activated = false;
+    let mut activate = |initial: Option<(u16, &[u8])>| {
+        if activated {
+            return;
+        }
+        activated = true;
+        let mut ring = shared.ring.lock().unwrap();
+        ring.stats.bytes = FILE_HEADER_LEN as u64;
+        if let Some((rtype, payload)) = initial {
+            let len = RECORD_HEADER_LEN + payload.len();
+            if ring.accepted_bytes.saturating_add(len as u64) > ring.byte_limit {
+                let limit = if ring.byte_limit >= 1 << 30 {
+                    format!("{} GiB", ring.byte_limit >> 30)
+                } else {
+                    format!("{} bytes", ring.byte_limit)
+                };
+                ring.reason = Some(format!("{limit} recording size limit reached"));
+                ring.stop = true;
+            } else if ring.buf.len() - ring.used < len {
+                ring.stats.dropped += 1;
+                ring.reason =
+                    Some("the recording could not keep up when sensor poses changed".into());
+                ring.stop = true;
+            } else {
+                let mut rec_hdr = [0u8; RECORD_HEADER_LEN];
+                rec_hdr[..2].copy_from_slice(&rtype.to_le_bytes());
+                rec_hdr[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                rec_hdr[8..16].copy_from_slice(&start_host_ns.to_le_bytes());
+                ring.put(&rec_hdr);
+                ring.put(payload);
+                ring.stats.records += 1;
+                ring.queued_records += 1;
+                ring.accepted_bytes += len as u64;
+            }
+        }
+        ring.opening = false;
+        shared.active.store(
+            if ring.stop { 0 } else { ring.admission },
+            Ordering::Release,
+        );
+    };
+    before_activate(&mut activate);
+    activate(None);
     Ok(())
 }
 
@@ -700,7 +752,7 @@ impl Recorder {
         open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>>,
     ) -> Result<(), String> {
         self.reserve_session(path, byte_limit, frames)?;
-        self.start_reserved_session(path, start_host_ns, open)
+        self.start_reserved_session(path, start_host_ns, open, |activate| activate(None))
     }
 
     fn start_reserved_session(
@@ -708,6 +760,7 @@ impl Recorder {
         path: &Path,
         start_host_ns: u64,
         open: impl FnOnce() -> io::Result<Box<dyn RecordingSink>>,
+        before_activate: impl FnOnce(&mut dyn FnMut(Option<(u16, &[u8])>)),
     ) -> Result<(), String> {
         let cancelled = self.shared.ring.lock().unwrap().stop;
         if cancelled {
@@ -716,7 +769,13 @@ impl Recorder {
         }
         let start = || -> Result<(), String> {
             let mut file = open().map_err(|e| format!("open {}: {e}", path.display()))?;
-            write_header(&self.shared, &mut *file, path, start_host_ns)?;
+            write_header(
+                &self.shared,
+                &mut *file,
+                path,
+                start_host_ns,
+                before_activate,
+            )?;
             self.spawn_writer(path.to_path_buf(), || Ok(file), None, None)
         };
         if let Err(error) = start() {
@@ -843,7 +902,9 @@ impl Recorder {
                     file = Some(open().map_err(|e| format!("open {}: {e}", path.display()))?);
                     let sink = file.as_deref_mut().unwrap();
                     if let Some((start_host_ns, _)) = &starting {
-                        write_header(&shared, sink, &path, *start_host_ns)?;
+                        write_header(&shared, sink, &path, *start_host_ns, |activate| {
+                            activate(None)
+                        })?;
                     }
                     if let Some((_, ready)) = starting.take() {
                         let _ = ready.send(Ok(()));
@@ -900,10 +961,6 @@ impl Recorder {
     }
     pub fn active(&self) -> bool {
         self.shared.active.load(Ordering::Acquire) != 0
-    }
-    /// Non-zero session token while a recording is active, 0 otherwise. Lock-free.
-    pub fn session_token(&self) -> u64 {
-        self.shared.active.load(Ordering::Acquire)
     }
     /// Status snapshot only; `write_frame` captures permission together with session identity.
     pub fn frames_enabled(&self) -> bool {

@@ -229,6 +229,11 @@ struct Daemon {
     landmark_shifts: Mutex<std::collections::BTreeMap<String, (f64, f64, usize)>>,
     /// Per sensor serial: where it stands with the pose watch (`repose`), for `status`.
     sensor_poses: Mutex<std::collections::BTreeMap<String, PoseNote>>,
+    /// Active live camera extrinsics updated in memory by session refit or re-placement
+    /// (`sensor_identity` -> `(serial, world_from_cam)`). Held across initial recording activation
+    /// and live `SENSOR_POSES` writes so every recording starts with the active poses before any
+    /// tracking record is admitted.
+    session_poses: Mutex<std::collections::BTreeMap<String, (String, nalgebra::Isometry3<f64>)>>,
     /// Per sensor serial: its agreement with the others, as of the last tick (`status`).
     sensor_agreement: Mutex<std::collections::BTreeMap<String, track::tracker::CameraAgreement>>,
     /// Fewer than two sensors agree with each other (see `repose::Change::Unsure`).
@@ -2574,6 +2579,7 @@ fn engine_session(
         // their removals from here
         clear_sensor_events(d);
         d.sensor_removals.lock().unwrap().clear();
+        d.session_poses.lock().unwrap().clear();
     }
     for serial in modes::unposed_sensors(opts, &open) {
         log!("sensor {serial} has no calibrated pose: it only observes (run `cv1touch calibrate`)");
@@ -3250,12 +3256,6 @@ struct Reposing {
     /// Whether the last refit finished with a rejection (prevents a static elevated residual floor
     /// from shortening the post-rejection backoff indefinitely).
     refit_last_rejected: bool,
-    /// Active live camera poses that diverge from the initial loaded calibration (`sensor_identity`
-    /// -> `(serial, world_from_cam)`), recorded into any active or newly started recording so
-    /// offline replay reproduces live tracking.
-    refit_active_poses: std::collections::BTreeMap<String, (String, nalgebra::Isometry3<f64>)>,
-    /// `Recorder::session_token()` that already received `refit_active_poses`.
-    refit_rec_token: u64,
 }
 
 impl Reposing {
@@ -3336,8 +3336,6 @@ impl Reposing {
             refit_skipped: Default::default(),
             refit_regime_trims: 0,
             refit_last_rejected: false,
-            refit_active_poses: Default::default(),
-            refit_rec_token: 0,
         }
     }
 
@@ -3359,7 +3357,6 @@ impl Reposing {
         let id = cv1touch::status::sensor_identity(serial);
         *self.removals.entry(id.clone()).or_default() += 1;
         self.anchors.remove(&id);
-        self.refit_active_poses.remove(&id);
         self.refit_skipped.remove(&id);
         self.refit_regime_trims = 0;
         self.refit_last_rejected = false;
@@ -3385,26 +3382,37 @@ impl Reposing {
     }
 
     fn record_sensor_poses(d: &Daemon, now: u64, poses: &[(&str, nalgebra::Isometry3<f64>)]) {
-        if poses.is_empty() || !d.rec.active() {
+        if poses.is_empty() {
             return;
         }
-        let encoded: Vec<(&str, [f64; 4], [f64; 3])> = poses
-            .iter()
-            .map(|(serial, iso)| {
-                let q = iso.rotation.quaternion();
-                let t = iso.translation.vector;
-                (*serial, [q.i, q.j, q.k, q.w], [t.x, t.y, t.z])
-            })
-            .collect();
-        let payload = recorder::encode_sensor_poses(&encoded);
-        d.rec
-            .write_boundary(recorder::SENSOR_POSES, now, &[&payload]);
+        // Lock order everywhere is `d.session_poses` -> `d.rec` ring: recording start snapshots
+        // `d.session_poses` and flips recording admission under the same lock, so a live update
+        // either lands in the opening snapshot or sees admission already active here.
+        let mut active = d.session_poses.lock().unwrap();
+        for &(serial, iso) in poses {
+            active.insert(
+                cv1touch::status::sensor_identity(serial),
+                (serial.to_string(), iso),
+            );
+        }
+        if d.rec.active() {
+            let encoded: Vec<(&str, [f64; 4], [f64; 3])> = poses
+                .iter()
+                .map(|&(serial, iso)| {
+                    let q = iso.rotation.quaternion();
+                    let t = iso.translation.vector;
+                    (serial, [q.i, q.j, q.k, q.w], [t.x, t.y, t.z])
+                })
+                .collect();
+            let payload = recorder::encode_sensor_poses(&encoded);
+            d.rec
+                .write_boundary(recorder::SENSOR_POSES, now, &[&payload]);
+        }
     }
 
     fn note_sensor_added(&mut self, serial: &str, world_from_cam: nalgebra::Isometry3<f64>) {
         let id = cv1touch::status::sensor_identity(serial);
         self.anchors.insert(id.clone(), world_from_cam);
-        self.refit_active_poses.remove(&id);
         self.refit_skipped.insert(id);
         self.refit_regime_trims = 0;
         self.refit_last_rejected = false;
@@ -3615,18 +3623,6 @@ impl Reposing {
         }
         self.next_tick = now + REPOSE_TICK_NS;
         self.sync_anchors(pipe);
-        let rec_token = d.rec.session_token();
-        if rec_token == 0 {
-            self.refit_rec_token = 0;
-        } else if rec_token != self.refit_rec_token && !self.refit_active_poses.is_empty() {
-            let poses: Vec<(&str, nalgebra::Isometry3<f64>)> = self
-                .refit_active_poses
-                .values()
-                .map(|(serial, iso)| (serial.as_str(), *iso))
-                .collect();
-            Self::record_sensor_poses(d, now, &poses);
-            self.refit_rec_token = rec_token;
-        }
         prune_placements(&mut self.placements, now);
         // An acknowledgement may still be arriving: the radio thread never waits for it.
         let restored = link
@@ -3730,12 +3726,7 @@ impl Reposing {
                     pipe.probe(&serial, false);
                     pipe.reset_agreement(&serial);
                     pipe.reset_refit_samples();
-                    self.refit_active_poses.insert(
-                        cv1touch::status::sensor_identity(&serial),
-                        (serial.clone(), fit.world_from_cam),
-                    );
                     Self::record_sensor_poses(d, now, &[(&serial, fit.world_from_cam)]);
-                    self.refit_rec_token = d.rec.session_token();
                     self.reposer.forget(camera);
                     self.probed_since.remove(&serial);
                     self.monitor.released(&serial);
@@ -3949,10 +3940,6 @@ impl Reposing {
                         pipe.sensor(&s.serial, cam.model, s.world_from_cam);
                         pipe.reset_agreement(&s.serial);
                         self.monitor.reset_agreement(&s.serial);
-                        self.refit_active_poses.insert(
-                            cv1touch::status::sensor_identity(&s.serial),
-                            (s.serial.clone(), s.world_from_cam),
-                        );
                         rec_poses.push((s.serial.as_str(), s.world_from_cam));
                         let (orient_xyzw, pos) = calib::iso_to_xyzw(&s.world_from_cam);
                         let matches = s.train_obs + s.heldout_obs;
@@ -3986,7 +3973,6 @@ impl Reposing {
                             .push((PoseChange::Refit(batch), 0));
                     }
                     Self::record_sensor_poses(d, now, &rec_poses);
-                    self.refit_rec_token = d.rec.session_token();
                     pipe.reset_refit_samples();
                     self.refit_version = self.refit_version.wrapping_add(1);
                     self.refit_last_at = Some(now);
@@ -5149,6 +5135,10 @@ fn retire_radio_sensor(
     serial: &str,
 ) {
     reposing.forget(serial, pipe);
+    d.session_poses
+        .lock()
+        .unwrap()
+        .remove(&cv1touch::status::sensor_identity(serial));
     d.sensor_poses
         .lock()
         .unwrap()
@@ -6825,6 +6815,30 @@ fn recording_started(d: &Daemon, started: Result<(), String>) -> String {
     }
 }
 
+fn start_recording(
+    d: &Daemon,
+    reserved: recorder::ReservedRecording<'_>,
+    start_host_ns: u64,
+) -> Result<(), String> {
+    reserved.start_with(start_host_ns, |activate| {
+        let poses = d.session_poses.lock().unwrap();
+        if poses.is_empty() {
+            activate(None);
+        } else {
+            let encoded: Vec<(&str, [f64; 4], [f64; 3])> = poses
+                .values()
+                .map(|(serial, iso)| {
+                    let q = iso.rotation.quaternion();
+                    let t = iso.translation.vector;
+                    (serial.as_str(), [q.i, q.j, q.k, q.w], [t.x, t.y, t.z])
+                })
+                .collect();
+            let payload = recorder::encode_sensor_poses(&encoded);
+            activate(Some((recorder::SENSOR_POSES, &payload)));
+        }
+    })
+}
+
 fn handle(d: &Daemon, line: &str) -> String {
     match control::parse(line) {
         Err(e) => format!("err {e}"),
@@ -6852,7 +6866,11 @@ fn handle(d: &Daemon, line: &str) -> String {
         // Control requests start recordings in `handle_control_recording`, which reserves the
         // session under the dispatch turn; this is the same start in one step.
         Ok(Command::RecordStart(path, frames)) => {
-            recording_started(d, d.rec.start_with_frames(&path, shm::now_ns(), frames))
+            let started = d
+                .rec
+                .reserve_with_frames(&path, frames)
+                .and_then(|reserved| start_recording(d, reserved, shm::now_ns()));
+            recording_started(d, started)
         }
         Ok(Command::RecordStop) => match d.rec.stop_timeout(None, RECORD_STOP_WAIT) {
             Some(status) => record_stop_reply(&status, false),
@@ -7417,7 +7435,7 @@ fn handle_control(d: &Daemon, line: &str, one_at_a_time: &Mutex<()>) -> String {
         line,
         one_at_a_time,
         Recorder::reserve_with_frames,
-        |reserved| reserved.start(shm::now_ns()),
+        |reserved| start_recording(d, reserved, shm::now_ns()),
     )
 }
 
@@ -7962,6 +7980,7 @@ fn main() {
         pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
         landmark_shifts: Mutex::new(Default::default()),
         sensor_poses: Mutex::new(Default::default()),
+        session_poses: Mutex::new(Default::default()),
         sensor_agreement: Mutex::new(Default::default()),
         sensors_unsure: AtomicBool::new(false),
         calibration: Mutex::new(calibration_path.map(LoadedCalibration::at)),
@@ -10093,6 +10112,7 @@ mod tests {
             pending_frames_dropped: std::sync::atomic::AtomicU64::new(0),
             landmark_shifts: Mutex::new(Default::default()),
             sensor_poses: Mutex::new(Default::default()),
+            session_poses: Mutex::new(Default::default()),
             sensor_agreement: Mutex::new(Default::default()),
             sensors_unsure: AtomicBool::new(false),
             calibration: Mutex::new(None),
@@ -23277,21 +23297,21 @@ mod tests {
         let p1 = recorder::decode_sensor_poses(&r1[0].payload).unwrap();
         assert_eq!(p1.len(), 4);
 
-        // A recording started after the session refit must also receive the active session poses.
+        // A recording started after the session refit must emit the active session poses during
+        // recording initialization, before any tracking record is admitted and even if stopped
+        // before the next periodic repose tick.
         let rec2 = dir.path().join("after.rec");
         now += REPOSE_TICK_NS;
-        d.rec.start(&rec2, now).unwrap();
-        reposing.tick(&d, &link, &mut pipe, &mut None, now);
+        let reserved = d.rec.reserve_with_frames(&rec2, false).unwrap();
+        start_recording(&d, reserved, now).unwrap();
+        d.rec.write(recorder::FRAME_OBS, now + 1, &[b"synthetic"]);
         d.rec.stop();
 
-        let r2: Vec<_> = recorder::Reader::open(&rec2)
-            .unwrap()
-            .filter(|r| r.rtype == recorder::SENSOR_POSES)
-            .collect();
+        let r2: Vec<_> = recorder::Reader::open(&rec2).unwrap().collect();
         assert_eq!(
-            r2.len(),
-            1,
-            "subsequent recording must record active session poses at start"
+            r2.iter().map(|r| r.rtype).collect::<Vec<_>>(),
+            [recorder::SENSOR_POSES, recorder::FRAME_OBS],
+            "initial session poses must precede any admitted tracking record"
         );
         let p2 = recorder::decode_sensor_poses(&r2[0].payload).unwrap();
         assert_eq!(p2.len(), 4);
