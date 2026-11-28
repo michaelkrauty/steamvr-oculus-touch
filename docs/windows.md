@@ -5,7 +5,7 @@ One installer sets up everything. No command line, Python or developer tools are
 ## What you need
 
 - Windows 11 x64 with [SteamVR](https://store.steampowered.com/app/250820/SteamVR/) and a headset SteamVR already tracks. The Rift CV1's display is not used: the CV1 headset is only the controllers' USB radio receiver, and its HDMI cable can stay unplugged.
-- The CV1 headset's original Touch controllers, already paired to it, with charged batteries.
+- Original Rift CV1 Touch controllers with charged batteries. If they are not paired to your CV1 headset yet, stop the daemon (`cv1touch stop` or **Stop daemon** in the tray app) and run `cv1touch pair`.
 - Two or more CV1 sensors with overlapping views, on USB 3 ports where possible and not all on one hub.
 - Permission to approve one Windows administrator prompt, for the sensor driver.
 - No Oculus or Meta PC software running: it competes for the same USB devices. cv1touch gives the sensors Windows' WinUSB driver, replacing any other driver they had.

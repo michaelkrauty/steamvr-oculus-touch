@@ -65,6 +65,19 @@ If the installer cannot find SteamVR, set `CV1TOUCH_STEAMVR` to the SteamVR fold
 
 The driver's input profile is built at install time from SteamVR's own Oculus Touch profile. SteamVR shows the controllers as **Oculus Touch (cv1touch)**, which uses each game's Oculus Touch bindings and adds the right controller's Oculus button.
 
+## Pair controllers
+
+Each controller must be paired to your CV1 headset; ones bought with the headset usually are. `cv1touch pair` checks and pairs them with no Oculus software. Stop the daemon first, since pairing uses the headset's radio:
+
+```sh
+cv1touch stop
+cv1touch pair --check
+cv1touch pair
+systemctl --user start cv1touchd
+```
+
+`--check` shows what is paired and changes nothing (add `--json` for machine-readable output); wake each controller first (press any button). `cv1touch pair` restarts the headset in pairing mode and lists each controller that asks to be paired; to make one ask, hold Menu (☰) and Y on the left controller, or the Oculus button and B on the right one, until its light blinks. Pairing writes the headset's radio address into the controller without unpairing any previous controller, so if you own spare controllers paired to the same headset, keep the unused pair asleep or remove its batteries so two controllers for the same hand do not transmit at once. `--listen` lists the controllers that ask without pairing any, and `--normal` returns a headset left in pairing mode back to normal mode. The headset returns to normal mode at the end, or on Ctrl+C, and every run saves what was paired before and after in `$XDG_STATE_HOME/cv1touch/pairing/` (on Windows, `%LOCALAPPDATA%\cv1touch\pairing\`).
+
 ## Guided setup
 
 Wake both controllers and make sure the daemon is running, then:

@@ -15,6 +15,8 @@ The root Apache 2.0 license covers original SteamVR Oculus Touch code and local 
 
 The unused upstream GStreamer plugin and 3Glasses driver are not distributed in this snapshot. OpenHMD files bearing both LGPL and Boost alternatives are used under Boost, with their original notices intact.
 
+Controller pairing (`src/pairing.rs`) is a Rust port of the CV1 radio pairing sequence and report layouts from [pH5/ouvrt](https://github.com/pH5/ouvrt) (`src/rift-radio.c`, `src/rift-hid-reports.h`; Copyright 2015-2016 Philipp Zabel), which offers them under LGPL-2.1-or-later or the [Boost Software License 1.0](third_party/openhmd/LICENSE); they are used under Boost.
+
 Local OpenHMD changes match configured, discovered and calibrated sensor serials without regard to ASCII letter case, using bounded comparisons.
 
 The local OpenHMD log callback forwards the daemon's native diagnostics to its bounded logging queue; other clients retain the engine's original stdout/stderr behavior for ordinary logs. The libusb callback covers its normal logging implementation; special libusb build options can bypass it.

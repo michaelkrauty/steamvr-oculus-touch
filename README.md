@@ -8,7 +8,7 @@ A Rust daemon tracks the controllers from the CV1 sensors and the controllers' I
 
 ## What you need
 
-- Rift CV1 Touch controllers, already paired to a CV1 headset. Rift S and Quest controllers are unsupported, and pairing is not implemented.
+- Rift CV1 Touch controllers, paired to a CV1 headset (`cv1touch pair` can pair them with no Oculus software). Rift S and Quest controllers are unsupported.
 - The CV1 headset connected over USB. It is only the controllers' radio receiver: its display is not used.
 - Two or more CV1 sensors with overlapping views of the play area.
 - SteamVR with another headset that SteamVR already tracks.

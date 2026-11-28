@@ -997,8 +997,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HidD_FreePreparsedData, HidD_GetHidGuid, HidD_GetPreparsedData, HidD_SetNumInputBuffers,
-    HidP_GetCaps, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+    HidD_FreePreparsedData, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData,
+    HidD_SetFeature, HidD_SetNumInputBuffers, HidP_GetCaps, HIDP_CAPS, HIDP_STATUS_SUCCESS,
 };
 use windows_sys::Win32::Foundation::{ERROR_IO_INCOMPLETE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -1209,6 +1209,97 @@ impl Drop for HidDevice {
                 GetOverlappedResult(self.handle.0, &*self.ov, &mut moved, 1);
             }
         }
+    }
+}
+
+/// One HID interface opened synchronously for feature reports (HidD_SetFeature / HidD_GetFeature).
+/// Windows' HID class driver requires every feature buffer to be at least
+/// `FeatureReportByteLength` bytes (69 on Rift CV1 interface 0) even for shorter reports.
+pub struct HidFeatureDevice {
+    handle: Handle,
+    feature_len: usize,
+}
+
+// SAFETY: the file handle may move across threads; callers synchronize access via `&mut self`.
+unsafe impl Send for HidFeatureDevice {}
+
+impl HidFeatureDevice {
+    pub fn open(path: &Path) -> io::Result<HidFeatureDevice> {
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path; the synchronous handle is owned by `Handle` below.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = Handle(handle);
+        let mut caps: HIDP_CAPS = unsafe { std::mem::zeroed() };
+        // SAFETY: our device handle; preparsed data is freed once.
+        unsafe {
+            let mut data = 0;
+            if HidD_GetPreparsedData(handle.0, &mut data) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let status = HidP_GetCaps(data, &mut caps);
+            HidD_FreePreparsedData(data);
+            if status != HIDP_STATUS_SUCCESS {
+                return Err(io::Error::other("the HID interface has no capabilities"));
+            }
+        }
+        let feature_len = caps.FeatureReportByteLength as usize;
+        if feature_len == 0 {
+            return Err(io::Error::other("the HID interface has no feature reports"));
+        }
+        Ok(HidFeatureDevice {
+            handle,
+            feature_len,
+        })
+    }
+
+    pub fn set_feature(&mut self, report: &[u8]) -> io::Result<()> {
+        if report.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty HID feature report",
+            ));
+        }
+        let mut tmp = vec![0u8; report.len().max(self.feature_len)];
+        tmp[..report.len()].copy_from_slice(report);
+        // SAFETY: `tmp` is at least `FeatureReportByteLength` bytes and `tmp[0]` is the report ID.
+        let ok = unsafe { HidD_SetFeature(self.handle.0, tmp.as_ptr().cast(), tmp.len() as u32) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty HID feature report",
+            ));
+        }
+        let mut tmp = vec![0u8; buf.len().max(self.feature_len)];
+        tmp[0] = buf[0];
+        // SAFETY: `tmp` is at least `FeatureReportByteLength` bytes and `tmp[0]` names the report.
+        let ok =
+            unsafe { HidD_GetFeature(self.handle.0, tmp.as_mut_ptr().cast(), tmp.len() as u32) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.copy_from_slice(&tmp[..buf.len()]);
+        Ok(buf.len())
     }
 }
 

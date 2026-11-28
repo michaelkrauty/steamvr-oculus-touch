@@ -23,6 +23,7 @@ pub mod headset_watch;
 pub mod input_calibration;
 mod log_lines;
 pub mod modes;
+pub mod pairing;
 pub mod platform;
 pub mod preview;
 pub mod recorder;
