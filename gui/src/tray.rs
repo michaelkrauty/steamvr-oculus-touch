@@ -274,6 +274,11 @@ impl Report {
     }
 }
 
+pub(super) fn tooltip(summary: &str) -> String {
+    let summary = summary.strip_prefix("cv1touch: ").unwrap_or(summary);
+    format!("cv1touch {}: {summary}", crate::window::VERSION)
+}
+
 // A doctor result cannot turn a failed status probe green, and an offline
 // diagnosis must have started after the current status outage began.
 #[derive(Default)]
@@ -496,7 +501,7 @@ mod linux {
             "cv1touch".into()
         }
         fn title(&self) -> String {
-            format!("cv1touch: {}", self.report.summary)
+            super::tooltip(&self.report.summary)
         }
         fn activate(&mut self, _: i32, _: i32) {
             self.window.lock().unwrap().toggle();
@@ -1007,6 +1012,21 @@ mod tests {
         assert_eq!(offered(&report), [ServiceAction::Start]);
         assert_eq!(report.summary, "Daemon stopped");
         assert_eq!(report.health.tint(), Tint::Stopped);
+    }
+
+    #[test]
+    fn tooltip_includes_version_without_duplicating_name() {
+        assert_eq!(
+            tooltip("Ready · 5 sensors · L 85% R 90%"),
+            format!(
+                "cv1touch {}: Ready · 5 sensors · L 85% R 90%",
+                crate::window::VERSION
+            )
+        );
+        assert_eq!(
+            tooltip("cv1touch: checking…"),
+            format!("cv1touch {}: checking…", crate::window::VERSION)
+        );
     }
 
     #[cfg(target_os = "linux")]

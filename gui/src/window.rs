@@ -23,6 +23,9 @@ pub use settings_tab::Local;
 /// The window's app ID, which Wayland compositors match to a desktop entry of that name.
 pub const APP_ID: &str = "cv1touch-gui";
 
+/// The installed GUI version, prefixed with `v` for display.
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 /// The default window fits a healthy setup's overview snugly; it grows to fit more.
 pub const SIZE: [f32; 2] = [660.0, 410.0];
 /// The heights between which the window follows its overview, and the least for the
@@ -787,7 +790,7 @@ fn header(ui: &mut Ui, view: &View, problems: &[(Level, String)], tab: &mut Tab)
 }
 
 fn subtitle(view: &View) -> String {
-    match (&view.snap.status, view.daemon) {
+    let state = match (&view.snap.status, view.daemon) {
         (_, Daemon::Busy(action)) => action.progress().to_owned(),
         (Some(status), _) => {
             let sensors = status["sensors"].as_array().map_or(0, Vec::len);
@@ -805,7 +808,8 @@ fn subtitle(view: &View) -> String {
         (None, Daemon::Stopped) => "cv1touchd is not running".to_owned(),
         (None, Daemon::Running) => "cv1touchd is not answering".to_owned(),
         (None, _) => "Looking for cv1touchd".to_owned(),
-    }
+    };
+    format!("{VERSION} · {state}")
 }
 
 /// The saved report's banner above the footer's buttons.
@@ -1347,6 +1351,42 @@ mod tests {
     use super::*;
     use crate::client::StatusError;
     use serde_json::json;
+
+    #[test]
+    fn subtitle_includes_version_in_every_state() {
+        let icons = Icons::load(&egui::Context::default());
+        let config = ConfigStats::default();
+        let local = Local::default();
+        let make = |snap: &Snapshot, daemon: Daemon| {
+            subtitle(&View {
+                snap,
+                config: &config,
+                daemon,
+                notice: None,
+                icons: &icons,
+                report: None,
+                local: &local,
+            })
+        };
+        let mut snap = Snapshot::default();
+        assert_eq!(
+            make(&snap, Daemon::Checking),
+            format!("{VERSION} · Looking for cv1touchd")
+        );
+        assert_eq!(
+            make(&snap, Daemon::Stopped),
+            format!("{VERSION} · cv1touchd is not running")
+        );
+        assert_eq!(
+            make(&snap, Daemon::Busy(ServiceAction::Restart)),
+            format!("{VERSION} · Restarting daemon…")
+        );
+        snap.status = Some(json!({"mode": "calibrated", "sensors": [{}, {}]}));
+        assert_eq!(
+            make(&snap, Daemon::Running),
+            format!("{VERSION} · Daemon running · calibrated · 2 sensors")
+        );
+    }
 
     #[test]
     fn live_summary_is_conservative() {

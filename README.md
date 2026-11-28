@@ -14,6 +14,14 @@ A Rust daemon tracks the controllers from the CV1 sensors and the controllers' I
 - SteamVR with another headset that SteamVR already tracks.
 - Linux x86-64 or Windows 11 x64. On Linux the default install runs the daemon as a systemd user service.
 
+## Desktop app
+
+`cv1touch-gui` provides a system tray icon, status window, live infrared sensor views and guided setup (included in the Windows installer; optional source build on Linux, see [gui/README.md](gui/README.md)).
+
+![cv1touch status window showing both controllers tracking, five active sensors, and calibration accuracy](docs/screenshots/overview.png)
+
+![Guided setup calibrating triggers, grips and thumbsticks live](docs/screenshots/setup-buttons.png)
+
 ## Install
 
 **Windows:** download `cv1touch-setup-0.7.0.exe` from the [v0.7.0 release](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) and follow [cv1touch on Windows](docs/windows.md).

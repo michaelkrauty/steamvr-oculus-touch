@@ -194,7 +194,7 @@ unsafe fn notify(hwnd: HWND, operation: u32, report: &Report) -> bool {
         hIcon: hicon,
         ..Default::default()
     };
-    let mut tip = wide(&format!("cv1touch: {}", report.summary));
+    let mut tip = wide(&super::tooltip(&report.summary));
     tip.truncate(data.szTip.len() - 1);
     tip.push(0);
     data.szTip[..tip.len()].copy_from_slice(&tip);
