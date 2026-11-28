@@ -77,6 +77,56 @@ const MAX_CLIENTS: usize = 16;
 const ENGINE_WORKER: u8 = 1;
 const RADIO_WORKER: u8 = 2;
 
+/// Minimum spacing between routine Touch battery change logs per hand. Under haptic load the
+/// battery ADC sags by 3-5% and oscillates faster than once per second; status/SHM still updates
+/// immediately on every radio report while the log stays quiet.
+const BATTERY_LOG_INTERVAL_NS: u64 = 60_000_000_000;
+/// Minimum percentage change for a routine log above the low-battery band.
+const BATTERY_LOG_STEP_PCT: i32 = 5;
+/// At or below this percentage, log any 1% change once per routine interval.
+const BATTERY_LOG_LOW_PCT: i32 = 10;
+/// Minimum spacing and percentage delta for an immediate large-jump log (e.g. a battery swap).
+const BATTERY_LOG_JUMP_INTERVAL_NS: u64 = 5_000_000_000;
+const BATTERY_LOG_JUMP_PCT: i32 = 15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatteryLog {
+    last_pct: i32,
+    last_ts_ns: u64,
+}
+
+impl BatteryLog {
+    const EMPTY: Self = Self {
+        last_pct: -1,
+        last_ts_ns: 0,
+    };
+
+    /// Returns `Some(None)` on the first reading, `Some(Some(was))` when a change should be
+    /// logged, or `None` when suppressed as short-term voltage-sag noise.
+    fn record(&mut self, ts_ns: u64, pct: i32) -> Option<Option<i32>> {
+        if self.last_pct < 0 {
+            self.last_pct = pct;
+            self.last_ts_ns = ts_ns;
+            return Some(None);
+        }
+        let was = self.last_pct;
+        let diff = (pct - was).abs();
+        if diff == 0 {
+            return None;
+        }
+        let elapsed = ts_ns.saturating_sub(self.last_ts_ns);
+        let log_now = (diff >= BATTERY_LOG_JUMP_PCT && elapsed >= BATTERY_LOG_JUMP_INTERVAL_NS)
+            || (elapsed >= BATTERY_LOG_INTERVAL_NS
+                && (diff >= BATTERY_LOG_STEP_PCT || pct <= BATTERY_LOG_LOW_PCT));
+        if !log_now {
+            return None;
+        }
+        self.last_pct = pct;
+        self.last_ts_ns = ts_ns;
+        Some(Some(was))
+    }
+}
+
 /// Which pose cv1touchd publishes: its own tracker (OpenHMD only acquires) or OpenHMD's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TrackerKind {
@@ -284,9 +334,8 @@ struct Daemon {
     classification: [PublishedClassification; 2],
     /// Per hand: the newest battery percentage from the radio, -1 before the first.
     battery: [std::sync::atomic::AtomicI32; 2],
-    /// Per hand: the last two battery percentages logged, newest first, -1 before any. A reading
-    /// on a step boundary alternates between two neighbours, so either is old news.
-    battery_logged: Mutex<[[i32; 2]; 2]>,
+    /// Per hand: the last logged battery percentage and timestamp, debounced against haptic sag.
+    battery_logged: Mutex<[BatteryLog; 2]>,
     /// Wakes the radio thread: new camera frames or bodies, or time to stop. It lives as long as
     /// the daemon, so a sensor thread never signals a closed (or reused) handle.
     radio_wake: hid::Waker,
@@ -861,14 +910,12 @@ impl EngineSink for Daemon {
         if source == 1 {
             for (hand, pct) in cv1touch::hand::battery_from_radio(data) {
                 self.battery[hand].store(pct, Ordering::Relaxed);
-                let mut logged = self.battery_logged.lock().unwrap();
-                let [was, before] = logged[hand];
-                if pct != was && pct != before {
-                    logged[hand] = [pct, was];
+                let event = self.battery_logged.lock().unwrap()[hand].record(ts, pct);
+                if let Some(was) = event {
                     log!(
                         "{} Touch battery {pct}%{}",
                         ["left", "right"][hand],
-                        if was >= 0 {
+                        if let Some(was) = was {
                             format!(" (was {was}%)")
                         } else {
                             String::new()
@@ -7254,7 +7301,7 @@ fn main() {
             std::sync::atomic::AtomicI32::new(-1),
             std::sync::atomic::AtomicI32::new(-1),
         ],
-        battery_logged: Mutex::new([[-1; 2]; 2]),
+        battery_logged: Mutex::new([BatteryLog::EMPTY; 2]),
         radio_wake: hid::Waker::new().expect("radio waker"),
         radio_on: AtomicBool::new(false),
         inject: Injection::default(),
@@ -9387,7 +9434,7 @@ mod tests {
                 std::sync::atomic::AtomicI32::new(-1),
                 std::sync::atomic::AtomicI32::new(-1),
             ],
-            battery_logged: Mutex::new([[-1; 2]; 2]),
+            battery_logged: Mutex::new([BatteryLog::EMPTY; 2]),
             radio_wake: hid::Waker::new().unwrap(),
             radio_on: AtomicBool::new(false),
             inject: Injection::default(),
@@ -14040,11 +14087,12 @@ mod tests {
 
     #[test]
     fn battery_reports_keep_atomic_updates_and_change_logs_in_message_order() {
+        const SEC: u64 = 1_000_000_000;
         for radio_on in [false, true] {
             let d = status_daemon();
             d.radio_on.store(radio_on, Ordering::Release);
             let lines = daemon_log::capture(|| {
-                let send = |messages: [(u8, u16); 2], expected| {
+                let send = |ts: u64, messages: [(u8, u16); 2], expected| {
                     let mut data = [0; 64];
                     data[0] = 0x0c;
                     for (i, (device, percent)) in messages.into_iter().enumerate() {
@@ -14054,29 +14102,37 @@ mod tests {
                         m[25] = 0x21;
                         m[26..28].copy_from_slice(&percent.to_le_bytes());
                     }
-                    d.report(1, 1, &data);
+                    d.report(1, ts, &data);
                     assert_eq!(
                         d.battery.each_ref().map(|b| b.load(Ordering::Relaxed)),
                         expected
                     );
                     data[0] = 0x0b;
-                    d.report(1, 2, &data);
-                    d.report(1, 3, &data[..63]);
+                    d.report(1, ts + 1, &data);
+                    d.report(1, ts + 2, &data[..63]);
                     data[0] = 0x0c;
-                    d.report(0, 4, &data);
+                    d.report(0, ts + 3, &data);
                 };
-                send([(2, 87), (3, 50)], [87, 50]);
-                send([(2, 87), (3, 50)], [87, 50]);
-                send([(2, 86), (2, 85)], [85, 50]);
-                send([(3, 65535), (2, 0)], [0, 100]);
-                // a reading on a step boundary alternates; only a third value is news
-                send([(2, 1), (2, 0)], [0, 100]);
-                send([(2, 1), (3, 99)], [1, 99]);
-                send([(3, 100), (3, 99)], [1, 99]);
-                send([(2, 2), (3, 98)], [2, 98]);
+                // First reading for each hand logs immediately in message order.
+                send(10 * SEC, [(2, 87), (3, 50)], [87, 50]);
+                // Identical values and multi-step haptic voltage sag update atomics without logging.
+                send(11 * SEC, [(2, 87), (3, 50)], [87, 50]);
+                send(12 * SEC, [(2, 84), (2, 82)], [82, 50]);
+                send(13 * SEC, [(2, 85), (2, 83)], [83, 50]);
+                send(14 * SEC, [(2, 87), (3, 47)], [87, 47]);
+                // Sub-5s large spike still updates atomics but does not spam logs.
+                send(14 * SEC, [(3, 65535), (2, 10)], [10, 100]);
+                // After 5s, a >=15% jump (e.g. fresh battery swap or major drop) logs immediately.
+                send(15 * SEC, [(3, 65535), (2, 10)], [10, 100]);
+                // Rapid oscillation in the low-battery band is still bounded by the 60s interval.
+                send(20 * SEC, [(2, 9), (2, 8)], [8, 100]);
+                // After 60s: small (<5%) noise at high battery stays quiet, while <=10% logs 1% drops.
+                send(75 * SEC, [(3, 97), (2, 9)], [9, 97]);
+                // A >=5% drop after 60s logs routinely.
+                send(76 * SEC, [(3, 95), (2, 9)], [9, 95]);
                 assert_eq!(
                     d.battery.each_ref().map(|b| b.load(Ordering::Relaxed)),
-                    [2, 98]
+                    [9, 95]
                 );
             });
             assert_eq!(
@@ -14084,14 +14140,10 @@ mod tests {
                 [
                     "left Touch battery 87%",
                     "right Touch battery 50%",
-                    "left Touch battery 86% (was 87%)",
-                    "left Touch battery 85% (was 86%)",
                     "right Touch battery 100% (was 50%)",
-                    "left Touch battery 0% (was 85%)",
-                    "left Touch battery 1% (was 0%)",
-                    "right Touch battery 99% (was 100%)",
-                    "left Touch battery 2% (was 1%)",
-                    "right Touch battery 98% (was 99%)",
+                    "left Touch battery 10% (was 87%)",
+                    "left Touch battery 9% (was 10%)",
+                    "right Touch battery 95% (was 100%)",
                 ]
             );
         }

@@ -8,6 +8,10 @@ All notable user-facing changes are recorded here. Version numbers follow semant
 
 - `cv1touch pair` pairs Rift CV1 Touch controllers to the CV1 headset without Oculus software on Linux and Windows. `--check` (with optional `--json`) reads and saves what is paired without changing anything, `--listen` lists controllers asking to be paired without pairing them, and `--normal` returns a headset left in pairing mode back to normal mode. Every run saves snapshots of what was paired before and after, and returns the headset to normal mode on exit or Ctrl+C.
 
+### Fixed
+
+- `cv1touchd` debounces Touch controller battery change logs (requiring a 5% step after 60 s, 1% at or below 10%, or an immediate 15% jump after 5 s) so haptic voltage sag no longer floods the daemon log ring while live status updates remain immediate.
+
 ## [0.7.0](https://github.com/michaelkrauty/steamvr-oculus-touch/releases/tag/v0.7.0) - 2026-11-26
 
 ### Added
